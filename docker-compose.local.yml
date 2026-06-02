@@ -1,0 +1,37 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: inkar_opt_db_local
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-inkar_opt}
+      POSTGRES_USER: ${POSTGRES_USER:-inkar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-inkar}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata_local:/var/lib/postgresql/data
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: inkar_opt_app_local
+    restart: unless-stopped
+    depends_on:
+      - db
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-dev}
+      PORT: 8000
+      FRONTEND_DIST: /app/front/dist
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-inkar}:${POSTGRES_PASSWORD:-inkar}@db:5432/${POSTGRES_DB:-inkar_opt}}
+      PHCENTER_BASE_URL: ${PHCENTER_BASE_URL:-https://ph.center}
+      PROVISOR_BASE_URL: ${PROVISOR_BASE_URL:-https://api.provisor.kz}
+      PROVISOR_EXCLUDED_FILIAL_IDS: ${PROVISOR_EXCLUDED_FILIAL_IDS:-1052,1076,1106,1107,1108,1111,1114,1149,1049}
+      # Если нужно дергать API с другого домена/порта, настрой CORS_ALLOW_ORIGINS.
+      # CORS_ALLOW_ORIGINS: "http://localhost:5173"
+    ports:
+      - "${APP_PORT:-8000}:8000"
+
+volumes:
+  pgdata_local:

@@ -1,0 +1,2 @@
+"""Pricing rule template domain."""
+

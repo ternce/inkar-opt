@@ -1,0 +1,39 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: inkar_opt_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-inkar_opt}
+      POSTGRES_USER: ${POSTGRES_USER:-inkar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-CHANGE_ME}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: inkar_opt_app
+    restart: unless-stopped
+    depends_on:
+      - db
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-prod}
+      PORT: 8000
+      FRONTEND_DIST: /app/front/dist
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-inkar}:${POSTGRES_PASSWORD:-CHANGE_ME}@db:5432/${POSTGRES_DB:-inkar_opt}}
+      # Подставь реальные токены/логины через переменные окружения на VPS (лучше через .env рядом с compose)
+      PHCENTER_TOKEN: ${PHCENTER_TOKEN:-}
+      PHCENTER_BASE_URL: ${PHCENTER_BASE_URL:-https://ph.center}
+      PROVISOR_BASE_URL: ${PROVISOR_BASE_URL:-https://api.provisor.kz}
+      PROVISOR_LOGIN: ${PROVISOR_LOGIN:-}
+      PROVISOR_PASSWORD: ${PROVISOR_PASSWORD:-}
+      PROVISOR_EXCLUDED_FILIAL_IDS: ${PROVISOR_EXCLUDED_FILIAL_IDS:-1052,1076,1106,1107,1108,1111,1114,1149,1049}
+      # Если фронт/бэк не на одном origin (обычно в этом docker-варианте они на одном), добавь сюда нужный origin.
+      # CORS_ALLOW_ORIGINS: "http://10.10.1.77:8010"
+    ports:
+      - "${APP_PORT:-8010}:8000"
+
+volumes:
+  pgdata:

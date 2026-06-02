@@ -1,0 +1,41 @@
+=== TOTAL ROWS ===
+2,665,254
+
+=== ALL TOP-LEVEL FIELDS ===
+bin: 2,665,254
+id: 2,665,254
+goodsId: 2,665,254
+goods: 2,665,254
+goodsPrice: 2,665,254
+filialId: 2,665,254
+filial: 2,665,254
+insertedDate: 2,665,254
+shelfLife: 2,665,254
+batch: 2,665,254
+isPromotion: 2,665,254
+promotionDescription: 2,665,254
+pack: 2,665,254
+box: 2,665,254
+multiplicity: 2,665,254
+isExclusive: 2,665,254
+minOrder: 2,665,254
+isntDiscount: 2,665,254
+stored: 2,665,254
+distributorGoodsId: 2,665,254
+distributorGoodsName: 2,665,254
+distributorProducer: 2,665,254
+priceStatus: 2,665,254
+userDiscount: 2,665,254
+goodsPriceWithUserDiscount: 2,665,254
+distributorContractId: 2,665,254
+isMarked: 2,665,254
+priceFilialPayments: 2,665,254
+priceFilialPromos: 2,665,254
+priceFilialWorkloads: 2,665,254
+priceScales: 2,665,254
+maxOrderDetails: 2,665,254
+
+
+=== FIRST 5 FULL ITEMS ===
+
+--- ITEM 1 ---

@@ -1,0 +1,2 @@
+"""Percentile domain read models."""
+

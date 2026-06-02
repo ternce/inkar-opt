@@ -1,0 +1,665 @@
+1. 🔐 Логин
+
+URL
+
+Request URL
+https://1.provizor.kz/pages/login
+
+Method
+
+POST
+
+Headers
+
+Status Code
+200 OK
+Remote Address
+37.18.30.77:443
+Referrer Policy
+strict-origin-when-cross-origin
+
+Payload (form-data / x-www-form-urlencoded)
+
+email
+Zhadi-90@mail.ru
+password
+Ss123456789
+
+Response (хотя бы кусок)
+
+пусто
+
+2. 📋 Список прайсов (самое важное)
+
+URL
+
+Request URL
+https://prv.kz/counterparts/view
+
+Method
+
+Request Method
+POST
+
+Headers
+
+Request Method
+POST
+Status Code
+200 OK
+Remote Address
+213.148.2.16:443
+Referrer Policy
+strict-origin-when-cross-origin
+cache-control
+no-store, no-cache, must-revalidate
+connection
+keep-alive
+content-encoding
+gzip
+content-type
+text/html; charset=UTF-8
+date
+Mon, 27 Apr 2026 18:22:26 GMT
+expires
+Thu, 19 Nov 1981 08:52:00 GMT
+pragma
+no-cache
+server
+nginx/1.22.1
+transfer-encoding
+chunked
+accept
+*/*
+accept-encoding
+gzip, deflate, br, zstd
+accept-language
+ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7
+cache-control
+no-cache
+connection
+keep-alive
+content-length
+4
+content-type
+application/x-www-form-urlencoded; charset=UTF-8
+cookie
+PHPSESSID=s00g7cv90lhacea9t0dtat01bo
+host
+prv.kz
+origin
+https://prv.kz
+pragma
+no-cache
+referer
+https://prv.kz/counterparts/index
+sec-ch-ua
+"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"
+sec-ch-ua-mobile
+?0
+sec-ch-ua-platform
+"Windows"
+sec-fetch-dest
+empty
+sec-fetch-mode
+cors
+sec-fetch-site
+same-origin
+user-agent
+Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36
+x-requested-with
+XMLHttpRequest
+
+Payload
+
+str
+
+Response (HTML или JSON)
+
+<table class='tbody no-hover'>
+	<tr>
+		<th>Контрагент</th>
+		<th width=140>Прайс</th>
+		<th width=90>Скидка</th>
+		<th width=100>Минимальный заказ</th>
+		<th>Кто изменил скидку</th>
+		<th width=120>Дата изменения</th>
+		<th>Телефон</th>
+		<th width=90>Город контрагента</th>
+		<th width=100>
+							Действие
+					</th>
+	</tr>
+	<tr>
+		<td title='868'>
+							<a href='/price/see/247'>Аманат Актобе</a>
+						<span id='discount_260718' style='display:none'>0</span>
+			<span id='min_order_260718' style='display:none'></span>
+			<span id='supplier_name_260718' style='display:none'>Аманат Актобе</span>
+			<span id='h_is_amanat_260718' style='display:none'>005</span>
+			<span id='h_amanat_payment_type_260718' style='display:none'>0</span>
+			<span id='h_amanat_discount_prepayment_260718' style='display:none'></span>
+		</td>
+		<td class='center'>
+			27.04.2026 17:56:00		</td>
+		<td class='center cell-action-general'>
+			0 %
+			<div style="color:green;cursor:help" title="Вид оплаты">Оплата</div>		</td>
+		<td class="center"></td>
+		<td></td>
+		<td class='center'>
+					</td>
+		<td>8(7132) 906-141, 906-145, 906-147</td>
+		<td>Актобе
+</td>
+		<th class='center'>
+			<img id='load_260718' style='display:none' src='/img/min_load.gif'>
+			<span id='action_260718'>
+			<span onclick="toogle_see_price(260718)" title="Прайс лист видно. Скрыть?" class="text_green glyphicon glyphicon-eye-open" style="cursor:pointer"></span>			</span>
+			<span onclick="edit(260718)" title='Изменить' class='text_blue b-action  glyphicon glyphicon-pencil'></span>
+			<span onclick="del(260718)" title='Удалить' class='text_red b-action glyphicon glyphicon-remove'></span>
+		</th>
+	</tr>
+	<tr>
+		<td title='1824'>
+							<a href='/price/see/1478'>ВИВА Фарм</a>
+						<span id='discount_296688' style='display:none'>0</span>
+			<span id='min_order_296688' style='display:none'></span>
+			<span id='supplier_name_296688' style='display:none'>ВИВА Фарм</span>
+			<span id='h_is_amanat_296688' style='display:none'></span>
+			<span id='h_amanat_payment_type_296688' style='display:none'>0</span>
+			<span id='h_amanat_discount_prepayment_296688' style='display:none'>0</span>
+		</td>
+		<td class='center'>
+			29.01.2024 09:23:34		</td>
+		<td class='center cell-action-general'>
+			0 %
+					</td>
+		<td class="center"></td>
+		<td></td>
+		<td class='center'>
+					</td>
+		<td>8727390-48-77</td>
+		<td>Алматы</td>
+		<th class='center'>
+			<img id='load_296688' style='display:none' src='/img/min_load.gif'>
+			<span id='action_296688'>
+			<span onclick="toogle_see_price(296688)" title="Прайс лист НЕ видно. Показать?" class="text_red glyphicon glyphicon-eye-close" style="cursor:pointer"></span>			</span>
+			<span onclick="edit(296688)" title='Изменить' class='text_blue b-action  glyphicon glyphicon-pencil'></span>
+			<span onclick="del(296688)" title='Удалить' class='text_red b-action glyphicon glyphicon-remove'></span>
+		</th>
+	</tr>
+
+3. 📊 Таблица товаров (price/see_view)
+
+URL
+
+Request URL
+https://prv.kz/price/see_view
+
+Method
+
+Request Method
+POST
+
+Headers
+
+Remote Address
+213.148.2.16:443
+Referrer Policy
+strict-origin-when-cross-origin
+cache-control
+no-store, no-cache, must-revalidate
+connection
+keep-alive
+content-encoding
+gzip
+content-type
+text/html; charset=UTF-8
+date
+Mon, 27 Apr 2026 18:23:45 GMT
+expires
+Thu, 19 Nov 1981 08:52:00 GMT
+pragma
+no-cache
+server
+nginx/1.22.1
+transfer-encoding
+chunked
+accept
+*/*
+accept-encoding
+gzip, deflate, br, zstd
+accept-language
+ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7
+cache-control
+no-cache
+connection
+keep-alive
+content-length
+16
+content-type
+application/x-www-form-urlencoded; charset=UTF-8
+cookie
+PHPSESSID=s00g7cv90lhacea9t0dtat01bo
+host
+prv.kz
+origin
+https://prv.kz
+pragma
+no-cache
+referer
+https://prv.kz/price/see/247
+sec-ch-ua
+"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"
+sec-ch-ua-mobile
+?0
+sec-ch-ua-platform
+"Windows"
+sec-fetch-dest
+empty
+sec-fetch-mode
+cors
+sec-fetch-site
+same-origin
+user-agent
+Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36
+x-requested-with
+XMLHttpRequest
+
+Payload
+
+main_id
+247
+
+Response (кусок HTML)
+
+<table class='tbody no-hover'>
+	<tr>
+		<th width=40>№</th>
+		<th>Наименование</th>
+		<th>Производитель</th>
+		<th width=120>Срок годности</th>
+		<th width=110>Цена</th>
+		<th width=100>Кол. в уп.</th>
+		<th width=100>Мин. заказ</th>
+		<th width=100>Остаток</th>
+	</tr>
+	<tr>
+		<th class='center'>1</th>
+		<td>Супрадин Кидс рыбки №60 жев. конфеты</td>
+		<td>Ф.Хунцикер &amp;Ко.АГ</td>
+		<td class='center'>25.07.2027</td>
+		<td>6824.00 тг</td>
+		<td>24</td>
+		<td>1</td>
+		<td>123</td>
+	</tr>	
+	<tr>
+		<th class='center'>2</th>
+		<td>Ингавирин® 60 мг №7 капс.</td>
+		<td>Валента Фарм АО</td>
+		<td class='center'>30.09.2028</td>
+		<td>3662.00 тг</td>
+		<td>6</td>
+		<td>1</td>
+		<td>50</td>
+	</tr>	
+	<tr>
+		<th class='center'>3</th>
+		<td>Супрадин Кидс рыбки №30 жев. конфеты</td>
+		<td>Ф.Хунцикер &amp;Ко.АГ</td>
+		<td class='center'>25.07.2027</td>
+		<td>4166.00 тг</td>
+		<td>24</td>
+		<td>1</td>
+		<td>55</td>
+	</tr>
+
+
+📦 Что нужно по Провизору
+1. 🔍 Один рабочий запрос (где реально приходят товары)
+
+Где сами прайсы:
+
+URL
+
+Request URL
+https://api.provisor.kz/Distributor/GetFilialsByContext
+
+Method
+
+Request Method
+GET
+
+Headers
+
+Status Code
+200 OK
+Remote Address
+135.181.74.52:443
+Referrer Policy
+no-referrer-when-downgrade
+access-control-allow-credentials
+true
+access-control-allow-origin
+https://new.provisor.kz
+access-control-expose-headers
+Content-Disposition
+content-length
+15255
+content-type
+application/json; charset=utf-8
+date
+Mon, 27 Apr 2026 18:25:53 GMT
+server
+Microsoft-IIS/10.0
+strict-transport-security
+max-age=31536000; includeSubDomains; preload
+vary
+Origin
+x-powered-by
+ASP.NET
+:authority
+api.provisor.kz
+:method
+GET
+:path
+/Distributor/GetFilialsByContext
+:scheme
+https
+accept
+application/json, text/plain, */*
+accept-encoding
+gzip, deflate, br, zstd
+accept-language
+ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7
+authorization
+Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI0OTkwYzQ2MS01YjUyLTQyYjMtOTNlZC01NmVlNGQ5YTBkMDEiLCJodHRwOi8vc2NoZW1hcy54bWxzb2FwLm9yZy93cy8yMDA1LzA1L2lkZW50aXR5L2NsYWltcy9uYW1laWRlbnRpZmllciI6IjVlZmIyOTZkLTk5NTItNGI5ZS1iYjcwLTgzZmFkMzE2MTM4MyIsImh0dHA6Ly9zY2hlbWFzLnhtbHNvYXAub3JnL3dzLzIwMDUvMDUvaWRlbnRpdHkvY2xhaW1zL25hbWUiOiJBa3NhaTQvODMiLCJodHRwOi8vc2NoZW1hcy54bWxzb2FwLm9yZy93cy8yMDA1LzA1L2lkZW50aXR5L2NsYWltcy9oYXNoIjoiQVFBQUFBRUFBQ2NRQUFBQUVFTTJ3azFLU1U5TEhlaW91eUZuZmIxRk1WZi85NzVZOXRzajRVNjRNZGQvTnFuQkRjeGRpZWY3MjlTNjRPRmNYdz09IiwiQ29tcGFueVR5cGUiOiLQkNC_0YLQtdC60LAiLCJodHRwOi8vc2NoZW1hcy5taWNyb3NvZnQuY29tL3dzLzIwMDgvMDYvaWRlbnRpdHkvY2xhaW1zL3JvbGUiOiJQaGFybWFjeSIsImV4cCI6MTc3NzM1MDM0NywiaXNzIjoiaHR0cHM6Ly9QaGFybWNlbnRlci5reiIsImF1ZCI6IlBoYXJtYWNldXRpY2FsIG1hcmtldCJ9.EL2oCXfRSU69lNL_sK_nDnqjt7sKXXyI1EYsF8CIDFM
+cache-control
+no-cache
+origin
+https://new.provisor.kz
+pragma
+no-cache
+priority
+u=1, i
+referer
+https://new.provisor.kz/Price
+sec-ch-ua
+"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"
+sec-ch-ua-mobile
+?0
+sec-ch-ua-platform
+"Windows"
+sec-fetch-dest
+empty
+sec-fetch-mode
+cors
+sec-fetch-site
+same-site
+user-agent
+Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36
+
+Response
+
+[
+    {
+        "id": 128,
+        "distributor": null,
+        "distributorId": 1,
+        "name": "Инкар (Алматы)",
+        "cityId": 1,
+        "city": null,
+        "phone": "7 (727) 388-44-88",
+        "email": " sales1@inkar.kz",
+        "priceRequestConfig": null,
+        "priceResponseConfig": null,
+        "shippingAddressRequestConfig": null,
+        "shippingAddressResponseConfig": null,
+        "contractRequestConfig": null,
+        "contractResponseConfig": null,
+        "orderRequestConfig": null,
+        "orderResponseConfig": null,
+        "invoiceRequestConfig": null,
+        "invoiceResponseConfig": null,
+        "clientBonusRequestConfig": null,
+        "clientBonusResponseConfig": null,
+        "discounts": null,
+        "invoices": null,
+        "filialOrderEmails": null,
+        "filialLines": null
+    },
+    {
+        "id": 148,
+        "distributor": null,
+        "distributorId": 4,
+        "name": "Медсервис (Караганда)",
+        "cityId": 6,
+        "city": null,
+        "phone": "8(7212)33-27-97, 33-28-00, 33-31-49",
+        "email": "krg_market@medservice.kz",
+        "priceRequestConfig": null,
+        "priceResponseConfig": null,
+        "shippingAddressRequestConfig": null,
+        "shippingAddressResponseConfig": null,
+        "contractRequestConfig": null,
+        "contractResponseConfig": null,
+        "orderRequestConfig": null,
+        "orderResponseConfig": null,
+        "invoiceRequestConfig": null,
+        "invoiceResponseConfig": null,
+        "clientBonusRequestConfig": null,
+        "clientBonusResponseConfig": null,
+        "discounts": null,
+        "invoices": null,
+        "filialOrderEmails": null,
+        "filialLines": null
+    },
+
+Preview
+
+
+[{id: 128, distributor: null, distributorId: 1, name: "Инкар (Алматы)", cityId: 1, city: null,…},…]
+
+2. 🔍 Запрос на получение товаров 
+
+URL 
+
+Request URL
+https://api.provisor.kz/Price/GetByFilialId?filialId=128
+
+Method
+
+Request Method
+GET
+
+Headers
+
+Status Code
+200 OK
+Remote Address
+135.181.74.52:443
+Referrer Policy
+no-referrer-when-downgrade
+access-control-allow-credentials
+true
+access-control-allow-origin
+https://new.provisor.kz
+access-control-expose-headers
+Content-Disposition
+content-length
+6620539
+content-type
+application/json; charset=utf-8
+date
+Mon, 27 Apr 2026 18:27:48 GMT
+server
+Microsoft-IIS/10.0
+strict-transport-security
+max-age=31536000; includeSubDomains; preload
+vary
+Origin
+x-powered-by
+ASP.NET
+:authority
+api.provisor.kz
+:method
+GET
+:path
+/Price/GetByFilialId?filialId=128
+:scheme
+https
+accept
+application/json, text/plain, */*
+accept-encoding
+gzip, deflate, br, zstd
+accept-language
+ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7
+authorization
+Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI0OTkwYzQ2MS01YjUyLTQyYjMtOTNlZC01NmVlNGQ5YTBkMDEiLCJodHRwOi8vc2NoZW1hcy54bWxzb2FwLm9yZy93cy8yMDA1LzA1L2lkZW50aXR5L2NsYWltcy9uYW1laWRlbnRpZmllciI6IjVlZmIyOTZkLTk5NTItNGI5ZS1iYjcwLTgzZmFkMzE2MTM4MyIsImh0dHA6Ly9zY2hlbWFzLnhtbHNvYXAub3JnL3dzLzIwMDUvMDUvaWRlbnRpdHkvY2xhaW1zL25hbWUiOiJBa3NhaTQvODMiLCJodHRwOi8vc2NoZW1hcy54bWxzb2FwLm9yZy93cy8yMDA1LzA1L2lkZW50aXR5L2NsYWltcy9oYXNoIjoiQVFBQUFBRUFBQ2NRQUFBQUVFTTJ3azFLU1U5TEhlaW91eUZuZmIxRk1WZi85NzVZOXRzajRVNjRNZGQvTnFuQkRjeGRpZWY3MjlTNjRPRmNYdz09IiwiQ29tcGFueVR5cGUiOiLQkNC_0YLQtdC60LAiLCJodHRwOi8vc2NoZW1hcy5taWNyb3NvZnQuY29tL3dzLzIwMDgvMDYvaWRlbnRpdHkvY2xhaW1zL3JvbGUiOiJQaGFybWFjeSIsImV4cCI6MTc3NzM1MDM0NywiaXNzIjoiaHR0cHM6Ly9QaGFybWNlbnRlci5reiIsImF1ZCI6IlBoYXJtYWNldXRpY2FsIG1hcmtldCJ9.EL2oCXfRSU69lNL_sK_nDnqjt7sKXXyI1EYsF8CIDFM
+cache-control
+no-cache
+origin
+https://new.provisor.kz
+pragma
+no-cache
+priority
+u=1, i
+referer
+https://new.provisor.kz/Price
+sec-ch-ua
+"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"
+sec-ch-ua-mobile
+?0
+sec-ch-ua-platform
+"Windows"
+sec-fetch-dest
+empty
+sec-fetch-mode
+cors
+sec-fetch-site
+same-site
+user-agent
+Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36
+
+Response
+
+[
+    {
+        "id": 93039032067,
+        "goodsId": 175146,
+        "goods": {
+            "id": 175146,
+            "categoryId": 3,
+            "category": null,
+            "nameId": 10289,
+            "name": null,
+            "dosageFormId": 579,
+            "dosageForm": null,
+            "doseId": 15,
+            "dose": null,
+            "genericId": 1,
+            "generic": null,
+            "atcId": 530,
+            "atc": null,
+            "euroATCId": 3669,
+            "euroATC": null,
+            "brandId": 27692,
+            "brand": null,
+            "producerId": 8022,
+            "producer": null,
+            "corporationId": 7329,
+            "corporation": null,
+            "countryId": 1023,
+            "country": null,
+            "innId": 1802,
+            "inn": null,
+            "rxOTCId": 1,
+            "rxOTC": null,
+            "number": 1,
+            "isFormular": false,
+            "hide": false,
+            "fullName": "Маска медицинская 3-х слойная на резинках/Маски медицинские/_/1/Nantong Kangyi Protective Equipment Co.,Ltd",
+            "regNumber": "_",
+            "regDateStart": null,
+            "regDateEnd": null,
+            "adItems": null,
+            "price": [],
+            "priceLimitation": null,
+            "priceLimitationArchive": null,
+            "annotationId": 4795,
+            "annotation": null,
+            "rating": null,
+            "salesSum": 0.00,
+            "orderDetails": null,
+            "invoiceDetails": null,
+            "searchProperty": null,
+            "insertedDate": "0001-01-01T00:00:00",
+            "isPromotion": false,
+            "barcodes": null,
+            "goodsKeywords": null,
+            "isAvailable": false,
+            "isAd": false
+        },
+        "goodsPrice": 13.40,
+        "filialId": 128,
+        "filial": {
+            "id": 128,
+            "distributor": null,
+            "distributorId": 1,
+            "name": "Инкар (Алматы)",
+            "cityId": 1,
+            "city": null,
+            "phone": "7 (727) 388-44-88",
+            "email": " sales1@inkar.kz",
+            "priceRequestConfig": null,
+            "priceResponseConfig": null,
+            "shippingAddressRequestConfig": null,
+            "shippingAddressResponseConfig": null,
+            "contractRequestConfig": null,
+            "contractResponseConfig": null,
+            "orderRequestConfig": null,
+            "orderResponseConfig": null,
+            "invoiceRequestConfig": null,
+            "invoiceResponseConfig": null,
+            "clientBonusRequestConfig": null,
+            "clientBonusResponseConfig": null,
+            "discounts": null,
+            "invoices": null,
+            "filialOrderEmails": null,
+            "filialLines": null
+        },
+        "insertedDate": "2026-04-27T19:00:37.9530061",
+        "shelfLife": "2027-12-30T05:00:00",
+        "batch": null,
+        "isPromotion": false,
+        "promotionDescription": null,
+        "pack": 0,
+        "box": 4200,
+        "multiplicity": 0,
+        "isExclusive": false,
+        "minOrder": 0,
+        "isntDiscount": true,
+        "stored": 3000,
+        "distributorGoodsId": "000000000001000014",
+        "distributorGoodsName": "Маска 3-х слойн на резин",
+        "distributorProducer": "Nantong Kangyi Protective Equi",
+        "priceStatus": "ПОЛНЫЙ",
+        "userDiscount": 0.0,
+        "goodsPriceWithUserDiscount": 0.0,
+        "distributorContractId": null,
+        "bin": null,
+        "isMarked": false,
+        "priceFilialPayments": null,
+        "priceFilialPromos": null,
+        "priceFilialWorkloads": null,
+        "priceScales": null,
+        "maxOrderDetails": null
+    },
+
+PAYLOAD
+
+filialId
+128
+

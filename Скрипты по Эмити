@@ -1,0 +1,4 @@
+1) emity_filter_by_our_sku.py основной, сопоставляет наши товары с эмити и вытягивает основные ПОЗИЦИИ
+2) provisor_json_to_csv.py джсон ответ от ответа преобразует в CSV
+3) emitiparseralmaty.py парсер эмити в джсон
+4) emity_aggregate_all_goods.py - общие позиции эмити

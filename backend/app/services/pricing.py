@@ -1,0 +1,977 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from datetime import date
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
+
+from sqlalchemy import select, delete
+from sqlalchemy.orm import Session
+
+from ..models import (
+    Product,
+    PriceFormat,
+    MarkupRange,
+    NoCompetitorMarkupRange,
+    BendRange,
+    UniversalList,
+    ListItem,
+    CompetitorPrice,
+    CompetitorPriceList,
+    CompetitorPricePercentile,
+    PriceList,
+    CalculatedPrice,
+    ProductRating,
+    PricingRule,
+    RoundingRule,
+)
+from .. import data
+from .competitor_matching import rebuild_competitor_prices_for_selected
+from .competitor_percentiles import recalculate_competitor_percentiles
+from .competitor_assignments import get_assigned_competitor_price_lists
+from .regions import allowed_provisor_source_names_for_city_id, city_id_from_branch
+
+
+# MVP universal list types (RU labels used in UI/Excel).
+# NOTE: We accept a couple of common synonyms for backward-compatibility.
+LIST_TYPE_FIXED_PRICE = "Фиксированная цена"
+LIST_TYPE_MIN_PRICE = "Минимальная цена"
+LIST_TYPE_MAX_PRICE = "Максимальная цена"
+
+LIST_TYPE_MIN_MARGIN = "Минимальная наценка"
+LIST_TYPE_CRITICAL_MARGIN = "Критичка"
+LIST_TYPE_MAX_MARGIN = "Максимальная наценка"
+
+
+@dataclass(frozen=True)
+class CompetitorResolved:
+    competitor_price: Decimal | None
+    applied_source: str
+
+
+@dataclass(frozen=True)
+class CompetitorResolvedMany:
+    prices: list[tuple[Decimal, str]]  # (computed_price, source_name)
+
+
+@dataclass(frozen=True)
+class SelectedSourceMeta:
+    selected_sources: set[str]
+    labels: dict[str, str]
+
+
+def _as_decimal(value: object, default: Decimal | None = None) -> Decimal | None:
+    if value is None:
+        return default
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return default
+
+
+ZONE_OPTIMAL_THRESHOLD = Decimal("0.03")
+
+
+def zone_reference_price(
+    *,
+    chosen_competitor_price: object = None,
+    lowest_competitor_price: object = None,
+) -> Decimal | None:
+    chosen = _as_decimal(chosen_competitor_price)
+    if chosen is not None and chosen > 0:
+        return chosen
+    lowest = _as_decimal(lowest_competitor_price)
+    if lowest is not None and lowest > 0:
+        return lowest
+    return None
+
+
+def calculate_price_zone(
+    final_price: object,
+    *,
+    chosen_competitor_price: object = None,
+    lowest_competitor_price: object = None,
+) -> tuple[str, Decimal | None, Decimal | None]:
+    price = _as_decimal(final_price)
+    reference_price = zone_reference_price(
+        chosen_competitor_price=chosen_competitor_price,
+        lowest_competitor_price=lowest_competitor_price,
+    )
+    if price is None or reference_price is None:
+        return "no-data", reference_price, None
+
+    deviation_pct = (price - reference_price) / reference_price
+    if price < reference_price:
+        return "left", reference_price, deviation_pct
+    if Decimal("0") <= deviation_pct <= ZONE_OPTIMAL_THRESHOLD:
+        return "optimal", reference_price, deviation_pct
+    if deviation_pct > ZONE_OPTIMAL_THRESHOLD:
+        return "right", reference_price, deviation_pct
+    return "no-data", reference_price, deviation_pct
+
+
+def _selected_source_meta(db: Session, price_format_id: int) -> SelectedSourceMeta:
+    labels: dict[str, str] = {}
+    for item in get_assigned_competitor_price_lists(db=db, price_format_id=price_format_id):
+        row = item.price_list
+        src = f"{row.source_type}:{row.source_key}"
+        labels[src] = row.display_name or row.supplier or src
+    return SelectedSourceMeta(selected_sources=set(labels), labels=labels)
+
+
+def get_markup_percent_by_range(db: Session, price_format_id: int, cost: Decimal) -> Decimal:
+    ranges = db.execute(
+        select(MarkupRange)
+        .where(MarkupRange.price_format_id == price_format_id)
+        .order_by(MarkupRange.cost_from.asc())
+    ).scalars().all()
+
+    if not ranges:
+        raise ValueError("Markup ranges are required")
+
+    for r in ranges:
+        cost_from = _as_decimal(r.cost_from, Decimal("0"))
+        cost_to = _as_decimal(r.cost_to)
+        if cost >= cost_from and (cost_to is None or cost <= cost_to):
+            return _as_decimal(r.markup_percent, Decimal("0")) or Decimal("0")
+
+    # если ничего не подошло — берём последний диапазон
+    return _as_decimal(ranges[-1].markup_percent, Decimal("0")) or Decimal("0")
+
+
+def get_no_competitor_markup_percent_by_range(
+    db: Session,
+    price_format_id: int,
+    cost: Decimal,
+    *,
+    fallback: Decimal,
+) -> Decimal:
+    ranges = db.execute(
+        select(NoCompetitorMarkupRange)
+        .where(NoCompetitorMarkupRange.price_format_id == price_format_id)
+        .order_by(NoCompetitorMarkupRange.cost_from.asc())
+    ).scalars().all()
+
+    if not ranges:
+        return fallback
+
+    for r in ranges:
+        cost_from = _as_decimal(r.cost_from, Decimal("0")) or Decimal("0")
+        cost_to = _as_decimal(r.cost_to)
+        if cost >= cost_from and (cost_to is None or cost <= cost_to):
+            return _as_decimal(r.markup_percent, fallback) or fallback
+
+    return _as_decimal(ranges[-1].markup_percent, fallback) or fallback
+
+
+def get_bend_percent_by_price_range(
+    db: Session,
+    price_format_id: int,
+    competitor_price: Decimal,
+    *,
+    fallback_percent: Decimal,
+) -> Decimal:
+    rows = db.execute(
+        select(BendRange)
+        .where(BendRange.price_format_id == price_format_id)
+        .order_by(BendRange.price_from.asc())
+    ).scalars().all()
+
+    if not rows:
+        return fallback_percent
+
+    chosen: Decimal | None = None
+    for r in rows:
+        p_from = _as_decimal(r.price_from, Decimal("0")) or Decimal("0")
+        if competitor_price >= p_from:
+            chosen = _as_decimal(r.bend_percent, fallback_percent)
+        else:
+            break
+
+    return chosen if chosen is not None else fallback_percent
+
+
+def _rounding_quantum(rule: RoundingRule | None) -> Decimal:
+    if rule is not None and rule.step is not None:
+        step = _as_decimal(rule.step, None)
+        if step is not None and step > 0:
+            return step
+    precision = 2
+    if rule is not None and rule.precision is not None:
+        try:
+            precision = max(0, min(int(rule.precision), 6))
+        except Exception:
+            precision = 2
+    return Decimal("1").scaleb(-precision)
+
+
+def _round_price(price: Decimal, rule: RoundingRule | None, *, force_up: bool = False) -> Decimal:
+    quantum = _rounding_quantum(rule)
+    if quantum <= 0:
+        quantum = Decimal("0.01")
+    mode = str(rule.mode if rule is not None else "math").strip().lower()
+    rounding = ROUND_HALF_UP
+    if force_up or mode == "up":
+        rounding = ROUND_CEILING
+    elif mode == "down":
+        rounding = ROUND_FLOOR
+    units = (price / quantum).to_integral_value(rounding=rounding)
+    rounded = units * quantum
+    output_quantum = Decimal("1").scaleb(-max(0, -quantum.as_tuple().exponent))
+    return rounded.quantize(output_quantum)
+
+
+def resolve_competitor_price(
+    db: Session,
+    price_format_id: int,
+    product_id: int,
+    *,
+    allowed_provisor_sources: set[str] | None = None,
+) -> CompetitorResolved:
+    # Схема: competitors_prices хранит
+    # - записи-настройки источника: product_id IS NULL, fields: source_name, coefficient
+    # - записи цен: product_id == product_id, fields: source_name, source_price
+
+    config_rows = db.execute(
+        select(CompetitorPrice)
+        .where(CompetitorPrice.price_format_id == price_format_id)
+        .where(CompetitorPrice.product_id.is_(None))
+    ).scalars().all()
+
+    if not config_rows:
+        return CompetitorResolved(None, "нет ПЛК")
+
+    best: Decimal | None = None
+    best_source = ""
+    selected_meta = _selected_source_meta(db, price_format_id)
+
+    for cfg in config_rows:
+        source_name = cfg.source_name
+        if (
+            allowed_provisor_sources is not None
+            and isinstance(source_name, str)
+            and source_name.startswith("provisor:")
+            and source_name not in selected_meta.selected_sources
+            and source_name not in allowed_provisor_sources
+        ):
+            continue
+        coefficient = _as_decimal(cfg.coefficient, Decimal("1")) or Decimal("1")
+
+        source_price_raw = (
+            db.execute(
+                select(CompetitorPrice.source_price)
+                .where(CompetitorPrice.price_format_id == price_format_id)
+                .where(CompetitorPrice.product_id == product_id)
+                .where(CompetitorPrice.source_name == source_name)
+                .where(CompetitorPrice.source_price.is_not(None))
+                .order_by(CompetitorPrice.source_price.asc())
+                .limit(1)
+            )
+            .scalars()
+            .first()
+        )
+
+        source_price = _as_decimal(source_price_raw)
+        if source_price is None:
+            continue
+
+        computed = source_price * coefficient
+        if best is None or computed < best:
+            best = computed
+            best_source = source_name
+
+    if best is None:
+        return CompetitorResolved(None, "нет цен ПЛК")
+
+    return CompetitorResolved(best, best_source)
+
+
+def resolve_competitor_prices(
+    db: Session,
+    price_format_id: int,
+    product_id: int,
+    *,
+    allowed_provisor_sources: set[str] | None = None,
+) -> CompetitorResolvedMany:
+    config_rows = db.execute(
+        select(CompetitorPrice)
+        .where(CompetitorPrice.price_format_id == price_format_id)
+        .where(CompetitorPrice.product_id.is_(None))
+    ).scalars().all()
+
+    if not config_rows:
+        return CompetitorResolvedMany([])
+
+    out: list[tuple[Decimal, str]] = []
+    selected_meta = _selected_source_meta(db, price_format_id)
+    for cfg in config_rows:
+        source_name = cfg.source_name
+        if (
+            allowed_provisor_sources is not None
+            and isinstance(source_name, str)
+            and source_name.startswith("provisor:")
+            and source_name not in selected_meta.selected_sources
+            and source_name not in allowed_provisor_sources
+        ):
+            continue
+        coefficient = _as_decimal(cfg.coefficient, Decimal("1")) or Decimal("1")
+
+        source_price_raw = (
+            db.execute(
+                select(CompetitorPrice.source_price)
+                .where(CompetitorPrice.price_format_id == price_format_id)
+                .where(CompetitorPrice.product_id == product_id)
+                .where(CompetitorPrice.source_name == source_name)
+                .where(CompetitorPrice.source_price.is_not(None))
+                .order_by(CompetitorPrice.source_price.asc())
+                .limit(1)
+            )
+            .scalars()
+            .first()
+        )
+
+        source_price = _as_decimal(source_price_raw)
+        if source_price is None:
+            continue
+
+        out.append((source_price * coefficient, source_name))
+
+    out.sort(key=lambda x: x[0])
+    return CompetitorResolvedMany(out)
+
+
+def resolve_percentile_prices(
+    db: Session,
+    price_format_id: int,
+    product_id: int,
+    *,
+    percentile_number: int,
+) -> CompetitorResolvedMany:
+    rows = (
+        db.execute(
+            select(CompetitorPricePercentile)
+            .where(CompetitorPricePercentile.price_format_id == price_format_id)
+            .where(CompetitorPricePercentile.product_id == product_id)
+            .where(CompetitorPricePercentile.percentile == percentile_number)
+            .where(CompetitorPricePercentile.value.is_not(None))
+        )
+        .scalars()
+        .all()
+    )
+    out: list[tuple[Decimal, str]] = []
+    for row in rows:
+        value = _as_decimal(row.value)
+        if value is None or value <= 0:
+            continue
+        src = f"percentile:{row.competitor_name}:{row.branch_name}:p{row.percentile}"
+        out.append((value, src))
+    out.sort(key=lambda x: x[0])
+    return CompetitorResolvedMany(out)
+
+
+def _active_lists_query(db: Session, price_format_id: int, as_of: date):
+    return (
+        select(UniversalList)
+        .where(UniversalList.status == "Активный")
+        .where((UniversalList.price_format_id.is_(None)) | (UniversalList.price_format_id == price_format_id))
+        .where((UniversalList.start_date.is_(None)) | (UniversalList.start_date <= as_of))
+        .where((UniversalList.end_date.is_(None)) | (UniversalList.end_date >= as_of))
+    )
+
+
+def _find_item_value(
+    db: Session, lists: list[UniversalList], product_id: int, list_type: str
+) -> Decimal | None:
+    match = _find_item_match(db, lists, product_id, list_type)
+    return match[0] if match else None
+
+
+def _find_item_match(
+    db: Session,
+    lists: list[UniversalList],
+    product_id: int,
+    list_type: str,
+) -> tuple[Decimal, int] | None:
+    list_ids = [l.id for l in lists if l.type == list_type]
+    if not list_ids:
+        return None
+
+    row = db.execute(
+        select(ListItem)
+        .where(ListItem.universal_list_id.in_(list_ids))
+        .where(ListItem.product_id == product_id)
+        .limit(1)
+    ).scalars().first()
+
+    if not row:
+        return None
+
+    value = _as_decimal(row.value)
+    return (value, int(row.universal_list_id)) if value is not None else None
+
+
+def _find_item_value_any(
+    db: Session,
+    lists: list[UniversalList],
+    product_id: int,
+    list_types: list[str],
+) -> Decimal | None:
+    for t in list_types:
+        v = _find_item_value(db, lists, product_id, t)
+        if v is not None:
+            return v
+    return None
+
+
+def _find_item_match_any(
+    db: Session,
+    lists: list[UniversalList],
+    product_id: int,
+    list_types: list[str],
+) -> tuple[Decimal, int, str] | None:
+    for t in list_types:
+        match = _find_item_match(db, lists, product_id, t)
+        if match is not None:
+            return match[0], match[1], t
+    return None
+
+
+def _source_type(source_name: str) -> str:
+    if not source_name:
+        return ""
+    return source_name.split(":", 1)[0] if ":" in source_name else "competitor"
+
+
+def _source_match_type(db: Session, price_format_id: int, product_id: int, source_name: str) -> str:
+    if not source_name or source_name.startswith("percentile:"):
+        return ""
+    row = (
+        db.execute(
+            select(CompetitorPrice.match_type)
+            .where(CompetitorPrice.price_format_id == price_format_id)
+            .where(CompetitorPrice.product_id == product_id)
+            .where(CompetitorPrice.source_name == source_name)
+            .where(CompetitorPrice.source_price.is_not(None))
+            .order_by(CompetitorPrice.source_price.asc(), CompetitorPrice.id.asc())
+            .limit(1)
+        )
+        .scalars()
+        .first()
+    )
+    return str(row or "")
+
+
+def _rating_value(db: Session, product_id: int, rating_type: str, branch_id: str = "") -> int | None:
+    stmt = (
+        select(ProductRating.rating)
+        .where(ProductRating.product_id == product_id)
+        .where(ProductRating.rating_type == rating_type)
+    )
+    if rating_type == "local":
+        stmt = stmt.where(ProductRating.branch_id == branch_id)
+    row = db.execute(stmt.order_by(ProductRating.updated_at.desc(), ProductRating.id.desc()).limit(1)).scalars().first()
+    return int(row) if row is not None else None
+
+
+def calculate_price_for_product(
+    *,
+    db: Session,
+    product: Product,
+    price_format: PriceFormat,
+    as_of: date,
+    region_id: int | None = None,
+) -> tuple[Decimal, dict]:
+    cost = _as_decimal(product.cost, Decimal("0")) or Decimal("0")
+
+    markup_percent = get_markup_percent_by_range(db, price_format.id, cost)
+    no_competitor_markup_percent = get_no_competitor_markup_percent_by_range(
+        db,
+        price_format.id,
+        cost,
+        fallback=markup_percent,
+    )
+    rounding_rule = db.get(RoundingRule, price_format.rounding_rule_id) if price_format.rounding_rule_id else None
+
+    # МДЦ (минимальная допустимая цена) — нижняя граница
+    mdc = cost * (Decimal("1") + markup_percent)
+
+    # For UI/debug only (legacy field name): base_price kept as МДЦ.
+    base_price = mdc
+
+    effective_city_id = region_id if region_id is not None else city_id_from_branch(price_format.branch)
+    allowed_provisor_sources = allowed_provisor_source_names_for_city_id(effective_city_id)
+    selected_meta = _selected_source_meta(db, price_format.id)
+
+    if (price_format.competitor_price_mode or "regular") == "percentile":
+        percentile_number = int(price_format.percentile_number or 10)
+        resolved_many = resolve_percentile_prices(
+            db,
+            price_format.id,
+            product.id,
+            percentile_number=percentile_number,
+        )
+    else:
+        resolved_many = resolve_competitor_prices(
+            db,
+            price_format.id,
+            product.id,
+            allowed_provisor_sources=allowed_provisor_sources,
+        )
+
+    fallback_bend_percent = _as_decimal(price_format.progib, Decimal("0")) or Decimal("0")
+
+    competitor_price_min: Decimal | None = resolved_many.prices[0][0] if resolved_many.prices else None
+    competitor_source_min: str = resolved_many.prices[0][1] if resolved_many.prices else ""
+
+    chosen_competitor: Decimal | None = None
+    chosen_source: str = ""
+    chosen_competitor_rank: int | None = None
+    chosen_bend_percent: Decimal = fallback_bend_percent
+    price_from_competitor: Decimal | None = None
+    rejected_competitors: list[dict] = []
+
+    # По формуле: считаем только от минимальной цены конкурента (Ц1).
+    # Если Ц1*(1-прогиб) < МДЦ — берём МДЦ.
+    price = mdc
+    reason = "mdc_floor"
+
+    if competitor_price_min is None:
+        price = cost * (Decimal("1") + no_competitor_markup_percent)
+        reason = "no_competitor_markup"
+        no_competitor_candidate_below_mdc = price < mdc
+    else:
+        no_competitor_candidate_below_mdc = False
+        for idx, (competitor_price, competitor_source) in enumerate(resolved_many.prices, start=1):
+            bend_percent = get_bend_percent_by_price_range(
+                db,
+                price_format.id,
+                cost,
+                fallback_percent=fallback_bend_percent,
+            )
+            candidate = competitor_price * (Decimal("1") - bend_percent / Decimal("100"))
+            if candidate >= mdc:
+                chosen_competitor = competitor_price
+                chosen_source = competitor_source
+                chosen_competitor_rank = idx
+                chosen_bend_percent = bend_percent
+                price_from_competitor = candidate
+                price = candidate
+                reason = "competitor_bend"
+                break
+            rejected_competitors.append(
+                {
+                    "rank": idx,
+                    "source": competitor_source,
+                    "price": competitor_price,
+                    "candidate": candidate,
+                    "mdc": mdc,
+                }
+            )
+        else:
+            reason = "all_competitors_failed_mdc"
+
+    # Активные списки
+    active_lists = db.execute(_active_lists_query(db, price_format.id, as_of)).scalars().all()
+    applied_list_effects: list[dict] = []
+
+    # MVP constraints priority (deterministic):
+    # 1) min/max margin (critical bounds)
+    # 2) min/max price
+    # 3) fixed price (overrides everything)
+    # 4) rounding
+
+    min_margin_match = _find_item_match_any(db, active_lists, product.id, [LIST_TYPE_MIN_MARGIN, LIST_TYPE_CRITICAL_MARGIN])
+    if min_margin_match is not None:
+        min_margin, list_id, list_type = min_margin_match
+        price = max(price, cost * (Decimal("1") + min_margin))
+        reason = "min_margin_floor"
+        applied_list_effects.append({"listId": list_id, "type": list_type, "effect": reason})
+
+    max_margin_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_MAX_MARGIN)
+    if max_margin_match is not None:
+        max_margin, list_id = max_margin_match
+        price = min(price, cost * (Decimal("1") + max_margin))
+        reason = "max_margin_cap"
+        applied_list_effects.append({"listId": list_id, "type": LIST_TYPE_MAX_MARGIN, "effect": reason})
+
+    min_price_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_MIN_PRICE)
+    if min_price_match is not None:
+        min_price, list_id = min_price_match
+        price = max(price, min_price)
+        reason = "min_price_floor"
+        applied_list_effects.append({"listId": list_id, "type": LIST_TYPE_MIN_PRICE, "effect": reason})
+
+    max_price_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_MAX_PRICE)
+    if max_price_match is not None:
+        max_price, list_id = max_price_match
+        price = min(price, max_price)
+        reason = "max_price_cap"
+        applied_list_effects.append({"listId": list_id, "type": LIST_TYPE_MAX_PRICE, "effect": reason})
+
+    fixed_price_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_FIXED_PRICE)
+    if fixed_price_match is not None:
+        fixed_price, list_id = fixed_price_match
+        price = fixed_price
+        reason = "fixed_price_list"
+        applied_list_effects.append({"listId": list_id, "type": LIST_TYPE_FIXED_PRICE, "effect": reason})
+
+    # Округление
+    price = _round_price(price, rounding_rule)
+    if price < mdc:
+        price = _round_price(mdc, rounding_rule, force_up=True)
+        if competitor_price_min is None and no_competitor_candidate_below_mdc:
+            reason = "no_competitor_markup_bumped_to_mdc"
+        else:
+            reason = "mdc_floor_after_rounding"
+
+    # ЛП/ЗЛ/ПП
+    zone, zone_reference, deviation_pct = calculate_price_zone(
+        price,
+        chosen_competitor_price=chosen_competitor,
+        lowest_competitor_price=competitor_price_min,
+    )
+
+    applied_source = chosen_source or competitor_source_min
+    source_match_type = _source_match_type(db, price_format.id, product.id, applied_source)
+    branch_id = str(region_id if region_id is not None else (price_format.branch or ""))
+
+    debug = {
+        "cost": cost,
+        "markup_percent": markup_percent,
+        "base_price": base_price,
+        "competitor_price": competitor_price_min,
+        "lowest_competitor_price": competitor_price_min,
+        "competitor_source": competitor_source_min or ("нет цен ПЛК" if competitor_price_min is None else ""),
+        "applied_source_name": applied_source,
+        "applied_source_type": _source_type(applied_source),
+        "used_percentile": applied_source.startswith("percentile:"),
+        "used_substitute": source_match_type == "provisor_manual_substitute",
+        "rating_global": _rating_value(db, product.id, "global"),
+        "rating_local": _rating_value(db, product.id, "local", branch_id),
+        "applied_list_effects": applied_list_effects,
+        "applied_list_ids": sorted({int(item["listId"]) for item in applied_list_effects}),
+        "bend_percent": chosen_bend_percent,
+        "bend_percent_used": chosen_bend_percent,
+        "markup_percent_used": markup_percent * Decimal("100"),
+        "chosen_competitor_price": chosen_competitor,
+        "chosen_competitor_source": chosen_source,
+        "chosen_competitor_rank": chosen_competitor_rank,
+        "rejected_competitors": rejected_competitors,
+        "price_from_competitor": price_from_competitor,
+        "final_price": price,
+        "reason": reason,
+        "log": _build_calculation_log(
+            reason=reason,
+            competitor_prices=resolved_many.prices,
+            chosen_source=chosen_source,
+            chosen_competitor=chosen_competitor,
+            chosen_rank=chosen_competitor_rank,
+            no_competitor_markup_percent=no_competitor_markup_percent,
+            markup_percent=markup_percent,
+            source_labels=selected_meta.labels,
+        ),
+        "zone": zone,
+        "zone_reference_price": zone_reference,
+        "deviation_pct": deviation_pct,
+    }
+
+    return price, debug
+
+
+def _pretty_source(source: str) -> str:
+    if source.startswith("provisor:"):
+        return f"Provisor {source.split(':', 1)[1]}"
+    if source.startswith("phcenter:"):
+        return f"Фармцентр {source.split(':', 1)[1]}"
+    if source.startswith("manual:"):
+        return source.split(":", 1)[1]
+    if source.startswith("percentile:"):
+        return source.split(":", 1)[1]
+    return source
+
+
+def _source_label(source: str, labels: dict[str, str] | None = None) -> str:
+    if labels and labels.get(source):
+        return labels[source]
+    return _pretty_source(source)
+
+
+def _build_calculation_log(
+    *,
+    reason: str,
+    competitor_prices: list[tuple[Decimal, str]],
+    chosen_source: str,
+    chosen_competitor: Decimal | None,
+    chosen_rank: int | None = None,
+    no_competitor_markup_percent: Decimal,
+    markup_percent: Decimal,
+    source_labels: dict[str, str] | None = None,
+) -> str:
+    if not competitor_prices:
+        pct = (no_competitor_markup_percent * Decimal("100")).quantize(Decimal("0.01"))
+        return f"Нет цен выбранных конкурентов. Применена отдельная шкала наценки для товаров без конкурентов: {pct}%."
+
+    if reason in {"competitor_bend", "competitor_bend_c1"} and chosen_competitor is not None:
+        idx = chosen_rank or next((i + 1 for i, (_, src) in enumerate(competitor_prices) if src == chosen_source), 1)
+        return f"Цена рассчитана относительно {idx}-й цены конкурента {_source_label(chosen_source, source_labels)}."
+        return f"Цена рассчитана относительно конкурента {_source_label(chosen_source, source_labels)} ({idx}-я по величине цена)."
+
+    if reason == "all_competitors_failed_mdc":
+        return "Ни одна цена конкурентов не прошла условие минимальной допустимой цены. Применена минимальная наценка."
+
+    if reason == "no_competitor_markup_bumped_to_mdc":
+        return "Нет цен выбранных конкурентов. Цена по шкале без конкурентов ниже МДЦ, применена МДЦ."
+
+    if reason == "mdc_floor_after_rounding":
+        return "Цена поднята до МДЦ после округления или ограничений."
+
+    if reason == "mdc_floor_after_competitor":
+        first_source = _source_label(competitor_prices[0][1], source_labels)
+        return (
+            f"Цена установлена по минимальной наценке, так как первая цена конкурента {first_source} "
+            "не прошла условие минимальной допустимой цены."
+        )
+
+    if reason == "min_margin_floor":
+        return "Цена поднята до минимальной наценки из активного универсального списка."
+    if reason == "max_margin_cap":
+        return "Цена ограничена максимальной наценкой из активного универсального списка."
+    if reason == "fixed_price_list":
+        return "Цена установлена фиксированной ценой из активного универсального списка."
+
+    pct = (markup_percent * Decimal("100")).quantize(Decimal("0.01"))
+    return f"Цена рассчитана по основной шкале наценки: {pct}%."
+
+
+def calculate_prices(
+    *,
+    db: Session,
+    price_format_code: str,
+    price_list_number: str,
+    as_of: date,
+    activation_date: date | None,
+    user: str,
+    region_id: int | None = None,
+    force_new_price_list: bool = False,
+) -> int:
+    pf = db.execute(select(PriceFormat).where(PriceFormat.code == price_format_code)).scalars().first()
+    if not pf:
+        # MVP: allow calculating on an empty DB by creating the price format from mock data.
+        meta = next((x for x in data.PRICE_FORMATS if x.get("code") == price_format_code), None)
+        pf = PriceFormat(
+            code=price_format_code,
+            name=(meta.get("name") if meta else None) or price_format_code,
+            branch=(meta.get("branch") if meta else None),
+        )
+
+        defaults = data.PRICING_SETTINGS_BY_FORMAT.get(price_format_code) or data.PRICING_SETTINGS_BY_FORMAT.get(
+            "ИПЛ_01_001"
+        )
+        if defaults and defaults.get("deflectionPercent") is not None:
+            try:
+                pf.progib = float(defaults["deflectionPercent"])
+            except Exception:
+                pass
+
+        db.add(pf)
+        db.flush()
+
+    def _get_defaults() -> dict:
+        return data.PRICING_SETTINGS_BY_FORMAT.get(price_format_code) or data.PRICING_SETTINGS_BY_FORMAT.get(
+            "ИПЛ_01_001"
+        ) or {}
+
+    def _seed_markup_ranges(defaults: dict) -> None:
+        rec = (defaults or {}).get("recommendedMarkups") or []
+        for row in rec:
+            try:
+                cost_from = float(row.get("lowerBound"))
+                cost_to = float(row.get("upperBound")) if row.get("upperBound") is not None else None
+                mp = float(row.get("markupPercent")) / 100.0
+            except Exception:
+                continue
+
+            db.add(
+                MarkupRange(
+                    price_format_id=pf.id,
+                    cost_from=cost_from,
+                    cost_to=cost_to,
+                    markup_percent=mp,
+                )
+            )
+
+    def _seed_bend_ranges(defaults: dict) -> None:
+        bends = (defaults or {}).get("bendRanges") or []
+        for row in bends:
+            try:
+                price_from = float(row.get("priceFrom"))
+                bend_percent = float(row.get("bendPercent"))
+            except Exception:
+                continue
+
+            db.add(
+                BendRange(
+                    price_format_id=pf.id,
+                    price_from=price_from,
+                    bend_percent=bend_percent,
+                )
+            )
+
+    def _is_legacy_seeded_markup(ranges: list[MarkupRange]) -> bool:
+        # Detect old placeholder defaults that were used earlier in the MVP.
+        # If ranges match this pattern, we can safely migrate them to current defaults.
+        expected = [
+            (Decimal("0"), Decimal("49.99"), Decimal("0.1")),
+            (Decimal("50"), Decimal("99.99"), Decimal("0.08")),
+            (Decimal("100"), Decimal("499.99"), Decimal("0.05")),
+            (Decimal("500"), Decimal("999.99"), Decimal("0.04")),
+            (Decimal("1000"), Decimal("2999.99"), Decimal("0.03")),
+            (Decimal("3000"), Decimal("99999999"), Decimal("0.01")),
+        ]
+
+        if len(ranges) != len(expected):
+            return False
+
+        for r, (cf, ct, mp) in zip(sorted(ranges, key=lambda x: float(x.cost_from)), expected):
+            cost_from = _as_decimal(r.cost_from, Decimal("0")) or Decimal("0")
+            cost_to = _as_decimal(r.cost_to, Decimal("0")) or Decimal("0")
+            markup = _as_decimal(r.markup_percent, Decimal("0")) or Decimal("0")
+
+            if cost_from != cf or cost_to != ct or markup != mp:
+                return False
+
+        return True
+
+    defaults = _get_defaults()
+
+    # Ensure markup ranges exist (seed from defaults if needed)
+    ranges = db.execute(
+        select(MarkupRange).where(MarkupRange.price_format_id == pf.id).order_by(MarkupRange.cost_from.asc())
+    ).scalars().all()
+    if not ranges:
+        _seed_markup_ranges(defaults)
+        db.flush()
+    elif _is_legacy_seeded_markup(ranges):
+        # Migrate legacy placeholder defaults to current defaults.
+        db.execute(delete(MarkupRange).where(MarkupRange.price_format_id == pf.id))
+        _seed_markup_ranges(defaults)
+        db.flush()
+
+        # Also migrate fallback progib (used only when bend table is empty).
+        try:
+            legacy_progib = _as_decimal(pf.progib, Decimal("0")) or Decimal("0")
+            new_progib = _as_decimal((defaults or {}).get("deflectionPercent"), Decimal("0")) or Decimal("0")
+            if legacy_progib == Decimal("5") and new_progib != Decimal("0"):
+                pf.progib = float(new_progib)
+                db.flush()
+        except Exception:
+            pass
+
+    # Ensure bend ranges exist (seed from defaults if needed)
+    bend_rows = db.execute(
+        select(BendRange).where(BendRange.price_format_id == pf.id).order_by(BendRange.price_from.asc())
+    ).scalars().all()
+    if not bend_rows:
+        _seed_bend_ranges(defaults)
+        db.flush()
+
+    # Safety: if still no ranges, fail with clear message.
+    ranges = db.execute(select(MarkupRange).where(MarkupRange.price_format_id == pf.id)).scalars().all()
+    if not ranges:
+        raise ValueError("Markup ranges are required")
+
+    existing_competitor_rows = (
+        db.execute(
+            select(CompetitorPrice.id)
+            .where(CompetitorPrice.price_format_id == pf.id)
+            .where(CompetitorPrice.product_id.is_not(None))
+            .limit(1)
+        )
+        .scalars()
+        .first()
+    )
+    if existing_competitor_rows is None:
+        rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id)
+        recalculate_competitor_percentiles(db=db, price_format_id=pf.id)
+        db.flush()
+
+    pl = db.execute(select(PriceList).where(PriceList.number == price_list_number)).scalars().first()
+    if pl is not None and force_new_price_list:
+        raise ValueError(f"price list number already exists: {price_list_number}")
+    if not pl:
+        pl = PriceList(
+            number=price_list_number,
+            price_format_id=pf.id,
+            activation_date=activation_date,
+            user=user,
+            status="Активен" if activation_date else "Черновик",
+        )
+        db.add(pl)
+        db.flush()
+
+    products = db.execute(select(Product)).scalars().all()
+    if not products:
+        # MVP: allow creating a price list before importing products.
+        db.commit()
+        return 0
+
+    rule = db.get(PricingRule, pf.pricing_rule_id) if pf.pricing_rule_id else None
+    applied_rule_name = (rule.name if rule else None) or pf.pricing_rule or pf.code
+    applied_rule_version = ""
+    if rule is not None and getattr(rule, "updated_at", None):
+        applied_rule_version = rule.updated_at.isoformat()
+
+    # upsert calculated_prices
+    count = 0
+    for p in products:
+        price, debug = calculate_price_for_product(
+            db=db,
+            product=p,
+            price_format=pf,
+            as_of=as_of,
+            region_id=region_id,
+        )
+
+        existing = db.execute(
+            select(CalculatedPrice)
+            .where(CalculatedPrice.price_list_id == pl.id)
+            .where(CalculatedPrice.product_id == p.id)
+        ).scalars().first()
+
+        cp = existing or CalculatedPrice(price_list_id=pl.id, product_id=p.id)
+        cp.cost = float(debug["cost"])
+        cp.base_price = float(debug["base_price"])
+        cp.competitor_price = float(debug["competitor_price"]) if debug["competitor_price"] is not None else None
+        cp.price_from_competitor = (
+            float(debug["price_from_competitor"]) if debug["price_from_competitor"] is not None else None
+        )
+        cp.lowest_competitor_price = (
+            float(debug["lowest_competitor_price"]) if debug["lowest_competitor_price"] is not None else None
+        )
+        cp.chosen_competitor_price = (
+            float(debug["chosen_competitor_price"]) if debug["chosen_competitor_price"] is not None else None
+        )
+        cp.bend_percent_used = float(debug["bend_percent_used"]) if debug["bend_percent_used"] is not None else None
+        cp.markup_percent_used = (
+            float(debug["markup_percent_used"]) if debug["markup_percent_used"] is not None else None
+        )
+        cp.final_price = float(price)
+        cp.applied_reason = str(debug.get("log") or debug["reason"])
+        cp.applied_source_name = str(debug.get("applied_source_name") or "")
+        cp.applied_source_type = str(debug.get("applied_source_type") or "")
+        cp.applied_rule_name = applied_rule_name
+        cp.applied_rule_version = applied_rule_version
+        cp.applied_list_ids = json.dumps(debug.get("applied_list_ids") or [], ensure_ascii=False)
+        cp.used_substitute = bool(debug.get("used_substitute"))
+        cp.used_percentile = bool(debug.get("used_percentile"))
+        cp.rating_global = debug.get("rating_global")
+        cp.rating_local = debug.get("rating_local")
+        cp.zone = str(debug["zone"])
+
+        if existing is None:
+            db.add(cp)
+
+        count += 1
+
+    db.commit()
+    return count

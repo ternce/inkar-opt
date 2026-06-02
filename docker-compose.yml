@@ -1,0 +1,79 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: apteka_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-apteka}
+      POSTGRES_USER: ${POSTGRES_USER:-apteka}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-apteka}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: apteka_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: apteka_backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-prod}
+      PORT: 8000
+      FRONTEND_DIST: /app/front/dist
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-apteka}:${POSTGRES_PASSWORD:-apteka}@postgres:5432/${POSTGRES_DB:-apteka}}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      PHCENTER_TOKEN: ${PHCENTER_TOKEN:-}
+      PHCENTER_BASE_URL: ${PHCENTER_BASE_URL:-https://ph.center}
+      PROVISOR_BASE_URL: ${PROVISOR_BASE_URL:-https://api.provisor.kz}
+      PROVISOR_LOGIN: ${PROVISOR_LOGIN:-}
+      PROVISOR_PASSWORD: ${PROVISOR_PASSWORD:-}
+      PROVISOR_EXCLUDED_FILIAL_IDS: ${PROVISOR_EXCLUDED_FILIAL_IDS:-1052,1076,1106,1107,1108,1111,1114,1149,1049}
+      VIDMAN_BASE_URL: ${VIDMAN_BASE_URL:-https://1.provizor.kz}
+      VIDMAN_LOGIN_PATH: ${VIDMAN_LOGIN_PATH:-/pages/login}
+      VIDMAN_PRICE_BASE_URL: ${VIDMAN_PRICE_BASE_URL:-https://prv.kz}
+      PRICE_SOURCE_SECRET: ${PRICE_SOURCE_SECRET:-}
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-}
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  postgres_data:
+  redis_data:

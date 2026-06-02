@@ -1,0 +1,32 @@
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.venv/
+**/venv/
+
+front/node_modules/
+front/dist/
+front/.vite/
+
+# Local DB artifacts
+backend/app.db
+**/*.sqlite
+**/*.sqlite3
+
+# Env / secrets
+**/.env
+**/.env.*
+
+.git/
+**/.git/
+.gitignore
+.vscode/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+*.log
