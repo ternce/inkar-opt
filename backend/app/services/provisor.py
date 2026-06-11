@@ -251,7 +251,9 @@ async def get_prices_by_filial_id(
 
         try:
             stage = "get_price_items"
+            http_started_at = time.perf_counter()
             resp = await asyncio.wait_for(_call(token), timeout=timeout_seconds)
+            http_elapsed_ms = round((time.perf_counter() - http_started_at) * 1000, 2)
 
             if resp.status_code in (401, 403):
                 stage = "login"
@@ -267,7 +269,9 @@ async def get_prices_by_filial_id(
                 )
 
                 stage = "get_price_items"
+                http_started_at = time.perf_counter()
                 resp = await asyncio.wait_for(_call(token2), timeout=timeout_seconds)
+                http_elapsed_ms = round((time.perf_counter() - http_started_at) * 1000, 2)
 
         except (asyncio.TimeoutError, httpx.TimeoutException) as e:
             elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
@@ -295,7 +299,10 @@ async def get_prices_by_filial_id(
 
         try:
             stage = "parsing"
+            response_size_bytes = len(resp.content)
+            decode_started_at = time.perf_counter()
             data = resp.json()
+            decode_elapsed_ms = round((time.perf_counter() - decode_started_at) * 1000, 2)
         except Exception:
             raise ProvisorAuthError(
                 f"Price/GetByFilialId returned invalid JSON: {resp.text}"
@@ -304,4 +311,12 @@ async def get_prices_by_filial_id(
         if not isinstance(data, list):
             raise ProvisorAuthError("Price/GetByFilialId returned non-list JSON")
 
+        logger.info(
+            "[PROVISOR_PLK_FETCH_TIMING] filial_id=%s rows=%s response_size_mb=%s http_fetch_elapsed_ms=%s json_decode_elapsed_ms=%s",
+            filial_id,
+            len(data),
+            round(response_size_bytes / (1024 * 1024), 3),
+            http_elapsed_ms,
+            decode_elapsed_ms,
+        )
         return data

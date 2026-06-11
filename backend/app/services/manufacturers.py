@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import lru_cache
 import re
 from difflib import SequenceMatcher
 
@@ -675,6 +676,14 @@ _ALIASES = {
 
 
 
+_SORTED_ALIASES: tuple[tuple[str, str], ...] = tuple(sorted(_ALIASES.items(), key=lambda x: -len(x[0])))
+
+
+@lru_cache(maxsize=1)
+def _alias_patterns() -> tuple[tuple[re.Pattern[str], str], ...]:
+    return tuple((re.compile(rf"\b{re.escape(alias)}\b"), canonical) for alias, canonical in _SORTED_ALIASES if len(alias) > 2)
+
+
 _HARD_CONFLICTS = {
     frozenset(("LEK", "SANDOZ")),
     frozenset(("BAYER", "SANDOZ")),
@@ -711,8 +720,8 @@ def normalize_manufacturer(value: object) -> str:
     if text in _ALIASES:
         return _ALIASES[text]
 
-    for alias, canonical in sorted(_ALIASES.items(), key=lambda x: -len(x[0])):
-        if len(alias) > 2 and re.search(rf"\b{re.escape(alias)}\b", text):
+    for pattern, canonical in _alias_patterns():
+        if pattern.search(text):
             return canonical
 
     return text
@@ -763,8 +772,8 @@ def extract_manufacturer(name: object) -> str:
             if normalized:
                 return normalized
 
-    for alias, canonical in sorted(_ALIASES.items(), key=lambda x: -len(x[0])):
-        if re.search(rf"\b{re.escape(alias)}\b", text):
+    for pattern, canonical in _alias_patterns():
+        if pattern.search(text):
             return canonical
 
     return ""

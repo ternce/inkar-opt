@@ -5864,6 +5864,15 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                         status="updated",
                         run_matching=False,
                     )
+                    db_replace_elapsed_ms = round((time.perf_counter() - save_started_at) * 1000, 2)
+                    if account_source_type == "provisor":
+                        logger.info(
+                            "[PROVISOR_PLK_DB_REPLACE_TIMING] account_id=%s filial_id=%s rows=%s db_replace_elapsed_ms=%s",
+                            account_id,
+                            price_list_id,
+                            len(items),
+                            db_replace_elapsed_ms,
+                        )
                     saved_source_type = str(saved.source_type or "")
                     saved_source_key = str(saved.source_key or "")
                     saved_display_name = str(saved.display_name or price_list_name)

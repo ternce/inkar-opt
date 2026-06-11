@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Protocol
@@ -207,6 +208,7 @@ class ProvisorPriceService:
         price_list: UnifiedPriceList,
     ) -> list[UnifiedPriceItem]:
         filial_id = int(price_list.price_list_id)
+        fetch_started_at = time.perf_counter()
         raw_items = await get_prices_by_filial_id(
             base_url=self.base_url,
             login=account.login,
@@ -215,41 +217,53 @@ class ProvisorPriceService:
             timeout_seconds=_provisor_item_timeout_seconds(),
             force_refresh=True,
         )
+        fetch_elapsed_ms = round((time.perf_counter() - fetch_started_at) * 1000, 2)
+        normalize_started_at = time.perf_counter()
         first = next((x for x in raw_items if isinstance(x, dict)), {})
         filial = first.get("filial") if isinstance(first.get("filial"), dict) else {}
         distributor_name = str(filial.get("name") or price_list.distributor_name or f"Provisor {filial_id}").strip()
 
         out: list[UnifiedPriceItem] = []
+        manufacturer_cache: dict[tuple[object, str], str] = {}
+        source = self.source
+        account_id = str(account.id)
+        price_list_id = str(filial_id)
+        as_decimal = _as_decimal
+        resolve = resolve_manufacturer
+        unified_item = UnifiedPriceItem
         for item in raw_items:
             if not isinstance(item, dict):
                 continue
             goods = item.get("goods") if isinstance(item.get("goods"), dict) else {}
-            price = _as_decimal(item.get("goodsPriceWithUserDiscount"))
+            price = as_decimal(item.get("goodsPriceWithUserDiscount"))
             if price is None or price <= 0:
-                price = _as_decimal(item.get("goodsPrice"))
-            stock = _as_decimal(item.get("stored"))
-            box = _as_decimal(item.get("box"))
-            pack = _as_decimal(item.get("pack"))
+                price = as_decimal(item.get("goodsPrice"))
+            stock = as_decimal(item.get("stored"))
+            box = as_decimal(item.get("box"))
+            pack = as_decimal(item.get("pack"))
             if box is not None and box > 0:
                 package_count = box
             elif pack is not None and pack > 0:
                 package_count = pack
             else:
                 package_count = None
+            product_name = str(item.get("distributorGoodsName") or goods.get("fullName") or "").strip()
+            manufacturer_raw = item.get("distributorProducer") or item.get("manufacturer") or item.get("producer") or goods.get("producer")
+            manufacturer_key = (manufacturer_raw, product_name)
+            manufacturer = manufacturer_cache.get(manufacturer_key)
+            if manufacturer is None:
+                manufacturer = resolve(manufacturer_raw, product_name, default="")
+                manufacturer_cache[manufacturer_key] = manufacturer
 
             out.append(
-                UnifiedPriceItem(
-                    source=self.source,
-                    account_id=str(account.id),
-                    price_list_id=str(filial_id),
+                unified_item(
+                    source=source,
+                    account_id=account_id,
+                    price_list_id=price_list_id,
                     price_list_name=distributor_name,
                     distributor_name=distributor_name,
-                    product_name=str(item.get("distributorGoodsName") or goods.get("fullName") or "").strip(),
-                    manufacturer=resolve_manufacturer(
-                        item.get("distributorProducer") or item.get("manufacturer") or item.get("producer") or goods.get("producer"),
-                        str(item.get("distributorGoodsName") or goods.get("fullName") or "").strip(),
-                        default="",
-                    ),
+                    product_name=product_name,
+                    manufacturer=manufacturer,
                     registration_number=str(goods.get("regNumber") or "").strip(),
                     distributor_product_name=str(item.get("distributorGoodsName") or "").strip(),
                     distributor_product_id=str(item.get("distributorGoodsId") or "").strip(),
@@ -260,6 +274,16 @@ class ProvisorPriceService:
                     raw=item,
                 )
             )
+        normalize_elapsed_ms = round((time.perf_counter() - normalize_started_at) * 1000, 2)
+        logger.info(
+            "[PROVISOR_PLK_NORMALIZATION_TIMING] account_id=%s filial_id=%s rows=%s fetch_elapsed_ms=%s normalization_elapsed_ms=%s manufacturer_cache_size=%s",
+            account.id,
+            filial_id,
+            len(out),
+            fetch_elapsed_ms,
+            normalize_elapsed_ms,
+            len(manufacturer_cache),
+        )
         return out
 
 
