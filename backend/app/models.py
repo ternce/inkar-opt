@@ -396,6 +396,45 @@ class Job(Base):
     )
 
 
+class RefreshJob(Base):
+    __tablename__ = "refresh_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_type: Mapped[str] = mapped_column(String(64), index=True)
+    mode: Mapped[str] = mapped_column(String(32), default="selected", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    requested_by: Mapped[str] = mapped_column(Text, default="")
+    total_accounts: Mapped[int] = mapped_column(Integer, default=0)
+    processed_accounts: Mapped[int] = mapped_column(Integer, default=0)
+    total_plk: Mapped[int] = mapped_column(Integer, default=0)
+    processed_plk: Mapped[int] = mapped_column(Integer, default=0)
+    success_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_count: Mapped[int] = mapped_column(Integer, default=0)
+    message: Mapped[str] = mapped_column(Text, default="")
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
+
+    __table_args__ = (
+        Index("ix_refresh_jobs_source_status", "source_type", "status", "started_at"),
+    )
+
+
+class RefreshLock(Base):
+    __tablename__ = "refresh_locks"
+
+    name: Mapped[str] = mapped_column(String(128), primary_key=True)
+    owner_token: Mapped[str] = mapped_column(String(128), default="", index=True)
+    lock_type: Mapped[str] = mapped_column(String(64), default="", index=True)
+    acquired_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    lease_until: Mapped[datetime] = mapped_column(DateTime, index=True)
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
 class NoCompetitorMarkupRange(Base):
     __tablename__ = "no_competitor_markup_ranges"
 

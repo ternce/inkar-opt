@@ -65,6 +65,7 @@ from .models import (
     ProductRating,
     ProductSubstituteMatch,
     ReferenceUpdateStatus,
+    RefreshJob,
     SourceGoodsMatch,
     UniversalList,
     UniversalListPriceFormat,
@@ -180,6 +181,26 @@ from .services.pricing_workflow.workflow import (
     price_format_to_workflow_dict,
     run_to_dict,
 )
+from .services.provisor_auto_refresh import (
+    active_or_stale_refresh_job,
+    all_refresh_targets,
+    create_skipped_job,
+    finish_job as finish_refresh_job,
+    heartbeat as refresh_job_heartbeat,
+    job_owner_token as refresh_job_owner_token,
+    latest_refresh_job,
+    normalize_mode as normalize_refresh_mode,
+    new_owner_token as new_refresh_owner_token,
+    release_scheduler_lock,
+    renew_scheduler_lock,
+    refresh_job_to_status,
+    selected_refresh_targets,
+    start_job as start_refresh_job,
+    target_counts as refresh_target_counts,
+    try_acquire_scheduler_lock,
+    try_create_refresh_job,
+    update_progress_from_result as update_refresh_job_progress,
+)
 
 
 logging.basicConfig(
@@ -194,6 +215,9 @@ for _logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access", "fastapi", "b
 app = FastAPI(title="aptekaopt-backend", version="0.1.0")
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+_provisor_auto_refresh_scheduler = None
+_provisor_auto_refresh_scheduler_token: str | None = None
+_provisor_auto_refresh_scheduler_renew_task = None
 
 settings = get_settings()
 PRICE_LISTS_FETCH_TIMEOUT_SECONDS = 30
@@ -308,6 +332,13 @@ def _env_flag(name: str) -> bool:
     return v.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except Exception:
+        return max(minimum, default)
+
+
 def _seed_price_formats_if_missing() -> None:
     # Dev convenience: ensure at least a couple of price formats exist,
     # otherwise the UI cannot start.
@@ -343,10 +374,11 @@ def _seed_price_formats_if_missing() -> None:
 
 
 @app.on_event("startup")
-def _startup() -> None:
+async def _startup() -> None:
     try:
         init_db()
         _seed_price_formats_if_missing()
+        _start_provisor_auto_refresh_scheduler()
     except Exception:
         # In production deployments (e.g., Railway) the database might be configured
         # after the first deploy or might be temporarily unavailable.
@@ -356,6 +388,95 @@ def _startup() -> None:
         traceback.print_exc()
         if settings.environment != "prod":
             raise
+
+
+def _start_provisor_auto_refresh_scheduler() -> None:
+    global _provisor_auto_refresh_scheduler, _provisor_auto_refresh_scheduler_token, _provisor_auto_refresh_scheduler_renew_task
+    if settings.environment != "prod":
+        logger.info("[PROVISOR_AUTO_REFRESH] scheduler disabled: environment=%s", settings.environment)
+        return
+    if not settings.provisor_auto_refresh_enabled:
+        logger.info("[PROVISOR_AUTO_REFRESH] scheduler disabled by PROVISOR_AUTO_REFRESH_ENABLED=false")
+        return
+    if _provisor_auto_refresh_scheduler is not None:
+        return
+    owner_token = new_refresh_owner_token()
+    with SessionLocal() as db:
+        if not try_acquire_scheduler_lock(db, owner_token=owner_token):
+            logger.info("[PROVISOR_AUTO_REFRESH] scheduler not started: another process owns scheduler lease")
+            return
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        from apscheduler.triggers.cron import CronTrigger
+    except Exception:
+        with SessionLocal() as db:
+            release_scheduler_lock(db, owner_token=owner_token)
+        logger.exception("[PROVISOR_AUTO_REFRESH] APScheduler is not installed; scheduler not started")
+        return
+    mode = normalize_refresh_mode(settings.provisor_auto_refresh_mode)
+    trigger = CronTrigger.from_crontab(settings.provisor_auto_refresh_cron)
+    scheduler_timezone = settings.provisor_auto_refresh_timezone
+    scheduler = AsyncIOScheduler(timezone=scheduler_timezone)
+    scheduler.add_job(
+        lambda: asyncio.create_task(_start_provisor_refresh_background(mode=mode, requested_by="scheduler")),
+        trigger=trigger,
+        id="provisor_auto_refresh",
+        name="Provisor PLK auto refresh",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=300,
+    )
+    scheduler.start()
+    _provisor_auto_refresh_scheduler = scheduler
+    _provisor_auto_refresh_scheduler_token = owner_token
+    try:
+        _provisor_auto_refresh_scheduler_renew_task = asyncio.create_task(_renew_provisor_scheduler_ownership(owner_token))
+    except RuntimeError:
+        logger.warning("[PROVISOR_AUTO_REFRESH] scheduler ownership renew task not started: no running event loop")
+    logger.info(
+        "[PROVISOR_AUTO_REFRESH] scheduler started cron=%s timezone=%s mode=%s max_parallel_accounts=%s max_parallel_plk=%s",
+        settings.provisor_auto_refresh_cron,
+        scheduler_timezone,
+        mode,
+        settings.provisor_auto_refresh_max_parallel_accounts,
+        settings.provisor_auto_refresh_max_parallel_plk,
+    )
+
+
+async def _renew_provisor_scheduler_ownership(owner_token: str) -> None:
+    global _provisor_auto_refresh_scheduler
+    while True:
+        await asyncio.sleep(30)
+        with SessionLocal() as db:
+            renewed = renew_scheduler_lock(db, owner_token=owner_token)
+        if renewed:
+            continue
+        logger.error("[PROVISOR_AUTO_REFRESH] scheduler lease lost; shutting down local scheduler")
+        scheduler = _provisor_auto_refresh_scheduler
+        if scheduler is not None:
+            scheduler.shutdown(wait=False)
+            _provisor_auto_refresh_scheduler = None
+        return
+
+
+@app.on_event("shutdown")
+def _shutdown() -> None:
+    _shutdown_provisor_auto_refresh_scheduler()
+
+
+def _shutdown_provisor_auto_refresh_scheduler() -> None:
+    global _provisor_auto_refresh_scheduler, _provisor_auto_refresh_scheduler_token, _provisor_auto_refresh_scheduler_renew_task
+    if _provisor_auto_refresh_scheduler_renew_task is not None:
+        _provisor_auto_refresh_scheduler_renew_task.cancel()
+        _provisor_auto_refresh_scheduler_renew_task = None
+    if _provisor_auto_refresh_scheduler is not None:
+        _provisor_auto_refresh_scheduler.shutdown(wait=False)
+        _provisor_auto_refresh_scheduler = None
+        logger.info("[PROVISOR_AUTO_REFRESH] scheduler shutdown")
+    if _provisor_auto_refresh_scheduler_token:
+        with SessionLocal() as db:
+            release_scheduler_lock(db, owner_token=_provisor_auto_refresh_scheduler_token)
+        _provisor_auto_refresh_scheduler_token = None
 
 
 def _fmt_dt(dt: datetime | None) -> str:
@@ -4387,6 +4508,217 @@ async def upload_competitor_price_list_excel(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+def _provisor_auto_refresh_payload(*, account_ids: list[str], filial_ids: set[str] | None, mode: str) -> dict:
+    payload = {
+        "source": "provisor",
+        "accountIds": [int(x) for x in account_ids if str(x).isdigit()],
+        "forceRefresh": True,
+        "runRebuildAfterRefresh": False,
+        "maxParallelAccounts": settings.provisor_auto_refresh_max_parallel_accounts,
+        "maxParallelPlk": settings.provisor_auto_refresh_max_parallel_plk,
+        "keepLastSuccess": settings.provisor_auto_refresh_keep_last_success,
+    }
+    if mode == "selected":
+        payload["provisorFilialIds"] = [int(x) for x in sorted(filial_ids or set()) if str(x).isdigit()]
+    return payload
+
+
+def _heartbeat_provisor_refresh_job(job_id: int, owner_token: str, message: str | None = None) -> bool:
+    with SessionLocal() as heartbeat_db:
+        current = heartbeat_db.get(RefreshJob, job_id)
+        if current is None:
+            return False
+        return refresh_job_heartbeat(heartbeat_db, current, message=message, owner_token=owner_token)
+
+
+async def _run_provisor_refresh_job(job_id: int, *, mode: str, requested_by: str, owner_token: str | None = None) -> None:
+    db = SessionLocal()
+    heartbeat_task = None
+    try:
+        job = db.get(RefreshJob, job_id)
+        if job is None:
+            logger.error("[PROVISOR_AUTO_REFRESH] job not found: %s", job_id)
+            return
+        owner_token = owner_token or refresh_job_owner_token(job)
+        if not owner_token:
+            logger.error("[PROVISOR_AUTO_REFRESH] job has no owner token: %s", job_id)
+            return
+        mode = normalize_refresh_mode(mode)
+        targets = selected_refresh_targets(db) if mode == "selected" else all_refresh_targets(db)
+        if not targets:
+            message = (
+                "No selected Provisor PLK configured for auto-refresh."
+                if mode == "selected"
+                else "No active Provisor accounts configured for auto-refresh."
+            )
+            finish_refresh_job(db, job, status="failed", message=message, error=message, owner_token=owner_token, release_refresh=True)
+            logger.warning("[PROVISOR_AUTO_REFRESH] job failed before start: %s", message)
+            return
+        total_accounts, total_plk = refresh_target_counts(targets, db, mode=mode)
+        if mode == "selected" and total_plk <= 0:
+            message = "No selected Provisor PLK configured for auto-refresh."
+            finish_refresh_job(db, job, status="failed", message=message, error=message, owner_token=owner_token, release_refresh=True)
+            logger.warning("[PROVISOR_AUTO_REFRESH] job failed before start: %s", message)
+            return
+        started = start_refresh_job(
+            db,
+            job,
+            total_accounts=total_accounts,
+            total_plk=total_plk,
+            metadata={"requested_by": requested_by, "targets": {fmt: {acc: sorted(ids) for acc, ids in by_acc.items()} for fmt, by_acc in targets.items()}},
+            owner_token=owner_token,
+        )
+        if not started:
+            logger.warning("[PROVISOR_AUTO_REFRESH] job start skipped because token/status no longer match: job_id=%s", job_id)
+            return
+
+        async def beat() -> None:
+            while True:
+                await asyncio.sleep(30)
+                if not _heartbeat_provisor_refresh_job(job_id, owner_token, "Refreshing Provisor PLK..."):
+                    return
+
+        heartbeat_task = asyncio.create_task(beat())
+        logger.info("[PROVISOR_AUTO_REFRESH] job started id=%s mode=%s requested_by=%s", job_id, mode, requested_by)
+        aggregate = {"results": [], "errors": [], "accounts": set(), "processed_plk": 0, "success": 0, "failed": 0, "skipped": 0}
+        for format_code, by_account in targets.items():
+            for account_id, filial_ids in by_account.items():
+                db.expire_all()
+                job = db.get(RefreshJob, job_id)
+                if job is None:
+                    return
+                if not _heartbeat_provisor_refresh_job(job_id, owner_token, f"Refreshing Provisor PLK for account {account_id}..."):
+                    logger.warning("[PROVISOR_AUTO_REFRESH] heartbeat failed before account refresh; stopping job_id=%s", job_id)
+                    return
+                payload = _provisor_auto_refresh_payload(account_ids=[account_id], filial_ids=filial_ids, mode=mode)
+                logger.info("[PROVISOR_AUTO_REFRESH] account started job_id=%s format=%s account_id=%s plk=%s", job_id, format_code, account_id, sorted(filial_ids) if mode == "selected" else "all")
+                result = await _run_refresh_price_lists_logic(format_code=format_code, payload=payload, db=db, job=None)
+                progress = result.get("progress") or {}
+                aggregate["results"].append({"format_code": format_code, "account_id": account_id})
+                aggregate["errors"].extend(result.get("errors") or [])
+                aggregate["accounts"].add(account_id)
+                aggregate["processed_plk"] += int(progress.get("processed") or 0)
+                aggregate["success"] += int(progress.get("success") or 0)
+                aggregate["failed"] += int(progress.get("errors") or 0)
+                aggregate["skipped"] += int(progress.get("skipped") or 0)
+                db.expire_all()
+                job = db.get(RefreshJob, job_id)
+                if job is not None:
+                    if not update_refresh_job_progress(db, job, result, owner_token=owner_token):
+                        logger.warning("[PROVISOR_AUTO_REFRESH] progress update skipped because token/status no longer match: job_id=%s", job_id)
+                        return
+                    job.processed_accounts = min(int(job.total_accounts or 0), len(aggregate["accounts"]))
+                    job.processed_plk = int(aggregate["processed_plk"])
+                    job.success_count = int(aggregate["success"])
+                    job.failed_count = int(aggregate["failed"])
+                    job.skipped_count = int(aggregate["skipped"])
+                    job.heartbeat_at = datetime.utcnow()
+                    db.commit()
+                logger.info("[PROVISOR_AUTO_REFRESH] account finished job_id=%s account_id=%s success=%s failed=%s skipped=%s", job_id, account_id, int(progress.get("success") or 0), int(progress.get("errors") or 0), int(progress.get("skipped") or 0))
+        db.expire_all()
+        job = db.get(RefreshJob, job_id)
+        if job is not None:
+            failed = int(aggregate["failed"] or 0)
+            status = "failed" if failed and not int(aggregate["success"] or 0) else "success"
+            message = f"Provisor refresh completed: success={aggregate['success']}, failed={aggregate['failed']}, skipped={aggregate['skipped']}." if status == "success" else "Provisor refresh failed."
+            finished = finish_refresh_job(
+                db,
+                job,
+                status=status,
+                message=message,
+                error="; ".join(str(x) for x in aggregate["errors"][:5]),
+                metadata={"result_count": len(aggregate["results"])},
+                owner_token=owner_token,
+                allowed_statuses={"running"},
+                release_refresh=True,
+            )
+            if not finished:
+                logger.warning("[PROVISOR_AUTO_REFRESH] final status skipped because token/status no longer match: job_id=%s", job_id)
+        logger.info("[PROVISOR_AUTO_REFRESH] job completed id=%s", job_id)
+    except Exception as e:
+        db.rollback()
+        logger.exception("[PROVISOR_AUTO_REFRESH] job failed id=%s", job_id)
+        job = db.get(RefreshJob, job_id)
+        if job is not None:
+            finish_refresh_job(
+                db,
+                job,
+                status="failed",
+                message="Provisor refresh failed.",
+                error=str(e),
+                owner_token=owner_token,
+                allowed_statuses={"pending", "running"},
+                release_refresh=True,
+            )
+    finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+        db.close()
+
+
+@app.get("/api/price-sources/refresh/status")
+def get_price_sources_refresh_status(db: Session = Depends(get_db)):
+    return refresh_job_to_status(latest_refresh_job(db))
+
+
+@app.post("/api/price-sources/refresh/provisor/auto/run-now", status_code=202)
+async def run_provisor_auto_refresh_now(payload: dict = Body(default={}), db: Session = Depends(get_db)):
+    mode = normalize_refresh_mode(str(payload.get("mode") or settings.provisor_auto_refresh_mode))
+    blocker = active_or_stale_refresh_job(db)
+    if blocker is not None:
+        message = "Provisor refresh is already running." if blocker.status != "stale" else "Provisor refresh is stale; resolve it before starting another job."
+        create_skipped_job(db, mode=mode, requested_by="manual", message=message)
+        raise HTTPException(status_code=409, detail=message)
+    job, blocker, owner_token = try_create_refresh_job(db, mode=mode, requested_by="manual")
+    if job is None:
+        message = "Provisor refresh is already running."
+        if blocker is not None and blocker.status == "stale":
+            message = "Provisor refresh is stale; resolve it before starting another job."
+        create_skipped_job(db, mode=mode, requested_by="manual", message=message)
+        raise HTTPException(status_code=409, detail=message)
+    assert owner_token is not None
+    asyncio.create_task(_run_provisor_refresh_job(int(job.id), mode=job.mode, requested_by="manual", owner_token=owner_token))
+    return {"job_id": job.id, **refresh_job_to_status(job)}
+
+
+@app.post("/api/price-sources/refresh/provisor/auto/resolve-stale")
+def resolve_stale_provisor_auto_refresh(db: Session = Depends(get_db)):
+    blocker = active_or_stale_refresh_job(db)
+    if blocker is None or blocker.status != "stale":
+        raise HTTPException(status_code=404, detail="No stale Provisor refresh job to resolve.")
+    finish_refresh_job(
+        db,
+        blocker,
+        status="failed",
+        message="Stale Provisor refresh marked failed by operator.",
+        error=blocker.error_message or "stale refresh resolved",
+        owner_token=refresh_job_owner_token(blocker),
+        allowed_statuses={"stale"},
+        release_refresh=True,
+    )
+    logger.warning("[PROVISOR_AUTO_REFRESH] stale job marked failed id=%s", blocker.id)
+    return refresh_job_to_status(blocker)
+
+
+async def _start_provisor_refresh_background(*, mode: str, requested_by: str) -> None:
+    db = SessionLocal()
+    try:
+        job, blocker, owner_token = try_create_refresh_job(db, mode=mode, requested_by=requested_by)
+        if blocker is not None:
+            message = "Provisor refresh is already running." if blocker.status != "stale" else "Provisor refresh is stale; resolve it before starting another job."
+            create_skipped_job(db, mode=mode, requested_by=requested_by, message=message)
+            logger.warning("[PROVISOR_AUTO_REFRESH] skipped new job: blocker_id=%s blocker_status=%s", blocker.id, blocker.status)
+            return
+        if job is None:
+            create_skipped_job(db, mode=mode, requested_by=requested_by, message="Provisor refresh is already running.")
+            logger.warning("[PROVISOR_AUTO_REFRESH] skipped new job: refresh lock is owned by another process")
+            return
+        assert owner_token is not None
+        asyncio.create_task(_run_provisor_refresh_job(int(job.id), mode=job.mode, requested_by=requested_by, owner_token=owner_token))
+    finally:
+        db.close()
+
+
 @app.post("/api/price-formats/{format_code}/competitor-price-lists/refresh")
 async def refresh_competitor_price_lists(format_code: str, payload: dict = Body(default={}), db: Session = Depends(get_db)):
     refresh_source = _refresh_source_from_payload(payload or {})
@@ -4512,16 +4844,22 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
 
     # External price sources are sensitive to parallel long-running item loads.
     # Keep timeout per active price list, but avoid overloading shared sessions/APIs.
-    source_limits = {"provisor": 2, "vidman": 1}
-    account_sem = asyncio.Semaphore(4)
+    provisor_account_parallel = _env_int("PROVISOR_AUTO_REFRESH_MAX_PARALLEL_ACCOUNTS", 2)
+    provisor_plk_parallel = _env_int("PROVISOR_AUTO_REFRESH_MAX_PARALLEL_PLK", 1)
+    if payload.get("maxParallelAccounts") is not None or payload.get("max_parallel_accounts") is not None:
+        provisor_account_parallel = max(1, int(payload.get("maxParallelAccounts") or payload.get("max_parallel_accounts") or provisor_account_parallel))
+    if payload.get("maxParallelPlk") is not None or payload.get("max_parallel_plk") is not None:
+        provisor_plk_parallel = max(1, int(payload.get("maxParallelPlk") or payload.get("max_parallel_plk") or provisor_plk_parallel))
+    source_limits = {"provisor": provisor_plk_parallel, "vidman": 1}
+    account_sem = asyncio.Semaphore(provisor_account_parallel if refresh_source == "provisor" else 4)
     source_sems = {source: asyncio.Semaphore(limit) for source, limit in source_limits.items()}
     logger.info(
         "[REFRESH] accounts_parallel=%s fetch_lists_timeout=%ss",
-        4,
+        provisor_account_parallel if refresh_source == "provisor" else 4,
         PRICE_LISTS_FETCH_TIMEOUT_SECONDS,
     )
     print(
-        f"[REFRESH] accounts_parallel=4 fetch_lists_timeout={PRICE_LISTS_FETCH_TIMEOUT_SECONDS}s",
+        f"[REFRESH] accounts_parallel={provisor_account_parallel if refresh_source == 'provisor' else 4} fetch_lists_timeout={PRICE_LISTS_FETCH_TIMEOUT_SECONDS}s",
         flush=True,
     )
 

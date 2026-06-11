@@ -16,6 +16,7 @@ redis_data/
 *.backup
 
 exports/
+deployment_data_export/
 backups/
 *.csv
 *.xlsx

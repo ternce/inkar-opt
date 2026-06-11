@@ -18,6 +18,13 @@ class Settings(BaseModel):
     provisor_price_total_timeout_seconds: int
     provisor_price_read_timeout_seconds: int
     provisor_price_connect_timeout_seconds: int
+    provisor_auto_refresh_enabled: bool
+    provisor_auto_refresh_cron: str
+    provisor_auto_refresh_mode: str
+    provisor_auto_refresh_max_parallel_accounts: int
+    provisor_auto_refresh_max_parallel_plk: int
+    provisor_auto_refresh_keep_last_success: bool
+    provisor_auto_refresh_timezone: str
     vidman_base_url: str
     vidman_login_path: str
     vidman_price_base_url: str
@@ -38,6 +45,12 @@ def get_settings() -> Settings:
         else ["http://localhost:5173"]
     )
 
+    def env_bool(name: str, default: bool = False) -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
     return Settings(
         environment=environment,
         cors_allow_origins=cors_allow_origins,
@@ -52,6 +65,13 @@ def get_settings() -> Settings:
             int(os.getenv("PROVISOR_PRICE_TOTAL_TIMEOUT_SECONDS", "120")),
         ),
         provisor_price_connect_timeout_seconds=int(os.getenv("PROVISOR_PRICE_CONNECT_TIMEOUT_SECONDS", "10")),
+        provisor_auto_refresh_enabled=env_bool("PROVISOR_AUTO_REFRESH_ENABLED", False),
+        provisor_auto_refresh_cron=os.getenv("PROVISOR_AUTO_REFRESH_CRON", "0 2 * * *"),
+        provisor_auto_refresh_mode=os.getenv("PROVISOR_AUTO_REFRESH_MODE", "selected").strip().lower() or "selected",
+        provisor_auto_refresh_max_parallel_accounts=max(1, int(os.getenv("PROVISOR_AUTO_REFRESH_MAX_PARALLEL_ACCOUNTS", "2"))),
+        provisor_auto_refresh_max_parallel_plk=max(1, int(os.getenv("PROVISOR_AUTO_REFRESH_MAX_PARALLEL_PLK", "1"))),
+        provisor_auto_refresh_keep_last_success=env_bool("PROVISOR_AUTO_REFRESH_KEEP_LAST_SUCCESS", True),
+        provisor_auto_refresh_timezone=os.getenv("PROVISOR_AUTO_REFRESH_TIMEZONE", os.getenv("TZ", "Asia/Qyzylorda")).strip() or "Asia/Qyzylorda",
         vidman_base_url=os.getenv("VIDMAN_BASE_URL", "https://1.provizor.kz"),
         vidman_login_path=os.getenv("VIDMAN_LOGIN_PATH", "/pages/login"),
         vidman_price_base_url=os.getenv("VIDMAN_PRICE_BASE_URL", "https://prv.kz"),

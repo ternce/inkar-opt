@@ -8,3 +8,4 @@ python-multipart==0.0.9
 openpyxl==3.1.5
 psycopg[binary]==3.2.9
 rapidfuzz==3.10.1
+APScheduler==3.10.4
