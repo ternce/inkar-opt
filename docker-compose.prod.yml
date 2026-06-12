@@ -22,7 +22,7 @@ services:
       ENVIRONMENT: ${ENVIRONMENT:-prod}
       PORT: 8000
       FRONTEND_DIST: /app/front/dist
-      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-inkar}:${POSTGRES_PASSWORD:-CHANGE_ME}@db:5432/${POSTGRES_DB:-inkar_opt}}
+      DATABASE_URL: ${DATABASE_URL}
       # Подставь реальные токены/логины через переменные окружения на VPS (лучше через .env рядом с compose)
       PHCENTER_TOKEN: ${PHCENTER_TOKEN:-}
       PHCENTER_BASE_URL: ${PHCENTER_BASE_URL:-https://ph.center}

@@ -201,6 +201,15 @@ from .services.provisor_auto_refresh import (
     try_create_refresh_job,
     update_progress_from_result as update_refresh_job_progress,
 )
+from .services.emit_worker import (
+    EmitConfig,
+    EmitWorker,
+    configured_filial_ids_for_mode,
+    emit_job_to_dict,
+    is_emit_plk,
+    latest_emit_job,
+    list_emit_jobs,
+)
 
 
 logging.basicConfig(
@@ -218,6 +227,8 @@ logger.setLevel(logging.INFO)
 _provisor_auto_refresh_scheduler = None
 _provisor_auto_refresh_scheduler_token: str | None = None
 _provisor_auto_refresh_scheduler_renew_task = None
+_emit_refresh_scheduler = None
+_emit_worker: EmitWorker | None = None
 
 settings = get_settings()
 PRICE_LISTS_FETCH_TIMEOUT_SECONDS = 30
@@ -311,6 +322,7 @@ def _get_any_active_refresh_job(db: Session, format_code: str) -> Job | None:
 
 def _provisor_excluded_filial_ids(account_config: dict[str, object] | None = None) -> set[str]:
     ids = _parse_id_set(os.getenv("PROVISOR_EXCLUDED_FILIAL_IDS", DEFAULT_PROVISOR_EXCLUDED_FILIAL_IDS))
+    ids.update(_parse_id_set(os.getenv("EMIT_FILIAL_IDS", ",".join(str(x) for x in settings.emit_filial_ids))))
     config = account_config or {}
     for key in ("excludedFilialIds", "excluded_filial_ids", "heavyFilialIds", "heavy_filial_ids"):
         ids.update(_parse_id_set(config.get(key)))
@@ -379,6 +391,7 @@ async def _startup() -> None:
         init_db()
         _seed_price_formats_if_missing()
         _start_provisor_auto_refresh_scheduler()
+        _start_emit_refresh_scheduler()
     except Exception:
         # In production deployments (e.g., Railway) the database might be configured
         # after the first deploy or might be temporarily unavailable.
@@ -462,6 +475,7 @@ async def _renew_provisor_scheduler_ownership(owner_token: str) -> None:
 @app.on_event("shutdown")
 def _shutdown() -> None:
     _shutdown_provisor_auto_refresh_scheduler()
+    _shutdown_emit_refresh_scheduler()
 
 
 def _shutdown_provisor_auto_refresh_scheduler() -> None:
@@ -477,6 +491,67 @@ def _shutdown_provisor_auto_refresh_scheduler() -> None:
         with SessionLocal() as db:
             release_scheduler_lock(db, owner_token=_provisor_auto_refresh_scheduler_token)
         _provisor_auto_refresh_scheduler_token = None
+
+
+def _emit_worker_instance() -> EmitWorker:
+    global _emit_worker
+    if _emit_worker is None:
+        _emit_worker = EmitWorker(session_factory=SessionLocal, config=EmitConfig.from_settings(settings))
+    return _emit_worker
+
+
+def _start_emit_refresh_scheduler() -> None:
+    global _emit_refresh_scheduler
+    config = EmitConfig.from_settings(settings)
+    if not config.enabled:
+        logger.info("[EMIT_REFRESH] scheduler disabled")
+        return
+    if _emit_refresh_scheduler is not None:
+        return
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        from apscheduler.triggers.cron import CronTrigger
+    except Exception:
+        logger.exception("[EMIT_REFRESH] APScheduler is not installed; scheduler not started")
+        return
+    scheduler = AsyncIOScheduler(timezone=config.timezone)
+    scheduler.add_job(
+        lambda: asyncio.create_task(_start_emit_refresh_background(mode="all", requested_by="scheduler")),
+        trigger=CronTrigger.from_crontab(config.cron),
+        id="emit_refresh",
+        name="Emit/Amity International refresh",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=300,
+    )
+    scheduler.start()
+    _emit_refresh_scheduler = scheduler
+    logger.info("[EMIT_REFRESH] scheduler started cron=%s timezone=%s", config.cron, config.timezone)
+
+
+def _shutdown_emit_refresh_scheduler() -> None:
+    global _emit_refresh_scheduler
+    if _emit_refresh_scheduler is not None:
+        _emit_refresh_scheduler.shutdown(wait=False)
+        _emit_refresh_scheduler = None
+        logger.info("[EMIT_REFRESH] scheduler shutdown")
+
+
+async def _start_emit_refresh_background(*, mode: str, requested_by: str, filial_ids: list[int] | None = None) -> None:
+    worker = _emit_worker_instance()
+    target_ids = configured_filial_ids_for_mode(worker.config, mode=mode, filial_ids=filial_ids)
+    if not target_ids:
+        logger.warning("[EMIT_REFRESH] skipped: no filial IDs requested")
+        return
+    with SessionLocal() as db:
+        if active_or_stale_refresh_job(db) is not None:
+            logger.warning("[EMIT_REFRESH] skipped: normal Provisor refresh is active or stale")
+            return
+    job, blocker, owner_token = worker.create_job(mode=mode, filial_ids=target_ids, requested_by=requested_by)
+    if job is None:
+        logger.warning("[EMIT_REFRESH] skipped: another Emit job is active blocker_id=%s", getattr(blocker, "id", None))
+        return
+    asyncio.create_task(worker.run_job(int(job.id), owner_token=owner_token))
 
 
 def _fmt_dt(dt: datetime | None) -> str:
@@ -4700,6 +4775,43 @@ def resolve_stale_provisor_auto_refresh(db: Session = Depends(get_db)):
     return refresh_job_to_status(blocker)
 
 
+@app.get("/api/emit/refresh/status")
+def get_emit_refresh_status(db: Session = Depends(get_db)):
+    return emit_job_to_dict(latest_emit_job(db))
+
+
+@app.post("/api/emit/refresh/run-now", status_code=202)
+async def run_emit_refresh_now(payload: dict = Body(default={}), db: Session = Depends(get_db)):
+    worker = _emit_worker_instance()
+    mode = str(payload.get("mode") or "selected").strip().lower()
+    if mode not in {"selected", "all"}:
+        raise HTTPException(status_code=400, detail="mode must be selected or all")
+    filial_ids = [int(x) for x in (payload.get("filial_ids") or payload.get("filialIds") or []) if str(x).strip().lstrip("-").isdigit()]
+    target_ids = configured_filial_ids_for_mode(worker.config, mode=mode, filial_ids=filial_ids)
+    if not target_ids:
+        raise HTTPException(status_code=400, detail="No Emit filial IDs requested")
+    if active_or_stale_refresh_job(db) is not None:
+        raise HTTPException(status_code=409, detail="Normal Provisor refresh is active or stale; wait before starting Emit refresh.")
+    job, blocker, owner_token = worker.create_job(mode=mode, filial_ids=target_ids, requested_by="manual")
+    if job is None:
+        raise HTTPException(status_code=409, detail={"message": "Emit refresh is already running.", "job": emit_job_to_dict(blocker)})
+    asyncio.create_task(worker.run_job(int(job.id), owner_token=owner_token))
+    return {"job_id": job.id, **emit_job_to_dict(job)}
+
+
+@app.get("/api/emit/refresh/jobs")
+def get_emit_refresh_jobs(limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(get_db)):
+    return {"items": list_emit_jobs(db, limit=limit)}
+
+
+@app.get("/api/emit/refresh/jobs/{job_id}")
+def get_emit_refresh_job(job_id: int, db: Session = Depends(get_db)):
+    job = db.get(RefreshJob, job_id)
+    if job is None or job.source_type != "emit":
+        raise HTTPException(status_code=404, detail="Emit refresh job not found")
+    return {"id": job.id, **emit_job_to_dict(job)}
+
+
 async def _start_provisor_refresh_background(*, mode: str, requested_by: str) -> None:
     db = SessionLocal()
     try:
@@ -5113,18 +5225,21 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                 f"price_id={price_list_id} price_name={price_list_name} timeout_seconds={price_list_timeout}",
                                 flush=True,
                             )
-                            if account.source_type == "provisor" and price_list_id in excluded_provisor_filial_ids:
+                            if account.source_type == "provisor" and (
+                                price_list_id in excluded_provisor_filial_ids
+                                or is_emit_plk(filial_id=price_list_id, name=price_list_name)
+                            ):
                                 elapsed_ms = round((time.perf_counter() - fetch_items_started_at) * 1000, 2)
                                 logger.info(
                                     "[PROVISOR_HEAVY_SKIPPED] account_id=%s filial_id=%s filial_name=%s reason=%s",
                                     account.id,
                                     price_list_id,
                                     price_list_name,
-                                    "excluded_heavy_filial",
+                                    "excluded_emit_or_heavy_filial",
                                 )
                                 print(
                                     f"[PROVISOR_HEAVY_SKIPPED] account_id={account.id} filial_id={price_list_id} "
-                                    f"filial_name={price_list_name} reason=excluded_heavy_filial",
+                                    f"filial_name={price_list_name} reason=excluded_emit_or_heavy_filial",
                                     flush=True,
                                 )
                                 return {
@@ -5139,7 +5254,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                         "id": price_list_id,
                                         "name": price_list_name,
                                         "source": account.source_type,
-                                        "reason": "excluded_heavy_filial",
+                                        "reason": "excluded_emit_or_heavy_filial",
                                         "fetch_duration_seconds": round(elapsed_ms / 1000, 3),
                                         "timeout_limit_seconds": price_list_timeout,
                                     },
