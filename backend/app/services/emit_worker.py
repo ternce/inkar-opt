@@ -103,6 +103,7 @@ class EmitStats:
     normalized_rows: int = 0
     duplicate_rows_removed: int = 0
     zero_price_rows_skipped: int = 0
+    skip_reasons: dict[str, int] = field(default_factory=dict)
     rows_without_goodsId: int = 0
     final_rows_saved: int = 0
     key_type_counts: dict[str, int] = field(default_factory=dict)
@@ -126,6 +127,7 @@ class EmitStats:
             "normalized_rows": self.normalized_rows,
             "duplicate_rows_removed": self.duplicate_rows_removed,
             "zero_price_rows_skipped": self.zero_price_rows_skipped,
+            "skip_reasons": self.skip_reasons,
             "rows_without_goodsId": self.rows_without_goodsId,
             "final_rows_saved": self.final_rows_saved,
             "key_type_counts": self.key_type_counts,
@@ -240,6 +242,43 @@ def _as_int(value: object) -> int | None:
         return None
 
 
+def _first_positive_decimal(*values: object) -> tuple[Decimal | None, str]:
+    saw_price = False
+    saw_invalid = False
+    for value in values:
+        price = _as_decimal(value)
+        if price is None:
+            continue
+        saw_price = True
+        if price > 0:
+            return price, ""
+        saw_invalid = True
+    if saw_invalid or saw_price:
+        return None, "invalid_price"
+    return None, "missing_price"
+
+
+def _increment_skip(stats: EmitStats, reason: str) -> None:
+    key = reason or "normalization_error"
+    stats.skip_reasons[key] = int(stats.skip_reasons.get(key) or 0) + 1
+    if key in {"invalid_price", "missing_price"}:
+        stats.zero_price_rows_skipped += 1
+
+
+def _emit_price(row: dict[str, Any], goods: dict[str, Any]) -> tuple[Decimal | None, str]:
+    if row.get("goodsPrice") not in (None, ""):
+        price = _as_decimal(row.get("goodsPrice"))
+        if price is not None and price > 0:
+            return price, ""
+        return None, "invalid_price"
+    return _first_positive_decimal(
+        row.get("goodsPriceWithUserDiscount"),
+        goods.get("price"),
+        row.get("price"),
+        row.get("distributor_price"),
+    )
+
+
 def _nested_dict(value: object) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
@@ -321,6 +360,7 @@ def extract_pack_signature(row: dict[str, Any], goods: dict[str, Any] | None = N
         "dose",
         "volume",
         "weight",
+        "number",
     ):
         value = _row_lookup(row, goods, key)
         if value not in (None, ""):
@@ -353,16 +393,19 @@ def normalize_name_without_price_noise(value: object) -> str:
 def normalize_emit_item(row: dict[str, Any], *, filial_id: int, filial_name: str) -> dict[str, Any] | None:
     goods = _nested_dict(row.get("goods"))
     goods_id = _as_int(_first(row, "goodsId", "goods_id", "provisor_goods_id") or goods.get("id") or goods.get("goodsId"))
-    price = _as_decimal(_first(row, "goodsPriceWithUserDiscount", "price", "goodsPrice", "distributor_price"))
-    if price is None or price <= 0:
+    price, _reason = _emit_price(row, goods)
+    if price is None:
         return None
     name = str(
-        _first(row, "distributorGoodsName", "goods_full_name", "fullName", "name")
-        or goods.get("fullName")
+        goods.get("fullName")
+        or _first(row, "goods_full_name", "fullName", "name")
+        or row.get("distributorGoodsName")
         or goods.get("name")
         or ""
     ).strip()
-    producer_raw = _first(row, "distributorProducer", "manufacturer", "producer") or goods.get("producer")
+    if not name:
+        return None
+    producer_raw = row.get("distributorProducer") or _first(row, "manufacturer", "producer") or goods.get("producer")
     producer = resolve_manufacturer(producer_raw, name, default="")
     distributor_goods_id = str(_first(row, "distributorGoodsId", "distributor_goods_id", "sku", "code") or "").strip()
     variant_key = extract_variant_key(row, goods)
@@ -410,6 +453,23 @@ def normalize_emit_item(row: dict[str, Any], *, filial_id: int, filial_name: str
         "normalized_name_key": normalized_name_key,
         "source_timestamp": source_timestamp,
     }
+
+
+def emit_skip_reason(row: dict[str, Any]) -> str:
+    goods = _nested_dict(row.get("goods"))
+    price, reason = _emit_price(row, goods)
+    if price is None:
+        return reason
+    name = str(
+        goods.get("fullName")
+        or _first(row, "goods_full_name", "fullName", "name")
+        or row.get("distributorGoodsName")
+        or goods.get("name")
+        or ""
+    ).strip()
+    if not name:
+        return "missing_name"
+    return "normalization_error"
 
 
 def _dedupe_key(item: dict[str, Any]) -> tuple[str, ...]:
@@ -999,9 +1059,14 @@ def parse_normalize_stage(
     try:
         for row in iter_source_rows(source_path):
             stats.input_rows += 1
-            item = normalize_emit_item(row, filial_id=filial_id, filial_name=filial_name)
+            try:
+                item = normalize_emit_item(row, filial_id=filial_id, filial_name=filial_name)
+            except Exception:
+                _increment_skip(stats, "normalization_error")
+                logger.exception("[EMIT_NORMALIZE_ERROR] filial_id=%s row_index=%s", filial_id, stats.input_rows)
+                continue
             if item is None:
-                stats.zero_price_rows_skipped += 1
+                _increment_skip(stats, emit_skip_reason(row))
                 continue
             stats.normalized_rows += 1
             if not item.get("provisor_goods_id"):
@@ -1026,12 +1091,13 @@ def parse_normalize_stage(
             f"Emit parse produced suspiciously low row count: {stats.final_rows_saved} < EMIT_MIN_FINAL_ROWS={cfg.min_final_rows}"
         )
     logger.info(
-        "[EMIT_PARSE_DEDUPE_SUMMARY] filial_id=%s input_rows=%s unique_rows=%s duplicates_removed=%s zero_price_rows_skipped=%s rows_without_goodsId=%s key_type_counts=%s stage_db_size_mb=%s source_file_size_gb=%s max_rss_mb=%s elapsed_sec=%s",
+        "[EMIT_PARSE_DEDUPE_SUMMARY] filial_id=%s input_rows=%s unique_rows=%s duplicates_removed=%s zero_price_rows_skipped=%s skip_reasons=%s rows_without_goodsId=%s key_type_counts=%s stage_db_size_mb=%s source_file_size_gb=%s max_rss_mb=%s elapsed_sec=%s",
         filial_id,
         stats.input_rows,
         stats.final_rows_saved,
         stats.duplicate_rows_removed,
         stats.zero_price_rows_skipped,
+        stats.skip_reasons,
         stats.rows_without_goodsId,
         stats.key_type_counts,
         stats.stage_db_size_mb,

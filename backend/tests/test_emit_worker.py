@@ -25,6 +25,7 @@ from backend.app.services.emit_worker import (
     download_emit_filial,
     iter_stage_rows,
     is_emit_plk,
+    normalize_emit_item,
     open_stage_db,
     parse_normalize_stage,
     replace_emit_price_list_from_staging,
@@ -281,6 +282,83 @@ def _parse_rows_to_stage(tmp_path, rows):
     )
     staged = [row for batch in iter_stage_rows(stage, batch_size=100) for row in batch]
     return stats, staged
+
+
+def _real_emit_sample_row():
+    return {
+        "id": 987654,
+        "goodsId": 12345,
+        "goodsPrice": 11885.77,
+        "goodsPriceWithUserDiscount": 0,
+        "filialId": 1106,
+        "insertedDate": "2026-06-01T10:20:30",
+        "shelfLife": "2027-12-31",
+        "pack": 1,
+        "box": 10,
+        "multiplicity": 1,
+        "stored": 42,
+        "distributorGoodsId": "EMIT-SKU-1",
+        "distributorGoodsName": "Distributor fallback name",
+        "distributorProducer": "Real Producer",
+        "priceStatus": "ok",
+        "userDiscount": 0,
+        "goods": {
+            "id": 12345,
+            "fullName": "Real Goods FullName N10",
+            "number": "N10",
+            "barcodes": ["4870000000011"],
+            "producer": "Nested Producer",
+            "country": "KZ",
+            "name": "Nested fallback name",
+            "price": 99999,
+        },
+    }
+
+
+def test_real_provisor_emit_sample_normalizes_with_goods_price():
+    item = normalize_emit_item(_real_emit_sample_row(), filial_id=1106, filial_name="Emit")
+
+    assert item is not None
+    assert item["distributor_price"] == 11885.77
+    assert item["name"] == "Real Goods FullName N10"
+    assert item["raw_manufacturer"] == "REAL PRODUCER"
+    assert item["provisor_goods_id"] == 12345
+    assert item["filial_id"] == 1106
+    assert item["distributor_goods_id"] == "EMIT-SKU-1"
+    assert item["stock"] == 42
+    assert item["expiry_date"] == "2027-12-31"
+    assert item["source_item_id"] == 987654
+    assert item["variant_key"] == "sku:emit-sku-1"
+    assert "number:n10" in item["pack_signature"]
+
+
+def test_real_provisor_emit_sample_stages_one_valid_row(tmp_path):
+    stats, rows = _parse_rows_to_stage(tmp_path, [_real_emit_sample_row()])
+
+    assert stats.input_rows == 1
+    assert stats.final_rows_saved == 1
+    assert stats.skip_reasons == {}
+    assert stats.key_type_counts["goodsId+variant"] == 1
+    assert len(rows) == 1
+    assert rows[0]["distributor_price"] == 11885.77
+
+
+def test_real_emit_skip_reason_diagnostics(tmp_path):
+    stats, rows = _parse_rows_to_stage(
+        tmp_path,
+        [
+            {"id": 1, "goodsId": 1, "goods": {"fullName": "Missing price"}},
+            {"id": 2, "goodsId": 2, "goodsPrice": 0, "goodsPriceWithUserDiscount": 10, "goods": {"fullName": "Zero price"}},
+            {"id": 3, "goodsId": 3, "goodsPrice": 10},
+            _real_emit_sample_row(),
+        ],
+    )
+
+    assert len(rows) == 1
+    assert stats.zero_price_rows_skipped == 2
+    assert stats.skip_reasons["missing_price"] == 1
+    assert stats.skip_reasons["invalid_price"] == 1
+    assert stats.skip_reasons["missing_name"] == 1
 
 
 def test_same_goods_id_different_barcode_keep_separate(tmp_path):
