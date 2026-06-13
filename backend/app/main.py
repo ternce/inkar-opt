@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 import httpx
 from sqlalchemy import delete, func, select
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 import io
 import csv
@@ -42,6 +42,8 @@ from .deps import (
 )
 from .models import (
     CalculatedPrice,
+    BusinessList,
+    BusinessListItem,
     CompetitorCodeMapping,
     CompetitorPrice,
     CompetitorPriceList,
@@ -135,6 +137,13 @@ from .services.pricing_rules.templates import (
 )
 from .services.products_excel_import import import_products_excel
 from .services.products_view import get_products_with_competitor_top5
+from .services.universal_list_import import (
+    business_list_item_to_dict,
+    business_list_to_dict,
+    import_business_list_excel,
+    import_universal_list_excel,
+    max_upload_size_bytes,
+)
 from .services.ph_center_top import FarmcenterTopService
 from .services.competitor_matching import (
     PROVISOR_REFERENCE_FILIAL_ID,
@@ -1938,6 +1947,18 @@ def _list_type_label(value: str | None) -> str:
     return LIST_TYPE_LABELS.get(code, value or "")
 
 
+def _parse_list_date(value: object) -> date | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+    raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD or DD.MM.YYYY")
+
+
 def _list_status_label(value: str | None) -> str:
     text = (value or "").strip().lower()
     if text in {"active", "активен", "активный"} or text.startswith("актив"):
@@ -1996,6 +2017,84 @@ def _universal_list_row(db: Session, ul: UniversalList, item_count: int, binding
         "updatedAt": _fmt_dt(ul.created_at),
         "comment": "",
     }
+
+
+async def _read_upload_limited(file: UploadFile, *, max_bytes: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            limit_mb = max_bytes // (1024 * 1024)
+            raise ValueError(f"file exceeds LIST_IMPORT_MAX_UPLOAD_SIZE_MB={limit_mb}")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+@app.post("/lists/import")
+async def import_business_list(
+    list_type: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    try:
+        content = await _read_upload_limited(file, max_bytes=max_upload_size_bytes())
+        return import_business_list_excel(
+            db=db,
+            content=content,
+            filename=file.filename or "upload.xlsx",
+            list_type=list_type,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="database error during list import") from exc
+
+
+@app.get("/lists")
+def get_business_lists(
+    list_type: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    stmt = select(BusinessList).order_by(BusinessList.created_at.desc(), BusinessList.id.desc())
+    if list_type:
+        stmt = stmt.where(BusinessList.list_type == list_type.strip().casefold())
+    rows = db.execute(stmt.offset(offset).limit(limit)).scalars().all()
+    return [business_list_to_dict(row) for row in rows]
+
+
+@app.get("/lists/{list_id}")
+def get_business_list(list_id: int, limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db)):
+    row = db.execute(select(BusinessList).where(BusinessList.id == list_id)).scalars().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="list not found")
+    items = db.execute(
+        select(BusinessListItem)
+        .where(BusinessListItem.business_list_id == row.id)
+        .order_by(BusinessListItem.source_row.asc(), BusinessListItem.id.asc())
+        .limit(limit)
+    ).scalars().all()
+    return business_list_to_dict(
+        row,
+        include_errors=True,
+        item_preview=[business_list_item_to_dict(item) for item in items],
+    )
+
+
+@app.delete("/lists/{list_id}")
+def delete_business_list(list_id: int, db: Session = Depends(get_db)):
+    row = db.execute(select(BusinessList).where(BusinessList.id == list_id)).scalars().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="list not found")
+    db.delete(row)
+    db.commit()
+    return {"status": "deleted", "id": list_id}
 
 
 @app.get("/api/lists-management")
@@ -2060,8 +2159,8 @@ def create_lists_management(payload: dict = Body(...), db: Session = Depends(get
         name=(payload.get("name") or "Новый список").strip(),
         type=LIST_TYPE_LABELS.get(payload.get("type"), payload.get("type") or "Фиксированная цена"),
         status="Активный" if payload.get("active", True) else "Неактивный",
-        start_date=date.fromisoformat(payload["startDate"]) if payload.get("startDate") else None,
-        end_date=date.fromisoformat(payload["endDate"]) if payload.get("endDate") else None,
+        start_date=_parse_list_date(payload.get("startDate")),
+        end_date=_parse_list_date(payload.get("endDate")),
     )
     db.add(ul)
     db.flush()
@@ -2088,9 +2187,9 @@ def update_lists_management(list_id: int, payload: dict = Body(...), db: Session
     if "status" in payload:
         ul.status = str(payload.get("status") or ul.status)
     if "startDate" in payload:
-        ul.start_date = date.fromisoformat(payload["startDate"]) if payload.get("startDate") else None
+        ul.start_date = _parse_list_date(payload.get("startDate"))
     if "endDate" in payload:
-        ul.end_date = date.fromisoformat(payload["endDate"]) if payload.get("endDate") else None
+        ul.end_date = _parse_list_date(payload.get("endDate"))
     _sync_universal_list_bindings(db, ul, payload.get("formatCodes") if "formatCodes" in payload else None)
     db.commit()
     return {"status": "ok"}
@@ -2172,6 +2271,26 @@ async def import_lists_management_items(list_id: int, file: UploadFile = File(..
         imported += 1
     db.commit()
     return {"status": "ok", "imported": imported}
+
+
+@app.post("/api/lists-management/{list_id}/import-excel")
+async def import_lists_management_excel(list_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    ul = db.execute(select(UniversalList).where(UniversalList.id == list_id)).scalars().first()
+    if not ul:
+        raise HTTPException(status_code=404, detail="list not found")
+    try:
+        content = await _read_upload_limited(file, max_bytes=max_upload_size_bytes())
+        return import_universal_list_excel(
+            db=db,
+            universal_list=ul,
+            content=content,
+            filename=file.filename or "upload.xlsx",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="database error during list import") from exc
 
 
 @app.get("/api/lists-management/{list_id}/export.{fmt}")

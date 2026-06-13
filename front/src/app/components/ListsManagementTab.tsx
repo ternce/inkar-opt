@@ -39,6 +39,33 @@ type ListCard = ListRow & {
   }>;
 };
 
+type ImportSummary = {
+  total_rows?: number;
+  processed?: number;
+  not_found?: number;
+  duplicates?: number;
+  errors?: number;
+  empty_rows?: number;
+  invalid_rows?: number;
+};
+
+type ImportIssue = {
+  row?: number;
+  code?: string;
+  message?: string;
+  identifier?: string;
+  field?: string;
+};
+
+type ImportResult = {
+  list_id?: number;
+  list_type: string;
+  filename: string;
+  item_count: number;
+  summary?: ImportSummary;
+  errors?: ImportIssue[];
+};
+
 type Props = {
   priceFormats?: PriceFormat[];
   selectedFormatCode?: string;
@@ -57,6 +84,14 @@ const formatScope = (row: ListRow) => {
   if (!row.priceFormats.length) return 'Не привязан';
   return row.priceFormats.map((format) => format.code).join(', ');
 };
+
+const formatFileSize = (bytes: number) => {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+};
+
+const isExcelFile = (file: File) => /\.(xlsx|xls)$/i.test(file.name);
 
 export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' }: Props) {
   const [rows, setRows] = useState<ListRow[]>([]);
@@ -78,6 +113,11 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
     formatCodes: [] as string[],
   });
   const [newItem, setNewItem] = useState({ sku: '', value: '' });
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const [importStatus, setImportStatus] = useState('');
+  const [importResult, setImportResult] = useState<ImportResult | null>(null);
+  const [importErrors, setImportErrors] = useState<ImportIssue[]>([]);
+  const [isImporting, setIsImporting] = useState(false);
 
   const selectedCodes = useMemo(() => new Set(form.formatCodes), [form.formatCodes]);
 
@@ -104,6 +144,12 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
   const openCard = async (id: number) => {
     setIsLoading(true);
     setError('');
+    if (opened?.id !== id) {
+      setImportFile(null);
+      setImportStatus('');
+      setImportResult(null);
+      setImportErrors([]);
+    }
     try {
       const res = await fetch(`/api/lists-management/${id}`);
       const text = await res.text();
@@ -169,12 +215,62 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
     await loadRows();
   };
 
-  const importItems = async (file: File | null) => {
-    if (!file || !opened) return;
+  const handleImportFile = (file: File | null) => {
+    setImportResult(null);
+    setImportErrors([]);
+    setImportStatus('');
+    if (!file) {
+      setImportFile(null);
+      return;
+    }
+    if (!isExcelFile(file)) {
+      setImportFile(null);
+      setImportStatus('Выберите файл Excel в формате .xlsx или .xls');
+      return;
+    }
+    setImportFile(file);
+  };
+
+  const importExcelList = async () => {
+    setImportResult(null);
+    setImportErrors([]);
+    if (!opened) {
+      setImportStatus('Откройте список для импорта Excel');
+      return;
+    }
+    if (!importFile) {
+      setImportStatus('Выберите Excel-файл');
+      return;
+    }
+    if (!isExcelFile(importFile)) {
+      setImportStatus('Поддерживаются только файлы .xlsx и .xls');
+      return;
+    }
     const fd = new FormData();
-    fd.append('file', file);
-    const res = await fetch(`/api/lists-management/${opened.id}/import`, { method: 'POST', body: fd });
-    if (res.ok) await openCard(opened.id);
+    fd.append('file', importFile);
+    setIsImporting(true);
+    setImportStatus('Загрузка файла...');
+    try {
+      const listId = opened.id;
+      const res = await fetch(`/api/lists-management/${listId}/import-excel`, { method: 'POST', body: fd });
+      const text = await res.text();
+      const data = parseJson(text);
+      if (!res.ok) {
+        const detail = data?.detail || text || 'Не удалось импортировать Excel';
+        setImportStatus(String(detail));
+        setImportErrors(Array.isArray(data?.errors) ? data.errors : []);
+        return;
+      }
+      setImportResult(data);
+      setImportErrors(Array.isArray(data?.errors) ? data.errors : []);
+      setImportStatus('Импорт завершен');
+      await loadRows();
+      await openCard(listId);
+    } catch (e: any) {
+      setImportStatus(e?.message || 'Ошибка импорта Excel');
+    } finally {
+      setIsImporting(false);
+    }
   };
 
   const addItem = async () => {
@@ -330,9 +426,49 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
               <div className="import-row">
                 <label className="file-button">
                   <FileUp className="h-4 w-4" />
-                  Excel import
-                  <input type="file" accept=".xlsx,.xls" onChange={(e) => void importItems(e.target.files?.[0] || null)} />
+                  Выбрать Excel
+                  <input type="file" accept=".xlsx,.xls" onChange={(e) => handleImportFile(e.target.files?.[0] || null)} />
                 </label>
+                <Button onClick={() => void importExcelList()} disabled={!importFile || isImporting}>
+                  {isImporting ? 'Импорт...' : 'Импортировать'}
+                </Button>
+                {importFile && <span className="muted">{importFile.name} · {formatFileSize(importFile.size)}</span>}
+              </div>
+              {importStatus && <div className={`business-alert ${importResult ? 'ok' : importStatus === 'Загрузка файла...' ? '' : 'bad'}`}>{importStatus}</div>}
+              {importResult && (
+                <div className="details-grid">
+                  <div><span>total_rows</span><strong>{importResult.summary?.total_rows ?? 0}</strong></div>
+                  <div><span>processed</span><strong>{importResult.summary?.processed ?? 0}</strong></div>
+                  <div><span>not_found</span><strong>{importResult.summary?.not_found ?? 0}</strong></div>
+                  <div><span>duplicates</span><strong>{importResult.summary?.duplicates ?? 0}</strong></div>
+                  <div><span>errors</span><strong>{importResult.summary?.errors ?? 0}</strong></div>
+                </div>
+              )}
+              {!!importErrors.length && (
+                <div className="table-scroll compact">
+                  <table className="business-table">
+                    <thead>
+                      <tr>
+                        <th>Строка</th>
+                        <th>Ошибка</th>
+                        <th>Идентификатор</th>
+                        <th>Поле</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {importErrors.slice(0, 20).map((issue, index) => (
+                        <tr key={`${issue.row || 0}-${issue.code || 'error'}-${index}`}>
+                          <td>{issue.row ?? '—'}</td>
+                          <td>{issue.message || issue.code || 'Ошибка валидации'}</td>
+                          <td>{issue.identifier || '—'}</td>
+                          <td>{issue.field || '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              <div className="import-row">
                 <Input placeholder="SKU" value={newItem.sku} onChange={(e) => setNewItem((prev) => ({ ...prev, sku: e.target.value }))} />
                 <Input placeholder="Значение правила" value={newItem.value} onChange={(e) => setNewItem((prev) => ({ ...prev, value: e.target.value }))} />
                 <Button variant="outline" onClick={() => void addItem()}>Добавить товар</Button>

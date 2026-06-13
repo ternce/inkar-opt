@@ -599,6 +599,53 @@ class ListItem(Base):
     )
 
 
+class BusinessList(Base):
+    __tablename__ = "business_lists"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    list_type: Mapped[str] = mapped_column(String(32), index=True)
+    name: Mapped[str] = mapped_column(Text, default="")
+    original_filename: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(32), default="imported", index=True)
+    summary_json: Mapped[str] = mapped_column(Text, default="{}")
+    errors_json: Mapped[str] = mapped_column(Text, default="[]")
+    item_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    items: Mapped[list["BusinessListItem"]] = relationship(
+        back_populates="business_list", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index("ix_business_lists_type_created", "list_type", "created_at"),
+    )
+
+
+class BusinessListItem(Base):
+    __tablename__ = "business_list_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    business_list_id: Mapped[int] = mapped_column(ForeignKey("business_lists.id"), index=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
+    sku: Mapped[str] = mapped_column(Text, default="", index=True)
+    product_name: Mapped[str] = mapped_column(Text, default="")
+    manufacturer: Mapped[str] = mapped_column(Text, default="")
+    value_json: Mapped[str] = mapped_column(Text, default="{}")
+    value_decimal: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    value_bool: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    source_row: Mapped[int] = mapped_column(Integer, default=0)
+    source_identifier: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    business_list: Mapped[BusinessList] = relationship(back_populates="items")
+
+    __table_args__ = (
+        UniqueConstraint("business_list_id", "product_id", name="uq_business_list_items_list_product"),
+        Index("ix_business_list_items_list_sku", "business_list_id", "sku"),
+    )
+
+
 class CalculatedPrice(Base):
     __tablename__ = "calculated_prices"
 
