@@ -19,9 +19,9 @@ from .sku import normalize_external_sku, normalize_sku_variants
 
 
 SUPPORTED_LIST_TYPES = {"critical", "markup", "exclusion"}
-UNIVERSAL_MARKUP_TYPES = {"critical_markup", "min_markup", "max_markup", "markup"}
+UNIVERSAL_MARKUP_TYPES = {"critical_markup", "min_markup", "max_markup", "fixed_markup", "markup", "percentile_override"}
 UNIVERSAL_FIXED_PRICE_TYPES = {"fixed_price", "min_price", "max_price"}
-UNIVERSAL_EXCLUSION_TYPES = {"exclusion", "exclude_from_pricing"}
+UNIVERSAL_EXCLUSION_TYPES = {"exclusion", "exclude_from_pricing", "no_bend"}
 UNIVERSAL_TYPE_LABELS = {
     "фиксированная цена": "fixed_price",
     "минимальная цена": "min_price",
@@ -30,6 +30,7 @@ UNIVERSAL_TYPE_LABELS = {
     "критическая наценка": "critical_markup",
     "максимальная наценка": "max_markup",
     "исключить из переоценки": "exclude_from_pricing",
+    "без прогиба": "no_bend",
 }
 DEFAULT_MAX_UPLOAD_SIZE_MB = 10
 DEFAULT_MAX_ROWS = 50_000
@@ -209,7 +210,7 @@ def _parse_markup_percent(value: object) -> Decimal | None:
         number = Decimal(text)
     except (InvalidOperation, ValueError):
         return None
-    if not is_percent and Decimal("0") < number <= Decimal("1"):
+    if not is_percent and Decimal("0") < number < Decimal("1"):
         number *= Decimal("100")
     return number.quantize(Decimal("0.000001"))
 

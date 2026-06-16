@@ -15,6 +15,7 @@ from ..models import (
     NoCompetitorMarkupRange,
     BendRange,
     UniversalList,
+    UniversalListPriceFormat,
     ListItem,
     CompetitorPrice,
     CompetitorPriceList,
@@ -31,6 +32,43 @@ from .competitor_percentiles import recalculate_competitor_percentiles
 from .competitor_assignments import get_assigned_competitor_price_lists
 from .regions import allowed_provisor_source_names_for_city_id, city_id_from_branch
 
+LIST_TYPE_FIXED_PRICE = "fixed_price"
+LIST_TYPE_MIN_PRICE = "min_price"
+LIST_TYPE_MAX_PRICE = "max_price"
+LIST_TYPE_FIXED_MARKUP = "fixed_markup"
+LIST_TYPE_MIN_MARKUP = "min_markup"
+LIST_TYPE_CRITICAL_MARKUP = "critical_markup"
+LIST_TYPE_MAX_MARKUP = "max_markup"
+LIST_TYPE_NO_BEND = "no_bend"
+LIST_TYPE_PERCENTILE_OVERRIDE = "percentile_override"
+LIST_TYPE_EXCLUDE_FROM_PRICING = "exclude_from_pricing"
+
+LIST_TYPE_ALIASES = {
+    "fixed_price": LIST_TYPE_FIXED_PRICE,
+    "min_price": LIST_TYPE_MIN_PRICE,
+    "max_price": LIST_TYPE_MAX_PRICE,
+    "fixed_markup": LIST_TYPE_FIXED_MARKUP,
+    "min_markup": LIST_TYPE_MIN_MARKUP,
+    "critical_markup": LIST_TYPE_CRITICAL_MARKUP,
+    "max_markup": LIST_TYPE_MAX_MARKUP,
+    "no_bend": LIST_TYPE_NO_BEND,
+    "percentile_override": LIST_TYPE_PERCENTILE_OVERRIDE,
+    "exclude_from_pricing": LIST_TYPE_EXCLUDE_FROM_PRICING,
+    "exclusion": LIST_TYPE_EXCLUDE_FROM_PRICING,
+    "markup": LIST_TYPE_FIXED_MARKUP,
+}
+
+ACTIVE_LIST_STATUSES = {
+    "active",
+    "enabled",
+    "активен",
+    "активный",
+    "Р°РєС‚РёРІ",
+    "Р°РєС‚РёРІРµРЅ",
+    "Р°РєС‚РёРІРЅС‹Р№",
+    "РђРєС‚РёРІРЅС‹Р№",
+}
+
 
 # MVP universal list types (RU labels used in UI/Excel).
 # NOTE: We accept a couple of common synonyms for backward-compatibility.
@@ -41,6 +79,47 @@ LIST_TYPE_MAX_PRICE = "Максимальная цена"
 LIST_TYPE_MIN_MARGIN = "Минимальная наценка"
 LIST_TYPE_CRITICAL_MARGIN = "Критичка"
 LIST_TYPE_MAX_MARGIN = "Максимальная наценка"
+
+
+# Canonical code values override the legacy label constants above. Pricing
+# logic must not depend on UI labels because DB rows may contain either form.
+LIST_TYPE_FIXED_PRICE = "fixed_price"
+LIST_TYPE_MIN_PRICE = "min_price"
+LIST_TYPE_MAX_PRICE = "max_price"
+LIST_TYPE_MIN_MARGIN = "min_markup"
+LIST_TYPE_CRITICAL_MARGIN = "critical_markup"
+LIST_TYPE_MAX_MARGIN = "max_markup"
+
+LIST_TYPE_ALIASES.update(
+    {
+        "Р¤РёРєСЃРёСЂРѕРІР°РЅРЅР°СЏ С†РµРЅР°": LIST_TYPE_FIXED_PRICE,
+        "Р¤РёРєСЃ С†РµРЅР°": LIST_TYPE_FIXED_PRICE,
+        "Р¤РёРєСЃ С†РµРЅС‹": LIST_TYPE_FIXED_PRICE,
+        "РњРёРЅРёРјР°Р»СЊРЅР°СЏ С†РµРЅР°": LIST_TYPE_MIN_PRICE,
+        "РњР°РєСЃРёРјР°Р»СЊРЅР°СЏ С†РµРЅР°": LIST_TYPE_MAX_PRICE,
+        "РњРёРЅРёРјР°Р»СЊРЅР°СЏ РЅР°С†РµРЅРєР°": LIST_TYPE_MIN_MARKUP,
+        "РљСЂРёС‚РёС‡РµСЃРєР°СЏ РЅР°С†РµРЅРєР°": LIST_TYPE_CRITICAL_MARKUP,
+        "РљСЂРёС‚РёС‡РєР°": LIST_TYPE_CRITICAL_MARKUP,
+        "РњР°РєСЃРёРјР°Р»СЊРЅР°СЏ РЅР°С†РµРЅРєР°": LIST_TYPE_MAX_MARKUP,
+        "РњР°РєСЃ РЅР°С†РµРЅРєР°": LIST_TYPE_MAX_MARKUP,
+        "РњР°РєСЃ. РЅР°С†РµРЅРєР°": LIST_TYPE_MAX_MARKUP,
+        "Р‘РµР· РїСЂРѕРіРёР±Р°": LIST_TYPE_NO_BEND,
+        "Percentile override": LIST_TYPE_PERCENTILE_OVERRIDE,
+        "РСЃРєР»СЋС‡РёС‚СЊ РёР· РїРµСЂРµРѕС†РµРЅРєРё": LIST_TYPE_EXCLUDE_FROM_PRICING,
+        "РСЃРєР»СЋС‡РёС‚СЊ РёР· СЂР°СЃС‡РµС‚Р°": LIST_TYPE_EXCLUDE_FROM_PRICING,
+        "Фиксированная цена": LIST_TYPE_FIXED_PRICE,
+        "Минимальная цена": LIST_TYPE_MIN_PRICE,
+        "Максимальная цена": LIST_TYPE_MAX_PRICE,
+        "Фиксированная наценка": LIST_TYPE_FIXED_MARKUP,
+        "Минимальная наценка": LIST_TYPE_MIN_MARKUP,
+        "Критическая наценка": LIST_TYPE_CRITICAL_MARKUP,
+        "Максимальная наценка": LIST_TYPE_MAX_MARKUP,
+        "Без прогиба": LIST_TYPE_NO_BEND,
+        "Переопределение персентиля": LIST_TYPE_PERCENTILE_OVERRIDE,
+        "Исключить из расчета": LIST_TYPE_EXCLUDE_FROM_PRICING,
+        "Исключить из переоценки": LIST_TYPE_EXCLUDE_FROM_PRICING,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -67,6 +146,51 @@ def _as_decimal(value: object, default: Decimal | None = None) -> Decimal | None
         return Decimal(str(value))
     except Exception:
         return default
+
+
+def normalize_list_type(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return LIST_TYPE_ALIASES.get(text, LIST_TYPE_ALIASES.get(text.casefold(), text))
+
+
+def _is_active_list(row: UniversalList) -> bool:
+    text = str(row.status or "").strip()
+    lowered = text.casefold()
+    if lowered in {"inactive", "disabled", "archived", "неактивный", "не активный", "архивный"}:
+        return False
+    if text in ACTIVE_LIST_STATUSES or lowered in ACTIVE_LIST_STATUSES:
+        return True
+    return (
+        lowered.startswith("active")
+        or lowered.startswith("enabled")
+        or lowered.startswith("актив")
+        or lowered.startswith("Р°РєС‚РёРІ")
+    )
+
+
+def _list_percent_as_fraction(value: Decimal) -> Decimal:
+    if Decimal("0") < value < Decimal("1"):
+        return value
+    return value / Decimal("100")
+
+
+def _list_effect(list_id: int, list_type: str, value: Decimal, effect: str) -> dict:
+    return {"listId": list_id, "type": list_type, "value": value, "effect": effect}
+
+
+def _list_markup_match_effect(
+    list_id: int,
+    list_type: str,
+    value: Decimal,
+    effect: str,
+    *,
+    markup_fraction: Decimal,
+) -> dict:
+    out = _list_effect(list_id, list_type, value, effect)
+    out["markupFraction"] = markup_fraction
+    return out
 
 
 ZONE_OPTIMAL_THRESHOLD = Decimal("0.03")
@@ -386,13 +510,46 @@ def _find_item_value(
     return match[0] if match else None
 
 
+def _active_lists_for_format(db: Session, price_format_id: int, as_of: date) -> list[UniversalList]:
+    rows = (
+        db.execute(
+            select(UniversalList)
+            .where((UniversalList.start_date.is_(None)) | (UniversalList.start_date <= as_of))
+            .where((UniversalList.end_date.is_(None)) | (UniversalList.end_date >= as_of))
+            .order_by(UniversalList.id.asc())
+        )
+        .scalars()
+        .all()
+    )
+    rows = [row for row in rows if _is_active_list(row)]
+    if not rows:
+        return []
+
+    links: dict[int, set[int]] = {}
+    for list_id, pf_id in db.execute(
+        select(UniversalListPriceFormat.universal_list_id, UniversalListPriceFormat.price_format_id)
+        .where(UniversalListPriceFormat.universal_list_id.in_([row.id for row in rows]))
+    ).all():
+        links.setdefault(int(list_id), set()).add(int(pf_id))
+
+    active: list[UniversalList] = []
+    for row in rows:
+        linked_format_ids = links.get(int(row.id), set())
+        direct_pf_id = int(row.price_format_id) if row.price_format_id is not None else None
+        if price_format_id in linked_format_ids or direct_pf_id == price_format_id:
+            active.append(row)
+        elif direct_pf_id is None and not linked_format_ids:
+            active.append(row)
+    return active
+
+
 def _find_item_match(
     db: Session,
     lists: list[UniversalList],
     product_id: int,
     list_type: str,
 ) -> tuple[Decimal, int] | None:
-    list_ids = [l.id for l in lists if l.type == list_type]
+    list_ids = [l.id for l in lists if normalize_list_type(l.type) == list_type]
     if not list_ids:
         return None
 
@@ -491,6 +648,71 @@ def calculate_price_for_product(
         fallback=markup_percent,
     )
     rounding_rule = db.get(RoundingRule, price_format.rounding_rule_id) if price_format.rounding_rule_id else None
+    active_lists = _active_lists_for_format(db, price_format.id, as_of)
+    applied_list_effects: list[dict] = []
+
+    fixed_markup_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_FIXED_MARKUP)
+    if fixed_markup_match is not None:
+        fixed_markup, list_id = fixed_markup_match
+        markup_percent = _list_percent_as_fraction(fixed_markup)
+        no_competitor_markup_percent = markup_percent
+        applied_list_effects.append(
+            _list_markup_match_effect(
+                list_id,
+                LIST_TYPE_FIXED_MARKUP,
+                fixed_markup,
+                "fixed_markup_mdc",
+                markup_fraction=markup_percent,
+            )
+        )
+
+    critical_markup_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_CRITICAL_MARKUP)
+    if critical_markup_match is not None:
+        critical_markup, list_id = critical_markup_match
+        markup_fraction = _list_percent_as_fraction(critical_markup)
+        markup_percent = max(markup_percent, markup_fraction)
+        no_competitor_markup_percent = max(no_competitor_markup_percent, markup_fraction)
+        applied_list_effects.append(
+            _list_markup_match_effect(
+                list_id,
+                LIST_TYPE_CRITICAL_MARKUP,
+                critical_markup,
+                "critical_markup_mdc_floor",
+                markup_fraction=markup_fraction,
+            )
+        )
+
+    min_markup_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_MIN_MARKUP)
+    if min_markup_match is not None:
+        min_markup, list_id = min_markup_match
+        markup_fraction = _list_percent_as_fraction(min_markup)
+        markup_percent = max(markup_percent, markup_fraction)
+        no_competitor_markup_percent = max(no_competitor_markup_percent, markup_fraction)
+        applied_list_effects.append(
+            _list_markup_match_effect(
+                list_id,
+                LIST_TYPE_MIN_MARKUP,
+                min_markup,
+                "min_markup_mdc_floor",
+                markup_fraction=markup_fraction,
+            )
+        )
+
+    max_markup_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_MAX_MARKUP)
+    if max_markup_match is not None:
+        max_markup, list_id = max_markup_match
+        markup_fraction = _list_percent_as_fraction(max_markup)
+        markup_percent = min(markup_percent, markup_fraction)
+        no_competitor_markup_percent = min(no_competitor_markup_percent, markup_fraction)
+        applied_list_effects.append(
+            _list_markup_match_effect(
+                list_id,
+                LIST_TYPE_MAX_MARKUP,
+                max_markup,
+                "max_markup_mdc_cap",
+                markup_fraction=markup_fraction,
+            )
+        )
 
     # МДЦ (минимальная допустимая цена) — нижняя граница
     mdc = cost * (Decimal("1") + markup_percent)
@@ -502,8 +724,14 @@ def calculate_price_for_product(
     allowed_provisor_sources = allowed_provisor_source_names_for_city_id(effective_city_id)
     selected_meta = _selected_source_meta(db, price_format.id)
 
+    percentile_number = int(price_format.percentile_number or 10)
+    percentile_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_PERCENTILE_OVERRIDE)
+    if percentile_match is not None:
+        percentile_value, list_id = percentile_match
+        percentile_number = max(1, min(99, int(percentile_value)))
+        applied_list_effects.append(_list_effect(list_id, LIST_TYPE_PERCENTILE_OVERRIDE, percentile_value, "percentile_override"))
+
     if (price_format.competitor_price_mode or "regular") == "percentile":
-        percentile_number = int(price_format.percentile_number or 10)
         resolved_many = resolve_percentile_prices(
             db,
             price_format.id,
@@ -518,10 +746,20 @@ def calculate_price_for_product(
             allowed_provisor_sources=allowed_provisor_sources,
         )
 
+    no_bend_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_NO_BEND)
     fallback_bend_percent = _as_decimal(price_format.progib, Decimal("0")) or Decimal("0")
+    if no_bend_match is not None:
+        no_bend_value, list_id = no_bend_match
+        if no_bend_value != 0:
+            fallback_bend_percent = Decimal("0")
+            applied_list_effects.append(_list_effect(list_id, LIST_TYPE_NO_BEND, no_bend_value, "no_bend"))
+        else:
+            no_bend_match = None
 
     competitor_price_min: Decimal | None = resolved_many.prices[0][0] if resolved_many.prices else None
     competitor_source_min: str = resolved_many.prices[0][1] if resolved_many.prices else ""
+    markup_percent_used = markup_percent * Decimal("100")
+    competitor_candidate_price: Decimal | None = None
 
     chosen_competitor: Decimal | None = None
     chosen_source: str = ""
@@ -542,13 +780,18 @@ def calculate_price_for_product(
     else:
         no_competitor_candidate_below_mdc = False
         for idx, (competitor_price, competitor_source) in enumerate(resolved_many.prices, start=1):
-            bend_percent = get_bend_percent_by_price_range(
-                db,
-                price_format.id,
-                cost,
-                fallback_percent=fallback_bend_percent,
-            )
+            if no_bend_match is not None:
+                bend_percent = Decimal("0")
+            else:
+                bend_percent = get_bend_percent_by_price_range(
+                    db,
+                    price_format.id,
+                    cost,
+                    fallback_percent=fallback_bend_percent,
+                )
             candidate = competitor_price * (Decimal("1") - bend_percent / Decimal("100"))
+            if competitor_candidate_price is None:
+                competitor_candidate_price = candidate
             if candidate >= mdc:
                 chosen_competitor = competitor_price
                 chosen_source = competitor_source
@@ -571,8 +814,8 @@ def calculate_price_for_product(
             reason = "all_competitors_failed_mdc"
 
     # Активные списки
-    active_lists = db.execute(_active_lists_query(db, price_format.id, as_of)).scalars().all()
-    applied_list_effects: list[dict] = []
+    # Active lists were loaded before competitor resolution because some list
+    # rules change competitor behavior for the product.
 
     # MVP constraints priority (deterministic):
     # 1) min/max margin (critical bounds)
@@ -580,44 +823,47 @@ def calculate_price_for_product(
     # 3) fixed price (overrides everything)
     # 4) rounding
 
-    min_margin_match = _find_item_match_any(db, active_lists, product.id, [LIST_TYPE_MIN_MARGIN, LIST_TYPE_CRITICAL_MARGIN])
-    if min_margin_match is not None:
-        min_margin, list_id, list_type = min_margin_match
-        price = max(price, cost * (Decimal("1") + min_margin))
-        reason = "min_margin_floor"
-        applied_list_effects.append({"listId": list_id, "type": list_type, "effect": reason})
+    excluded_from_pricing = False
+    skip_rounding_floor = False
 
-    max_margin_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_MAX_MARGIN)
-    if max_margin_match is not None:
-        max_margin, list_id = max_margin_match
-        price = min(price, cost * (Decimal("1") + max_margin))
-        reason = "max_margin_cap"
-        applied_list_effects.append({"listId": list_id, "type": LIST_TYPE_MAX_MARGIN, "effect": reason})
+    exclude_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_EXCLUDE_FROM_PRICING)
+    if exclude_match is not None:
+        exclude_value, list_id = exclude_match
+        if exclude_value != 0:
+            price = cost
+            reason = "exclude_from_pricing_list"
+            excluded_from_pricing = True
+            skip_rounding_floor = True
+            applied_list_effects.append(_list_effect(list_id, LIST_TYPE_EXCLUDE_FROM_PRICING, exclude_value, reason))
 
-    min_price_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_MIN_PRICE)
-    if min_price_match is not None:
-        min_price, list_id = min_price_match
-        price = max(price, min_price)
-        reason = "min_price_floor"
-        applied_list_effects.append({"listId": list_id, "type": LIST_TYPE_MIN_PRICE, "effect": reason})
+    if not excluded_from_pricing:
+        fixed_price_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_FIXED_PRICE)
+        if fixed_price_match is not None:
+            fixed_price, list_id = fixed_price_match
+            price = fixed_price
+            reason = "fixed_price_list"
+            skip_rounding_floor = True
+            applied_list_effects.append(_list_effect(list_id, LIST_TYPE_FIXED_PRICE, fixed_price, reason))
+        else:
+            min_price_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_MIN_PRICE)
+            if min_price_match is not None:
+                min_price, list_id = min_price_match
+                price = max(price, min_price)
+                reason = "min_price_floor"
+                applied_list_effects.append(_list_effect(list_id, LIST_TYPE_MIN_PRICE, min_price, reason))
 
-    max_price_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_MAX_PRICE)
-    if max_price_match is not None:
-        max_price, list_id = max_price_match
-        price = min(price, max_price)
-        reason = "max_price_cap"
-        applied_list_effects.append({"listId": list_id, "type": LIST_TYPE_MAX_PRICE, "effect": reason})
-
-    fixed_price_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_FIXED_PRICE)
-    if fixed_price_match is not None:
-        fixed_price, list_id = fixed_price_match
-        price = fixed_price
-        reason = "fixed_price_list"
-        applied_list_effects.append({"listId": list_id, "type": LIST_TYPE_FIXED_PRICE, "effect": reason})
+            max_price_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_MAX_PRICE)
+            if max_price_match is not None:
+                max_price, list_id = max_price_match
+                price = min(price, max_price)
+                reason = "max_price_cap"
+                skip_rounding_floor = True
+                applied_list_effects.append(_list_effect(list_id, LIST_TYPE_MAX_PRICE, max_price, reason))
 
     # Округление
-    price = _round_price(price, rounding_rule)
-    if price < mdc:
+    if not skip_rounding_floor:
+        price = _round_price(price, rounding_rule)
+    if not skip_rounding_floor and price < mdc:
         price = _round_price(mdc, rounding_rule, force_up=True)
         if competitor_price_min is None and no_competitor_candidate_below_mdc:
             reason = "no_competitor_markup_bumped_to_mdc"
@@ -634,6 +880,7 @@ def calculate_price_for_product(
     applied_source = chosen_source or competitor_source_min
     source_match_type = _source_match_type(db, price_format.id, product.id, applied_source)
     branch_id = str(region_id if region_id is not None else (price_format.branch or ""))
+    primary_list_effect = applied_list_effects[-1] if applied_list_effects else {}
 
     debug = {
         "cost": cost,
@@ -650,9 +897,16 @@ def calculate_price_for_product(
         "rating_local": _rating_value(db, product.id, "local", branch_id),
         "applied_list_effects": applied_list_effects,
         "applied_list_ids": sorted({int(item["listId"]) for item in applied_list_effects}),
+        "applied_rule_type": str(primary_list_effect.get("type") or ""),
+        "applied_rule_value": primary_list_effect.get("value"),
+        "applied_list_id": primary_list_effect.get("listId"),
+        "excluded_from_pricing": excluded_from_pricing,
         "bend_percent": chosen_bend_percent,
         "bend_percent_used": chosen_bend_percent,
-        "markup_percent_used": markup_percent * Decimal("100"),
+        "markup_percent_used": markup_percent_used,
+        "mdc_markup_percent": markup_percent_used,
+        "mdc_price": mdc,
+        "competitor_candidate_price": competitor_candidate_price,
         "chosen_competitor_price": chosen_competitor,
         "chosen_competitor_source": chosen_source,
         "chosen_competitor_rank": chosen_competitor_rank,
@@ -955,6 +1209,16 @@ def calculate_prices(
         cp.markup_percent_used = (
             float(debug["markup_percent_used"]) if debug["markup_percent_used"] is not None else None
         )
+        if hasattr(cp, "mdc_markup_percent"):
+            cp.mdc_markup_percent = (
+                float(debug["mdc_markup_percent"]) if debug["mdc_markup_percent"] is not None else None
+            )
+        if hasattr(cp, "mdc_price"):
+            cp.mdc_price = float(debug["mdc_price"]) if debug["mdc_price"] is not None else None
+        if hasattr(cp, "competitor_candidate_price"):
+            cp.competitor_candidate_price = (
+                float(debug["competitor_candidate_price"]) if debug["competitor_candidate_price"] is not None else None
+            )
         cp.final_price = float(price)
         cp.applied_reason = str(debug.get("log") or debug["reason"])
         cp.applied_source_name = str(debug.get("applied_source_name") or "")
@@ -962,6 +1226,14 @@ def calculate_prices(
         cp.applied_rule_name = applied_rule_name
         cp.applied_rule_version = applied_rule_version
         cp.applied_list_ids = json.dumps(debug.get("applied_list_ids") or [], ensure_ascii=False)
+        if hasattr(cp, "applied_rule_type"):
+            cp.applied_rule_type = str(debug.get("applied_rule_type") or "")
+        if hasattr(cp, "applied_rule_value"):
+            value = debug.get("applied_rule_value")
+            cp.applied_rule_value = float(value) if value is not None else None
+        if hasattr(cp, "applied_list_id"):
+            value = debug.get("applied_list_id")
+            cp.applied_list_id = int(value) if value is not None else None
         cp.used_substitute = bool(debug.get("used_substitute"))
         cp.used_percentile = bool(debug.get("used_percentile"))
         cp.rating_global = debug.get("rating_global")

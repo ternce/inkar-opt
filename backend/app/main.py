@@ -85,7 +85,7 @@ from .schemas import (
     UploadExcelResponse,
 )
 from .services.excel_import import import_excel
-from .services.pricing import calculate_price_zone, resolve_competitor_price, calculate_prices
+from .services.pricing import calculate_price_zone, resolve_competitor_price, calculate_prices, normalize_list_type
 from .services.provisor import ProvisorAuthError, get_prices_by_filial_id
 from .services.widman_client import WidmanInvalidCredentialsError
 from .services.competitor_persist import persist_phcenter_report, persist_provisor_prices
@@ -1592,6 +1592,9 @@ def _generated_item_dict(db: Session, cp: CalculatedPrice, product: Product, pf:
         "priceAfterBend": float(cp.price_from_competitor) if cp.price_from_competitor is not None else None,
         "bendPercentUsed": float(cp.bend_percent_used) if cp.bend_percent_used is not None else None,
         "markupPercentUsed": float(cp.markup_percent_used) if cp.markup_percent_used is not None else None,
+        "mdcMarkupPercent": float(cp.mdc_markup_percent) if getattr(cp, "mdc_markup_percent", None) is not None else None,
+        "mdcPrice": float(cp.mdc_price) if getattr(cp, "mdc_price", None) is not None else None,
+        "competitorCandidatePrice": float(cp.competitor_candidate_price) if getattr(cp, "competitor_candidate_price", None) is not None else None,
         "finalPrice": final,
         "markupPercent": float(cp.markup_percent_used) if cp.markup_percent_used is not None else actual_margin_percent,
         "actualMarginPercent": actual_margin_percent,
@@ -1934,17 +1937,39 @@ LIST_TYPE_LABELS = {
     "exclude_from_pricing": "Исключить из переоценки",
 }
 
+LIST_TYPE_LABELS.setdefault("fixed_markup", "Фиксированная наценка")
 LIST_TYPE_CODES = {v: k for k, v in LIST_TYPE_LABELS.items()}
+PERCENT_LIST_TYPES = {"fixed_markup", "critical_markup", "min_markup", "max_markup", "percentile_override", "markup"}
+PRICE_LIST_TYPES = {"fixed_price", "min_price", "max_price"}
+BOOLEAN_LIST_TYPES = {"exclude_from_pricing", "no_bend", "exclusion"}
 
 
 def _list_type_code(value: str | None) -> str:
     text = (value or "").strip()
-    return LIST_TYPE_CODES.get(text, text or "fixed_price")
+    return normalize_list_type(LIST_TYPE_CODES.get(text, text or "fixed_price")) or "fixed_price"
 
 
 def _list_type_label(value: str | None) -> str:
     code = _list_type_code(value)
     return LIST_TYPE_LABELS.get(code, value or "")
+
+
+def _format_list_item_value(list_type: str | None, value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        numeric = float(value)
+    except Exception:
+        return ""
+    text = f"{numeric:g}"
+    type_code = _list_type_code(list_type)
+    if type_code in PERCENT_LIST_TYPES:
+        return f"{text}%"
+    if type_code in PRICE_LIST_TYPES:
+        return text
+    if type_code in BOOLEAN_LIST_TYPES:
+        return "Да" if numeric != 0 else "Нет"
+    return text
 
 
 def _parse_list_date(value: object) -> date | None:
@@ -2145,6 +2170,7 @@ def get_lists_management_card(list_id: int, db: Session = Depends(get_db)):
             "name": p.name,
             "manufacturer": extra.manufacturer if extra else "",
             "value": float(item.value) if item.value is not None else None,
+            "valueDisplay": _format_list_item_value(ul.type, item.value),
             "comment": "",
         }
         for item, p, extra in items
@@ -2162,6 +2188,7 @@ def create_lists_management(payload: dict = Body(...), db: Session = Depends(get
         start_date=_parse_list_date(payload.get("startDate")),
         end_date=_parse_list_date(payload.get("endDate")),
     )
+    ul.type = _list_type_code(ul.type)
     db.add(ul)
     db.flush()
     if not ul.code:
@@ -2182,6 +2209,7 @@ def update_lists_management(list_id: int, payload: dict = Body(...), db: Session
         ul.code = str(payload.get("code") or ul.code or "").strip() or None
     if "type" in payload:
         ul.type = LIST_TYPE_LABELS.get(payload.get("type"), payload.get("type") or ul.type)
+        ul.type = _list_type_code(ul.type)
     if "active" in payload:
         ul.status = "Активный" if payload.get("active") else "Неактивный"
     if "status" in payload:

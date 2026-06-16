@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 
+import pytest
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
 from sqlalchemy import create_engine, func, select
@@ -118,6 +119,30 @@ def test_markup_list_normalizes_fraction():
     details = client.get(f"/lists/{response.json()['id']}").json()
     assert details["items"][0]["value"]["markup_percent"] == 20.0
     assert details["items"][0]["value"]["display"] == "20%"
+
+
+def test_markup_list_normalizes_one_as_one_percent():
+    client, Session = _client()
+    _seed_products(Session)
+
+    response = _upload(client, [["SKU", "Markup"], ["12345", 1]], "markup")
+
+    assert response.status_code == 200
+    details = client.get(f"/lists/{response.json()['id']}").json()
+    assert details["items"][0]["value"]["markup_percent"] == 1.0
+    assert details["items"][0]["value"]["display"] == "1%"
+
+
+def test_markup_list_normalizes_integer_percents():
+    client, Session = _client()
+    _seed_products(Session)
+
+    response = _upload(client, [["SKU", "Markup"], ["12345", 2], ["A-77", 20]], "markup")
+
+    assert response.status_code == 200
+    details = client.get(f"/lists/{response.json()['id']}").json()
+    values = {item["sku"]: item["value"]["markup_percent"] for item in details["items"]}
+    assert values == {"12345": 2.0, "A-77": 20.0}
 
 
 def test_shuffled_column_order_and_product_code_lookup():
@@ -343,5 +368,60 @@ def test_lists_management_import_excel_adds_items_to_existing_list():
     try:
         assert db.scalar(select(func.count(BusinessList.id))) == 0
         assert db.scalar(select(func.count(ListItem.id)).where(ListItem.universal_list_id == list_id)) == 2
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("list_type", "raw_value", "expected_value", "expected_display"),
+    [
+        ("critical_markup", 1, 1.0, "1%"),
+        ("fixed_markup", 1, 1.0, "1%"),
+        ("fixed_markup", 33, 33.0, "33%"),
+        ("fixed_markup", 0.2, 20.0, "20%"),
+        ("fixed_price", 2500, 2500.0, "2500"),
+        ("fixed_price", 120.5, 120.5, "120.5"),
+        ("min_price", 1200, 1200.0, "1200"),
+        ("max_price", 3000, 3000.0, "3000"),
+        ("min_markup", 2, 2.0, "2%"),
+        ("max_markup", 0.2, 20.0, "20%"),
+        ("percentile_override", 0.2, 20.0, "20%"),
+        ("exclude_from_pricing", 1, 1.0, "Да"),
+        ("exclude_from_pricing", "нет", 0.0, "Нет"),
+        ("no_bend", "да", 1.0, "Да"),
+        ("no_bend", 0, 0.0, "Нет"),
+    ],
+)
+def test_lists_management_import_excel_normalizes_by_selected_list_type(list_type, raw_value, expected_value, expected_display):
+    client, Session = _client()
+    _seed_products(Session)
+    create_response = client.post(
+        "/api/lists-management",
+        json={"code": f"UL-{list_type}", "name": list_type, "type": list_type, "active": True},
+    )
+    assert create_response.status_code == 200
+    list_id = create_response.json()["id"]
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "list.xlsx",
+                _xlsx([["Material", "Value"], ["12345", raw_value]]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["summary"]["processed"] == 1
+    card = client.get(f"/api/lists-management/{list_id}").json()
+    assert card["items"][0]["value"] == expected_value
+    assert card["items"][0]["valueDisplay"] == expected_display
+    db = Session()
+    try:
+        saved = db.get(UniversalList, list_id)
+        assert saved is not None
+        assert saved.type == list_type
     finally:
         db.close()

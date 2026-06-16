@@ -10,6 +10,8 @@ export const LIST_TYPE_LABELS: Record<string, string> = {
   exclude_from_pricing: 'Исключить из расчета',
 };
 
+LIST_TYPE_LABELS.fixed_markup = 'Фиксированная наценка';
+
 const LABEL_TO_CODE = Object.fromEntries(
   Object.entries(LIST_TYPE_LABELS).map(([code, label]) => [label.toLocaleLowerCase('ru-RU'), code])
 );

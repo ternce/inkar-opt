@@ -64,7 +64,14 @@ def _range_rows(db: Session, model: type, price_format_id: int, order_field: Any
 
 def _is_active_list(row: UniversalList) -> bool:
     status = str(row.status or "").casefold()
-    return "актив" in status and "не актив" not in status
+    if status in {"inactive", "disabled", "archived", "неактивный", "не активный", "архивный"}:
+        return False
+    return (
+        status.startswith("active")
+        or status.startswith("enabled")
+        or "актив" in status
+        or "Р°РєС‚РёРІ" in status
+    ) and "не актив" not in status
 
 
 def _active_lists_snapshot(db: Session, pf: PriceFormat, as_of: date) -> list[dict]:
