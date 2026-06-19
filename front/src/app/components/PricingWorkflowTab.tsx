@@ -5,6 +5,7 @@ import { Download, FileText, Play, RefreshCw } from 'lucide-react';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
+import { formatDateTimeKz } from '../timezone';
 
 type PriceFormat = {
   id?: string | number;
@@ -130,9 +131,7 @@ const inputDateToDisplayDate = (value: string) => {
 
 const fmtDate = (value: any) => {
   if (!value) return '—';
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return String(value);
-  return parsed.toLocaleString('ru-RU');
+  return formatDateTimeKz(value);
 };
 
 const readinessText = (row?: FormatReadiness) => {

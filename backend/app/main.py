@@ -85,7 +85,14 @@ from .schemas import (
     UploadExcelResponse,
 )
 from .services.excel_import import import_excel
-from .services.pricing import calculate_price_zone, resolve_competitor_price, calculate_prices, normalize_list_type
+from .services.pricing import (
+    AMBIGUOUS_LIST_TYPES,
+    calculate_price_zone,
+    resolve_competitor_price,
+    calculate_prices,
+    margin_percent_from_price,
+    normalize_list_type,
+)
 from .services.provisor import ProvisorAuthError, get_prices_by_filial_id
 from .services.widman_client import WidmanInvalidCredentialsError
 from .services.competitor_persist import persist_phcenter_report, persist_provisor_prices
@@ -142,8 +149,12 @@ from .services.universal_list_import import (
     business_list_to_dict,
     import_business_list_excel,
     import_universal_list_excel,
+    is_exclude_from_pricing_type,
     max_upload_size_bytes,
+    normalize_universal_list_value,
+    parse_list_decimal,
 )
+from .timezone import local_display, local_iso, now_kz_naive
 from .services.ph_center_top import FarmcenterTopService
 from .services.competitor_matching import (
     PROVISOR_REFERENCE_FILIAL_ID,
@@ -264,7 +275,7 @@ def _is_provisor_price_unhealthy(*, account_id: object, filial_id: object) -> da
     if not state:
         return None
     skip_until = state.get("skip_until")
-    if isinstance(skip_until, datetime) and skip_until > datetime.utcnow():
+    if isinstance(skip_until, datetime) and skip_until > now_kz_naive():
         return skip_until
     if isinstance(skip_until, datetime):
         _provisor_price_health.pop(key, None)
@@ -281,7 +292,7 @@ def _record_provisor_price_timeout(*, account_id: object, filial_id: object) -> 
     timeouts = int(state.get("timeouts") or 0) + 1
     state["timeouts"] = timeouts
     if timeouts >= PROVISOR_PRICE_UNHEALTHY_TIMEOUTS:
-        skip_until = datetime.utcnow() + PROVISOR_PRICE_UNHEALTHY_SKIP_FOR
+        skip_until = now_kz_naive() + PROVISOR_PRICE_UNHEALTHY_SKIP_FOR
         state["skip_until"] = skip_until
         return skip_until
     return None
@@ -564,9 +575,7 @@ async def _start_emit_refresh_background(*, mode: str, requested_by: str, filial
 
 
 def _fmt_dt(dt: datetime | None) -> str:
-    if not dt:
-        return ""
-    return dt.strftime("%d.%m.%Y %H:%M")
+    return local_display(dt)
 
 
 def _fmt_d(d: date | None) -> str:
@@ -686,6 +695,14 @@ def _generated_price_export_rows(
         price_format_code=pf.code,
         price_list_number=pl.number,
     )
+    calculated_skus = set(
+        db.execute(
+            select(Product.code)
+            .join(CalculatedPrice, CalculatedPrice.product_id == Product.id)
+            .where(CalculatedPrice.price_list_id == pl.id)
+        ).scalars().all()
+    )
+    products = [row for row in products if str(row.get("sku") or "") in calculated_skus]
     competitor_columns = []
     if products:
         competitor_columns = [
@@ -1141,7 +1158,7 @@ def _branch_format_row(db: Session, pf: PriceFormat) -> dict:
         "roundingRuleId": int(pf.rounding_rule_id) if pf.rounding_rule_id is not None else None,
         "appliedRule": pricing_rule_application_status(db=db, pf=pf),
         "assignedPlkCount": len(assignments),
-        "lastGeneratedAt": latest.created_at.isoformat() if latest else "",
+        "lastGeneratedAt": local_iso(latest.created_at) if latest else "",
         "lastActivationDate": latest.activation_date.isoformat() if latest and latest.activation_date else "",
         "lastRunStatus": latest.status if latest else "нет расчёта",
         "lastPriceListNumber": latest.number if latest else "",
@@ -1270,7 +1287,7 @@ def post_pricing_workflow_generate_batch(
     activation_date = payload.get("activation_date") or payload.get("activationDate") or payload.get("date_start") or payload.get("dateStart")
     comment = str(payload.get("comment") or "")
     context = _workflow_context_for_branch(db, branch_id)
-    batch_id = f"batch-{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
+    batch_id = f"batch-{now_kz_naive().strftime('%Y%m%d%H%M%S%f')}"
     items: list[dict] = []
     completed = 0
     failed = 0
@@ -1349,8 +1366,8 @@ def post_pricing_workflow_generate_batch(
         "totalFormats": len(codes),
         "completedFormats": completed,
         "failedFormats": failed,
-        "startedAt": datetime.utcnow().isoformat(),
-        "finishedAt": datetime.utcnow().isoformat(),
+        "startedAt": local_iso(now_kz_naive()),
+        "finishedAt": local_iso(now_kz_naive()),
         "items": items,
     }
     if failed and not completed:
@@ -1445,7 +1462,7 @@ def _generated_price_list_summary(db: Session, pl: PriceList, pf: PriceFormat) -
         "pricingRule": pf.pricing_rule or "",
         "pricingRuleId": int(pf.pricing_rule_id) if pf.pricing_rule_id is not None else None,
         "date": _fmt_dt(pl.created_at),
-        "createdAt": pl.created_at.isoformat() if pl.created_at else "",
+        "createdAt": local_iso(pl.created_at) if pl.created_at else "",
         "activationDate": _fmt_d(pl.activation_date),
         "user": pl.user,
         "generatedBy": getattr(pl, "generated_by", "") or pl.user,
@@ -1548,13 +1565,27 @@ def _calculated_zone_reference_and_deviation(cp: CalculatedPrice) -> tuple[float
     )
 
 
-def _pricing_log(cp: CalculatedPrice, product: Product, source: CompetitorPrice | None) -> list[dict]:
+def _applied_list_summary(db: Session, cp: CalculatedPrice) -> dict | None:
+    list_id = getattr(cp, "applied_list_id", None)
+    if list_id is None:
+        return None
+    row = db.get(UniversalList, int(list_id))
+    return {
+        "applied_rule_type": cp.applied_rule_type or "",
+        "applied_rule_value": float(cp.applied_rule_value) if cp.applied_rule_value is not None else None,
+        "list_id": int(list_id),
+        "list_name": row.name if row else str(list_id),
+        "ambiguous": (cp.applied_rule_type or "") in AMBIGUOUS_LIST_TYPES,
+    }
+
+
+def _pricing_log(db: Session, cp: CalculatedPrice, product: Product, source: CompetitorPrice | None) -> list[dict]:
     cost = float(cp.cost or 0)
     final = float(cp.final_price or 0)
-    markup = ((final - cost) / cost * 100) if cost else None
-    return [
+    margin = margin_percent_from_price(cost, final)
+    log = [
         {"label": "Себестоимость", "value": round(cost, 4), "description": "Загруженная себестоимость товара на момент расчёта."},
-        {"label": "Рекомендованная наценка", "value": f"{markup:.2f}%" if markup is not None else "нет данных", "description": "Оценка по финальной цене и себестоимости."},
+        {"label": "Фактическая маржа", "value": f"{margin:.2f}%" if margin is not None else "нет данных", "description": "Маржа по финальной цене и себестоимости."},
         {"label": "МДЦ", "value": float(cp.base_price or 0), "description": "Минимально допустимая цена, сохранённая в результате расчёта."},
         {
             "label": "Конкуренты",
@@ -1568,13 +1599,28 @@ def _pricing_log(cp: CalculatedPrice, product: Product, source: CompetitorPrice 
         {"label": "Percentile", "value": "сработал" if source and str(source.source_name or "").startswith("percentile:") else "не сработал", "description": _source_label(source.source_name) if source else ""},
         {"label": "Финальная причина", "value": cp.applied_reason or "", "description": "Человекочитаемый лог, сохранённый pricing engine."},
     ]
+    applied = _applied_list_summary(db, cp)
+    if applied:
+        log.append(
+            {
+                "label": "Applied Rule",
+                "value": f"{applied['applied_rule_type']} {applied['applied_rule_value']}",
+                "description": (
+                    f"List #{applied['list_id']}: {applied['list_name']}"
+                    + ("; AMBIGUOUS: existing behavior retained pending business confirmation" if applied["ambiguous"] else "")
+                ),
+            }
+        )
+    return log
 
 
 def _generated_item_dict(db: Session, cp: CalculatedPrice, product: Product, pf: PriceFormat, extra: ProductExtra | None) -> dict:
     cost = float(cp.cost or 0)
     final = float(cp.final_price or 0)
-    actual_margin_percent = round((final - cost) / cost * 100, 2) if cost else None
+    actual_margin = margin_percent_from_price(cost, final)
+    actual_margin_percent = round(float(actual_margin), 2) if actual_margin is not None else None
     source_label = _source_label(cp.applied_source_name or "")
+    applied_list = _applied_list_summary(db, cp)
     return {
         "sku": product.code,
         "name": product.name,
@@ -1589,8 +1635,10 @@ def _generated_item_dict(db: Session, cp: CalculatedPrice, product: Product, pf:
         "bestCompetitorPrice": float(cp.competitor_price) if cp.competitor_price is not None else None,
         "lowestCompetitorPrice": float(cp.lowest_competitor_price or cp.competitor_price) if (cp.lowest_competitor_price is not None or cp.competitor_price is not None) else None,
         "chosenCompetitorPrice": float(cp.chosen_competitor_price) if cp.chosen_competitor_price is not None else None,
+        "selectedCompetitorPrice": float(cp.chosen_competitor_price) if cp.chosen_competitor_price is not None else None,
         "priceAfterBend": float(cp.price_from_competitor) if cp.price_from_competitor is not None else None,
         "bendPercentUsed": float(cp.bend_percent_used) if cp.bend_percent_used is not None else None,
+        "effectiveMarkupPercent": float(cp.markup_percent_used) if cp.markup_percent_used is not None else None,
         "markupPercentUsed": float(cp.markup_percent_used) if cp.markup_percent_used is not None else None,
         "mdcMarkupPercent": float(cp.mdc_markup_percent) if getattr(cp, "mdc_markup_percent", None) is not None else None,
         "mdcPrice": float(cp.mdc_price) if getattr(cp, "mdc_price", None) is not None else None,
@@ -1606,12 +1654,18 @@ def _generated_item_dict(db: Session, cp: CalculatedPrice, product: Product, pf:
         "usedPercentile": bool(cp.used_percentile),
         "usedSubstitute": bool(cp.used_substitute),
         "appliedListIds": cp.applied_list_ids or "[]",
+        "appliedRuleType": cp.applied_rule_type or "",
+        "appliedRuleValue": float(cp.applied_rule_value) if cp.applied_rule_value is not None else None,
+        "appliedListId": int(cp.applied_list_id) if cp.applied_list_id is not None else None,
+        "appliedListName": applied_list["list_name"] if applied_list else "",
+        "appliedRuleAmbiguous": bool(applied_list and applied_list["ambiguous"]),
+        "appliedRule": applied_list,
         "ratingGlobal": cp.rating_global,
         "ratingLocal": cp.rating_local,
         "pricingReason": cp.applied_reason or "",
         "pricingRule": cp.applied_rule_name or pf.pricing_rule or "",
         "pricingRuleVersion": cp.applied_rule_version or "",
-        "log": _pricing_log(cp, product, None),
+        "log": _pricing_log(db, cp, product, None),
     }
 
 
@@ -2257,7 +2311,13 @@ def upsert_lists_management_item(list_id: int, payload: dict = Body(...), db: Se
     product = db.execute(select(Product).where(Product.code == sku)).scalars().first()
     if not product:
         raise HTTPException(status_code=404, detail="product not found")
-    value = float(payload.get("value") or 0)
+    raw_value = payload.get("value")
+    if is_exclude_from_pricing_type(str(ul.type or "")):
+        value, value_error = normalize_universal_list_value(str(ul.type or ""), raw_value)
+    else:
+        value, value_error = parse_list_decimal(raw_value), None
+    if value is None:
+        raise HTTPException(status_code=400, detail=value_error or "invalid numeric value")
     item = db.execute(
         select(ListItem).where(ListItem.universal_list_id == ul.id).where(ListItem.product_id == product.id)
     ).scalars().first()
@@ -2279,7 +2339,8 @@ async def import_lists_management_items(list_id: int, file: UploadFile = File(..
     ws = wb.active
     headers = [str(cell.value or "").strip().lower() for cell in next(ws.iter_rows(min_row=1, max_row=1))]
     sku_idx = headers.index("sku") if "sku" in headers else 0
-    value_idx = headers.index("value") if "value" in headers else 1
+    exclusion_by_presence = is_exclude_from_pricing_type(str(ul.type or ""))
+    value_idx = headers.index("value") if "value" in headers else (None if exclusion_by_presence else 1)
     imported = 0
     for row in ws.iter_rows(min_row=2, values_only=True):
         sku = str(row[sku_idx] or "").strip()
@@ -2288,7 +2349,13 @@ async def import_lists_management_items(list_id: int, file: UploadFile = File(..
         product = db.execute(select(Product).where(Product.code == sku)).scalars().first()
         if not product:
             continue
-        value = float(row[value_idx] or 0)
+        raw_value = row[value_idx] if value_idx is not None and value_idx < len(row) else None
+        if exclusion_by_presence:
+            value, _value_error = normalize_universal_list_value(str(ul.type or ""), raw_value)
+        else:
+            value = parse_list_decimal(raw_value)
+        if value is None:
+            continue
         item = db.execute(
             select(ListItem).where(ListItem.universal_list_id == ul.id).where(ListItem.product_id == product.id)
         ).scalars().first()
@@ -2555,8 +2622,9 @@ def get_price_list_analytics_dashboard(
         cost = float(cp.cost or 0)
         final = float(cp.final_price or 0)
         base = float(cp.base_price or 0)
-        if cost:
-            markups.append(round((final - cost) / cost * 100, 2))
+        margin = margin_percent_from_price(cost, final)
+        if margin is not None:
+            markups.append(round(float(margin), 2))
         if cp.bend_percent_used is not None and cp.price_from_competitor is not None:
             bends.append(round(float(cp.bend_percent_used), 2))
         elif cp.price_from_competitor is not None and cp.chosen_competitor_price:
@@ -3961,7 +4029,7 @@ def patch_competitor_assignment(format_code: str, assignment_id: str, payload: d
     assignment.coefficient = coefficient
     if active is not None:
         assignment.is_active = bool(active)
-    assignment.updated_at = datetime.utcnow()
+    assignment.updated_at = now_kz_naive()
     sync_selected_competitor_configs(db=db, price_format_id=pf.id)
     db.commit()
     return {"status": "ok"}
@@ -3998,7 +4066,7 @@ def delete_competitor_assignment(format_code: str, assignment_id: str, db: Sessi
     if row is None or assignment is None:
         raise HTTPException(status_code=404, detail="assignment not found")
     assignment.is_active = False
-    assignment.updated_at = datetime.utcnow()
+    assignment.updated_at = now_kz_naive()
     sync_selected_competitor_configs(db=db, price_format_id=pf.id)
     db.commit()
     return {"status": "ok"}
@@ -4183,7 +4251,7 @@ def unmap_competitor_code_mapping(mapping_id: int, db: Session = Depends(get_db)
     row.our_sku = ""
     row.confidence = None
     row.approved_at = None
-    row.updated_at = datetime.utcnow()
+    row.updated_at = now_kz_naive()
     touched = apply_mapping_to_matching_items(db=db, mapping=row, product=None, clear=True)
     db.commit()
     db.refresh(row)
@@ -4206,7 +4274,7 @@ def reject_competitor_code_mapping(mapping_id: int, db: Session = Depends(get_db
     row.our_sku = ""
     row.confidence = None
     row.approved_at = None
-    row.updated_at = datetime.utcnow()
+    row.updated_at = now_kz_naive()
     touched = apply_mapping_to_matching_items(db=db, mapping=row, product=None)
     db.commit()
     db.refresh(row)
@@ -4606,7 +4674,7 @@ def delete_price_source_account(account_id: int, db: Session = Depends(get_db)):
     if row is None:
         raise HTTPException(status_code=404, detail="account not found")
     row.is_active = False
-    row.updated_at = datetime.utcnow()
+    row.updated_at = now_kz_naive()
     db.commit()
     return {"status": "ok"}
 
@@ -4834,7 +4902,7 @@ async def _run_provisor_refresh_job(job_id: int, *, mode: str, requested_by: str
                     job.success_count = int(aggregate["success"])
                     job.failed_count = int(aggregate["failed"])
                     job.skipped_count = int(aggregate["skipped"])
-                    job.heartbeat_at = datetime.utcnow()
+                    job.heartbeat_at = now_kz_naive()
                     db.commit()
                 logger.info("[PROVISOR_AUTO_REFRESH] account finished job_id=%s account_id=%s success=%s failed=%s skipped=%s", job_id, account_id, int(progress.get("success") or 0), int(progress.get("errors") or 0), int(progress.get("skipped") or 0))
         db.expire_all()
@@ -5196,7 +5264,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                     f"[REFRESH] FETCH_LISTS START source={account.source_type} account_id={account.id}",
                     flush=True,
                 )
-                fetch_lists_started_wall = datetime.utcnow().isoformat()
+                fetch_lists_started_wall = local_iso(now_kz_naive())
                 try:
                     async with source_sems.get(account.source_type, asyncio.Semaphore(2)):
                         if shared_vidman_client is not None and isinstance(adapter, VidmanPriceService):
@@ -5332,7 +5400,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                     async with source_sems.get(account.source_type, asyncio.Semaphore(2)):
                         nonlocal active_fetch_count
                         fetch_items_started_at = time.perf_counter()
-                        fetch_items_started_wall = datetime.utcnow().isoformat()
+                        fetch_items_started_wall = local_iso(now_kz_naive())
                         timeout_stage = "precheck"
                         price_list_id = str(getattr(price_list, "price_list_id", ""))
                         price_list_timeout = (
@@ -5498,7 +5566,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                 and not force_refresh
                                 and local_items_count > 0
                                 and local_row_updated_at is not None
-                                and datetime.utcnow() - local_row_updated_at < PRICE_LIST_REFRESH_TTL
+                                and now_kz_naive() - local_row_updated_at < PRICE_LIST_REFRESH_TTL
                             ):
                                 elapsed_ms = round((time.perf_counter() - fetch_items_started_at) * 1000, 2)
                                 logger.info("[REFRESH] source=%s price_list=%s action=skip_unchanged", account.source_type, price_list_id)
@@ -6224,9 +6292,9 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
             account_row.status = "connected" if available_count > 0 else "auth_error"
             account_row.status_message = str(status.get("message") or "")[:512]
             if available_count > 0:
-                account_row.last_success_at = datetime.utcnow()
+                account_row.last_success_at = now_kz_naive()
             account_row.price_lists_count = available_count
-            account_row.updated_at = datetime.utcnow()
+            account_row.updated_at = now_kz_naive()
         commit_started_at = time.perf_counter()
         db.commit()
         _timing(f"{operation}:account:{account_id}", "commit", commit_started_at)
@@ -7062,7 +7130,7 @@ def create_product_substitute(product_id: int, payload: dict = Body(...), db: Se
     row.status = str(payload.get("status") or "approved").strip() or "approved"
     row.priority = int(payload.get("priority") or 100)
     row.comment = str(payload.get("comment") or "").strip()
-    row.updated_at = datetime.utcnow()
+    row.updated_at = now_kz_naive()
     db.flush()
 
     region_id = None

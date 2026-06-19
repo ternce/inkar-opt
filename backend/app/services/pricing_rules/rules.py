@@ -20,6 +20,7 @@ from ...models import (
 )
 from .common import touch
 from .templates import rounding_to_dict, template_to_dict
+from ...timezone import local_iso, now_kz_naive
 
 
 def pricing_rule_to_dict(row: PricingRule, *, include_templates: bool = True) -> dict:
@@ -35,8 +36,8 @@ def pricing_rule_to_dict(row: PricingRule, *, include_templates: bool = True) ->
         "noCompetitorTemplateId": row.no_competitor_template_id,
         "roundingRuleId": row.rounding_rule_id,
         "isActive": bool(row.is_active),
-        "createdAt": row.created_at.isoformat() if row.created_at else "",
-        "updatedAt": row.updated_at.isoformat() if row.updated_at else "",
+        "createdAt": local_iso(row.created_at) if row.created_at else "",
+        "updatedAt": local_iso(row.updated_at) if row.updated_at else "",
         "markupTemplate": template_to_dict(row.markup_template, "markup") if include_templates and getattr(row, "markup_template", None) else None,
         "bendTemplate": template_to_dict(row.bend_template, "bend") if include_templates and getattr(row, "bend_template", None) else None,
         "noCompetitorTemplate": template_to_dict(row.no_competitor_template, "no_competitor") if include_templates and getattr(row, "no_competitor_template", None) else None,
@@ -208,7 +209,7 @@ def delete_pricing_rule(*, db: Session, rule_id: int) -> None:
 def copy_pricing_rule(*, db: Session, rule_id: int) -> PricingRule:
     source = get_pricing_rule(db=db, rule_id=rule_id)
     payload = pricing_rule_to_dict(source, include_templates=False)
-    payload["code"] = f"{payload['code']}_copy_{int(datetime.utcnow().timestamp())}"
+    payload["code"] = f"{payload['code']}_copy_{int(now_kz_naive().timestamp())}"
     payload["name"] = f"{payload['name']} (копия)"
     return upsert_pricing_rule(db=db, payload=payload)
 
@@ -223,7 +224,7 @@ def apply_pricing_rule_to_format(*, db: Session, format_code: str, rule_id: int)
     pf.pricing_rule_id = rule.id
     pf.pricing_rule = rule.code
     pf.rounding_rule_id = rule.rounding_rule_id
-    pf.pricing_rule_applied_at = datetime.utcnow()
+    pf.pricing_rule_applied_at = now_kz_naive()
     updated_tables: list[str] = []
 
     if rule.markup_template is not None:

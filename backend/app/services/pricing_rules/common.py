@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime
 from decimal import Decimal
 from typing import Iterable
+
+from ...timezone import now_kz_naive
 
 
 def as_decimal(value: object, field: str) -> Decimal:
@@ -46,5 +47,4 @@ def validate_ranges(rows: Iterable[dict], percent_key: str) -> list[dict]:
 
 
 def touch(row) -> None:
-    row.updated_at = datetime.utcnow()
-
+    row.updated_at = now_kz_naive()

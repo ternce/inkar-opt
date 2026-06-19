@@ -15,6 +15,7 @@ from ...models import (
     RoundingRule,
 )
 from .common import touch, validate_ranges
+from ...timezone import local_iso, now_kz_naive
 
 
 TEMPLATE_SPECS = {
@@ -42,8 +43,8 @@ def template_to_dict(template, kind: str, *, include_rows: bool = True) -> dict:
         "name": template.name,
         "description": template.description,
         "isActive": bool(template.is_active),
-        "createdAt": template.created_at.isoformat() if template.created_at else "",
-        "updatedAt": template.updated_at.isoformat() if template.updated_at else "",
+        "createdAt": local_iso(template.created_at) if template.created_at else "",
+        "updatedAt": local_iso(template.updated_at) if template.updated_at else "",
         "rows": [
             row_to_dict(row, value_attr, value_key)
             for row in sorted(getattr(template, "rows", []), key=lambda x: (x.sort_order, float(x.cost_from)))
@@ -116,7 +117,7 @@ def upsert_template(*, db: Session, kind: str, payload: dict, template_id: int |
 def copy_template(*, db: Session, kind: str, template_id: int):
     source = get_template(db=db, kind=kind, template_id=template_id)
     payload = template_to_dict(source, kind)
-    payload["code"] = f"{payload['code']}_copy_{int(datetime.utcnow().timestamp())}"
+    payload["code"] = f"{payload['code']}_copy_{int(now_kz_naive().timestamp())}"
     payload["name"] = f"{payload['name']} (копия)"
     return upsert_template(db=db, kind=kind, payload=payload)
 
@@ -130,8 +131,8 @@ def rounding_to_dict(row: RoundingRule) -> dict:
         "precision": row.precision,
         "step": float(row.step) if row.step is not None else None,
         "isActive": bool(row.is_active),
-        "createdAt": row.created_at.isoformat() if row.created_at else "",
-        "updatedAt": row.updated_at.isoformat() if row.updated_at else "",
+        "createdAt": local_iso(row.created_at) if row.created_at else "",
+        "updatedAt": local_iso(row.updated_at) if row.updated_at else "",
     }
 
 
@@ -178,4 +179,3 @@ def upsert_rounding_rule(*, db: Session, payload: dict, rule_id: int | None = No
     db.commit()
     db.refresh(row)
     return row
-

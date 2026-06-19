@@ -19,7 +19,8 @@ from ..competitor_matching import rebuild_competitor_prices_for_selected
 from ..competitor_percentiles import recalculate_competitor_percentiles
 from ..competitor_price_lists import list_competitor_price_lists, save_selected_competitor_price_lists_only
 from ..competitor_assignments import get_assigned_competitor_price_lists
-from ..pricing import calculate_price_zone, calculate_prices
+from ..pricing import AMBIGUOUS_LIST_TYPES, calculate_price_zone, calculate_prices
+from ...timezone import local_iso, now_kz_naive
 from .analytics import build_workflow_analytics
 from .snapshot import build_generate_snapshot, dumps_snapshot, loads_snapshot
 
@@ -54,7 +55,7 @@ def price_format_to_workflow_dict(row: PriceFormat) -> dict:
         "pricingRule": row.pricing_rule,
         "pricingRuleId": row.pricing_rule_id,
         "status": "active",
-        "updatedAt": row.created_at.isoformat() if row.created_at else "",
+        "updatedAt": local_iso(row.created_at) if row.created_at else "",
     }
 
 
@@ -121,7 +122,7 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
         competitor_sources_json=_json(competitor_sources),
         percentile_sources_json=_json(percentile_sources),
         generated_by=user,
-        started_at=datetime.utcnow(),
+        started_at=now_kz_naive(),
         status="running",
     )
     db.add(run)
@@ -190,7 +191,7 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
         _apply_snapshot(run, snapshot)
         run.analytics_json = _json(analytics)
         run.status = "success"
-        run.finished_at = datetime.utcnow()
+        run.finished_at = now_kz_naive()
         db.commit()
         db.refresh(run)
         return run
@@ -200,7 +201,7 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
         if run is not None:
             run.status = "error"
             run.error = str(exc)
-            run.finished_at = datetime.utcnow()
+            run.finished_at = now_kz_naive()
             db.commit()
             db.refresh(run)
             return run
@@ -217,8 +218,8 @@ def run_to_dict(*, db: Session, run: PricingWorkflowRun, include_items: bool = F
         "priceFormatId": run.price_format_id,
         "pricingRuleId": run.pricing_rule_id,
         "priceListNumber": run.price_list_number,
-        "startedAt": run.started_at.isoformat() if run.started_at else "",
-        "finishedAt": run.finished_at.isoformat() if run.finished_at else "",
+        "startedAt": local_iso(run.started_at) if run.started_at else "",
+        "finishedAt": local_iso(run.finished_at) if run.finished_at else "",
         "status": run.status,
         "error": run.error,
         "context": {"name": context.name, "region": context.region, "salesChannel": context.sales_channel} if context else None,
@@ -258,6 +259,10 @@ def run_to_dict(*, db: Session, run: PricingWorkflowRun, include_items: bool = F
                     lowest_competitor_price=cp.lowest_competitor_price if cp.lowest_competitor_price is not None else cp.competitor_price,
                 )[0],
                 "reason": cp.applied_reason,
+                "appliedRuleType": cp.applied_rule_type or "",
+                "appliedRuleValue": float(cp.applied_rule_value) if cp.applied_rule_value is not None else None,
+                "appliedListId": int(cp.applied_list_id) if cp.applied_list_id is not None else None,
+                "appliedRuleAmbiguous": (cp.applied_rule_type or "") in AMBIGUOUS_LIST_TYPES,
             }
             for cp, product in rows
         ]

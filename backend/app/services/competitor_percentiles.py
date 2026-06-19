@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ..models import CompetitorPriceList, CompetitorPriceListItem, CompetitorPricePercentile
+from ..timezone import now_kz_naive
 from .competitor_assignments import get_assigned_competitor_price_lists
 
 
@@ -67,7 +67,7 @@ def recalculate_competitor_percentiles(*, db: Session, price_format_id: int) -> 
             competitor = price_list.source_type
         grouped[(int(item.product_id), branch, competitor)].append(price)
 
-    now = datetime.utcnow()
+    now = now_kz_naive()
     inserted = 0
     for (product_id, branch, competitor), values in grouped.items():
         if not values:

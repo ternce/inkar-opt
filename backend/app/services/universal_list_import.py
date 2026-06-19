@@ -5,7 +5,6 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -15,6 +14,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ..models import BusinessList, BusinessListItem, ListItem, Product, UniversalList
+from ..timezone import now_kz_naive, local_iso
 from .sku import normalize_external_sku, normalize_sku_variants
 
 
@@ -225,6 +225,10 @@ def _parse_decimal_value(value: object) -> Decimal | None:
         return None
 
 
+def parse_list_decimal(value: object) -> Decimal | None:
+    return _parse_decimal_value(value)
+
+
 def _format_percent(value: Decimal) -> str:
     text = format(value.normalize(), "f")
     if "." in text:
@@ -265,6 +269,12 @@ def _universal_import_behavior(list_type: str) -> str:
     return "decimal"
 
 
+def is_exclude_from_pricing_type(list_type: str) -> bool:
+    normalized = str(list_type or "").strip().casefold()
+    normalized = UNIVERSAL_TYPE_LABELS.get(normalized, normalized)
+    return normalized in {"exclude_from_pricing", "exclusion"}
+
+
 def _normalize_universal_value(list_type: str, raw_value: object) -> tuple[Decimal | None, str | None]:
     behavior = _universal_import_behavior(list_type)
     if behavior == "markup":
@@ -283,6 +293,10 @@ def _normalize_universal_value(list_type: str, raw_value: object) -> tuple[Decim
     if value is None:
         return None, "invalid numeric value"
     return value, None
+
+
+def normalize_universal_list_value(list_type: str, raw_value: object) -> tuple[Decimal | None, str | None]:
+    return _normalize_universal_value(list_type, raw_value)
 
 
 def _summary(total_rows: int = 0) -> dict[str, int]:
@@ -354,7 +368,7 @@ def import_business_list_excel(
             issues.append(ImportIssue(excel_row_number, "missing_required_field", "missing product identifier", field="identifier"))
             continue
 
-        raw_value = row[value_idx] if value_idx < len(row) else None
+        raw_value = row[value_idx] if value_idx is not None and value_idx < len(row) else None
         value_json, value_decimal, value_bool, error = _normalize_value(list_type, raw_value)
         if error:
             summary["invalid_rows"] += 1
@@ -397,7 +411,7 @@ def import_business_list_excel(
     try:
         business_list = BusinessList(
             list_type=list_type,
-            name=f"{list_type} import {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}",
+            name=f"{list_type} import {now_kz_naive().strftime('%Y-%m-%d %H:%M:%S')}",
             original_filename=filename,
             status="imported",
             summary_json=json.dumps(summary, ensure_ascii=False),
@@ -464,7 +478,8 @@ def import_universal_list_excel(
     identifier_indexes, value_idx, _manufacturer_idx = _find_header_indexes(headers)
     if not identifier_indexes:
         raise ValueError("missing product identifier column")
-    if value_idx is None:
+    exclusion_by_presence = is_exclude_from_pricing_type(str(universal_list.type or ""))
+    if value_idx is None and not exclusion_by_presence:
         raise ValueError("missing value column")
 
     summary = _summary()
@@ -487,7 +502,7 @@ def import_universal_list_excel(
             issues.append(ImportIssue(excel_row_number, "missing_required_field", "missing product identifier", field="identifier"))
             continue
 
-        raw_value = row[value_idx] if value_idx < len(row) else None
+        raw_value = row[value_idx] if value_idx is not None and value_idx < len(row) else None
         value, error = _normalize_universal_value(str(universal_list.type or ""), raw_value)
         if error or value is None:
             summary["invalid_rows"] += 1
@@ -564,8 +579,8 @@ def business_list_to_dict(row: BusinessList, *, include_errors: bool = False, it
         "status": row.status,
         "item_count": row.item_count,
         "summary": json.loads(row.summary_json or "{}"),
-        "created_at": row.created_at.isoformat() if row.created_at else None,
-        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "created_at": local_iso(row.created_at) if row.created_at else None,
+        "updated_at": local_iso(row.updated_at) if row.updated_at else None,
     }
     if include_errors:
         payload["errors"] = json.loads(row.errors_json or "[]")

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import io
+from datetime import date
 
 import pytest
 from fastapi.testclient import TestClient
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
@@ -12,8 +13,19 @@ from sqlalchemy.pool import StaticPool
 
 from backend.app.db import Base
 from backend.app.deps import get_db
-from backend.app.main import app
-from backend.app.models import BusinessList, BusinessListItem, ListItem, PriceFormat, Product, UniversalList, UniversalListPriceFormat
+from backend.app.main import _generated_price_export_rows, app
+from backend.app.models import (
+    BusinessList,
+    BusinessListItem,
+    CalculatedPrice,
+    ListItem,
+    MarkupRange,
+    PriceFormat,
+    Product,
+    UniversalList,
+    UniversalListPriceFormat,
+)
+from backend.app.services.pricing import calculate_prices
 
 
 def _client():
@@ -95,6 +107,16 @@ def test_markup_list_normalizes_20():
     details = client.get(f"/lists/{response.json()['id']}").json()
     assert details["items"][0]["value"]["markup_percent"] == 20.0
     assert details["items"][0]["value"]["display"] == "20%"
+
+
+def test_business_list_import_timestamps_are_kazakhstan_offset():
+    client, Session = _client()
+    _seed_products(Session)
+
+    response = _upload(client, [["SKU", "Markup"], ["12345", 20]], "markup")
+
+    assert response.status_code == 200
+    assert response.json()["created_at"].endswith("+05:00")
 
 
 def test_markup_list_normalizes_20_percent():
@@ -381,6 +403,9 @@ def test_lists_management_import_excel_adds_items_to_existing_list():
         ("fixed_markup", 0.2, 20.0, "20%"),
         ("fixed_price", 2500, 2500.0, "2500"),
         ("fixed_price", 120.5, 120.5, "120.5"),
+        ("fixed_price", 1000, 1000.0, "1000"),
+        ("fixed_price", "1000.5", 1000.5, "1000.5"),
+        ("fixed_price", "1000,5", 1000.5, "1000.5"),
         ("min_price", 1200, 1200.0, "1200"),
         ("max_price", 3000, 3000.0, "3000"),
         ("min_markup", 2, 2.0, "2%"),
@@ -425,3 +450,124 @@ def test_lists_management_import_excel_normalizes_by_selected_list_type(list_typ
         assert saved.type == list_type
     finally:
         db.close()
+
+
+def test_lists_management_manual_item_accepts_comma_decimal():
+    client, Session = _client()
+    _seed_products(Session)
+    create_response = client.post(
+        "/api/lists-management",
+        json={"code": "UL-COMMA", "name": "Comma Decimal", "type": "fixed_price", "active": True},
+    )
+    assert create_response.status_code == 200
+    list_id = create_response.json()["id"]
+
+    response = client.post(f"/api/lists-management/{list_id}/items", json={"sku": "12345", "value": "1000,5"})
+
+    assert response.status_code == 200
+    card = client.get(f"/api/lists-management/{list_id}").json()
+    assert card["items"][0]["value"] == 1000.5
+
+
+def test_exclude_from_pricing_manual_item_allows_sku_without_value():
+    client, Session = _client()
+    _seed_products(Session)
+    create_response = client.post(
+        "/api/lists-management",
+        json={"code": "UL-EXCLUDE-MANUAL", "name": "Exclude Manual", "type": "exclude_from_pricing", "active": True},
+    )
+    list_id = create_response.json()["id"]
+
+    response = client.post(f"/api/lists-management/{list_id}/items", json={"sku": "12345"})
+
+    assert response.status_code == 200
+    card = client.get(f"/api/lists-management/{list_id}").json()
+    assert card["items"][0]["sku"] == "12345"
+    assert card["items"][0]["value"] == 1.0
+    assert card["items"][0]["valueDisplay"] == "Да"
+
+
+def test_exclude_from_pricing_sku_only_excel_is_absent_from_generation_and_export():
+    client, Session = _client()
+    db = Session()
+    try:
+        price_format = PriceFormat(code="PF-EXCLUDE", name="PF Exclude", branch="Almaty")
+        excluded = Product(code="EXCLUDED-SKU", name="Excluded", cost=100)
+        included = Product(code="INCLUDED-SKU", name="Included", cost=100)
+        db.add_all([price_format, excluded, included])
+        db.flush()
+        db.add(MarkupRange(price_format_id=price_format.id, cost_from=0, cost_to=None, markup_percent=0.15))
+        db.commit()
+    finally:
+        db.close()
+
+    create_response = client.post(
+        "/api/lists-management",
+        json={
+            "code": "UL-EXCLUDE-SKU-ONLY",
+            "name": "Exclude SKU only",
+            "type": "exclude_from_pricing",
+            "active": True,
+            "formatCodes": ["PF-EXCLUDE"],
+        },
+    )
+    assert create_response.status_code == 200
+    list_id = create_response.json()["id"]
+    import_response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "exclude.xlsx",
+                _xlsx([["SKU"], ["EXCLUDED-SKU"]]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+    assert import_response.status_code == 200
+    assert import_response.json()["summary"]["processed"] == 1
+
+    db = Session()
+    try:
+        imported_item = db.execute(
+            select(ListItem)
+            .join(Product, Product.id == ListItem.product_id)
+            .where(ListItem.universal_list_id == list_id)
+            .where(Product.code == "EXCLUDED-SKU")
+        ).scalars().one()
+        assert float(imported_item.value) == 1.0
+
+        count = calculate_prices(
+            db=db,
+            price_format_code="PF-EXCLUDE",
+            price_list_number="PL-EXCLUDE-SKU-ONLY",
+            as_of=date.today(),
+            activation_date=None,
+            user="test",
+            force_new_price_list=True,
+        )
+        assert count == 1
+        calculated_skus = db.execute(
+            select(Product.code)
+            .join(CalculatedPrice, CalculatedPrice.product_id == Product.id)
+        ).scalars().all()
+        assert calculated_skus == ["INCLUDED-SKU"]
+
+        _pl, _pf, export_rows, _competitor_columns = _generated_price_export_rows(
+            db,
+            "PL-EXCLUDE-SKU-ONLY",
+        )
+        assert [row["sku"] for row in export_rows] == ["INCLUDED-SKU"]
+    finally:
+        db.close()
+
+    csv_response = client.get("/api/price-lists/PL-EXCLUDE-SKU-ONLY/export.csv")
+    assert csv_response.status_code == 200
+    assert "INCLUDED-SKU" in csv_response.text
+    assert "EXCLUDED-SKU" not in csv_response.text
+
+    xlsx_response = client.get("/api/price-lists/PL-EXCLUDE-SKU-ONLY/export.xlsx")
+    assert xlsx_response.status_code == 200
+    workbook = load_workbook(io.BytesIO(xlsx_response.content), data_only=True)
+    exported_cells = [str(cell.value or "") for row in workbook.active.iter_rows() for cell in row]
+    assert "INCLUDED-SKU" in exported_cells
+    assert "EXCLUDED-SKU" not in exported_cells

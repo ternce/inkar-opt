@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ...models import CalculatedPrice, PriceList, PricingWorkflowRun, Product
-from ..pricing import calculate_price_zone
+from ..pricing import calculate_price_zone, margin_percent_from_price
 from .snapshot import loads_snapshot
 
 
@@ -180,16 +180,17 @@ def build_workflow_analytics(*, db: Session, price_list_id: int) -> dict:
                     "zone": zone,
                 }
             )
-        if final is not None and cost not in (None, 0):
-            markup = (final - float(cost)) / float(cost) * 100
-            markups.append(markup)
-            if markup < 0:
+        margin_value = margin_percent_from_price(cost, final)
+        if margin_value is not None:
+            margin = float(margin_value)
+            markups.append(margin)
+            if margin < 0:
                 markup_buckets["<0%"] += 1
-            elif markup < 5:
+            elif margin < 5:
                 markup_buckets["0-5%"] += 1
-            elif markup < 10:
+            elif margin < 10:
                 markup_buckets["5-10%"] += 1
-            elif markup < 20:
+            elif margin < 20:
                 markup_buckets["10-20%"] += 1
             else:
                 markup_buckets["20%+"] += 1

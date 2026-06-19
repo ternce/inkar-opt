@@ -17,6 +17,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
+from .timezone import now_kz_naive
 
 
 class Product(Base):
@@ -29,7 +30,7 @@ class Product(Base):
     top_rank: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     provisor_goods_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
 
 class ProductExtra(Base):
@@ -39,7 +40,7 @@ class ProductExtra(Base):
     stock: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
     manufacturer: Mapped[str] = mapped_column(Text, default="")
 
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
 
 class PriceFormat(Base):
@@ -61,7 +62,7 @@ class PriceFormat(Base):
     # на сколько цена должна быть ниже МЦК (минимальной цены конкурента).
     progib: Mapped[float] = mapped_column(Numeric(18, 4), default=0)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     markup_ranges: Mapped[list[MarkupRange]] = relationship(
         back_populates="price_format", cascade="all, delete-orphan"
@@ -77,8 +78,8 @@ class PricingContext(Base):
     sales_channel: Mapped[str] = mapped_column(Text, default="", index=True)
     name: Mapped[str] = mapped_column(Text)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     __table_args__ = (
         UniqueConstraint("branch_id", "region", "sales_channel", "name", name="uq_pricing_context_scope"),
@@ -94,8 +95,8 @@ class AppUser(Base):
     display_name: Mapped[str] = mapped_column(Text, default="")
     role: Mapped[str] = mapped_column(String(32), default="admin", index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     branches: Mapped[list["UserBranchAssignment"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
@@ -109,7 +110,7 @@ class UserBranchAssignment(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("app_users.id"), index=True)
     branch_id: Mapped[str] = mapped_column(Text, default="", index=True)
     branch_name: Mapped[str] = mapped_column(Text, default="", index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     user: Mapped[AppUser] = relationship(back_populates="branches")
 
@@ -158,7 +159,7 @@ class PriceList(Base):
 
     price_format_id: Mapped[int] = mapped_column(ForeignKey("price_formats.id"), index=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
     activation_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     user: Mapped[str] = mapped_column(Text, default="")
@@ -236,8 +237,8 @@ class CompetitorPriceList(Base):
     coefficient: Mapped[float] = mapped_column(Numeric(18, 6), default=1.0)
     is_selected: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     items: Mapped[list["CompetitorPriceListItem"]] = relationship(
         back_populates="price_list", cascade="all, delete-orphan"
@@ -259,8 +260,8 @@ class PriceFormatCompetitorAssignment(Base):
     coefficient: Mapped[float] = mapped_column(Numeric(18, 6), default=1.0)
     percentile_mode: Mapped[str] = mapped_column(String(32), default="")
     source_mode: Mapped[str] = mapped_column(String(32), default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     __table_args__ = (
         UniqueConstraint("price_format_id", "competitor_price_list_id", name="uq_pf_competitor_assignment"),
@@ -333,7 +334,7 @@ class CompetitorPricePercentile(Base):
     percentile: Mapped[int] = mapped_column(Integer, index=True)
     value: Mapped[float] = mapped_column(Numeric(18, 4))
     source_count: Mapped[int] = mapped_column(Integer, default=0)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     __table_args__ = (
         UniqueConstraint(
@@ -363,8 +364,8 @@ class PriceSourceAccount(Base):
     price_lists_count: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     __table_args__ = (
         UniqueConstraint("source_type", "login", name="uq_price_source_accounts_source_login"),
@@ -386,9 +387,9 @@ class Job(Base):
     logs: Mapped[str] = mapped_column(Text, default="[]")
     result_json: Mapped[str] = mapped_column(Text, default="{}")
     error: Mapped[str] = mapped_column(Text, default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     __table_args__ = (
@@ -429,8 +430,8 @@ class RefreshLock(Base):
     name: Mapped[str] = mapped_column(String(128), primary_key=True)
     owner_token: Mapped[str] = mapped_column(String(128), default="", index=True)
     lock_type: Mapped[str] = mapped_column(String(64), default="", index=True)
-    acquired_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    heartbeat_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    acquired_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
     lease_until: Mapped[datetime] = mapped_column(DateTime, index=True)
     metadata_json: Mapped[str] = mapped_column(Text, default="{}")
 
@@ -461,7 +462,7 @@ class ProvisorGoodsMap(Base):
     # Our product (Excel SKU) that corresponds to this goodsId
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     __table_args__ = (
         UniqueConstraint("price_format_id", "goods_id", name="uq_provisor_goods_map_pf_goods"),
@@ -482,8 +483,8 @@ class ProductSubstituteMatch(Base):
     status: Mapped[str] = mapped_column(String(32), default="approved", index=True)
     priority: Mapped[int] = mapped_column(Integer, default=100)
     comment: Mapped[str] = mapped_column(Text, default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     __table_args__ = (
         UniqueConstraint("product_id", "source_type", "source_goods_id", name="uq_product_substitute_source_goods"),
@@ -504,8 +505,8 @@ class SourceGoodsMatch(Base):
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
     similarity_score: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
     match_method: Mapped[str] = mapped_column(Text, default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     __table_args__ = (
         UniqueConstraint(
@@ -533,8 +534,8 @@ class CompetitorCodeMapping(Base):
     our_sku: Mapped[str] = mapped_column(Text, default="", index=True)
     status: Mapped[str] = mapped_column(String(32), default="unmapped", index=True)
     confidence: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_by: Mapped[str] = mapped_column(Text, default="")
 
@@ -561,7 +562,7 @@ class UniversalList(Base):
     # Список может быть привязан к ЦФ (если NULL — глобальный)
     price_format_id: Mapped[int | None] = mapped_column(ForeignKey("price_formats.id"), nullable=True, index=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
 
 class UniversalListPriceFormat(Base):
@@ -570,7 +571,7 @@ class UniversalListPriceFormat(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     universal_list_id: Mapped[int] = mapped_column(ForeignKey("universal_lists.id"), index=True)
     price_format_id: Mapped[int] = mapped_column(ForeignKey("price_formats.id"), index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     __table_args__ = (
         UniqueConstraint("universal_list_id", "price_format_id", name="uq_universal_list_price_format"),
@@ -610,8 +611,8 @@ class BusinessList(Base):
     summary_json: Mapped[str] = mapped_column(Text, default="{}")
     errors_json: Mapped[str] = mapped_column(Text, default="[]")
     item_count: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     items: Mapped[list["BusinessListItem"]] = relationship(
         back_populates="business_list", cascade="all, delete-orphan"
@@ -636,7 +637,7 @@ class BusinessListItem(Base):
     value_bool: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     source_row: Mapped[int] = mapped_column(Integer, default=0)
     source_identifier: Mapped[str] = mapped_column(Text, default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     business_list: Mapped[BusinessList] = relationship(back_populates="items")
 
@@ -684,7 +685,7 @@ class CalculatedPrice(Base):
 
     zone: Mapped[str] = mapped_column(String(32), default="no-data")  # left|optimal|right|no-data
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     __table_args__ = (
         UniqueConstraint("price_list_id", "product_id", name="uq_calculated_prices_pl_product"),
@@ -703,7 +704,7 @@ class PricingWorkflowRun(Base):
     price_list_number: Mapped[str] = mapped_column(Text, default="", index=True)
     competitor_sources_json: Mapped[str] = mapped_column(Text, default="[]")
     percentile_sources_json: Mapped[str] = mapped_column(Text, default="[]")
-    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
     analytics_json: Mapped[str] = mapped_column(Text, default="{}")
@@ -736,7 +737,7 @@ class ReferenceImportJob(Base):
     rows_failed: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str] = mapped_column(Text, default="")
     log_json: Mapped[str] = mapped_column(Text, default="[]")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     user_name: Mapped[str] = mapped_column(Text, default="")
@@ -773,7 +774,7 @@ class BranchStock(Base):
     sku: Mapped[str] = mapped_column(Text, index=True)
     stock: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
     source_type: Mapped[str] = mapped_column(String(32), default="excel")
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     __table_args__ = (
         UniqueConstraint("branch_id", "product_id", name="uq_branch_stock_branch_product"),
@@ -789,7 +790,7 @@ class BranchCost(Base):
     sku: Mapped[str] = mapped_column(Text, index=True)
     cost: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
     source_type: Mapped[str] = mapped_column(String(32), default="excel")
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     __table_args__ = (
         UniqueConstraint("branch_id", "product_id", name="uq_branch_cost_branch_product"),
@@ -806,7 +807,7 @@ class ProductRating(Base):
     rating_type: Mapped[str] = mapped_column(String(32), index=True)  # global|local
     rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
     source_type: Mapped[str] = mapped_column(String(32), default="excel")
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     __table_args__ = (
         UniqueConstraint("branch_id", "product_id", "rating_type", name="uq_product_rating_scope"),
@@ -821,7 +822,7 @@ class Holding(Base):
     name: Mapped[str] = mapped_column(Text)
     branch_id: Mapped[str] = mapped_column(Text, default="", index=True)
     source_type: Mapped[str] = mapped_column(String(32), default="excel")
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
 
 class Counterparty(Base):
@@ -833,7 +834,7 @@ class Counterparty(Base):
     holding_id: Mapped[str] = mapped_column(Text, default="", index=True)
     branch_id: Mapped[str] = mapped_column(Text, default="", index=True)
     source_type: Mapped[str] = mapped_column(String(32), default="excel")
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
 
 class DeliveryPoint(Base):
@@ -846,7 +847,7 @@ class DeliveryPoint(Base):
     address: Mapped[str] = mapped_column(Text, default="")
     branch_id: Mapped[str] = mapped_column(Text, default="", index=True)
     source_type: Mapped[str] = mapped_column(String(32), default="excel")
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
 
 class CounterpartyPriceFormat(Base):
@@ -859,7 +860,7 @@ class CounterpartyPriceFormat(Base):
     price_format_id: Mapped[int] = mapped_column(ForeignKey("price_formats.id"), index=True)
     status: Mapped[str] = mapped_column(String(32), default="active", index=True)
     source_type: Mapped[str] = mapped_column(String(32), default="excel")
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     __table_args__ = (
         UniqueConstraint(
@@ -880,8 +881,8 @@ class MarkupTemplate(Base):
     name: Mapped[str] = mapped_column(Text)
     description: Mapped[str] = mapped_column(Text, default="")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     rows: Mapped[list["MarkupTemplateRow"]] = relationship(cascade="all, delete-orphan")
 
@@ -905,8 +906,8 @@ class BendTemplate(Base):
     name: Mapped[str] = mapped_column(Text)
     description: Mapped[str] = mapped_column(Text, default="")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     rows: Mapped[list["BendTemplateRow"]] = relationship(cascade="all, delete-orphan")
 
@@ -930,8 +931,8 @@ class NoCompetitorMarkupTemplate(Base):
     name: Mapped[str] = mapped_column(Text)
     description: Mapped[str] = mapped_column(Text, default="")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     rows: Mapped[list["NoCompetitorMarkupTemplateRow"]] = relationship(cascade="all, delete-orphan")
 
@@ -957,8 +958,8 @@ class RoundingRule(Base):
     precision: Mapped[int] = mapped_column(Integer, default=2)
     step: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
 
 class PricingRule(Base):
@@ -975,5 +976,5 @@ class PricingRule(Base):
     no_competitor_template_id: Mapped[int | None] = mapped_column(ForeignKey("no_competitor_markup_templates.id"), nullable=True, index=True)
     rounding_rule_id: Mapped[int | None] = mapped_column(ForeignKey("rounding_rules.id"), nullable=True, index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)

@@ -85,8 +85,20 @@ type PriceItem = {
   percentileSource: string;
   pricingReason: string;
   pricingRule: string;
+  appliedRuleType?: string;
+  appliedRuleValue?: number | null;
+  appliedListName?: string;
+  appliedRuleAmbiguous?: boolean;
   competitorPrices?: Record<string, CompetitorPriceCell>;
   log: Array<{ label: string; value: any; description: string }>;
+};
+
+const appliedRuleSummary = (row: PriceItem) => {
+  if (!row.appliedRuleType) return row.pricingReason || 'Лог расчёта';
+  const value = row.appliedRuleValue ?? '—';
+  const list = row.appliedListName || 'список не указан';
+  const ambiguity = row.appliedRuleAmbiguous ? ' · неоднозначное правило' : '';
+  return `${row.appliedRuleType} · ${list} · ${value}${ambiguity}`;
 };
 
 type CompareRow = {
@@ -471,7 +483,7 @@ export function PriceListsTab({ formatCode, initialPriceListNumber = '' }: Price
                 <ZoneBadge key={`${row.sku}-zone`} zone={row.zone} />,
                 row.priceSource || DASH,
                 row.percentileSource || DASH,
-                <button key={`${row.sku}-log`} type="button" className="table-link" onClick={() => setSelectedItem(row)}>{row.pricingReason || 'Лог расчёта'}</button>,
+                <button key={`${row.sku}-log`} type="button" className="table-link" onClick={() => setSelectedItem(row)}>{appliedRuleSummary(row)}</button>,
               ])}
             />
             <div className="generated-pagination">

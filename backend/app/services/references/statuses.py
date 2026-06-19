@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ...models import ReferenceImportJob, ReferenceUpdateStatus
+from ...timezone import local_iso
 from .types import BRANCHES, REFERENCE_TYPES
 
 
@@ -28,7 +29,7 @@ def status_to_dict(row: ReferenceUpdateStatus) -> dict:
         "branchId": row.branch_id,
         "branchName": row.branch_name,
         "dataType": row.data_type,
-        "lastUpdatedAt": row.last_updated_at.isoformat() if row.last_updated_at else "",
+        "lastUpdatedAt": local_iso(row.last_updated_at) if row.last_updated_at else "",
         "rowsCount": row.rows_count,
         "status": row.status,
         "freshness": freshness,
@@ -111,9 +112,9 @@ def import_job_to_dict(row: ReferenceImportJob) -> dict:
         "rowsFailed": row.rows_failed,
         "error": row.error,
         "log": row.log_json,
-        "createdAt": row.created_at.isoformat() if row.created_at else "",
-        "startedAt": row.started_at.isoformat() if row.started_at else "",
-        "finishedAt": row.finished_at.isoformat() if row.finished_at else "",
+        "createdAt": local_iso(row.created_at) if row.created_at else "",
+        "startedAt": local_iso(row.started_at) if row.started_at else "",
+        "finishedAt": local_iso(row.finished_at) if row.finished_at else "",
         "userName": row.user_name,
     }
 

@@ -278,7 +278,7 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
     const res = await fetch(`/api/lists-management/${opened.id}/items`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sku: newItem.sku.trim(), value: Number(newItem.value || 0) }),
+      body: JSON.stringify({ sku: newItem.sku.trim(), value: newItem.value }),
     });
     if (res.ok) {
       setNewItem({ sku: '', value: '' });

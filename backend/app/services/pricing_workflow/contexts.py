@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime
-
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ...models import PricingContext
+from ...timezone import now_kz_naive
 from ..references.types import BRANCHES
 
 
@@ -27,7 +26,7 @@ def ensure_default_contexts(*, db: Session) -> None:
     existing = int(db.execute(select(PricingContext.id).limit(1)).scalar() or 0)
     if existing:
         return
-    now = datetime.utcnow()
+    now = now_kz_naive()
     for branch in BRANCHES:
         for channel in DEFAULT_CHANNELS:
             db.add(
@@ -56,4 +55,3 @@ def list_contexts(*, db: Session) -> list[dict]:
         .all()
     )
     return [context_to_dict(row) for row in rows]
-

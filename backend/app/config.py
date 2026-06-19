@@ -9,6 +9,7 @@ from pathlib import Path
 
 class Settings(BaseModel):
     environment: str
+    app_timezone: str
     cors_allow_origins: list[str]
     phcenter_token: str | None
     phcenter_base_url: str
@@ -80,6 +81,7 @@ def get_settings() -> Settings:
 
     return Settings(
         environment=environment,
+        app_timezone=os.getenv("APP_TIMEZONE", os.getenv("TZ", "Asia/Qyzylorda")).strip() or "Asia/Qyzylorda",
         cors_allow_origins=cors_allow_origins,
         phcenter_token=os.getenv("PHCENTER_TOKEN"),
         phcenter_base_url=os.getenv("PHCENTER_BASE_URL", "https://ph.center"),

@@ -19,6 +19,7 @@ from ...models import (
     ReferenceImportJob,
     ReferenceUpdateStatus,
 )
+from ...timezone import now_kz_naive
 from ..sku import normalize_sku
 from .parsers import as_decimal, as_int, parse_excel_rows
 from .types import BRANCH_BY_ID, REFERENCE_TYPE_BY_CODE
@@ -71,7 +72,7 @@ def _upsert_status(
         row = ReferenceUpdateStatus(branch_id=branch_id, data_type=data_type)
         db.add(row)
     row.branch_name = _branch_name(branch_id)
-    row.last_updated_at = datetime.utcnow() if status != "running" else row.last_updated_at
+    row.last_updated_at = now_kz_naive() if status != "running" else row.last_updated_at
     row.rows_count = rows_count
     row.status = status
     row.error = error
@@ -97,7 +98,7 @@ def _upsert_branch_stock(db: Session, *, branch_id: str, product: Product, sku: 
         db.add(row)
     row.stock = float(stock) if stock is not None else None
     row.source_type = "excel"
-    row.updated_at = datetime.utcnow()
+    row.updated_at = now_kz_naive()
 
 
 def _upsert_branch_cost(db: Session, *, branch_id: str, product: Product, sku: str, cost: Decimal | None) -> None:
@@ -111,7 +112,7 @@ def _upsert_branch_cost(db: Session, *, branch_id: str, product: Product, sku: s
         db.add(row)
     row.cost = float(cost) if cost is not None else None
     row.source_type = "excel"
-    row.updated_at = datetime.utcnow()
+    row.updated_at = now_kz_naive()
 
 
 def _upsert_rating(db: Session, *, branch_id: str, product: Product, sku: str, rating_type: str, rating: int | None) -> None:
@@ -130,7 +131,7 @@ def _upsert_rating(db: Session, *, branch_id: str, product: Product, sku: str, r
         db.add(row)
     row.rating = rating
     row.source_type = "excel"
-    row.updated_at = datetime.utcnow()
+    row.updated_at = now_kz_naive()
 
 
 def import_reference_excel(
@@ -154,7 +155,7 @@ def import_reference_excel(
         filename=filename,
         source_type="excel",
         status="running",
-        started_at=datetime.utcnow(),
+        started_at=now_kz_naive(),
         user_name=user_name,
     )
     db.add(job)
@@ -192,7 +193,7 @@ def import_reference_excel(
                         manufacturer = str(raw.get("manufacturer") or "").strip()
                         if manufacturer:
                             extra.manufacturer = manufacturer
-                        extra.updated_at = datetime.utcnow()
+                        extra.updated_at = now_kz_naive()
                         for branch_id in row_branch_ids:
                             success_by_branch.setdefault(branch_id, 0)
                             success_by_branch[branch_id] += 1
@@ -203,7 +204,7 @@ def import_reference_excel(
                             _upsert_branch_stock(db, branch_id=branch_id, product=product, sku=sku, stock=stock)
                             if len(row_branch_ids) == 1:
                                 extra.stock = float(stock) if stock is not None else None
-                                extra.updated_at = datetime.utcnow()
+                                extra.updated_at = now_kz_naive()
                             success_by_branch.setdefault(branch_id, 0)
                             success_by_branch[branch_id] += 1
 
@@ -286,7 +287,7 @@ def import_reference_excel(
         job.rows_failed = failed
         job.status = "success" if failed == 0 else "partial"
         job.log_json = json.dumps(logs[:500], ensure_ascii=False)
-        job.finished_at = datetime.utcnow()
+        job.finished_at = now_kz_naive()
         for branch_id, count in success_by_branch.items():
             _upsert_status(db=db, branch_id=branch_id, data_type=data_type, rows_count=count, status=job.status)
         db.commit()
@@ -298,7 +299,7 @@ def import_reference_excel(
         if job is not None:
             job.status = "error"
             job.error = str(exc)
-            job.finished_at = datetime.utcnow()
+            job.finished_at = now_kz_naive()
             job.log_json = json.dumps(logs[:500], ensure_ascii=False)
         for branch_id in branch_ids:
             _upsert_status(db=db, branch_id=branch_id, data_type=data_type, rows_count=0, status="error", error=str(exc))
@@ -307,4 +308,3 @@ def import_reference_excel(
             raise
         db.refresh(job)
         return job
-

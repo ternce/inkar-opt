@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from ..db import SessionLocal
 from ..models import Job, PriceFormat
+from ..timezone import local_iso, now_kz_naive
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +41,10 @@ def job_to_dict(job: Job) -> dict[str, Any]:
         "logs": _json_loads(job.logs, []),
         "result": _json_loads(job.result_json, {}),
         "error": job.error or None,
-        "created_at": job.created_at.isoformat() if job.created_at else "",
-        "started_at": job.started_at.isoformat() if job.started_at else "",
-        "updated_at": job.updated_at.isoformat() if job.updated_at else "",
-        "finished_at": job.finished_at.isoformat() if job.finished_at else "",
+        "created_at": local_iso(job.created_at) if job.created_at else "",
+        "started_at": local_iso(job.started_at) if job.started_at else "",
+        "updated_at": local_iso(job.updated_at) if job.updated_at else "",
+        "finished_at": local_iso(job.finished_at) if job.finished_at else "",
     }
 
 
@@ -88,7 +89,7 @@ def get_active_job(*, db: Session, job_type: str, format_code: str, account_id: 
     if account_id is not None:
         stmt = stmt.where(Job.account_id == account_id)
 
-    now = datetime.utcnow()
+    now = now_kz_naive()
     for row in db.execute(stmt).scalars().all():
         age_seconds = _job_heartbeat_age_seconds(row, now)
         if age_seconds > STALE_JOB_SECONDS:
@@ -110,7 +111,7 @@ def create_job(
     if price_format_id is None and format_code:
         pf = db.execute(select(PriceFormat).where(PriceFormat.code == format_code)).scalars().first()
         price_format_id = int(pf.id) if pf else None
-    now = datetime.utcnow()
+    now = now_kz_naive()
     job = Job(
         id=uuid.uuid4().hex,
         type=job_type,
@@ -136,7 +137,7 @@ def append_job_log(job: Job, *, level: str, message: str, meta: dict[str, Any] |
     logs = _json_loads(job.logs, [])
     logs.append(
         {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": local_iso(now_kz_naive()),
             "level": level,
             "message": message,
             "meta": meta or {},
@@ -157,7 +158,7 @@ def update_job(
     log_level: str | None = None,
     log_meta: dict[str, Any] | None = None,
 ) -> None:
-    now = datetime.utcnow()
+    now = now_kz_naive()
     if status is not None:
         job.status = status
         if status == "running" and job.started_at is None:

@@ -28,6 +28,7 @@ from ...models import (
     UniversalListPriceFormat,
 )
 from ..competitor_assignments import get_assigned_competitor_price_lists
+from ...timezone import now_kz_naive
 
 
 def _jsonable(value: Any) -> Any:
@@ -227,7 +228,7 @@ def _reference_versions_snapshot(db: Session, branch_id: str) -> dict:
         } if row else None
     return {
         "branchId": branch_id,
-        "capturedAt": datetime.utcnow(),
+        "capturedAt": now_kz_naive(),
         "counts": {
             "products": count(Product),
             "productExtras": int(db.execute(select(func.count(ProductExtra.product_id))).scalar() or 0),
@@ -295,7 +296,7 @@ def build_generate_snapshot(
     return {
         "schemaVersion": 1,
         "generatedBy": generated_by,
-        "createdAt": datetime.utcnow(),
+        "createdAt": now_kz_naive(),
         "activationDate": activation_date,
         "asOf": as_of,
         "branchId": branch_id,

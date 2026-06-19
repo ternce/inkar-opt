@@ -16,6 +16,7 @@ from ...models import (
     ReferenceUpdateStatus,
 )
 from ..competitor_assignments import get_assigned_competitor_price_lists
+from ...timezone import local_iso, now_kz_naive
 
 
 def _days_old(value: date | datetime | None) -> int | None:
@@ -25,7 +26,7 @@ def _days_old(value: date | datetime | None) -> int | None:
         d = value.date()
     else:
         d = value
-    return max(0, (date.today() - d).days)
+    return max(0, (now_kz_naive().date() - d).days)
 
 
 def _status(kind: str, label: str, ok: bool, message: str, severity: str = "info") -> dict:
@@ -111,7 +112,7 @@ def build_workflow_status(
                     f"reference_{code}",
                     label,
                     days is not None and days <= 2,
-                    f"Последнее обновление: {row.last_updated_at.isoformat()} ({days} дн.)",
+                    f"Последнее обновление: {local_iso(row.last_updated_at)} ({days} дн.)",
                     "warning",
                 )
             )
