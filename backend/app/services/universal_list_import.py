@@ -31,6 +31,11 @@ UNIVERSAL_TYPE_LABELS = {
     "максимальная наценка": "max_markup",
     "исключить из переоценки": "exclude_from_pricing",
     "без прогиба": "no_bend",
+    "fixed markup": "fixed_markup",
+    "fixed margin": "fixed_markup",
+    "фикс наценка": "fixed_markup",
+    "фиксированная наценка": "fixed_markup",
+    "фиксированная маржа": "fixed_markup",
 }
 DEFAULT_MAX_UPLOAD_SIZE_MB = 10
 DEFAULT_MAX_ROWS = 50_000
@@ -58,6 +63,37 @@ VALUE_ALIASES = (
     "exclude",
     "excluded",
 )
+
+PRICE_TYPE_VALUE_ALIASES: dict[str, tuple[str, ...]] = {
+    "fixed_markup": (
+        "фикс наценка",
+        "фиксированная наценка",
+        "наценка",
+        "критичка",
+        "критическая наценка",
+        "значение",
+        "%",
+        "процент",
+    ),
+    "max_price": ("макс цена", "максимальная цена", "цена"),
+    "min_price": ("мин цена", "минимальная цена", "цена"),
+    "fixed_price": ("фикс цена", "фиксированная цена", "цена"),
+}
+
+PRICE_TYPE_VALUE_COLUMN_ERRORS: dict[str, str] = {
+    "fixed_markup": "Для списка типа Фиксированная наценка нужна колонка значения",
+    "max_price": "Для списка типа Максимальная цена нужна колонка значения:\nМакс цена / Максимальная цена / Цена",
+    "min_price": "Для списка типа Минимальная цена нужна колонка значения:\nМин цена / Минимальная цена / Цена",
+    "fixed_price": "Для списка типа Фиксированная цена нужна колонка значения:\nФикс цена / Фиксированная цена / Цена",
+}
+
+
+def _missing_value_column_error(list_type: str, headers: list[str]) -> str:
+    expected = PRICE_TYPE_VALUE_ALIASES.get(list_type, VALUE_ALIASES)
+    prefix = PRICE_TYPE_VALUE_COLUMN_ERRORS.get(list_type, "Не найдена колонка значения")
+    detected_text = ", ".join(header or "<пусто>" for header in headers) or "<нет заголовков>"
+    expected_text = ", ".join(expected)
+    return f"{prefix}. Обнаружены заголовки: {detected_text}. Ожидался один из заголовков: {expected_text}."
 
 MANUFACTURER_ALIASES = ("manufacturer", "producer", "производитель")
 
@@ -138,7 +174,11 @@ def _is_empty_row(row: tuple[Any, ...]) -> bool:
     return all(_cell_text(value) == "" for value in row)
 
 
-def _find_header_indexes(headers: list[str]) -> tuple[dict[str, int], int | None, int | None]:
+def _find_header_indexes(
+    headers: list[str],
+    *,
+    additional_value_aliases: tuple[str, ...] = (),
+) -> tuple[dict[str, int], int | None, int | None]:
     identifier_indexes: dict[str, int] = {}
     for identifier_type, aliases in IDENTIFIER_ALIASES.items():
         alias_set = {normalize_header(alias) for alias in aliases}
@@ -148,7 +188,7 @@ def _find_header_indexes(headers: list[str]) -> tuple[dict[str, int], int | None
                 break
 
     value_idx = None
-    value_aliases = {normalize_header(alias) for alias in VALUE_ALIASES}
+    value_aliases = {normalize_header(alias) for alias in (*VALUE_ALIASES, *additional_value_aliases)}
     for idx, header in enumerate(headers):
         if header in value_aliases:
             value_idx = idx
@@ -475,12 +515,17 @@ def import_universal_list_excel(
         raise ValueError("file without headers")
 
     headers = [normalize_header(value) for value in header_row]
-    identifier_indexes, value_idx, _manufacturer_idx = _find_header_indexes(headers)
+    normalized_list_type = str(universal_list.type or "").strip().casefold()
+    normalized_list_type = UNIVERSAL_TYPE_LABELS.get(normalized_list_type, normalized_list_type)
+    identifier_indexes, value_idx, _manufacturer_idx = _find_header_indexes(
+        headers,
+        additional_value_aliases=PRICE_TYPE_VALUE_ALIASES.get(normalized_list_type, ()),
+    )
     if not identifier_indexes:
         raise ValueError("missing product identifier column")
     exclusion_by_presence = is_exclude_from_pricing_type(str(universal_list.type or ""))
     if value_idx is None and not exclusion_by_presence:
-        raise ValueError("missing value column")
+        raise ValueError(_missing_value_column_error(normalized_list_type, headers))
 
     summary = _summary()
     issues: list[ImportIssue] = []
@@ -533,6 +578,14 @@ def import_universal_list_excel(
             value=value,
             source_row=excel_row_number,
             source_identifier=identifier,
+        )
+
+    invalid_value_issues = [issue for issue in issues if issue.code == "invalid_value"]
+    if invalid_value_issues:
+        first = invalid_value_issues[0]
+        raise ValueError(
+            f"Некорректное значение в строке {first.row}: {first.message}. "
+            "Допустимы числа вида 10, 10,5 или 10.5."
         )
 
     summary["processed"] = len(items_by_product)

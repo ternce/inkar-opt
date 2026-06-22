@@ -365,10 +365,11 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
               </thead>
               <tbody>
                 {rows.map((row) => (
-                  <tr key={row.id} className={opened?.id === row.id ? 'active-row' : ''}>
+                  <tr key={row.id} className={opened?.id === row.id ? 'active-row selected-list-row' : ''} aria-selected={opened?.id === row.id}>
                     <td>
                       <button className="link-button" onClick={() => void openCard(row.id)}>{row.name}</button>
                       <div className="muted">{row.code}</div>
+                      {opened?.id === row.id ? <span className="selected-list-badge">Выбран</span> : null}
                     </td>
                     <td>{listTypeLabel(row.type, row.typeLabel)}</td>
                     <td><span className={`status-pill ${row.active ? 'ok' : 'muted'}`}>{row.status}</span></td>

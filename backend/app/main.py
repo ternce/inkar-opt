@@ -186,6 +186,7 @@ from .services.competitors.percentiles.read_models import list_percentile_source
 from .services.jobs import create_job, get_active_job, job_to_dict, schedule_job, update_job
 from .services.references.batch import import_reference_batch
 from .services.references.imports import import_reference_excel
+from .services.references.ratings import RATING_DATA_TYPES, import_top_rating_excel
 from .services.references.sources import ReferenceFilePayload, make_reference_source
 from .services.references.statuses import import_job_to_dict, list_reference_imports, list_reference_statuses, reference_readiness_matrix
 from .services.references.types import BRANCHES, REFERENCE_TYPES
@@ -1544,7 +1545,7 @@ def _source_label(source_name: str) -> str:
     return source_name
 
 
-def _calculated_zone(cp: CalculatedPrice) -> str:
+def _calculated_zone(cp: CalculatedPrice) -> str | None:
     zone, _reference, _deviation = calculate_price_zone(
         cp.final_price,
         chosen_competitor_price=cp.chosen_competitor_price,
@@ -1575,7 +1576,34 @@ def _applied_list_summary(db: Session, cp: CalculatedPrice) -> dict | None:
         "applied_rule_value": float(cp.applied_rule_value) if cp.applied_rule_value is not None else None,
         "list_id": int(list_id),
         "list_name": row.name if row else str(list_id),
+        "list_code": row.code if row else "",
         "ambiguous": (cp.applied_rule_type or "") in AMBIGUOUS_LIST_TYPES,
+    }
+
+
+def _list_override_log(applied: dict | None) -> dict | None:
+    if not applied:
+        return None
+    list_type = str(applied.get("applied_rule_type") or "")
+    value = applied.get("applied_rule_value")
+    display_value = f"{value:g}%" if value is not None and list_type in {"fixed_markup", "critical_markup"} else f"{value:g}" if value is not None else "—"
+    actions = {
+        "fixed_markup": "Использовано значение списка вместо глобального правила.",
+        "critical_markup": "Использовано значение списка вместо глобального правила.",
+        "fixed_price": "Применена фиксированная цена из списка.",
+        "min_price": "Применено ограничение минимальной цены.",
+        "max_price": "Применено ограничение максимальной цены.",
+        "no_bend": "Прогиб отключён значением списка.",
+        "exclude_from_pricing": "Позиция исключена из расчёта значением списка.",
+    }
+    return {
+        "listName": applied.get("list_name") or "",
+        "listCode": applied.get("list_code") or "",
+        "listType": list_type,
+        "value": value,
+        "displayValue": display_value,
+        "action": actions.get(list_type, "Применено значение активного списка."),
+        "ambiguous": bool(applied.get("ambiguous")),
     }
 
 
@@ -1595,38 +1623,40 @@ def _pricing_log(db: Session, cp: CalculatedPrice, product: Product, source: Com
         {"label": "Прогиб", "value": float(cp.price_from_competitor) if cp.price_from_competitor is not None else "не применён", "description": "Цена после применения прогиба к конкурентной цене, если она была рассчитана."},
         {"label": "Выбор конкурента", "value": _source_label(source.source_name) if source else "не применялся", "description": "Для отображения выбран ближайший сохранённый конкурентный источник по товару."},
         {"label": "Отклонения", "value": _calculated_zone(cp), "description": "Зона показывает положение финальной цены относительно конкурента."},
-        {"label": "Universal lists", "value": "см. причину расчёта", "description": "Если список сработал, его след обычно присутствует в причине применения цены."},
         {"label": "Percentile", "value": "сработал" if source and str(source.source_name or "").startswith("percentile:") else "не сработал", "description": _source_label(source.source_name) if source else ""},
         {"label": "Финальная причина", "value": cp.applied_reason or "", "description": "Человекочитаемый лог, сохранённый pricing engine."},
     ]
-    applied = _applied_list_summary(db, cp)
-    if applied:
-        log.append(
-            {
-                "label": "Applied Rule",
-                "value": f"{applied['applied_rule_type']} {applied['applied_rule_value']}",
-                "description": (
-                    f"List #{applied['list_id']}: {applied['list_name']}"
-                    + ("; AMBIGUOUS: existing behavior retained pending business confirmation" if applied["ambiguous"] else "")
-                ),
-            }
-        )
     return log
 
 
-def _generated_item_dict(db: Session, cp: CalculatedPrice, product: Product, pf: PriceFormat, extra: ProductExtra | None) -> dict:
+def _generated_item_dict(
+    db: Session,
+    cp: CalculatedPrice,
+    product: Product,
+    pf: PriceFormat,
+    extra: ProductExtra | None,
+    ratings: dict[str, int | None] | None = None,
+) -> dict:
     cost = float(cp.cost or 0)
     final = float(cp.final_price or 0)
     actual_margin = margin_percent_from_price(cost, final)
     actual_margin_percent = round(float(actual_margin), 2) if actual_margin is not None else None
     source_label = _source_label(cp.applied_source_name or "")
     applied_list = _applied_list_summary(db, cp)
+    list_override_log = _list_override_log(applied_list)
+    ratings = ratings if ratings is not None else _product_ratings_by_id(db, [int(product.id)], str(pf.branch or "")).get(int(product.id), {})
+    global_rating = ratings.get("global")
+    local_rating = ratings.get("local")
     return {
         "sku": product.code,
         "name": product.name,
         "topRank": int(product.top_rank) if product.top_rank is not None else None,
         "isTop": product.top_rank is not None,
         "is_top": int(product.top_rank) if product.top_rank is not None else 0,
+        "globalRating": global_rating,
+        "localRating": local_rating,
+        "global_rating": global_rating,
+        "local_rating": local_rating,
         "manufacturer": extra.manufacturer if extra else "",
         "stock": float(extra.stock) if extra and extra.stock is not None else None,
         "cost": cost,
@@ -1660,8 +1690,10 @@ def _generated_item_dict(db: Session, cp: CalculatedPrice, product: Product, pf:
         "appliedListName": applied_list["list_name"] if applied_list else "",
         "appliedRuleAmbiguous": bool(applied_list and applied_list["ambiguous"]),
         "appliedRule": applied_list,
-        "ratingGlobal": cp.rating_global,
-        "ratingLocal": cp.rating_local,
+        "pricingCalculationLog": cp.applied_reason or "",
+        "listOverrideLog": list_override_log,
+        "ratingGlobal": global_rating,
+        "ratingLocal": local_rating,
         "pricingReason": cp.applied_reason or "",
         "pricingRule": cp.applied_rule_name or pf.pricing_rule or "",
         "pricingRuleVersion": cp.applied_rule_version or "",
@@ -1669,8 +1701,45 @@ def _generated_item_dict(db: Session, cp: CalculatedPrice, product: Product, pf:
     }
 
 
+def _product_ratings_by_id(db: Session, product_ids: list[int], branch_id: str) -> dict[int, dict[str, int | None]]:
+    """Return the newest global and branch-local ProductRating values per product."""
+    if not product_ids:
+        return {}
+    rows = (
+        db.execute(
+            select(ProductRating)
+            .where(ProductRating.product_id.in_(product_ids))
+            .where(
+                (ProductRating.rating_type == "global")
+                | ((ProductRating.rating_type == "local") & (ProductRating.branch_id == branch_id))
+            )
+            .order_by(ProductRating.updated_at.desc(), ProductRating.id.desc())
+        )
+        .scalars()
+        .all()
+    )
+    result: dict[int, dict[str, int | None]] = {}
+    for row in rows:
+        ratings = result.setdefault(int(row.product_id), {})
+        if row.rating_type not in ratings:
+            ratings[row.rating_type] = int(row.rating) if row.rating is not None else None
+    return result
+
+
 def _competitor_column_key(source_type: object, source_key: object) -> str:
     return f"{str(source_type or '').strip()}:{str(source_key or '').strip()}"
+
+
+def _competitor_column_title(value: object, fallback: object = "") -> str:
+    """Remove only adjacent duplicate labels from a rendered competitor title."""
+    raw = str(value or fallback or "").strip()
+    parts = [part.strip() for part in raw.split("—") if part.strip()]
+    unique_parts: list[str] = []
+    for part in parts:
+        if unique_parts and unique_parts[-1].casefold() == part.casefold():
+            continue
+        unique_parts.append(part)
+    return " — ".join(unique_parts) if unique_parts else raw
 
 
 def _competitor_columns_for_price_list(db: Session, pl: PriceList, pf: PriceFormat) -> list[dict]:
@@ -1684,7 +1753,10 @@ def _competitor_columns_for_price_list(db: Session, pl: PriceList, pf: PriceForm
             key = _competitor_column_key(source.get("sourceType"), source.get("sourceKey"))
             if key == ":":
                 continue
-            title = source.get("displayName") or source.get("competitorName") or source.get("supplier") or key
+            title = _competitor_column_title(
+                source.get("displayName") or source.get("competitorName") or source.get("supplier"),
+                key,
+            )
             columns.append(
                 {
                     "id": source.get("id") or index + 1,
@@ -1712,7 +1784,10 @@ def _competitor_columns_for_price_list(db: Session, pl: PriceList, pf: PriceForm
         {
             "id": item.price_list.id,
             "key": _competitor_column_key(item.price_list.source_type, item.price_list.source_key),
-            "title": item.price_list.display_name or item.price_list.competitor_name or item.price_list.supplier or item.price_list.source_key,
+            "title": _competitor_column_title(
+                item.price_list.display_name or item.price_list.competitor_name or item.price_list.supplier,
+                item.price_list.source_key,
+            ),
             "sourceType": item.price_list.source_type,
             "priceListId": item.price_list.id,
             "competitorName": item.price_list.competitor_name or item.price_list.supplier or item.price_list.display_name,
@@ -1801,11 +1876,14 @@ def get_generated_price_list_items(
     all_rows = db.execute(stmt).all()
     if zone and zone != "__all__":
         all_rows = [(cp, product) for cp, product in all_rows if _calculated_zone(cp) == zone]
+    ratings_by_product = _product_ratings_by_id(
+        db, [int(product.id) for _, product in all_rows], str(pf.branch or "")
+    )
     top_filter_normalized = (top_filter or "all").strip().lower()
     if top_filter_normalized in {"top", "top_only"}:
-        all_rows = [(cp, product) for cp, product in all_rows if product.top_rank is not None]
+        all_rows = [(cp, product) for cp, product in all_rows if ratings_by_product.get(int(product.id), {}).get("global") is not None]
     elif top_filter_normalized in {"no_top", "non_top", "non_top_only"}:
-        all_rows = [(cp, product) for cp, product in all_rows if product.top_rank is None]
+        all_rows = [(cp, product) for cp, product in all_rows if ratings_by_product.get(int(product.id), {}).get("global") is None]
     total = len(all_rows)
     rows = all_rows[(page - 1) * page_size : page * page_size]
     product_ids = [int(product.id) for _, product in rows]
@@ -1817,7 +1895,9 @@ def get_generated_price_list_items(
     competitor_prices = _competitor_prices_by_product(db, pf=pf, product_ids=product_ids, columns=competitor_columns)
     items = []
     for cp, product in rows:
-        item = _generated_item_dict(db, cp, product, pf, extras.get(product.id))
+        item = _generated_item_dict(
+            db, cp, product, pf, extras.get(product.id), ratings_by_product.get(int(product.id), {})
+        )
         item["competitorPrices"] = competitor_prices.get(int(product.id), {})
         items.append(item)
     return {
@@ -1868,7 +1948,8 @@ def export_generated_price_list(
     headers = [
         ("sku", "SKU"),
         ("name", "Наименование"),
-        ("is_top", "PharmCenter Top / is_top"),
+        ("globalRating", "Рейтинг глобальный"),
+        ("localRating", "Рейтинг локальный"),
         ("manufacturer", "Производитель"),
         ("stock", "Остаток"),
         ("cost", "Себестоимость"),
@@ -1898,8 +1979,6 @@ def export_generated_price_list(
             cell = (row.get("competitorPrices") or {}).get(column_key) or {}
             price = cell.get("price")
             return "" if _is_missing_price_value(price) else price
-        if key == "is_top":
-            return row.get("topRank") or ""
         value = row.get(key, "")
         mojibake_dash_values = {"\u0432\u0402\u201d", "\u0420\u0406\u0420\u201a\u0432\u0402\u045c"}
         competitor_price_keys = {"bestCompetitorPrice", "lowestCompetitorPrice", "chosenCompetitorPrice"}
@@ -2609,7 +2688,6 @@ def get_price_list_analytics_dashboard(
         {"code": "left", "label": "Левое плечо: ниже конкурента", "count": int(summary.get("leftZone") or 0), "percent": round((int(summary.get("leftZone") or 0) / total) * 100, 2), "change": 0},
         {"code": "optimal", "label": "ЗЛ", "count": int(summary.get("optimalZone") or 0), "percent": round((int(summary.get("optimalZone") or 0) / total) * 100, 2), "change": 0},
         {"code": "right", "label": "ПП", "count": int(summary.get("rightZone") or 0), "percent": round((int(summary.get("rightZone") or 0) / total) * 100, 2), "change": 0},
-        {"code": "no-data", "label": "Зона no-data", "count": int(summary.get("noDataZone") or 0), "percent": round((int(summary.get("noDataZone") or 0) / total) * 100, 2), "change": 0},
     ]
     markups: list[float] = []
     bends: list[float] = []
@@ -2724,7 +2802,6 @@ def export_price_list_analytics(
         ["Левое плечо: ниже конкурента", payload["summary"].get("leftZone", 0)],
         ["ЗЛ", payload["summary"].get("optimalZone", 0)],
         ["ПП", payload["summary"].get("rightZone", 0)],
-        ["Зона no-data", payload["summary"].get("noDataZone", 0)],
         ["Применена логика без конкурентов", payload["summary"].get("noCompetitorRuleApplied", 0)],
         ["Средняя наценка", payload["summary"].get("averageMarkup", 0)],
         ["Средняя цена", payload["summary"].get("averageFinalPrice", 0)],
@@ -2735,7 +2812,6 @@ def export_price_list_analytics(
         ["Price decreased", payload.get("repricing", {}).get("decreasedCount", 0)],
         ["Unchanged", payload.get("repricing", {}).get("unchangedCount", 0)],
         ["Universal lists", payload.get("repricing", {}).get("withUniversalLists", 0)],
-        ["No intersection", payload["summary"].get("noIntersection", 0)],
     ]
     filename = f"itogi_co_{payload['priceList']['number']}.{fmt}"
     if fmt == "csv":
@@ -2941,7 +3017,7 @@ def get_price_list_analysis(price_list_id: str, db: Session = Depends(get_db)):
             return "Зона логичности"
         if z == "right":
             return "Правое плечо"
-        return "no-data"
+        return "—"
 
     zone_counts = {"left": 0, "optimal": 0, "right": 0}
     products: list[dict] = []
@@ -4523,6 +4599,15 @@ async def post_reference_import(
         if not user_can_access_branch(current_user, branch_id, ""):
             raise HTTPException(status_code=403, detail="branch is not assigned to current user")
     try:
+        if data_type in RATING_DATA_TYPES:
+            return import_top_rating_excel(
+                db=db,
+                data_type=data_type,
+                branch_ids=branches,
+                content=content,
+                filename=file.filename or "reference.xlsx",
+                user_name=current_user.username or user_name,
+            )
         row = import_reference_excel(
             db=db,
             data_type=data_type,
@@ -7298,6 +7383,8 @@ def generate_price_list(payload: dict = Body(...), db: Session = Depends(get_db)
                 if str(col.get("source")) in prices
             },
             "log": cp.applied_reason or "",
+            "pricingCalculationLog": cp.applied_reason or "",
+            "listOverrideLog": _list_override_log(_applied_list_summary(db, cp)),
             "zone": _calculated_zone(cp),
         }
         for (cp, p) in items_rows

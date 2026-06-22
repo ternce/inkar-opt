@@ -683,7 +683,7 @@ class CalculatedPrice(Base):
     rating_global: Mapped[int | None] = mapped_column(Integer, nullable=True)
     rating_local: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
-    zone: Mapped[str] = mapped_column(String(32), default="no-data")  # left|optimal|right|no-data
+    zone: Mapped[str] = mapped_column(String(32), default="")  # left|optimal|right; empty when Ц1 is absent
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 

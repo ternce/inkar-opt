@@ -230,9 +230,6 @@ def zone_reference_price(
     chosen_competitor_price: object = None,
     lowest_competitor_price: object = None,
 ) -> Decimal | None:
-    chosen = _as_decimal(chosen_competitor_price)
-    if chosen is not None and chosen > 0:
-        return chosen
     lowest = _as_decimal(lowest_competitor_price)
     if lowest is not None and lowest > 0:
         return lowest
@@ -244,23 +241,21 @@ def calculate_price_zone(
     *,
     chosen_competitor_price: object = None,
     lowest_competitor_price: object = None,
-) -> tuple[str, Decimal | None, Decimal | None]:
+) -> tuple[str | None, Decimal | None, Decimal | None]:
     price = _as_decimal(final_price)
     reference_price = zone_reference_price(
         chosen_competitor_price=chosen_competitor_price,
         lowest_competitor_price=lowest_competitor_price,
     )
     if price is None or reference_price is None:
-        return "no-data", reference_price, None
+        return None, reference_price, None
 
     deviation_pct = (price - reference_price) / reference_price
     if price < reference_price:
         return "left", reference_price, deviation_pct
-    if Decimal("0") <= deviation_pct <= ZONE_OPTIMAL_THRESHOLD:
+    if price <= reference_price * (Decimal("1") + ZONE_OPTIMAL_THRESHOLD):
         return "optimal", reference_price, deviation_pct
-    if deviation_pct > ZONE_OPTIMAL_THRESHOLD:
-        return "right", reference_price, deviation_pct
-    return "no-data", reference_price, deviation_pct
+    return "right", reference_price, deviation_pct
 
 
 def _selected_source_meta(db: Session, price_format_id: int) -> SelectedSourceMeta:
@@ -783,11 +778,8 @@ def calculate_price_for_product(
             "price_from_competitor": None,
             "final_price": fixed_price,
             "reason": "fixed_price_list",
-            "log": (
-                f'Applied Rule: Type: fixed_price; Value: {fixed_price}; List: "{list_name}". '
-                "Final price set exactly from Lists Management; normal competitor and bend calculation skipped."
-            ),
-            "zone": "no-data",
+            "log": "Финальная цена установлена напрямую из фиксированной цены; выбор конкурента и прогиб не применялись.",
+            "zone": None,
             "zone_reference_price": None,
             "deviation_pct": None,
         }
@@ -812,14 +804,14 @@ def calculate_price_for_product(
     if critical_markup_match is not None:
         critical_markup, list_id = critical_markup_match
         markup_fraction = _list_percent_as_fraction(critical_markup)
-        markup_percent = max(markup_percent, markup_fraction)
-        no_competitor_markup_percent = max(no_competitor_markup_percent, markup_fraction)
+        markup_percent = markup_fraction
+        no_competitor_markup_percent = markup_fraction
         applied_list_effects.append(
             _list_markup_match_effect(
                 list_id,
                 LIST_TYPE_CRITICAL_MARKUP,
                 critical_markup,
-                "critical_markup_mdc_floor",
+                "critical_markup_mdc_override",
                 markup_fraction=markup_fraction,
             )
         )
@@ -956,6 +948,10 @@ def calculate_price_for_product(
         else:
             reason = "all_competitors_failed_mdc"
 
+    # Keep the pricing decision independent from any later Lists Management
+    # constraint.  List effects must not replace the competitor/MDC explanation.
+    pricing_reason = reason
+
     # Активные списки
     # Active lists were loaded before competitor resolution because some list
     # rules change competitor behavior for the product.
@@ -968,6 +964,7 @@ def calculate_price_for_product(
 
     excluded_from_pricing = False
     skip_rounding_floor = False
+    min_price_bound: Decimal | None = None
 
     exclude_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_EXCLUDE_FROM_PRICING)
     if exclude_match is not None:
@@ -991,6 +988,7 @@ def calculate_price_for_product(
             min_price_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_MIN_PRICE)
             if min_price_match is not None:
                 min_price, list_id = min_price_match
+                min_price_bound = min_price
                 price = max(price, min_price)
                 reason = "min_price_floor"
                 applied_list_effects.append(_list_effect(list_id, LIST_TYPE_MIN_PRICE, min_price, reason))
@@ -1012,6 +1010,13 @@ def calculate_price_for_product(
             reason = "no_competitor_markup_bumped_to_mdc"
         else:
             reason = "mdc_floor_after_rounding"
+        pricing_reason = reason
+
+    # min_price is a hard final lower bound.  Rounding and MDC finalization run
+    # before this guard so no later pricing stage can lower the list value.
+    if min_price_bound is not None and price < min_price_bound:
+        price = min_price_bound
+        reason = "min_price_floor"
 
     # ЛП/ЗЛ/ПП
     zone, zone_reference, deviation_pct = calculate_price_zone(
@@ -1030,7 +1035,7 @@ def calculate_price_for_product(
             effect["listName"] = list_names.get(int(list_id), str(list_id))
     primary_list_effect = applied_list_effects[-1] if applied_list_effects else {}
     calculation_log = _build_calculation_log(
-        reason=reason,
+        reason=pricing_reason,
         competitor_prices=resolved_many.prices,
         chosen_source=chosen_source,
         chosen_competitor=chosen_competitor,
@@ -1038,19 +1043,11 @@ def calculate_price_for_product(
         no_competitor_markup_percent=no_competitor_markup_percent,
         markup_percent=markup_percent,
         source_labels=selected_meta.labels,
-        applied_rule=primary_list_effect,
+        margin_overridden_by_list=any(
+            effect.get("type") in {LIST_TYPE_FIXED_MARKUP, LIST_TYPE_CRITICAL_MARKUP}
+            for effect in applied_list_effects
+        ),
     )
-    ambiguous_effects = [effect for effect in applied_list_effects if effect.get("ambiguous")]
-    if ambiguous_effects:
-        ambiguity_details = "; ".join(
-            f"{effect.get('type')}={effect.get('value')} from \"{effect.get('listName') or effect.get('listId')}\""
-            for effect in ambiguous_effects
-        )
-        calculation_log += (
-            " Ambiguous Lists Management rule(s) matched; existing behavior retained pending business confirmation: "
-            + ambiguity_details
-            + "."
-        )
 
     debug = {
         "cost": cost,
@@ -1125,51 +1122,43 @@ def _build_calculation_log(
     no_competitor_markup_percent: Decimal,
     markup_percent: Decimal,
     source_labels: dict[str, str] | None = None,
-    applied_rule: dict | None = None,
+    margin_overridden_by_list: bool = False,
 ) -> str:
-    rule_prefix = ""
-    if applied_rule and applied_rule.get("type"):
-        value = applied_rule.get("value")
-        ambiguity = " Status: AMBIGUOUS; existing behavior retained pending business confirmation." if applied_rule.get("ambiguous") else ""
-        rule_prefix = (
-            f"Applied Rule: Type: {applied_rule.get('type')}; "
-            f"Value: {value}; List: \"{applied_rule.get('listName') or applied_rule.get('listId')}\"."
-            f"{ambiguity} "
-        )
     if not competitor_prices:
-        pct = (no_competitor_markup_percent * Decimal("100")).quantize(Decimal("0.01"))
-        return rule_prefix + f"Нет цен выбранных конкурентов. Применена отдельная шкала наценки для товаров без конкурентов: {pct}%."
+        if margin_overridden_by_list:
+            return "Нет цен выбранных конкурентов. Применена шкала маржи для товаров без конкурентов с учетом Lists Management."
+        return "Нет цен выбранных конкурентов. Применена глобальная шкала маржи для товаров без конкурентов."
 
     if reason in {"competitor_bend", "competitor_bend_c1"} and chosen_competitor is not None:
         idx = chosen_rank or next((i + 1 for i, (_, src) in enumerate(competitor_prices) if src == chosen_source), 1)
-        return rule_prefix + f"Цена рассчитана относительно {idx}-й цены конкурента {_source_label(chosen_source, source_labels)}."
+        return f"Цена рассчитана относительно {idx}-й цены конкурента {_source_label(chosen_source, source_labels)}."
         return f"Цена рассчитана относительно конкурента {_source_label(chosen_source, source_labels)} ({idx}-я по величине цена)."
 
     if reason == "all_competitors_failed_mdc":
-        return rule_prefix + "Ни одна цена конкурентов не прошла условие минимальной допустимой цены. Применена минимальная наценка."
+        return "Ни одна цена конкурентов не прошла условие минимальной допустимой цены. Применена минимальная наценка."
 
     if reason == "no_competitor_markup_bumped_to_mdc":
-        return rule_prefix + "Нет цен выбранных конкурентов. Цена по шкале без конкурентов ниже МДЦ, применена МДЦ."
+        return "Нет цен выбранных конкурентов. Цена по шкале без конкурентов ниже МДЦ, применена МДЦ."
 
     if reason == "mdc_floor_after_rounding":
-        return rule_prefix + "Цена поднята до МДЦ после округления или ограничений."
+        return "Цена поднята до МДЦ после округления или ограничений."
 
     if reason == "mdc_floor_after_competitor":
         first_source = _source_label(competitor_prices[0][1], source_labels)
-        return rule_prefix + (
+        return (
             f"Цена установлена по минимальной наценке, так как первая цена конкурента {first_source} "
             "не прошла условие минимальной допустимой цены."
         )
 
     if reason == "min_margin_floor":
-        return rule_prefix + "Цена поднята до минимальной наценки из активного универсального списка."
+        return "Цена поднята до минимальной наценки."
     if reason == "max_margin_cap":
-        return rule_prefix + "Цена ограничена максимальной наценкой из активного универсального списка."
+        return "Цена ограничена максимальной наценкой."
     if reason == "fixed_price_list":
-        return rule_prefix + "Цена установлена фиксированной ценой из активного универсального списка."
+        return "Финальная цена установлена напрямую из фиксированной цены; выбор конкурента и прогиб не применялись."
 
     pct = (markup_percent * Decimal("100")).quantize(Decimal("0.01"))
-    return rule_prefix + f"Цена рассчитана по основной шкале наценки: {pct}%."
+    return f"Цена рассчитана по основной шкале наценки: {pct}%."
 
 
 def calculate_prices(
@@ -1430,7 +1419,7 @@ def calculate_prices(
         cp.used_percentile = bool(debug.get("used_percentile"))
         cp.rating_global = debug.get("rating_global")
         cp.rating_local = debug.get("rating_local")
-        cp.zone = str(debug["zone"])
+        cp.zone = str(debug["zone"] or "")
 
         if existing is None:
             db.add(cp)

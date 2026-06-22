@@ -395,6 +395,147 @@ def test_lists_management_import_excel_adds_items_to_existing_list():
 
 
 @pytest.mark.parametrize(
+    ("list_type", "header"),
+    [
+        ("max_price", "Макс цена"),
+        ("max_price", "Максимальная цена"),
+        ("max_price", "Цена"),
+        ("min_price", "Мин цена"),
+        ("min_price", "Минимальная цена"),
+        ("min_price", "Цена"),
+        ("fixed_price", "Фикс цена"),
+        ("fixed_price", "Фиксированная цена"),
+        ("fixed_price", "Цена"),
+    ],
+)
+def test_lists_management_import_excel_accepts_price_type_business_headers(list_type, header):
+    client, Session = _client()
+    _seed_products(Session)
+    create_response = client.post(
+        "/api/lists-management",
+        json={"code": f"UL-{list_type}", "name": list_type, "type": list_type, "active": True},
+    )
+    list_id = create_response.json()["id"]
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={"file": ("prices.xlsx", _xlsx([["Материал", header], ["12345", 1234.5]]), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["summary"]["processed"] == 1
+    card = client.get(f"/api/lists-management/{list_id}").json()
+    assert card["items"][0]["value"] == 1234.5
+
+
+@pytest.mark.parametrize(
+    ("list_type", "expected_detail"),
+    [
+        ("max_price", "Для списка типа Максимальная цена нужна колонка значения:\nМакс цена / Максимальная цена / Цена"),
+        ("min_price", "Для списка типа Минимальная цена нужна колонка значения:\nМин цена / Минимальная цена / Цена"),
+        ("fixed_price", "Для списка типа Фиксированная цена нужна колонка значения:\nФикс цена / Фиксированная цена / Цена"),
+    ],
+)
+def test_lists_management_import_excel_returns_business_error_for_missing_price_value_column(list_type, expected_detail):
+    client, Session = _client()
+    _seed_products(Session)
+    create_response = client.post(
+        "/api/lists-management",
+        json={"code": f"UL-{list_type}", "name": list_type, "type": list_type, "active": True},
+    )
+    list_id = create_response.json()["id"]
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={"file": ("prices.xlsx", _xlsx([["Материал"], ["12345"]]), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert expected_detail in detail
+    assert "Обнаружены заголовки: материал" in detail
+    assert "Ожидался один из заголовков:" in detail
+
+
+@pytest.mark.parametrize("header", ["Фикс наценка", "Критичка"])
+def test_fixed_markup_import_accepts_template_value_headers(header):
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = client.post(
+        "/api/lists-management",
+        json={"code": f"UL-FM-{header}", "name": "Fixed markup", "type": "fixed_markup", "active": True},
+    ).json()["id"]
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={"file": ("fixed-markup.xlsx", _xlsx([
+            ["Материал", "Артикул", "Производитель", header],
+            ["12345", "", "Maker", 10],
+        ]), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["summary"]["processed"] == 1
+
+
+@pytest.mark.parametrize("raw_value", ["10,5", "10.5"])
+def test_fixed_markup_import_accepts_comma_and_dot_decimals(raw_value):
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = client.post(
+        "/api/lists-management",
+        json={"code": f"UL-FM-{raw_value}", "name": "Fixed markup", "type": "fixed_markup", "active": True},
+    ).json()["id"]
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={"file": ("fixed-markup.xlsx", _xlsx([["Материал", "Фикс наценка"], ["12345", raw_value]]), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+
+    assert response.status_code == 200
+    card = client.get(f"/api/lists-management/{list_id}").json()
+    assert card["items"][0]["value"] == 10.5
+
+
+def test_fixed_markup_unknown_header_returns_detected_and_expected_aliases():
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = client.post(
+        "/api/lists-management",
+        json={"code": "UL-FM-UNKNOWN", "name": "Fixed markup", "type": "fixed_markup", "active": True},
+    ).json()["id"]
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={"file": ("fixed-markup.xlsx", _xlsx([["Материал", "Артикул", "Производитель", "Неизвестно"], ["12345", "", "Maker", 10]]), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "Обнаружены заголовки: материал, артикул, производитель, неизвестно" in detail
+    assert "фикс наценка" in detail
+    assert "критичка" in detail
+
+
+def test_invalid_markup_decimal_returns_json_400_with_clear_detail():
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = client.post(
+        "/api/lists-management",
+        json={"code": "UL-FM-BAD", "name": "Fixed markup", "type": "fixed_markup", "active": True},
+    ).json()["id"]
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={"file": ("fixed-markup.xlsx", _xlsx([["Материал", "Фикс наценка"], ["12345", "ten"]]), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("application/json")
+    assert "Некорректное значение в строке 2" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
     ("list_type", "raw_value", "expected_value", "expected_display"),
     [
         ("critical_markup", 1, 1.0, "1%"),

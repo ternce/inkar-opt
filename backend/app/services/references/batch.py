@@ -3,6 +3,7 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 
 from .imports import import_reference_excel
+from .ratings import RATING_DATA_TYPES, import_top_rating_excel
 from .sources import ReferenceImportSource
 from .statuses import import_job_to_dict
 from .types import BRANCHES
@@ -27,6 +28,18 @@ def import_reference_batch(
     jobs = []
     for payload in source.get_payloads():
         branch_ids = branch_ids_for_import(payload.data_type, selected_branch_ids)
+        if payload.data_type in RATING_DATA_TYPES:
+            jobs.append(
+                import_top_rating_excel(
+                    db=db,
+                    data_type=payload.data_type,
+                    branch_ids=branch_ids,
+                    content=payload.content,
+                    filename=payload.filename,
+                    user_name=user_name,
+                )
+            )
+            continue
         row = import_reference_excel(
             db=db,
             data_type=payload.data_type,

@@ -249,6 +249,10 @@ def run_to_dict(*, db: Session, run: PricingWorkflowRun, include_items: bool = F
             {
                 "sku": product.code,
                 "name": product.name,
+                "globalRating": cp.rating_global,
+                "localRating": cp.rating_local,
+                "global_rating": cp.rating_global,
+                "local_rating": cp.rating_local,
                 "cost": float(cp.cost),
                 "basePrice": float(cp.base_price),
                 "competitorPrice": float(cp.competitor_price) if cp.competitor_price is not None else None,

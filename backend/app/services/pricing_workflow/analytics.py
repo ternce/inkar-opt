@@ -39,7 +39,7 @@ def _lowest_competitor_price(row: CalculatedPrice) -> object:
     return row.lowest_competitor_price if row.lowest_competitor_price is not None else row.competitor_price
 
 
-def _derived_zone(row: CalculatedPrice) -> str:
+def _derived_zone(row: CalculatedPrice) -> str | None:
     zone, _reference, _deviation = calculate_price_zone(
         row.final_price,
         chosen_competitor_price=getattr(row, "chosen_competitor_price", None),
@@ -91,7 +91,7 @@ def build_workflow_analytics(*, db: Session, price_list_id: int) -> dict:
         if isinstance(item, dict) and item.get("id") is not None
     }
 
-    zone_counts = {"left": 0, "optimal": 0, "right": 0, "no-data": 0}
+    zone_counts = {"left": 0, "optimal": 0, "right": 0}
     right_zone_reasons = {
         "right_due_to_mdc_floor": 0,
         "right_due_to_chosen_higher_competitor": 0,
@@ -116,7 +116,8 @@ def build_workflow_analytics(*, db: Session, price_list_id: int) -> dict:
 
     for row in rows:
         zone = _derived_zone(row)
-        zone_counts[zone if zone in zone_counts else "no-data"] += 1
+        if zone in zone_counts:
+            zone_counts[zone] += 1
 
         reason = row.applied_reason or ""
         if "минимальн" in reason.lower() or "mdc" in reason.lower() or "мдц" in reason.lower():
@@ -227,9 +228,7 @@ def build_workflow_analytics(*, db: Session, price_list_id: int) -> dict:
             "leftZone": zone_counts["left"],
             "optimalZone": zone_counts["optimal"],
             "rightZone": zone_counts["right"],
-            "noDataZone": zone_counts["no-data"],
             "noCompetitorRuleApplied": no_competitor_rule_applied,
-            "noIntersection": zone_counts["no-data"],
             "averageMarkup": avg_markup,
             "averageBendPercent": avg_bend,
             "averageFinalPrice": round(sum(final_prices) / len(final_prices), 2) if final_prices else 0,
@@ -243,7 +242,6 @@ def build_workflow_analytics(*, db: Session, price_list_id: int) -> dict:
             {"name": "left", "label": "Левое плечо", "value": zone_counts["left"]},
             {"name": "optimal", "label": "Зона логичности", "value": zone_counts["optimal"]},
             {"name": "right", "label": "Правое плечо", "value": zone_counts["right"]},
-            {"name": "no-data", "label": "Не пересек", "value": zone_counts["no-data"]},
         ],
         "markupHistogram": [{"bucket": key, "value": value} for key, value in markup_buckets.items()],
         "competitorUsage": competitor_usage,

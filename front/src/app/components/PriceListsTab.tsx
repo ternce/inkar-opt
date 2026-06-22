@@ -31,7 +31,6 @@ type AnalyticsSummary = {
   leftZone: number;
   optimalZone: number;
   rightZone: number;
-  noDataZone: number;
   noCompetitorRuleApplied?: number;
   averageMarkup: number;
   minPrice: number | null;
@@ -71,6 +70,8 @@ type PriceItem = {
   topRank?: number | null;
   isTop?: boolean;
   is_top?: number | string | null;
+  globalRating?: number | null;
+  localRating?: number | null;
   manufacturer: string;
   stock: number | null;
   cost: number;
@@ -80,10 +81,20 @@ type PriceItem = {
   priceAfterBend: number | null;
   finalPrice: number;
   markupPercent: number | null;
-  zone: string;
+  zone: string | null;
   priceSource: string;
   percentileSource: string;
   pricingReason: string;
+  pricingCalculationLog?: string;
+  listOverrideLog?: {
+    listName: string;
+    listCode: string;
+    listType: string;
+    value: number | null;
+    displayValue: string;
+    action: string;
+    ambiguous?: boolean;
+  } | null;
   pricingRule: string;
   appliedRuleType?: string;
   appliedRuleValue?: number | null;
@@ -93,13 +104,7 @@ type PriceItem = {
   log: Array<{ label: string; value: any; description: string }>;
 };
 
-const appliedRuleSummary = (row: PriceItem) => {
-  if (!row.appliedRuleType) return row.pricingReason || 'Лог расчёта';
-  const value = row.appliedRuleValue ?? '—';
-  const list = row.appliedListName || 'список не указан';
-  const ambiguity = row.appliedRuleAmbiguous ? ' · неоднозначное правило' : '';
-  return `${row.appliedRuleType} · ${list} · ${value}${ambiguity}`;
-};
+const pricingLogText = (row: PriceItem) => row.pricingCalculationLog || row.pricingReason || 'Причина расчёта не сохранена.';
 
 type CompareRow = {
   sku: string;
@@ -157,16 +162,10 @@ const renderCompetitorCell = (row: PriceItem, column: CompetitorColumn) => {
   return <span title={competitorCellTitle(cell)}>{fmtNumber(cell.price)}{marker}</span>;
 };
 
-const pharmCenterTopLabel = (row: PriceItem) => {
-  const rank = row.topRank ?? row.is_top;
-  return row.isTop || Number(rank) > 0 ? String(rank || 1) : DASH;
-};
-
 const zoneMeta: Record<string, { label: string; title: string; className: string }> = {
   left: { label: 'left', title: 'Цена ниже лучшей цены конкурента', className: 'left' },
   optimal: { label: 'optimal', title: 'Цена в оптимальной зоне', className: 'optimal' },
   right: { label: 'right', title: 'Цена выше оптимального диапазона', className: 'right' },
-  'no-data': { label: 'Зона no-data', title: 'Зона no-data', className: 'no-data' },
 };
 
 export function PriceListsTab({ formatCode, initialPriceListNumber = '' }: PriceListsTabProps) {
@@ -414,13 +413,12 @@ export function PriceListsTab({ formatCode, initialPriceListNumber = '' }: Price
               <Metric label="Левое плечо: ниже конкурента" value={summary?.leftZone ?? 0} />
               <Metric label="optimal" value={summary?.optimalZone ?? 0} />
               <Metric label="right" value={summary?.rightZone ?? 0} />
-              <Metric label="Зона no-data" value={summary?.noDataZone ?? 0} />
               <Metric label="Средняя наценка" value={`${fmtNumber(summary?.averageMarkup)}%`} />
               <Metric label="Avg final price" value={summary?.minPrice != null && summary?.maxPrice != null ? `${fmtNumber(summary.minPrice)}-${fmtNumber(summary.maxPrice)}` : '—'} />
               <Metric label="Percentile usage" value={summary?.percentileUsage ?? 0} />
               <Metric label="Substitute usage" value={opened.analytics?.productsWithSubstituteMatches ?? 0} />
             </div>
-            <p className="text-sm text-gray-600 mt-3">Без конкурентной цены считается по отсутствию competitor_price. Зона no-data — отдельная зона расчета. Левое плечо означает, что цена ниже конкурентной.</p>
+            <p className="text-sm text-gray-600 mt-3">Зона рассчитывается только при наличии первой цены конкурента. Для товаров без конкурентной цены отображается «—».</p>
           </section>
 
           <section className="generated-panel">
@@ -441,15 +439,14 @@ export function PriceListsTab({ formatCode, initialPriceListNumber = '' }: Price
                     <SelectItem value="left">left</SelectItem>
                     <SelectItem value="optimal">optimal</SelectItem>
                     <SelectItem value="right">right</SelectItem>
-                    <SelectItem value="no-data">Зона no-data</SelectItem>
                   </SelectContent>
                 </Select>
                 <Select value={topFilter} onValueChange={(value) => { setTopFilter(value); setPage(1); }}>
-                  <SelectTrigger><SelectValue placeholder="Top PharmCenter" /></SelectTrigger>
+                  <SelectTrigger><SelectValue placeholder="Рейтинг глобальный" /></SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="__all__">All</SelectItem>
-                    <SelectItem value="top">Top only</SelectItem>
-                    <SelectItem value="non_top">Non-top only</SelectItem>
+                    <SelectItem value="__all__">Все</SelectItem>
+                    <SelectItem value="top">С глобальным рейтингом</SelectItem>
+                    <SelectItem value="non_top">Без глобального рейтинга</SelectItem>
                   </SelectContent>
                 </Select>
                 <Select value={sort} onValueChange={setSort}>
@@ -465,10 +462,11 @@ export function PriceListsTab({ formatCode, initialPriceListNumber = '' }: Price
             </div>
             <CompactTable
               empty="По выбранным фильтрам нет товаров"
-              columns={['SKU', 'Top PharmCenter', 'Наименование', 'Производитель', 'Остаток', 'Себестоимость', 'Базовая цена', 'МДЦ', 'Лучший конкурент', ...competitorColumns.map((column) => column.title || column.key), 'После прогиба', 'Финальная цена', 'Наценка %', 'Зона', 'Источник', 'Percentile', 'Причина']}
+              columns={['SKU', 'Рейтинг глобальный', 'Рейтинг локальный', 'Наименование', 'Производитель', 'Остаток', 'Себестоимость', 'Базовая цена', 'МДЦ', 'Лучший конкурент', ...competitorColumns.map((column) => column.title || column.key), 'После прогиба', 'Финальная цена', 'Наценка %', 'Зона', 'Источник', 'Percentile', 'Причина']}
               rows={items.map((row) => [
                 row.sku,
-                pharmCenterTopLabel(row),
+                fmtNumber(row.globalRating),
+                fmtNumber(row.localRating),
                 row.name,
                 row.manufacturer || DASH,
                 fmtNumber(row.stock),
@@ -483,7 +481,12 @@ export function PriceListsTab({ formatCode, initialPriceListNumber = '' }: Price
                 <ZoneBadge key={`${row.sku}-zone`} zone={row.zone} />,
                 row.priceSource || DASH,
                 row.percentileSource || DASH,
-                <button key={`${row.sku}-log`} type="button" className="table-link" onClick={() => setSelectedItem(row)}>{appliedRuleSummary(row)}</button>,
+                <button key={`${row.sku}-log`} type="button" className="table-link max-w-80 text-left" onClick={() => setSelectedItem(row)}>
+                  <span className="block text-blue-700">● {pricingLogText(row)}</span>
+                  {row.listOverrideLog ? (
+                    <span className="mt-1 block text-amber-700">● {row.listOverrideLog.listType} · {row.listOverrideLog.listName} · {row.listOverrideLog.displayValue}</span>
+                  ) : null}
+                </button>,
               ])}
             />
             <div className="generated-pagination">
@@ -531,6 +534,22 @@ export function PriceListsTab({ formatCode, initialPriceListNumber = '' }: Price
                   <p>{selectedItem.name}</p>
                 </div>
               </div>
+              <div className="rounded-md border border-blue-200 bg-blue-50 p-4 text-sm text-blue-950">
+                <strong className="block mb-2">Лог #1 — причина расчёта цены</strong>
+                <p>{selectedItem.pricingCalculationLog || selectedItem.pricingReason || 'Причина расчёта не сохранена.'}</p>
+              </div>
+              {selectedItem.listOverrideLog ? (
+                <div className="rounded-md border border-amber-300 bg-amber-50 p-4 text-sm text-amber-950">
+                  <strong className="block mb-2">Лог #2 — Lists Management</strong>
+                  <p>Позиция найдена в списке:</p>
+                  <p>Название: {selectedItem.listOverrideLog.listName || '—'}</p>
+                  <p>Код: {selectedItem.listOverrideLog.listCode || '—'}</p>
+                  <p>Тип: {selectedItem.listOverrideLog.listType}</p>
+                  <p>Значение: {selectedItem.listOverrideLog.displayValue}</p>
+                  <p className="mt-2 font-medium">{selectedItem.listOverrideLog.action}</p>
+                  {selectedItem.listOverrideLog.ambiguous ? <p className="mt-2 font-semibold">Статус: правило требует бизнес-подтверждения.</p> : null}
+                </div>
+              ) : null}
               {selectedItem.log.map((line) => (
                 <div key={line.label} className="price-log-line">
                   <div>
@@ -559,8 +578,9 @@ function Metric({ label, value }: { label: string; value: any }) {
   );
 }
 
-function ZoneBadge({ zone }: { zone: string }) {
-  const meta = zoneMeta[zone] || zoneMeta['no-data'];
+function ZoneBadge({ zone }: { zone: string | null }) {
+  const meta = zone ? zoneMeta[zone] : undefined;
+  if (!meta) return <span>—</span>;
   return <span className={`zone-badge ${meta.className}`} title={meta.title}>{meta.label}</span>;
 }
 
