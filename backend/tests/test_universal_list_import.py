@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import io
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -353,6 +353,47 @@ def test_lists_management_patch_bad_date_returns_json_400():
     assert response.json() == {"detail": "date must be YYYY-MM-DD or DD.MM.YYYY"}
 
 
+def test_lists_management_response_exposes_effective_status_from_dates():
+    client, Session = _client()
+    today = date.today()
+    db = Session()
+    try:
+        db.add_all(
+            [
+                UniversalList(code="ACTIVE", name="Active", type="fixed_price", status="Активный", start_date=today - timedelta(days=1), end_date=today + timedelta(days=1)),
+                UniversalList(code="EXPIRED", name="Expired", type="fixed_price", status="Активный", start_date=today - timedelta(days=3), end_date=today - timedelta(days=1)),
+                UniversalList(code="FUTURE", name="Future", type="fixed_price", status="Активный", start_date=today + timedelta(days=1), end_date=None),
+                UniversalList(code="OFF", name="Off", type="fixed_price", status="Неактивный", start_date=today - timedelta(days=1), end_date=today + timedelta(days=1)),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    rows = {row["code"]: row for row in client.get("/api/lists-management").json()}
+
+    assert rows["ACTIVE"]["rawStatus"] == "Активный"
+    assert rows["ACTIVE"]["effectiveStatus"] == "active"
+    assert rows["ACTIVE"]["status"] == "Активный"
+    assert rows["ACTIVE"]["active"] is True
+    assert rows["EXPIRED"]["rawStatus"] == "Активный"
+    assert rows["EXPIRED"]["effectiveStatus"] == "expired"
+    assert rows["EXPIRED"]["status"] == "Истёк"
+    assert rows["EXPIRED"]["active"] is False
+    assert rows["EXPIRED"]["dateValidity"]["expired"] is True
+    assert rows["FUTURE"]["effectiveStatus"] == "not_started"
+    assert rows["FUTURE"]["status"] == "Не начался"
+    assert rows["FUTURE"]["active"] is False
+    assert rows["FUTURE"]["dateValidity"]["startsInFuture"] is True
+    assert rows["OFF"]["effectiveStatus"] == "inactive"
+    assert rows["OFF"]["rawStatus"] == "Неактивный"
+
+    active_rows = client.get("/api/lists-management?status=active").json()
+    assert [row["code"] for row in active_rows] == ["ACTIVE"]
+    expired_rows = client.get("/api/lists-management?status=expired").json()
+    assert [row["code"] for row in expired_rows] == ["EXPIRED"]
+
+
 def test_lists_management_import_excel_adds_items_to_existing_list():
     client, Session = _client()
     _seed_products(Session)
@@ -608,6 +649,23 @@ def test_lists_management_manual_item_accepts_comma_decimal():
     assert response.status_code == 200
     card = client.get(f"/api/lists-management/{list_id}").json()
     assert card["items"][0]["value"] == 1000.5
+
+
+def test_lists_management_manual_item_normalizes_sku_before_linking_product():
+    client, Session = _client()
+    _seed_products(Session)
+    create_response = client.post(
+        "/api/lists-management",
+        json={"code": "UL-SKU-NORMALIZED", "name": "Normalized SKU", "type": "fixed_markup", "active": True},
+    )
+    list_id = create_response.json()["id"]
+
+    response = client.post(f"/api/lists-management/{list_id}/items", json={"sku": "222", "value": "5,5"})
+
+    assert response.status_code == 200
+    card = client.get(f"/api/lists-management/{list_id}").json()
+    assert card["items"][0]["sku"] == "000000000000000222"
+    assert card["items"][0]["value"] == 5.5
 
 
 def test_exclude_from_pricing_manual_item_allows_sku_without_value():

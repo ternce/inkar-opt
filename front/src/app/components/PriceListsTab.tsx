@@ -92,6 +92,7 @@ type PriceItem = {
     listType: string;
     value: number | null;
     displayValue: string;
+    affectedField?: string;
     action: string;
     ambiguous?: boolean;
   } | null;
@@ -105,6 +106,16 @@ type PriceItem = {
 };
 
 const pricingLogText = (row: PriceItem) => row.pricingCalculationLog || row.pricingReason || 'Причина расчёта не сохранена.';
+
+const pricingLogTone = (row: PriceItem) => {
+  if (row.appliedRuleType === 'fixed_price') {
+    return 'border-blue-200 bg-blue-50 text-blue-950';
+  }
+  if (row.bestCompetitorPrice == null || row.priceAfterBend == null) {
+    return 'border-red-200 bg-red-50 text-red-950';
+  }
+  return 'border-blue-200 bg-blue-50 text-blue-950';
+};
 
 type CompareRow = {
   sku: string;
@@ -534,7 +545,7 @@ export function PriceListsTab({ formatCode, initialPriceListNumber = '' }: Price
                   <p>{selectedItem.name}</p>
                 </div>
               </div>
-              <div className="rounded-md border border-blue-200 bg-blue-50 p-4 text-sm text-blue-950">
+              <div className={`rounded-md border p-4 text-sm ${pricingLogTone(selectedItem)}`}>
                 <strong className="block mb-2">Лог #1 — причина расчёта цены</strong>
                 <p>{selectedItem.pricingCalculationLog || selectedItem.pricingReason || 'Причина расчёта не сохранена.'}</p>
               </div>
@@ -546,6 +557,7 @@ export function PriceListsTab({ formatCode, initialPriceListNumber = '' }: Price
                   <p>Код: {selectedItem.listOverrideLog.listCode || '—'}</p>
                   <p>Тип: {selectedItem.listOverrideLog.listType}</p>
                   <p>Значение: {selectedItem.listOverrideLog.displayValue}</p>
+                  <p>Поле: {selectedItem.listOverrideLog.affectedField || 'Параметр расчёта'}</p>
                   <p className="mt-2 font-medium">{selectedItem.listOverrideLog.action}</p>
                   {selectedItem.listOverrideLog.ambiguous ? <p className="mt-2 font-semibold">Статус: правило требует бизнес-подтверждения.</p> : null}
                 </div>

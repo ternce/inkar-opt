@@ -12,6 +12,7 @@ import re
 import unicodedata
 from dataclasses import replace
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from urllib.parse import quote
 from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -90,6 +91,7 @@ from .services.pricing import (
     calculate_price_zone,
     resolve_competitor_price,
     calculate_prices,
+    get_markup_percent_by_range,
     margin_percent_from_price,
     normalize_list_type,
 )
@@ -149,6 +151,7 @@ from .services.universal_list_import import (
     business_list_to_dict,
     import_business_list_excel,
     import_universal_list_excel,
+    find_product_by_identifier,
     is_exclude_from_pricing_type,
     max_upload_size_bytes,
     normalize_universal_list_value,
@@ -1581,28 +1584,52 @@ def _applied_list_summary(db: Session, cp: CalculatedPrice) -> dict | None:
     }
 
 
-def _list_override_log(applied: dict | None) -> dict | None:
+def _list_override_log(
+    applied: dict | None,
+    *,
+    global_margin_percent: float | None = None,
+    pricing_margin_percent: float | None = None,
+) -> dict | None:
     if not applied:
         return None
     list_type = str(applied.get("applied_rule_type") or "")
     value = applied.get("applied_rule_value")
     display_value = f"{value:g}%" if value is not None and list_type in {"fixed_markup", "critical_markup"} else f"{value:g}" if value is not None else "—"
     actions = {
-        "fixed_markup": "Использовано значение списка вместо глобального правила.",
-        "critical_markup": "Использовано значение списка вместо глобального правила.",
+        "fixed_markup": "Маржа для расчёта заменена значением списка.",
+        "critical_markup": "Маржа для расчёта заменена значением списка.",
         "fixed_price": "Применена фиксированная цена из списка.",
         "min_price": "Применено ограничение минимальной цены.",
         "max_price": "Применено ограничение максимальной цены.",
         "no_bend": "Прогиб отключён значением списка.",
         "exclude_from_pricing": "Позиция исключена из расчёта значением списка.",
     }
+    affected_fields = {
+        "fixed_markup": "Маржа для расчёта МДЦ",
+        "critical_markup": "Маржа для расчёта МДЦ",
+        "fixed_price": "Финальная цена",
+        "min_price": "Минимальная финальная цена",
+        "max_price": "Максимальная финальная цена",
+        "no_bend": "Прогиб",
+        "exclude_from_pricing": "Участие в расчёте и экспорте",
+    }
+    action = actions.get(list_type, "Применено значение активного списка.")
+    if list_type in {"fixed_markup", "critical_markup"} and pricing_margin_percent is not None:
+        if global_margin_percent is not None:
+            action = (
+                f"Маржа для расчёта переопределена с {global_margin_percent:g}% "
+                f"на {pricing_margin_percent:g}%."
+            )
+        else:
+            action = f"Маржа для расчёта установлена в {pricing_margin_percent:g}%."
     return {
         "listName": applied.get("list_name") or "",
         "listCode": applied.get("list_code") or "",
         "listType": list_type,
         "value": value,
         "displayValue": display_value,
-        "action": actions.get(list_type, "Применено значение активного списка."),
+        "affectedField": affected_fields.get(list_type, "Параметр расчёта"),
+        "action": action,
         "ambiguous": bool(applied.get("ambiguous")),
     }
 
@@ -1611,8 +1638,18 @@ def _pricing_log(db: Session, cp: CalculatedPrice, product: Product, source: Com
     cost = float(cp.cost or 0)
     final = float(cp.final_price or 0)
     margin = margin_percent_from_price(cost, final)
+    pricing_margin = (
+        float(cp.mdc_markup_percent)
+        if getattr(cp, "mdc_markup_percent", None) is not None
+        else float(cp.markup_percent_used)
+        if cp.markup_percent_used is not None
+        else (float(cp.base_price or 0) - cost) / cost * 100
+        if cost
+        else None
+    )
     log = [
         {"label": "Себестоимость", "value": round(cost, 4), "description": "Загруженная себестоимость товара на момент расчёта."},
+        {"label": "Маржа (наценка)", "value": f"{pricing_margin:.2f}%" if pricing_margin is not None else "нет данных", "description": "Эффективная маржа, использованная pricing engine для расчёта МДЦ."},
         {"label": "Фактическая маржа", "value": f"{margin:.2f}%" if margin is not None else "нет данных", "description": "Маржа по финальной цене и себестоимости."},
         {"label": "МДЦ", "value": float(cp.base_price or 0), "description": "Минимально допустимая цена, сохранённая в результате расчёта."},
         {
@@ -1643,7 +1680,20 @@ def _generated_item_dict(
     actual_margin_percent = round(float(actual_margin), 2) if actual_margin is not None else None
     source_label = _source_label(cp.applied_source_name or "")
     applied_list = _applied_list_summary(db, cp)
-    list_override_log = _list_override_log(applied_list)
+    global_margin_percent = None
+    try:
+        global_margin_percent = float(get_markup_percent_by_range(db, pf.id, Decimal(str(cost))) * Decimal("100"))
+    except ValueError:
+        pass
+    list_override_log = _list_override_log(
+        applied_list,
+        global_margin_percent=global_margin_percent,
+        pricing_margin_percent=float(cp.mdc_markup_percent)
+        if getattr(cp, "mdc_markup_percent", None) is not None
+        else float(cp.markup_percent_used)
+        if cp.markup_percent_used is not None
+        else None,
+    )
     ratings = ratings if ratings is not None else _product_ratings_by_id(db, [int(product.id)], str(pf.branch or "")).get(int(product.id), {})
     global_rating = ratings.get("global")
     local_rating = ratings.get("local")
@@ -2126,6 +2176,38 @@ def _list_status_label(value: str | None) -> str:
     return "Неактивный"
 
 
+def _effective_list_status(ul: UniversalList, *, today: date | None = None) -> dict:
+    today = today or date.today()
+    raw_label = _list_status_label(ul.status)
+    if raw_label != "Активный":
+        return {
+            "code": "inactive",
+            "label": "Неактивный",
+            "active": False,
+            "reason": "Список отключён вручную.",
+        }
+    if ul.start_date is not None and ul.start_date > today:
+        return {
+            "code": "not_started",
+            "label": "Не начался",
+            "active": False,
+            "reason": f"Список начнёт применяться {ul.start_date.isoformat()}.",
+        }
+    if ul.end_date is not None and ul.end_date < today:
+        return {
+            "code": "expired",
+            "label": "Истёк",
+            "active": False,
+            "reason": f"Срок действия списка закончился {ul.end_date.isoformat()}.",
+        }
+    return {
+        "code": "active",
+        "label": "Активный",
+        "active": True,
+        "reason": "Список сейчас применим по статусу и периоду действия.",
+    }
+
+
 def _list_bindings(db: Session, list_ids: list[int]) -> dict[int, list[PriceFormat]]:
     if not list_ids:
         return {}
@@ -2159,14 +2241,26 @@ def _sync_universal_list_bindings(db: Session, ul: UniversalList, format_codes: 
 def _universal_list_row(db: Session, ul: UniversalList, item_count: int, bindings: list[PriceFormat] | None) -> dict:
     bindings = bindings or []
     is_global = ul.price_format_id is None and not bindings
+    raw_status = _list_status_label(ul.status)
+    today = date.today()
+    effective_status = _effective_list_status(ul, today=today)
     return {
         "id": ul.id,
         "name": ul.name,
         "code": ul.code or f"UL_{ul.id:06d}",
         "type": _list_type_code(ul.type),
         "typeLabel": _list_type_label(ul.type),
-        "active": _list_status_label(ul.status) == "Активный",
-        "status": _list_status_label(ul.status),
+        "active": bool(effective_status["active"]),
+        "status": effective_status["label"],
+        "rawStatus": raw_status,
+        "effectiveStatus": effective_status["code"],
+        "effectiveStatusLabel": effective_status["label"],
+        "effectiveStatusReason": effective_status["reason"],
+        "dateValidity": {
+            "today": today.isoformat(),
+            "startsInFuture": bool(ul.start_date is not None and ul.start_date > today),
+            "expired": bool(ul.end_date is not None and ul.end_date < today),
+        },
         "itemsCount": int(item_count or 0),
         "priceFormats": [{"code": pf.code, "name": pf.name, "branch": pf.branch} for pf in bindings],
         "scope": "global" if is_global else "formats",
@@ -2271,7 +2365,13 @@ def get_lists_management(
         stmt = stmt.where((UniversalList.type == type) | (UniversalList.type == type_label))
     rows = db.execute(stmt.limit(300)).scalars().all()
     if status and status != "__all__":
-        rows = [row for row in rows if _list_status_label(row.status).lower().startswith(status.lower())]
+        needle = str(status).strip().lower()
+        filtered = []
+        for row in rows:
+            effective_status = _effective_list_status(row)
+            if effective_status["code"].lower().startswith(needle) or effective_status["label"].lower().startswith(needle):
+                filtered.append(row)
+        rows = filtered
     counts = dict(
         db.execute(
             select(ListItem.universal_list_id, func.count(ListItem.id))
@@ -2387,7 +2487,7 @@ def upsert_lists_management_item(list_id: int, payload: dict = Body(...), db: Se
     if not ul:
         raise HTTPException(status_code=404, detail="list not found")
     sku = str(payload.get("sku") or "").strip()
-    product = db.execute(select(Product).where(Product.code == sku)).scalars().first()
+    product = find_product_by_identifier(db, sku)
     if not product:
         raise HTTPException(status_code=404, detail="product not found")
     raw_value = payload.get("value")
@@ -2425,7 +2525,7 @@ async def import_lists_management_items(list_id: int, file: UploadFile = File(..
         sku = str(row[sku_idx] or "").strip()
         if not sku:
             continue
-        product = db.execute(select(Product).where(Product.code == sku)).scalars().first()
+        product = find_product_by_identifier(db, sku)
         if not product:
             continue
         raw_value = row[value_idx] if value_idx is not None and value_idx < len(row) else None
@@ -4225,7 +4325,9 @@ def get_competitor_code_mappings_catalog_view(
     format_code: str | None = Query(None),
     source_q: str = Query(""),
     product_q: str = Query(""),
+    page: int = Query(1, ge=1),
     limit: int = Query(300, ge=1, le=1000),
+    include_candidates: bool = Query(True),
     db: Session = Depends(get_db),
 ):
     try:
@@ -4239,7 +4341,9 @@ def get_competitor_code_mappings_catalog_view(
         status=status,
         source_q=source_q,
         product_q=product_q,
+        page=page,
         limit=limit,
+        include_candidates=include_candidates,
     )
 
 
@@ -4303,6 +4407,11 @@ def create_competitor_code_mapping(payload: dict = Body(...), db: Session = Depe
         confidence=payload.get("confidence", 100),
         created_by=str(payload.get("createdBy") or payload.get("created_by") or ""),
     )
+    if platform == "provisor" and status == "mapped" and product is not None:
+        item_id = payload.get("itemId") or payload.get("item_id")
+        source_item = db.get(CompetitorPriceListItem, int(item_id)) if item_id not in (None, "") else None
+        if source_item is not None and source_item.provisor_goods_id is not None:
+            product.provisor_goods_id = int(source_item.provisor_goods_id)
     db.flush()
     touched = apply_mapping_to_matching_items(db=db, mapping=row, product=product, clear=status == "unmapped")
     db.commit()
@@ -4322,6 +4431,13 @@ def unmap_competitor_code_mapping(mapping_id: int, db: Session = Depends(get_db)
         platform_from_value(row.platform)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    mapped_product = db.get(Product, row.our_product_id) if row.our_product_id else None
+    if (
+        row.platform == "provisor"
+        and mapped_product is not None
+        and str(mapped_product.provisor_goods_id or "") == str(row.source_external_key or "")
+    ):
+        mapped_product.provisor_goods_id = None
     row.status = "unmapped"
     row.our_product_id = None
     row.our_sku = ""

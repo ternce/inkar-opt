@@ -19,6 +19,95 @@ from ...models import (
 from ..competitor_assignments import get_assigned_competitor_price_lists
 
 SUPPORTED_PLATFORMS = {"provisor", "vidman"}
+MANUAL_SUGGESTION_MIN_SCORE = 55.0
+
+
+def _same_manual_value(left: object, right: object) -> bool:
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return abs(float(left) - float(right)) < 0.001
+    return left == right
+
+
+def _manual_suggestion_score(
+    *,
+    product_name: str,
+    product_manufacturer: str,
+    candidate_name: str,
+    candidate_manufacturer: str,
+) -> tuple[float, dict] | None:
+    """Broader scoring used only by the manual Matching Table workflow."""
+    # Local import avoids a module cycle: the automatic matcher imports this
+    # module to apply approved mappings.  No automatic matcher rule is changed.
+    from ..competitor_matching import _base_name_similarity, parse_drug_structure
+
+    product = parse_drug_structure(product_name)
+    candidate = parse_drug_structure(candidate_name)
+    product_base = product.base_name or normalize_mapping_text(product_name)
+    candidate_base = candidate.base_name or normalize_mapping_text(candidate_name)
+    if not product_base or not candidate_base:
+        return None
+    if product_base.split(" ", 1)[0] != candidate_base.split(" ", 1)[0]:
+        return None
+
+    name_score = _base_name_similarity(product_base, candidate_base)
+    if name_score < 68:
+        return None
+
+    strength_fields = (
+        "dosage",
+        "dosage_volume",
+        "concentration",
+        "percent_strength",
+        "iu_dosage",
+        "strength_signature",
+        "volume",
+        "weight",
+    )
+    strength_matches = 0
+    missing_candidate_strength = False
+    for field in strength_fields:
+        left = getattr(product, field, None)
+        right = getattr(candidate, field, None)
+        if left is not None and right is not None:
+            if not _same_manual_value(left, right):
+                return None
+            strength_matches += 1
+        elif left is not None and right is None:
+            missing_candidate_strength = True
+
+    score = name_score * 0.60
+    if strength_matches:
+        score += 18
+    elif missing_candidate_strength:
+        score -= 6
+
+    quantity_match = None
+    if product.quantity is not None and candidate.quantity is not None:
+        quantity_match = product.quantity == candidate.quantity
+        score += 8 if quantity_match else -8
+
+    product_forms = set(product.forms or ((product.form,) if product.form else ()))
+    candidate_forms = set(candidate.forms or ((candidate.form,) if candidate.form else ()))
+    form_match = None
+    if product_forms and candidate_forms:
+        form_match = not product_forms.isdisjoint(candidate_forms)
+        score += 6 if form_match else -6
+
+    manufacturer_score = 0.0
+    if product_manufacturer and candidate_manufacturer:
+        manufacturer_score = _base_name_similarity(product_manufacturer, candidate_manufacturer)
+        score += manufacturer_score * 0.08
+
+    score = round(max(0.0, min(100.0, score)), 2)
+    if score < MANUAL_SUGGESTION_MIN_SCORE:
+        return None
+    return score, {
+        "nameScore": round(name_score, 2),
+        "dosageMatch": bool(strength_matches),
+        "quantityMatch": quantity_match,
+        "formMatch": form_match,
+        "manufacturerScore": round(manufacturer_score, 2),
+    }
 
 
 def normalize_mapping_text(value: object) -> str:
@@ -241,24 +330,20 @@ def list_catalog_code_mappings(
     status: str = "all",
     source_q: str = "",
     product_q: str = "",
+    page: int = 1,
     limit: int = 300,
+    include_candidates: bool = True,
 ) -> dict:
     platform = platform_from_value(platform)
     status = status if status in {"all", "mapped", "unmapped", "rejected", "no_candidates"} else "all"
     limit = max(1, min(int(limit or 300), 1000))
+    page = max(1, int(page or 1))
 
-    product_like = f"%{product_q.strip()}%" if product_q.strip() else ""
     product_stmt = (
         select(Product, ProductExtra)
         .join(ProductExtra, ProductExtra.product_id == Product.id, isouter=True)
         .order_by(Product.code.asc())
     )
-    if product_like:
-        product_stmt = product_stmt.where(
-            (Product.code.ilike(product_like))
-            | (Product.name.ilike(product_like))
-            | (ProductExtra.manufacturer.ilike(product_like))
-        )
     product_rows = db.execute(product_stmt).all()
     products_by_id = {int(product.id): (product, extra) for product, extra in product_rows}
     products_by_sku = {product.code: int(product.id) for product, _ in product_rows}
@@ -285,20 +370,83 @@ def list_catalog_code_mappings(
 
     item_payloads: list[dict] = []
     items_by_product: dict[int, list[dict]] = {}
-    items_by_norm_name: dict[str, list[dict]] = {}
+    payload_by_match_key: dict[str, dict] = {}
+    payloads_by_external_key: dict[str, list[dict]] = {}
     keys: set[str] = set()
     for item, price_list in item_rows:
         payload = _source_item_to_payload(platform, item, price_list)
         item_payloads.append(payload)
-        keys.add(str(payload["sourceMatchKey"] or ""))
+        match_key = str(payload["sourceMatchKey"] or "")
+        keys.add(match_key)
+        if match_key and match_key not in payload_by_match_key:
+            payload_by_match_key[match_key] = payload
+        external_key = str(payload.get("sourceExternalKey") or "")
+        if external_key:
+            payloads_by_external_key.setdefault(external_key, []).append(payload)
         product_id = int(item.product_id) if item.product_id else None
         if product_id is None and item.matched_sku:
             product_id = products_by_sku.get(item.matched_sku)
         if product_id:
             items_by_product.setdefault(product_id, []).append(payload)
-        norm_name = normalize_mapping_text(payload.get("sourceName"))
-        if norm_name:
-            items_by_norm_name.setdefault(norm_name, []).append(payload)
+
+    source_search_requested = bool(source_q.strip())
+    classify_candidates_during_scan = status in {"no_candidates", "rejected"} or source_search_requested
+    needs_candidate_index = include_candidates or classify_candidates_during_scan
+    manual_candidates_by_first_token: dict[str, list[dict]] = {}
+    seen_manual_source_keys: set[str] = set()
+    if needs_candidate_index:
+        from ..competitor_matching import parse_drug_structure
+
+        for payload in item_payloads:
+            source_key = str(payload.get("sourceMatchKey") or payload.get("itemId") or "")
+            if source_key in seen_manual_source_keys:
+                continue
+            seen_manual_source_keys.add(source_key)
+            structure = parse_drug_structure(payload.get("sourceName") or "")
+            base_name = structure.base_name or normalize_mapping_text(payload.get("sourceName"))
+            first_token = base_name.split(" ", 1)[0] if base_name else ""
+            if first_token:
+                manual_candidates_by_first_token.setdefault(first_token, []).append(payload)
+
+    def candidate_pool_for_product(product: Product) -> list[dict]:
+        candidate_pool = []
+        if manual_candidates_by_first_token:
+            from ..competitor_matching import parse_drug_structure
+
+            product_structure = parse_drug_structure(product.name)
+            product_base = product_structure.base_name or normalize_mapping_text(product.name)
+            first_token = product_base.split(" ", 1)[0] if product_base else ""
+            candidate_pool = list(manual_candidates_by_first_token.get(first_token, []))
+        candidate_pool.extend(items_by_product.get(int(product.id), []))
+        return candidate_pool
+
+    def score_candidates_for_product(product: Product, extra: ProductExtra | None, candidate_pool: list[dict]) -> list[dict]:
+        candidate_by_key: dict[str, dict] = {}
+        for candidate in candidate_pool:
+            scored = _manual_suggestion_score(
+                product_name=product.name,
+                product_manufacturer=(extra.manufacturer if extra else "") or "",
+                candidate_name=str(candidate.get("sourceName") or ""),
+                candidate_manufacturer=str(candidate.get("sourceManufacturer") or ""),
+            )
+            if scored is None:
+                continue
+            confidence, score_details = scored
+            candidate_key = str(candidate.get("sourceMatchKey") or candidate.get("itemId") or "")
+            candidate_payload = {
+                **candidate,
+                "confidence": confidence,
+                "matchType": "manual_suggestion",
+                "manualSuggestion": score_details,
+            }
+            previous = candidate_by_key.get(candidate_key)
+            if previous is None or float(previous.get("confidence") or 0) < confidence:
+                candidate_by_key[candidate_key] = candidate_payload
+        return sorted(
+            candidate_by_key.values(),
+            key=lambda item: (float(item.get("confidence") or 0), str(item.get("priceDate") or "")),
+            reverse=True,
+        )[:10]
 
     mappings_by_product: dict[int, CompetitorCodeMapping] = {}
     rejected_keys: set[str] = set()
@@ -327,21 +475,25 @@ def list_catalog_code_mappings(
         "generatedPricingCoverage": generated_coverage,
     }
     rows: list[dict] = []
+    product_search = product_q.strip().casefold()
     for product, extra in product_rows:
         product_id = int(product.id)
         manual = mappings_by_product.get(product_id)
-        candidates = list(items_by_product.get(product_id, []))
-        norm_product_name = normalize_mapping_text(product.name)
-        for candidate in items_by_norm_name.get(norm_product_name, []):
-            if candidate not in candidates:
-                candidates.append(candidate)
-        candidates = candidates[:10]
+        product_items = list(items_by_product.get(product_id, []))
+        existing_matched_item = next((item for item in product_items if item.get("matchedSku") == product.code), None)
+        has_primary_goods_mapping = platform == "provisor" and product.provisor_goods_id is not None
+        candidate_pool = [] if (manual or has_primary_goods_mapping or existing_matched_item) else candidate_pool_for_product(product)
+        candidates = (
+            score_candidates_for_product(product, extra, candidate_pool)
+            if candidate_pool and classify_candidates_during_scan
+            else []
+        )
 
         mapped_item = None
         mapping_id = None
         row_status = "unmapped"
         if manual is not None:
-            mapped_item = next((item for item in item_payloads if item.get("sourceMatchKey") == manual.source_match_key), None)
+            mapped_item = payload_by_match_key.get(manual.source_match_key)
             mapped_item = mapped_item or {
                 "sourceExternalKey": manual.source_external_key,
                 "sourceMatchKey": manual.source_match_key,
@@ -354,12 +506,31 @@ def list_catalog_code_mappings(
             }
             mapping_id = manual.id
             row_status = "mapped"
-        elif candidates:
-            mapped_item = candidates[0]
+        elif has_primary_goods_mapping:
+            # Provisor goodsId is the canonical durable product mapping.  The
+            # latest price list is only a candidate/price source and must not
+            # make an already mapped catalog product appear as unmatched.
+            mapped_item = next(iter(payloads_by_external_key.get(str(product.provisor_goods_id), [])), None)
+            mapped_item = mapped_item or {
+                "sourceExternalKey": str(product.provisor_goods_id),
+                "sourceMatchKey": source_match_key(platform=platform, source_external_key=product.provisor_goods_id),
+                "matchType": "provisor_goods_id",
+                "matchedSku": product.code,
+                "platform": platform,
+            }
+            row_status = "mapped"
+        elif existing_matched_item is not None:
+            mapped_item = existing_matched_item
+            row_status = "mapped"
+        elif classify_candidates_during_scan and candidates:
+            matched_candidate = next((item for item in candidates if item.get("matchedSku") == product.code), None)
+            mapped_item = matched_candidate or candidates[0]
             if mapped_item.get("sourceMatchKey") in rejected_keys:
                 row_status = "rejected"
             else:
-                row_status = "mapped" if mapped_item.get("matchedSku") == product.code else "unmapped"
+                row_status = "mapped" if matched_candidate is not None else "unmapped"
+        elif candidate_pool:
+            row_status = "unmapped"
         else:
             row_status = "no_candidates"
 
@@ -373,14 +544,20 @@ def list_catalog_code_mappings(
         else:
             metrics["unmapped"] += 1
 
-        if status != "all" and row_status != status:
+        if status == "unmapped" and row_status not in {"unmapped", "no_candidates"}:
             continue
-        if source_q.strip() and not candidates and manual is None:
+        if status not in {"all", "unmapped"} and row_status != status:
+            continue
+        if product_search and not any(
+            product_search in str(value or "").casefold()
+            for value in (product.code, product.name, extra.manufacturer if extra else "")
+        ):
+            continue
+        if source_search_requested and not candidates and manual is None:
             continue
 
         source = mapped_item or {}
-        if len(rows) < limit:
-            rows.append(
+        rows.append(
                 {
                     "productId": product_id,
                     "ourProductId": product_id,
@@ -391,7 +568,7 @@ def list_catalog_code_mappings(
                     "status": "unmapped" if row_status == "no_candidates" else row_status,
                     "mappingStatus": row_status,
                     "mappingId": mapping_id,
-                    "candidatesCount": len(candidates),
+                    "candidatesCount": len(candidates) if classify_candidates_during_scan else len(candidate_pool),
                     "candidates": candidates,
                     "bestCandidate": candidates[0] if candidates else None,
                     "confidence": source.get("confidence"),
@@ -413,7 +590,54 @@ def list_catalog_code_mappings(
 
     metrics["coveragePercent"] = round((metrics["mapped"] / metrics["total"]) * 100, 2) if metrics["total"] else 0
     metrics["mappingCoveragePercent"] = metrics["coveragePercent"]
-    return {"items": rows, "metrics": [metrics]}
+    filtered_total = len(rows)
+    page_count = (filtered_total + limit - 1) // limit if filtered_total else 0
+    if page_count and page > page_count:
+        page = page_count
+    start = (page - 1) * limit
+    page_rows = rows[start : start + limit]
+    if include_candidates:
+        for row in page_rows:
+            if row.get("mappingStatus") not in {"unmapped", "no_candidates"}:
+                continue
+            product, extra = products_by_id.get(int(row["productId"]), (None, None))
+            if product is None:
+                continue
+            candidates = score_candidates_for_product(product, extra, candidate_pool_for_product(product))
+            row["candidates"] = candidates
+            row["candidatesCount"] = len(candidates)
+            row["bestCandidate"] = candidates[0] if candidates else None
+            if candidates:
+                source = candidates[0]
+                row["mappingStatus"] = "unmapped"
+                row["status"] = "unmapped"
+                row["confidence"] = source.get("confidence")
+                row["itemId"] = source.get("itemId")
+                row["priceListId"] = source.get("priceListId")
+                row["priceListName"] = source.get("priceListName") or ""
+                row["matchType"] = source.get("matchType") or ""
+                row["matchedSku"] = source.get("matchedSku") or ""
+                row["sourcePrice"] = source.get("sourcePrice")
+                row["priceDate"] = source.get("priceDate") or ""
+                row["sourceExternalKey"] = source.get("sourceExternalKey")
+                row["sourceMatchKey"] = source.get("sourceMatchKey") or ""
+                row["sourceName"] = source.get("sourceName") or ""
+                row["sourceManufacturer"] = source.get("sourceManufacturer") or ""
+                row["sourceDosageForm"] = source.get("sourceDosageForm") or ""
+                row["sourceNormalizedName"] = source.get("sourceNormalizedName") or ""
+            else:
+                row["mappingStatus"] = "no_candidates"
+                row["status"] = "unmapped"
+    return {
+        "items": page_rows,
+        "metrics": [metrics],
+        "pagination": {
+            "page": page,
+            "pageSize": limit,
+            "total": filtered_total,
+            "pageCount": page_count,
+        },
+    }
 
 
 def list_code_mappings(

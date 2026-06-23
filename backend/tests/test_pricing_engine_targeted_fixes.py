@@ -1,4 +1,5 @@
 from datetime import date
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import create_engine
@@ -283,6 +284,122 @@ def test_fixed_markup_list_overrides_default_markup():
     assert round(float(debug["mdc_price"]), 2) == 105.26
 
 
+def test_fixed_markup_5_5_overrides_global_20_and_is_persisted_in_logs():
+    db = _session()
+    pf = _format(db)
+    db.query(MarkupRange).filter(MarkupRange.price_format_id == pf.id).delete()
+    db.add(MarkupRange(price_format_id=pf.id, cost_from=0, cost_to=None, markup_percent=0.20))
+    product = _product(db, code="FIXED-5-5", cost=1000)
+    row = _list_item(db, product, "fixed_markup", 5.5, pf=pf)
+
+    calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="PL-FIXED-5-5",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        force_new_price_list=True,
+    )
+
+    cp = db.query(CalculatedPrice).one()
+    payload = _generated_item_dict(db, cp, product, pf, None)
+    log_by_label = {line["label"]: line["value"] for line in payload["log"]}
+
+    assert float(cp.markup_percent_used) == 5.5
+    assert float(cp.mdc_markup_percent) == 5.5
+    assert round(float(cp.mdc_price), 2) == 1058.20
+    assert cp.applied_list_id == row.id
+    assert cp.applied_list_ids == f"[{row.id}]"
+    assert log_by_label["Маржа (наценка)"] == "5.50%"
+    assert payload["listOverrideLog"]["affectedField"] == "Маржа для расчёта МДЦ"
+    assert payload["listOverrideLog"]["action"] == "Маржа для расчёта переопределена с 20% на 5.5%."
+
+
+def test_exact_lists_management_audit_skus_apply_overrides_during_generation():
+    db = _session()
+    rounding = RoundingRule(code="R01", name="R01", mode="math", precision=2, step=0.01)
+    db.add(rounding)
+    db.flush()
+    pf = _format(db, rounding=rounding)
+    db.query(MarkupRange).filter(MarkupRange.price_format_id == pf.id).delete()
+    db.add(MarkupRange(price_format_id=pf.id, cost_from=0, cost_to=None, markup_percent=0.20))
+    db.flush()
+
+    specs = [
+        ("000000000001017768", 8589.64, "fixed_price", Decimal("12100")),
+        ("000000000001017769", 5257.77, "fixed_price", Decimal("9000")),
+        ("000000000001017758", 3000, "fixed_price", Decimal("4200")),
+        ("000000000001003454", 617.50, "max_price", Decimal("900")),
+        ("000000000001005967", 559.45, "max_price", Decimal("820")),
+        ("000000000001005754", 678.87, "max_price", Decimal("1000")),
+        ("000000000001015510", 5000, "min_price", Decimal("7300")),
+        ("000000000001015509", 1733.14, "min_price", Decimal("2200")),
+        ("000000000001013903", 383, "fixed_markup", Decimal("5.5")),
+        ("000000000001015508", 6239.30, "fixed_markup", Decimal("3.3")),
+        ("000000000001002221", 10656, "critical_markup", Decimal("4.6")),
+        ("000000000001006722", 2312.75, "critical_markup", Decimal("15.5")),
+    ]
+    expected_by_sku = {sku: (list_type, value, Decimal(str(cost))) for sku, cost, list_type, value in specs}
+
+    for sku, cost, list_type, value in specs:
+        product = _product(db, code=sku, cost=cost)
+        ul = UniversalList(
+            code=f"UL-AUDIT-{list_type}-{sku}",
+            name=f"audit {list_type}",
+            type=list_type,
+            status="active",
+            price_format_id=None,
+        )
+        db.add(ul)
+        db.flush()
+        db.add(UniversalListPriceFormat(universal_list_id=ul.id, price_format_id=pf.id))
+        db.add(ListItem(universal_list_id=ul.id, product_id=product.id, value=value))
+    db.flush()
+
+    calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="PL-EXACT-LISTS-AUDIT",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        force_new_price_list=True,
+    )
+
+    products_by_id = {row.id: row for row in db.query(Product).all()}
+    calculated = db.query(CalculatedPrice).all()
+    assert len(calculated) == len(specs)
+
+    for cp in calculated:
+        product = products_by_id[cp.product_id]
+        list_type, expected_value, cost = expected_by_sku[product.code]
+        payload = _generated_item_dict(db, cp, product, pf, None)
+        list_log = payload["listOverrideLog"]
+        log_by_label = {line["label"]: line["value"] for line in payload["log"]}
+
+        assert cp.applied_rule_type == list_type
+        assert float(cp.applied_rule_value) == float(expected_value)
+        assert list_log["listType"] == list_type
+        assert list_log["displayValue"] in {f"{float(expected_value):g}", f"{float(expected_value):g}%"}
+        assert "Маржа (наценка)" in log_by_label
+        assert "Фактическая маржа" in log_by_label
+
+        if list_type == "fixed_price":
+            assert Decimal(str(cp.final_price)) == expected_value
+            assert payload["finalPrice"] == float(expected_value)
+        elif list_type == "min_price":
+            assert Decimal(str(cp.final_price)) >= expected_value
+        elif list_type == "max_price":
+            assert Decimal(str(cp.final_price)) <= expected_value
+        else:
+            expected_mdc = cost / (Decimal("1") - expected_value / Decimal("100"))
+            assert Decimal(str(cp.mdc_markup_percent)) == expected_value
+            assert Decimal(str(cp.markup_percent_used)) == expected_value
+            assert Decimal(str(cp.mdc_price)).quantize(Decimal("0.01")) == expected_mdc.quantize(Decimal("0.01"))
+            assert log_by_label["Маржа (наценка)"] == f"{float(expected_value):.2f}%"
+
+
 def test_fixed_markup_one_is_one_percent_not_one_hundred_percent():
     db = _session()
     pf = _format(db)
@@ -540,6 +657,7 @@ def test_api_payload_keeps_pricing_and_max_price_list_logs_independent():
         "listType": "max_price",
         "value": 820.0,
         "displayValue": "820",
+        "affectedField": "Максимальная финальная цена",
         "action": "Применено ограничение максимальной цены.",
         "ambiguous": False,
     }
@@ -867,6 +985,7 @@ def test_generated_item_payload_exposes_applied_list_rule_details():
         "listType": "fixed_price",
         "value": 2500.0,
         "displayValue": "2500",
+        "affectedField": "Финальная цена",
         "action": "Применена фиксированная цена из списка.",
         "ambiguous": False,
     }
@@ -898,6 +1017,21 @@ def test_zone_boundaries_are_relative_to_lowest_competitor(final_price, expected
 
     assert zone == expected_zone
     assert float(reference) == 100
+
+
+@pytest.mark.parametrize(
+    ("final_price", "expected_zone"),
+    [(999, "left"), (1000, "optimal"), (1030, "optimal"), (1031, "right")],
+)
+def test_zone_business_rule_exact_c1_1000_cases(final_price, expected_zone):
+    zone, reference, _deviation = calculate_price_zone(
+        final_price,
+        chosen_competitor_price=1500,
+        lowest_competitor_price=1000,
+    )
+
+    assert zone == expected_zone
+    assert float(reference) == 1000
 
 
 def test_zone_falls_back_to_lowest_competitor_when_chosen_missing():
@@ -939,6 +1073,7 @@ def test_generated_item_markup_is_rule_markup_and_actual_margin_is_separate():
         competitor_price=None,
         final_price=120,
         markup_percent_used=15,
+        mdc_markup_percent=10,
         zone="",
     )
     db.add(cp)
@@ -948,8 +1083,36 @@ def test_generated_item_markup_is_rule_markup_and_actual_margin_is_separate():
 
     assert item["markupPercent"] == 15
     assert item["actualMarginPercent"] == 16.67
+    log_by_label = {line["label"]: line["value"] for line in item["log"]}
+    assert log_by_label["Маржа (наценка)"] == "10.00%"
+    assert log_by_label["Фактическая маржа"] == "16.67%"
     assert item["zone"] is None
     assert _export_zone(cp) == ""
+
+
+def test_legacy_generated_item_recovers_pricing_percent_from_stored_base_price():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, cost=100)
+    pl = PriceList(number="PL-LEGACY", price_format_id=pf.id, user="test")
+    db.add(pl)
+    db.flush()
+    cp = CalculatedPrice(
+        price_list_id=pl.id,
+        product_id=product.id,
+        cost=100,
+        base_price=115,
+        final_price=120,
+        zone="",
+    )
+    db.add(cp)
+    db.flush()
+
+    item = _generated_item_dict(db, cp, product, pf, None)
+    log_by_label = {line["label"]: line["value"] for line in item["log"]}
+
+    assert log_by_label["Маржа (наценка)"] == "15.00%"
+    assert log_by_label["Фактическая маржа"] == "16.67%"
 
 
 def test_mapping_response_exposes_mapping_and_generated_coverage():

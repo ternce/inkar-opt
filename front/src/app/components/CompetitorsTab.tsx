@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { ChevronDown, Eye, FileDown, FileUp, Link2, RefreshCw, Search, Trash2, XCircle } from 'lucide-react';
 import { Button } from './ui/button';
@@ -120,6 +120,13 @@ type CodeMappingRow = CodeMappingCandidate & {
   ourSku?: string;
   ourName?: string;
   ourManufacturer?: string;
+};
+
+type MappingPagination = {
+  page: number;
+  pageSize: number;
+  total: number;
+  pageCount: number;
 };
 
 type ProductSearchRow = {
@@ -278,6 +285,10 @@ export function CompetitorsTab({ formatCode }: Props) {
   const [mappingStatus, setMappingStatus] = useState<MappingStatus>('unmapped');
   const [sourceQuery, setSourceQuery] = useState('');
   const [productQuery, setProductQuery] = useState('');
+  const [appliedSourceQuery, setAppliedSourceQuery] = useState('');
+  const [appliedProductQuery, setAppliedProductQuery] = useState('');
+  const [mappingPage, setMappingPage] = useState(1);
+  const [mappingPagination, setMappingPagination] = useState<MappingPagination>({ page: 1, pageSize: 50, total: 0, pageCount: 0 });
   const [codeRows, setCodeRows] = useState<CodeMappingRow[]>([]);
   const [metrics, setMetrics] = useState<CodeMappingMetric[]>([]);
   const [selectedRow, setSelectedRow] = useState<CodeMappingRow | null>(null);
@@ -289,6 +300,7 @@ export function CompetitorsTab({ formatCode }: Props) {
   const [activeJob, setActiveJob] = useState<JobState | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const mappingRequestRef = useRef<AbortController | null>(null);
 
   const loadSources = async () => {
     const res = await fetch(`/api/competitors/price-lists?format_code=${encodeURIComponent(formatCode)}`);
@@ -322,28 +334,39 @@ export function CompetitorsTab({ formatCode }: Props) {
     setProvisorAccounts(Array.isArray(data) ? data : []);
   };
 
-  const loadCodeMappings = async () => {
+  const loadCodeMappings = async (signal?: AbortSignal) => {
+    const controller = signal ? null : new AbortController();
+    if (controller) {
+      mappingRequestRef.current?.abort();
+      mappingRequestRef.current = controller;
+    }
+    const requestSignal = signal || controller?.signal;
     const params = new URLSearchParams({
       platform: mappingPlatform,
       status: mappingStatus,
       format_code: formatCode,
-      limit: '300',
+      page: String(mappingPage),
+      limit: '50',
+      include_candidates: 'false',
     });
-    if (sourceQuery.trim()) params.set('source_q', sourceQuery.trim());
-    if (productQuery.trim()) params.set('product_q', productQuery.trim());
-    const res = await fetch(`/api/competitors/code-mappings/catalog-view?${params.toString()}`);
+    if (appliedSourceQuery) params.set('source_q', appliedSourceQuery);
+    if (appliedProductQuery) params.set('product_q', appliedProductQuery);
+    const res = await fetch(`/api/competitors/code-mappings/catalog-view?${params.toString()}`, { signal: requestSignal });
     const text = await res.text();
     const data = parseJsonOrNull(text);
     if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить таблицу соответствий');
     setCodeRows(Array.isArray(data?.items) ? data.items : []);
     setMetrics(Array.isArray(data?.metrics) ? data.metrics : []);
+    setMappingPagination(data?.pagination || { page: mappingPage, pageSize: 50, total: 0, pageCount: 0 });
+    if (data?.pagination?.page && data.pagination.page !== mappingPage) setMappingPage(data.pagination.page);
+    if (controller && mappingRequestRef.current === controller) mappingRequestRef.current = null;
   };
 
   const loadAll = async () => {
     setIsLoading(true);
     setError(null);
     try {
-      await Promise.all([loadSources(), loadPercentiles(), loadCodeMappings(), loadProvisorDiagnostics(), loadProvisorAccounts()]);
+      await Promise.all([loadSources(), loadPercentiles(), loadProvisorDiagnostics(), loadProvisorAccounts()]);
     } catch (e: any) {
       setError(e?.message || 'Ошибка загрузки');
     } finally {
@@ -357,12 +380,34 @@ export function CompetitorsTab({ formatCode }: Props) {
   }, [formatCode]);
 
   useEffect(() => {
+    mappingRequestRef.current?.abort();
+    const controller = new AbortController();
+    mappingRequestRef.current = controller;
     const timer = window.setTimeout(() => {
-      void loadCodeMappings().catch((e: any) => setError(e?.message || 'Ошибка загрузки таблицы соответствий'));
+      setIsLoading(true);
+      void loadCodeMappings(controller.signal)
+        .catch((e: any) => {
+          if (e?.name !== 'AbortError') setError(e?.message || 'Ошибка загрузки таблицы соответствий');
+        })
+        .finally(() => {
+          if (mappingRequestRef.current === controller) {
+            setIsLoading(false);
+            mappingRequestRef.current = null;
+          }
+        });
     }, 250);
-    return () => window.clearTimeout(timer);
+    return () => {
+      window.clearTimeout(timer);
+      mappingRequestRef.current?.abort();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mappingPlatform, mappingStatus, sourceQuery, productQuery, formatCode]);
+  }, [mappingPlatform, mappingStatus, appliedSourceQuery, appliedProductQuery, mappingPage, formatCode]);
+
+  const submitMappingSearch = () => {
+    setAppliedSourceQuery(sourceQuery.trim());
+    setAppliedProductQuery(productQuery.trim());
+    setMappingPage(1);
+  };
 
   const pollJob = async (jobId: string) => {
     while (true) {
@@ -459,6 +504,30 @@ export function CompetitorsTab({ formatCode }: Props) {
     setProductResults(Array.isArray(data) ? data : []);
   };
 
+  const loadCandidatesForRow = async (row: CodeMappingRow) => {
+    if (row.candidates?.length || row.mappingStatus === 'mapped') return;
+    const params = new URLSearchParams({
+      platform: mappingPlatform,
+      status: 'unmapped',
+      format_code: formatCode,
+      product_q: row.ourSku || row.ourName || '',
+      page: '1',
+      limit: '1',
+      include_candidates: 'true',
+    });
+    const res = await fetch(`/api/competitors/code-mappings/catalog-view?${params.toString()}`);
+    const text = await res.text();
+    const data = parseJsonOrNull(text);
+    if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить кандидатов');
+    const fresh = (Array.isArray(data?.items) ? data.items : []).find(
+      (item: CodeMappingRow) => item.ourProductId === row.ourProductId || item.ourSku === row.ourSku,
+    );
+    if (!fresh) return;
+    setSelectedRow((current) => (current?.ourProductId === row.ourProductId ? { ...current, ...fresh } : current));
+    setSelectedCandidate(fresh.bestCandidate || fresh.candidates?.[0] || (fresh.itemId ? fresh : null));
+    setCodeRows((current) => current.map((item) => (item.ourProductId === row.ourProductId ? { ...item, ...fresh } : item)));
+  };
+
   const selectMappingRow = (row: CodeMappingRow) => {
     setSelectedRow(row);
     setSelectedCandidate(row.bestCandidate || row.candidates?.[0] || (row.itemId ? row : null));
@@ -466,6 +535,7 @@ export function CompetitorsTab({ formatCode }: Props) {
     const query = candidateQueryForRow(row);
     setProductSearch(query);
     setProductResults([]);
+    void loadCandidatesForRow(row).catch((err: any) => setError(err?.message || 'Ошибка загрузки кандидатов'));
   };
 
   const mapSelected = async () => {
@@ -739,6 +809,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                 size="sm"
                 onClick={() => {
                   setMappingPlatform(platform);
+                  setMappingPage(1);
                   setSelectedRow(null);
                   setSelectedProduct(null);
                   setProductResults([]);
@@ -773,7 +844,7 @@ export function CompetitorsTab({ formatCode }: Props) {
       <div className="admin-card p-4">
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-            {(['unmapped', 'mapped', 'rejected', 'no_candidates'] as MappingStatus[]).map((status) => (
+            {(['unmapped'] as MappingStatus[]).map((status) => (
               <Button
                 key={status}
                 type="button"
@@ -781,6 +852,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                 size="sm"
                 onClick={() => {
                   setMappingStatus(status);
+                  setMappingPage(1);
                   setSelectedRow(null);
                   setSelectedProduct(null);
                   setProductResults([]);
@@ -792,8 +864,13 @@ export function CompetitorsTab({ formatCode }: Props) {
           </div>
           <div className="grid grid-cols-1 gap-2 lg:grid-cols-[minmax(220px,1fr)_minmax(220px,1fr)_auto]">
             <Input value={sourceQuery} onChange={(e) => setSourceQuery(e.target.value)} placeholder="Товар конкурента или производитель" />
-            <Input value={productQuery} onChange={(e) => setProductQuery(e.target.value)} placeholder="Наш SKU, товар или производитель" />
-            <Button variant="outline" size="sm" onClick={loadCodeMappings}>
+            <Input
+              value={productQuery}
+              onChange={(e) => setProductQuery(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') submitMappingSearch(); }}
+              placeholder="Наш SKU, товар или производитель"
+            />
+            <Button variant="outline" size="sm" onClick={submitMappingSearch}>
               <Search className="mr-2 h-4 w-4" />
               Найти
             </Button>
@@ -846,6 +923,13 @@ export function CompetitorsTab({ formatCode }: Props) {
                 ) : null}
               </tbody>
             </table>
+          </div>
+          <div className="flex items-center justify-between gap-3 border-t border-gray-200 px-4 py-3 text-sm text-gray-600">
+            <span>{fmtNumber(mappingPagination.total)} товаров · страница {fmtNumber(mappingPagination.page)} из {fmtNumber(mappingPagination.pageCount || 1)}</span>
+            <div className="flex gap-2">
+              <Button variant="outline" size="sm" disabled={mappingPage <= 1} onClick={() => setMappingPage((page) => Math.max(1, page - 1))}>Назад</Button>
+              <Button variant="outline" size="sm" disabled={mappingPagination.pageCount === 0 || mappingPage >= mappingPagination.pageCount} onClick={() => setMappingPage((page) => page + 1)}>Вперёд</Button>
+            </div>
           </div>
         </div>
 

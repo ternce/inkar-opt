@@ -20,6 +20,10 @@ type ListRow = {
   typeLabel: string;
   active: boolean;
   status: string;
+  rawStatus?: string;
+  effectiveStatus?: 'active' | 'expired' | 'not_started' | 'inactive' | string;
+  effectiveStatusLabel?: string;
+  effectiveStatusReason?: string;
   itemsCount: number;
   priceFormats: PriceFormat[];
   scope: 'global' | 'formats';
@@ -84,6 +88,14 @@ const formatScope = (row: ListRow) => {
   if (!row.priceFormats.length) return 'Не привязан';
   return row.priceFormats.map((format) => format.code).join(', ');
 };
+
+const effectiveStatusClass = (row: ListRow) => {
+  if (row.effectiveStatus === 'active' || row.active) return 'ok';
+  if (row.effectiveStatus === 'expired' || row.effectiveStatus === 'not_started') return 'warn';
+  return 'muted';
+};
+
+const effectiveStatusText = (row: ListRow) => row.effectiveStatusLabel || row.status || '—';
 
 const formatFileSize = (bytes: number) => {
   if (bytes < 1024) return `${bytes} B`;
@@ -332,9 +344,10 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
           <SelectTrigger><SelectValue placeholder="Статус" /></SelectTrigger>
           <SelectContent>
             <SelectItem value="__all__">Все статусы</SelectItem>
-            <SelectItem value="актив">Активные</SelectItem>
-            <SelectItem value="неактив">Неактивные</SelectItem>
-            <SelectItem value="архив">Архивные</SelectItem>
+            <SelectItem value="active">Активные сейчас</SelectItem>
+            <SelectItem value="expired">Истёкшие</SelectItem>
+            <SelectItem value="not_started">Не начались</SelectItem>
+            <SelectItem value="inactive">Неактивные вручную</SelectItem>
           </SelectContent>
         </Select>
       </div>
@@ -352,15 +365,15 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
               <thead>
                 <tr>
                   <th>Наименование</th>
+                  <th>Действия</th>
                   <th>Тип списка</th>
-                  <th>Активен</th>
+                  <th>Статус</th>
                   <th>Товаров</th>
                   <th>Привязанные ЦФ</th>
                   <th>Дата начала</th>
                   <th>Дата окончания</th>
                   <th>Последнее изменение</th>
                   <th>Комментарий</th>
-                  <th>Действия</th>
                 </tr>
               </thead>
               <tbody>
@@ -371,14 +384,6 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
                       <div className="muted">{row.code}</div>
                       {opened?.id === row.id ? <span className="selected-list-badge">Выбран</span> : null}
                     </td>
-                    <td>{listTypeLabel(row.type, row.typeLabel)}</td>
-                    <td><span className={`status-pill ${row.active ? 'ok' : 'muted'}`}>{row.status}</span></td>
-                    <td>{row.itemsCount}</td>
-                    <td>{formatScope(row)}</td>
-                    <td>{row.startDate || '—'}</td>
-                    <td>{row.endDate || '—'}</td>
-                    <td>{row.updatedAt || '—'}</td>
-                    <td>{row.comment || '—'}</td>
                     <td>
                       <div className="row-actions">
                         <Button variant="ghost" size="sm" onClick={() => void openCard(row.id)}>Открыть</Button>
@@ -388,6 +393,19 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
                         <Button variant="ghost" size="sm" onClick={() => void deleteList(row)}><Trash2 className="h-4 w-4" /></Button>
                       </div>
                     </td>
+                    <td>{listTypeLabel(row.type, row.typeLabel)}</td>
+                    <td>
+                      <span className={`status-pill ${effectiveStatusClass(row)}`} title={row.effectiveStatusReason || ''}>
+                        {effectiveStatusText(row)}
+                      </span>
+                      <div className="muted">DB: {row.rawStatus || row.status || '—'}</div>
+                    </td>
+                    <td>{row.itemsCount}</td>
+                    <td>{formatScope(row)}</td>
+                    <td>{row.startDate || '—'}</td>
+                    <td>{row.endDate || '—'}</td>
+                    <td>{row.updatedAt || '—'}</td>
+                    <td>{row.comment || '—'}</td>
                   </tr>
                 ))}
                 {!rows.length && (
@@ -420,7 +438,15 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
                 <div><span>Наименование</span><strong>{opened.name}</strong></div>
                 <div><span>Код</span><strong>{opened.code}</strong></div>
                 <div><span>Тип</span><strong>{opened.typeLabel || opened.type}</strong></div>
-                <div><span>Активность</span><strong>{opened.status}</strong></div>
+                <div><span>Статус в БД</span><strong>{opened.rawStatus || opened.status}</strong></div>
+                <div>
+                  <span>Эффективный статус</span>
+                  <strong>
+                    <span className={`status-pill ${effectiveStatusClass(opened)}`} title={opened.effectiveStatusReason || ''}>
+                      {effectiveStatusText(opened)}
+                    </span>
+                  </strong>
+                </div>
                 <div><span>Период</span><strong>{opened.startDate || '—'} — {opened.endDate || '—'}</strong></div>
                 <div><span>Привязка</span><strong>{formatScope(opened)}</strong></div>
               </div>

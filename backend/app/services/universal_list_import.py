@@ -223,7 +223,7 @@ def _product_lookup_keys(value: object) -> list[str]:
     return keys
 
 
-def _find_product(db: Session, identifier: object) -> Product | None:
+def find_product_by_identifier(db: Session, identifier: object) -> Product | None:
     keys = _product_lookup_keys(identifier)
     if not keys:
         return None
@@ -416,7 +416,7 @@ def import_business_list_excel(
             issues.append(ImportIssue(excel_row_number, "invalid_value", error, identifier=identifier, field="value"))
             continue
 
-        product = _find_product(db, identifier)
+        product = find_product_by_identifier(db, identifier)
         if product is None:
             summary["not_found"] += 1
             issues.append(
@@ -555,7 +555,7 @@ def import_universal_list_excel(
             issues.append(ImportIssue(excel_row_number, "invalid_value", error or "invalid value", identifier=identifier, field="value"))
             continue
 
-        product = _find_product(db, identifier)
+        product = find_product_by_identifier(db, identifier)
         if product is None:
             summary["not_found"] += 1
             issues.append(
