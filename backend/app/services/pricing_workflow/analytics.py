@@ -45,7 +45,7 @@ def _derived_zone(row: CalculatedPrice) -> str | None:
         chosen_competitor_price=getattr(row, "chosen_competitor_price", None),
         lowest_competitor_price=_lowest_competitor_price(row),
     )
-    return zone
+    return zone or "no-data"
 
 
 def _source_label(source_name: str, snapshot: dict) -> str:
@@ -239,9 +239,10 @@ def build_workflow_analytics(*, db: Session, price_list_id: int) -> dict:
             "changedPriceCount": changed_price_count,
         },
         "zones": [
-            {"name": "left", "label": "Левое плечо", "value": zone_counts["left"]},
+            {"name": "left", "label": "ЛП", "value": zone_counts["left"]},
             {"name": "optimal", "label": "Зона логичности", "value": zone_counts["optimal"]},
-            {"name": "right", "label": "Правое плечо", "value": zone_counts["right"]},
+            {"name": "right", "label": "ПП", "value": zone_counts["right"]},
+            {"name": "no-data", "label": "Зона без цен", "value": total - with_competitors},
         ],
         "markupHistogram": [{"bucket": key, "value": value} for key, value in markup_buckets.items()],
         "competitorUsage": competitor_usage,

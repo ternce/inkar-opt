@@ -770,3 +770,90 @@ def test_exclude_from_pricing_sku_only_excel_is_absent_from_generation_and_expor
     exported_cells = [str(cell.value or "") for row in workbook.active.iter_rows() for cell in row]
     assert "INCLUDED-SKU" in exported_cells
     assert "EXCLUDED-SKU" not in exported_cells
+
+
+def test_generated_csv_and_xlsx_export_keep_only_pricing_log_without_list():
+    client, Session = _client()
+    db = Session()
+    try:
+        price_format = PriceFormat(code="PF-EXPORT-NO-LIST", name="PF Export No List", branch="Almaty")
+        product = Product(code="SKU-NO-LIST", name="No List", cost=100)
+        db.add_all([price_format, product])
+        db.flush()
+        db.add(MarkupRange(price_format_id=price_format.id, cost_from=0, cost_to=None, markup_percent=0.15))
+        calculate_prices(
+            db=db,
+            price_format_code="PF-EXPORT-NO-LIST",
+            price_list_number="PL-EXPORT-NO-LIST",
+            as_of=date.today(),
+            activation_date=None,
+            user="test",
+            force_new_price_list=True,
+        )
+    finally:
+        db.close()
+
+    csv_response = client.get("/api/price-lists/PL-EXPORT-NO-LIST/export.csv")
+    assert csv_response.status_code == 200
+    assert "SKU-NO-LIST" in csv_response.text
+    assert "Применен список" not in csv_response.text
+
+    xlsx_response = client.get("/api/price-lists/PL-EXPORT-NO-LIST/export.xlsx")
+    assert xlsx_response.status_code == 200
+    workbook = load_workbook(io.BytesIO(xlsx_response.content), data_only=True)
+    exported_cells = [str(cell.value or "") for row in workbook.active.iter_rows() for cell in row]
+    assert any("SKU-NO-LIST" in cell for cell in exported_cells)
+    assert not any("Применен список" in cell for cell in exported_cells)
+
+
+def test_generated_csv_and_xlsx_export_append_list_log_when_list_applies():
+    client, Session = _client()
+    db = Session()
+    try:
+        price_format = PriceFormat(code="PF-EXPORT-LIST", name="PF Export List", branch="Almaty")
+        product = Product(code="SKU-WITH-LIST", name="With List", cost=100)
+        db.add_all([price_format, product])
+        db.flush()
+        db.add(MarkupRange(price_format_id=price_format.id, cost_from=0, cost_to=None, markup_percent=0.15))
+        universal_list = UniversalList(
+            code="UL_EXPORT_FIXED_MARKUP",
+            name="Export Fixed Markup",
+            type="fixed_markup",
+            status="active",
+            price_format_id=price_format.id,
+        )
+        db.add(universal_list)
+        db.flush()
+        db.add(ListItem(universal_list_id=universal_list.id, product_id=product.id, value=5.5))
+        calculate_prices(
+            db=db,
+            price_format_code="PF-EXPORT-LIST",
+            price_list_number="PL-EXPORT-LIST",
+            as_of=date.today(),
+            activation_date=None,
+            user="test",
+            force_new_price_list=True,
+        )
+    finally:
+        db.close()
+
+    csv_response = client.get("/api/price-lists/PL-EXPORT-LIST/export.csv")
+    assert csv_response.status_code == 200
+    assert "SKU-WITH-LIST" in csv_response.text
+    assert "Применен список" in csv_response.text
+    assert "Export Fixed Markup" in csv_response.text
+    assert "fixed_markup" in csv_response.text
+    assert "5.5%" in csv_response.text
+    assert "Конкуренты и прогиб не применялись" in csv_response.text
+
+    xlsx_response = client.get("/api/price-lists/PL-EXPORT-LIST/export.xlsx")
+    assert xlsx_response.status_code == 200
+    workbook = load_workbook(io.BytesIO(xlsx_response.content), data_only=True)
+    exported_cells = [str(cell.value or "") for row in workbook.active.iter_rows() for cell in row]
+    joined = "\n".join(exported_cells)
+    assert "SKU-WITH-LIST" in joined
+    assert "Применен список" in joined
+    assert "Export Fixed Markup" in joined
+    assert "fixed_markup" in joined
+    assert "5.5%" in joined
+    assert "Конкуренты и прогиб не применялись" in joined

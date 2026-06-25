@@ -707,6 +707,18 @@ def _generated_price_export_rows(
         ).scalars().all()
     )
     products = [row for row in products if str(row.get("sku") or "") in calculated_skus]
+    calculated_by_sku = {
+        str(product.code): cp
+        for cp, product in db.execute(
+            select(CalculatedPrice, Product)
+            .join(Product, Product.id == CalculatedPrice.product_id)
+            .where(CalculatedPrice.price_list_id == pl.id)
+        ).all()
+    }
+    for product_row in products:
+        cp = calculated_by_sku.get(str(product_row.get("sku") or ""))
+        if cp is not None:
+            product_row["modelLog"] = _combined_export_log(db, cp, pf)
     competitor_columns = []
     if products:
         competitor_columns = [
@@ -1554,7 +1566,7 @@ def _calculated_zone(cp: CalculatedPrice) -> str | None:
         chosen_competitor_price=cp.chosen_competitor_price,
         lowest_competitor_price=cp.lowest_competitor_price if cp.lowest_competitor_price is not None else cp.competitor_price,
     )
-    return zone
+    return zone or "no-data"
 
 
 def _calculated_zone_reference_and_deviation(cp: CalculatedPrice) -> tuple[float | None, float | None]:
@@ -1589,6 +1601,7 @@ def _list_override_log(
     *,
     global_margin_percent: float | None = None,
     pricing_margin_percent: float | None = None,
+    final_price: float | None = None,
 ) -> dict | None:
     if not applied:
         return None
@@ -1596,7 +1609,7 @@ def _list_override_log(
     value = applied.get("applied_rule_value")
     display_value = f"{value:g}%" if value is not None and list_type in {"fixed_markup", "critical_markup"} else f"{value:g}" if value is not None else "—"
     actions = {
-        "fixed_markup": "Маржа для расчёта заменена значением списка.",
+        "fixed_markup": "МДЦ рассчитана по марже из списка и применена как финальная цена; конкуренты и прогиб не применялись.",
         "critical_markup": "Маржа для расчёта заменена значением списка.",
         "fixed_price": "Применена фиксированная цена из списка.",
         "min_price": "Применено ограничение минимальной цены.",
@@ -1614,7 +1627,9 @@ def _list_override_log(
         "exclude_from_pricing": "Участие в расчёте и экспорте",
     }
     action = actions.get(list_type, "Применено значение активного списка.")
-    if list_type in {"fixed_markup", "critical_markup"} and pricing_margin_percent is not None:
+    if list_type == "fixed_markup" and pricing_margin_percent is not None:
+        action = f"МДЦ рассчитана по марже из списка {pricing_margin_percent:g}% и применена как финальная цена; конкуренты и прогиб не применялись."
+    elif list_type == "critical_markup" and pricing_margin_percent is not None:
         if global_margin_percent is not None:
             action = (
                 f"Маржа для расчёта переопределена с {global_margin_percent:g}% "
@@ -1622,6 +1637,20 @@ def _list_override_log(
             )
         else:
             action = f"Маржа для расчёта установлена в {pricing_margin_percent:g}%."
+    list_changed_final_price = None
+    list_effect_message = action
+    if list_type == "min_price" and value is not None and final_price is not None:
+        list_changed_final_price = final_price <= float(value)
+        if final_price > float(value):
+            list_effect_message = "Список проверен, но не изменил цену, потому что рассчитанная цена уже выше минимальной цены."
+            action = list_effect_message
+    elif list_type == "max_price" and value is not None and final_price is not None:
+        list_changed_final_price = final_price >= float(value)
+        if final_price < float(value):
+            list_effect_message = "Список проверен, но не изменил цену, потому что рассчитанная цена уже ниже максимальной цены."
+            action = list_effect_message
+    elif list_type == "fixed_price":
+        list_changed_final_price = True
     return {
         "listName": applied.get("list_name") or "",
         "listCode": applied.get("list_code") or "",
@@ -1631,7 +1660,49 @@ def _list_override_log(
         "affectedField": affected_fields.get(list_type, "Параметр расчёта"),
         "action": action,
         "ambiguous": bool(applied.get("ambiguous")),
+        "listMatched": True,
+        "listApplied": True,
+        "listChangedFinalPrice": list_changed_final_price,
+        "listEffectMessage": list_effect_message,
     }
+
+
+def _list_override_log_text(log: dict | None) -> str:
+    if not log:
+        return ""
+    lines = [
+        "Применен список:",
+        f"Название: {log.get('listName') or ''}",
+        f"Код: {log.get('listCode') or ''}",
+        f"Тип: {log.get('listType') or ''}",
+        f"Значение: {log.get('displayValue') or ''}",
+    ]
+    message = str(log.get("listEffectMessage") or log.get("action") or "").strip()
+    if message:
+        lines.extend(["", message])
+    return "\n".join(lines)
+
+
+def _combined_export_log(db: Session, cp: CalculatedPrice, pf: PriceFormat) -> str:
+    pricing_log = str(cp.applied_reason or "")
+    applied_list = _applied_list_summary(db, cp)
+    global_margin_percent = None
+    try:
+        global_margin_percent = float(get_markup_percent_by_range(db, pf.id, Decimal(str(float(cp.cost or 0)))) * Decimal("100"))
+    except ValueError:
+        pass
+    list_log = _list_override_log(
+        applied_list,
+        global_margin_percent=global_margin_percent,
+        pricing_margin_percent=float(cp.mdc_markup_percent)
+        if getattr(cp, "mdc_markup_percent", None) is not None
+        else float(cp.markup_percent_used)
+        if cp.markup_percent_used is not None
+        else None,
+        final_price=float(cp.final_price) if cp.final_price is not None else None,
+    )
+    list_text = _list_override_log_text(list_log)
+    return "\n\n".join(part for part in [pricing_log, list_text] if part)
 
 
 def _pricing_log(db: Session, cp: CalculatedPrice, product: Product, source: CompetitorPrice | None) -> list[dict]:
@@ -1693,6 +1764,7 @@ def _generated_item_dict(
         else float(cp.markup_percent_used)
         if cp.markup_percent_used is not None
         else None,
+        final_price=final,
     )
     ratings = ratings if ratings is not None else _product_ratings_by_id(db, [int(product.id)], str(pf.branch or "")).get(int(product.id), {})
     global_rating = ratings.get("global")
@@ -2785,9 +2857,10 @@ def get_price_list_analytics_dashboard(
     rows = db.execute(select(CalculatedPrice, Product).join(Product, Product.id == CalculatedPrice.product_id).where(CalculatedPrice.price_list_id == pl.id)).all()
     total = max(1, len(rows))
     zones = [
-        {"code": "left", "label": "Левое плечо: ниже конкурента", "count": int(summary.get("leftZone") or 0), "percent": round((int(summary.get("leftZone") or 0) / total) * 100, 2), "change": 0},
-        {"code": "optimal", "label": "ЗЛ", "count": int(summary.get("optimalZone") or 0), "percent": round((int(summary.get("optimalZone") or 0) / total) * 100, 2), "change": 0},
+        {"code": "left", "label": "ЛП", "count": int(summary.get("leftZone") or 0), "percent": round((int(summary.get("leftZone") or 0) / total) * 100, 2), "change": 0},
+        {"code": "optimal", "label": "Зона логичности", "count": int(summary.get("optimalZone") or 0), "percent": round((int(summary.get("optimalZone") or 0) / total) * 100, 2), "change": 0},
         {"code": "right", "label": "ПП", "count": int(summary.get("rightZone") or 0), "percent": round((int(summary.get("rightZone") or 0) / total) * 100, 2), "change": 0},
+        {"code": "no-data", "label": "Зона без цен", "count": int(summary.get("withoutCompetitors") or 0), "percent": round((int(summary.get("withoutCompetitors") or 0) / total) * 100, 2), "change": 0},
     ]
     markups: list[float] = []
     bends: list[float] = []
@@ -2899,9 +2972,10 @@ def export_price_list_analytics(
         ["Всего SKU", payload["summary"].get("skuTotal", 0)],
         ["С конкурентной ценой", payload["summary"].get("withCompetitors", 0)],
         ["Без конкурентной цены", payload["summary"].get("withoutCompetitors", 0)],
-        ["Левое плечо: ниже конкурента", payload["summary"].get("leftZone", 0)],
-        ["ЗЛ", payload["summary"].get("optimalZone", 0)],
+        ["ЛП", payload["summary"].get("leftZone", 0)],
+        ["Зона логичности", payload["summary"].get("optimalZone", 0)],
         ["ПП", payload["summary"].get("rightZone", 0)],
+        ["Зона без цен", payload["summary"].get("withoutCompetitors", 0)],
         ["Применена логика без конкурентов", payload["summary"].get("noCompetitorRuleApplied", 0)],
         ["Средняя наценка", payload["summary"].get("averageMarkup", 0)],
         ["Средняя цена", payload["summary"].get("averageFinalPrice", 0)],
@@ -3103,23 +3177,26 @@ def get_price_list_analysis(price_list_id: str, db: Session = Depends(get_db)):
                 "branch": pf.branch,
             },
             "distribution": [
-                {"name": "Левое плечо", "value": 0, "fill": "#EF4444"},
+                {"name": "ЛП", "value": 0, "fill": "#EF4444"},
                 {"name": "Зона логичности", "value": 0, "fill": "#10B981"},
-                {"name": "Правое плечо", "value": 0, "fill": "#F59E0B"},
+                {"name": "ПП", "value": 0, "fill": "#F59E0B"},
+                {"name": "Зона без цен", "value": 0, "fill": "#64748B"},
             ],
             "products": [],
         }
 
     def _zone_name(z: str) -> str:
         if z == "left":
-            return "Левое плечо"
+            return "ЛП"
         if z == "optimal":
             return "Зона логичности"
         if z == "right":
-            return "Правое плечо"
+            return "ПП"
+        if z == "no-data":
+            return "Зона без цен"
         return "—"
 
-    zone_counts = {"left": 0, "optimal": 0, "right": 0}
+    zone_counts = {"left": 0, "optimal": 0, "right": 0, "no-data": 0}
     products: list[dict] = []
     for cp, product in calc_rows:
         competitor_price = float(cp.competitor_price) if cp.competitor_price is not None else None
@@ -3147,6 +3224,7 @@ def get_price_list_analysis(price_list_id: str, db: Session = Depends(get_db)):
         {"name": _zone_name("left"), "value": zone_counts["left"], "fill": "#EF4444"},
         {"name": _zone_name("optimal"), "value": zone_counts["optimal"], "fill": "#10B981"},
         {"name": _zone_name("right"), "value": zone_counts["right"], "fill": "#F59E0B"},
+        {"name": _zone_name("no-data"), "value": zone_counts["no-data"], "fill": "#64748B"},
     ]
 
     return {

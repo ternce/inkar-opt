@@ -19,7 +19,7 @@ def _export_zone(cp: CalculatedPrice) -> str:
         chosen_competitor_price=cp.chosen_competitor_price,
         lowest_competitor_price=cp.lowest_competitor_price if cp.lowest_competitor_price is not None else cp.competitor_price,
     )
-    return zone or ""
+    return zone or "no-data"
 
 
 def _price_rows(*, db: Session, run: PricingWorkflowRun) -> list[dict]:

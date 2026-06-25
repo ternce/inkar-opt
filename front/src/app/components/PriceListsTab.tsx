@@ -174,9 +174,10 @@ const renderCompetitorCell = (row: PriceItem, column: CompetitorColumn) => {
 };
 
 const zoneMeta: Record<string, { label: string; title: string; className: string }> = {
-  left: { label: 'left', title: 'Цена ниже лучшей цены конкурента', className: 'left' },
-  optimal: { label: 'optimal', title: 'Цена в оптимальной зоне', className: 'optimal' },
-  right: { label: 'right', title: 'Цена выше оптимального диапазона', className: 'right' },
+  left: { label: 'ЛП', title: 'Цена ниже лучшей цены конкурента', className: 'left' },
+  optimal: { label: 'Зона логичности', title: 'Цена в зоне логичности', className: 'optimal' },
+  right: { label: 'ПП', title: 'Цена выше зоны логичности', className: 'right' },
+  'no-data': { label: 'Зона без цен', title: 'Нет цен конкурентов для сравнения зоны', className: 'no-data' },
 };
 
 export function PriceListsTab({ formatCode, initialPriceListNumber = '' }: PriceListsTabProps) {
@@ -421,15 +422,16 @@ export function PriceListsTab({ formatCode, initialPriceListNumber = '' }: Price
               <Metric label="С конкурентной ценой" value={summary?.withCompetitors ?? opened.withCompetitors} />
               <Metric label="Без конкурентной цены" value={summary?.withoutCompetitors ?? opened.withoutCompetitors} />
               <Metric label="Применена логика без конкурентов" value={summary?.noCompetitorRuleApplied ?? 0} />
-              <Metric label="Левое плечо: ниже конкурента" value={summary?.leftZone ?? 0} />
-              <Metric label="optimal" value={summary?.optimalZone ?? 0} />
-              <Metric label="right" value={summary?.rightZone ?? 0} />
+              <Metric label="ЛП" value={summary?.leftZone ?? 0} />
+              <Metric label="Зона логичности" value={summary?.optimalZone ?? 0} />
+              <Metric label="ПП" value={summary?.rightZone ?? 0} />
+              <Metric label="Зона без цен" value={summary?.withoutCompetitors ?? opened.withoutCompetitors} />
               <Metric label="Средняя наценка" value={`${fmtNumber(summary?.averageMarkup)}%`} />
-              <Metric label="Avg final price" value={summary?.minPrice != null && summary?.maxPrice != null ? `${fmtNumber(summary.minPrice)}-${fmtNumber(summary.maxPrice)}` : '—'} />
+              <Metric label="Avg final price" value={summary?.minPrice != null && summary?.maxPrice != null ? `${fmtNumber(summary.minPrice)}-${fmtNumber(summary.maxPrice)}` : DASH} />
               <Metric label="Percentile usage" value={summary?.percentileUsage ?? 0} />
               <Metric label="Substitute usage" value={opened.analytics?.productsWithSubstituteMatches ?? 0} />
             </div>
-            <p className="text-sm text-gray-600 mt-3">Зона рассчитывается только при наличии первой цены конкурента. Для товаров без конкурентной цены отображается «—».</p>
+            <p className="text-sm text-gray-600 mt-3">Зона рассчитывается только при наличии первой цены конкурента. Для товаров без конкурентной цены отображается «Зона без цен».</p>
           </section>
 
           <section className="generated-panel">
@@ -447,9 +449,7 @@ export function PriceListsTab({ formatCode, initialPriceListNumber = '' }: Price
                   <SelectTrigger><SelectValue placeholder="Зона" /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value="__all__">Все зоны</SelectItem>
-                    <SelectItem value="left">left</SelectItem>
-                    <SelectItem value="optimal">optimal</SelectItem>
-                    <SelectItem value="right">right</SelectItem>
+                    {Object.entries(zoneMeta).map(([value, meta]) => <SelectItem key={value} value={value}>{meta.label}</SelectItem>)}
                   </SelectContent>
                 </Select>
                 <Select value={topFilter} onValueChange={(value) => { setTopFilter(value); setPage(1); }}>
@@ -489,7 +489,7 @@ export function PriceListsTab({ formatCode, initialPriceListNumber = '' }: Price
                 fmtNumber(row.priceAfterBend),
                 <strong key={`${row.sku}-final`}>{fmtNumber(row.finalPrice)}</strong>,
                 row.markupPercent != null ? `${fmtNumber(row.markupPercent)}%` : DASH,
-                <ZoneBadge key={`${row.sku}-zone`} zone={row.zone} />,
+                <ZoneBadge key={`${row.sku}-zone`} zone={row.zone} showList={Boolean(row.listOverrideLog)} />,
                 row.priceSource || DASH,
                 row.percentileSource || DASH,
                 <button key={`${row.sku}-log`} type="button" className="table-link max-w-80 text-left" onClick={() => setSelectedItem(row)}>
@@ -590,10 +590,15 @@ function Metric({ label, value }: { label: string; value: any }) {
   );
 }
 
-function ZoneBadge({ zone }: { zone: string | null }) {
+function ZoneBadge({ zone, showList = false }: { zone: string | null; showList?: boolean }) {
   const meta = zone ? zoneMeta[zone] : undefined;
-  if (!meta) return <span>—</span>;
-  return <span className={`zone-badge ${meta.className}`} title={meta.title}>{meta.label}</span>;
+  if (!meta && !showList) return <span>—</span>;
+  return (
+    <span className="zone-stack">
+      {meta ? <span className={`zone-badge ${meta.className}`} title={meta.title}>{meta.label}</span> : <span>—</span>}
+      {showList ? <span className="zone-badge list">Список</span> : null}
+    </span>
+  );
 }
 
 function CompactTable({ columns, rows, empty }: { columns: string[]; rows: any[][]; empty: string }) {

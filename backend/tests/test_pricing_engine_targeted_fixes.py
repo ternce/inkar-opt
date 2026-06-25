@@ -276,12 +276,15 @@ def test_fixed_markup_list_overrides_default_markup():
 
     price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
 
-    assert float(price) == 105.27
-    assert debug["reason"] == "mdc_floor_after_rounding"
+    assert float(price) == 105.26
+    assert debug["reason"] == "fixed_markup_list_final"
     assert debug["applied_list_ids"] == [row.id]
     assert debug["applied_rule_type"] == "fixed_markup"
     assert float(debug["mdc_markup_percent"]) == 5.0
-    assert round(float(debug["mdc_price"]), 2) == 105.26
+    assert float(debug["mdc_price"]) == 105.26
+    assert float(debug["final_price"]) == 105.26
+    assert debug["chosen_competitor_price"] is None
+    assert debug["competitor_candidate_price"] is None
 
 
 def test_fixed_markup_5_5_overrides_global_20_and_is_persisted_in_logs():
@@ -313,7 +316,7 @@ def test_fixed_markup_5_5_overrides_global_20_and_is_persisted_in_logs():
     assert cp.applied_list_ids == f"[{row.id}]"
     assert log_by_label["Маржа (наценка)"] == "5.50%"
     assert payload["listOverrideLog"]["affectedField"] == "Маржа для расчёта МДЦ"
-    assert payload["listOverrideLog"]["action"] == "Маржа для расчёта переопределена с 20% на 5.5%."
+    assert "конкуренты и прогиб не применялись" in payload["listOverrideLog"]["action"]
 
 
 def test_exact_lists_management_audit_skus_apply_overrides_during_generation():
@@ -408,7 +411,7 @@ def test_fixed_markup_one_is_one_percent_not_one_hundred_percent():
 
     price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
 
-    assert float(price) == 101.02
+    assert float(price) == 101.01
     assert debug["applied_rule_type"] == "fixed_markup"
     assert debug["applied_list_ids"] == [row.id]
     assert float(debug["mdc_markup_percent"]) == 1.0
@@ -429,14 +432,14 @@ def test_lists_management_active_fixed_markup_m2m_overrides_default_markup():
     price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
 
     assert float(price) == 1492.54
-    assert debug["reason"] == "no_competitor_markup"
+    assert debug["reason"] == "fixed_markup_list_final"
     assert debug["applied_list_ids"] == [row.id]
     assert debug["applied_rule_type"] == "fixed_markup"
     assert float(debug["applied_rule_value"]) == 33.0
     assert float(debug["mdc_markup_percent"]) == 33.0
     assert round(float(debug["mdc_price"]), 2) == 1492.54
     assert debug["applied_list_name"] == "Fixed markup"
-    assert "Нет цен выбранных конкурентов" in debug["log"]
+    assert "Конкуренты и прогиб не применялись" in debug["log"]
     assert "Applied Rule" not in debug["log"]
 
 
@@ -463,7 +466,28 @@ def test_critical_markup_overrides_global_margin_for_mdc_and_no_competitor(criti
     assert debug["applied_list_ids"] == [row.id]
 
 
-def test_fixed_markup_only_overrides_mdc_and_keeps_competitor_bend_workflow():
+def test_critical_markup_still_uses_competitor_workflow():
+    db = _session()
+    pf = _format(db)
+    db.query(BendRange).filter(BendRange.price_format_id == pf.id).delete()
+    db.add(BendRange(price_format_id=pf.id, price_from=0, bend_percent=0))
+    db.flush()
+    product = _product(db, cost=100)
+    row = _list_item(db, product, "critical_markup", 10, pf=pf)
+    _competitor(db, pf, product, "manual:high", 200)
+
+    price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
+
+    assert float(price) == 200.0
+    assert debug["reason"] == "competitor_bend"
+    assert debug["applied_list_ids"] == [row.id]
+    assert debug["applied_rule_type"] == "critical_markup"
+    assert round(float(debug["mdc_price"]), 2) == 111.11
+    assert float(debug["chosen_competitor_price"]) == 200
+    assert float(debug["competitor_candidate_price"]) == 200
+
+
+def test_fixed_markup_bypasses_competitors_and_uses_mdc_as_final_price():
     db = _session()
     pf = _format(db)
     db.query(MarkupRange).filter(MarkupRange.price_format_id == pf.id).delete()
@@ -488,21 +512,21 @@ def test_fixed_markup_only_overrides_mdc_and_keeps_competitor_bend_workflow():
 
     assert float(debug["effective_markup_percent"]) == 5.5
     assert round(float(debug["mdc_price"]), 2) == 294.18
-    assert float(debug["selected_competitor_price"]) == 315
-    assert float(debug["chosen_competitor_price"]) == 315
-    assert float(debug["bend_percent_used"]) == 5
-    assert round(float(debug["competitor_candidate_price"]), 2) == 299.25
-    assert round(float(debug["price_from_competitor"]), 2) == 299.25
-    assert round(float(price), 2) == 299.25
-    assert round(float(debug["final_price"]), 2) == 299.25
+    assert debug["selected_competitor_price"] is None
+    assert debug["chosen_competitor_price"] is None
+    assert float(debug["bend_percent_used"]) == 0
+    assert debug["competitor_candidate_price"] is None
+    assert debug["price_from_competitor"] is None
+    assert round(float(price), 2) == 294.18
+    assert round(float(debug["final_price"]), 2) == 294.18
     assert debug["applied_rule_type"] == "fixed_markup"
     assert float(debug["applied_rule_value"]) == 5.5
     assert debug["applied_list_id"] == row.id
     assert debug["applied_list_name"] == "010101"
-    assert [round(float(item["candidate"]), 2) for item in debug["rejected_competitors"]] == [230.80, 261.25]
+    assert debug["rejected_competitors"] == []
 
 
-def test_fixed_markup_sets_mdc_and_competitor_below_mdc_uses_mdc():
+def test_fixed_markup_sets_mdc_final_without_competitor_candidate():
     db = _session()
     pf = _format(db)
     db.query(BendRange).filter(BendRange.price_format_id == pf.id).delete()
@@ -514,38 +538,69 @@ def test_fixed_markup_sets_mdc_and_competitor_below_mdc_uses_mdc():
 
     price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
 
-    assert float(price) == 135.41
-    assert debug["reason"] == "mdc_floor_after_rounding"
+    assert float(price) == 135.4
+    assert debug["reason"] == "fixed_markup_list_final"
     assert debug["applied_list_ids"] == [row.id]
     assert debug["applied_rule_type"] == "fixed_markup"
     assert float(debug["applied_rule_value"]) == 33.0
     assert float(debug["mdc_markup_percent"]) == 33.0
     assert round(float(debug["mdc_price"]), 2) == 135.4
-    assert float(debug["competitor_candidate_price"]) == 12.0
-    assert float(debug["final_price"]) == 135.41
+    assert debug["competitor_candidate_price"] is None
+    assert debug["chosen_competitor_price"] is None
+    assert float(debug["final_price"]) == 135.4
 
 
-def test_fixed_markup_sets_mdc_and_competitor_above_mdc_wins():
+def test_fixed_markup_does_not_apply_bend():
     db = _session()
     pf = _format(db)
     db.query(BendRange).filter(BendRange.price_format_id == pf.id).delete()
-    db.add(BendRange(price_format_id=pf.id, price_from=0, bend_percent=0))
+    db.add(BendRange(price_format_id=pf.id, price_from=0, bend_percent=20))
     db.flush()
-    product = _product(db, cost=90.72)
-    row = _list_item(db, product, "fixed_markup", 33, pf=pf)
-    _competitor(db, pf, product, "manual:high", 200)
+    product = _product(db, cost=100)
+    row = _list_item(db, product, "fixed_markup", 10, pf=pf)
+    _competitor(db, pf, product, "manual:high", 1000)
 
     price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
 
-    assert float(price) == 200.0
-    assert debug["reason"] == "competitor_bend"
+    assert float(price) == 111.11
+    assert debug["reason"] == "fixed_markup_list_final"
     assert debug["applied_list_ids"] == [row.id]
     assert debug["applied_rule_type"] == "fixed_markup"
-    assert float(debug["applied_rule_value"]) == 33.0
-    assert float(debug["mdc_markup_percent"]) == 33.0
-    assert round(float(debug["mdc_price"]), 2) == 135.4
-    assert float(debug["competitor_candidate_price"]) == 200.0
-    assert float(debug["final_price"]) == 200.0
+    assert float(debug["applied_rule_value"]) == 10.0
+    assert float(debug["mdc_markup_percent"]) == 10.0
+    assert float(debug["mdc_price"]) == 111.11
+    assert debug["competitor_candidate_price"] is None
+    assert debug["chosen_competitor_price"] is None
+    assert debug["price_from_competitor"] is None
+    assert float(debug["bend_percent_used"]) == 0
+    assert float(debug["final_price"]) == 111.11
+
+
+def test_fixed_markup_bypasses_multiple_competitors():
+    db = _session()
+    pf = _format(db)
+    db.query(BendRange).filter(BendRange.price_format_id == pf.id).delete()
+    db.add(BendRange(price_format_id=pf.id, price_from=0, bend_percent=5))
+    db.flush()
+    product = _product(db, cost=100)
+    row = _list_item(db, product, "fixed_markup", 5.5, pf=pf)
+    _competitor(db, pf, product, "manual:low", 90)
+    _competitor(db, pf, product, "manual:mid", 200)
+    _competitor(db, pf, product, "manual:high", 300)
+
+    price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
+
+    assert float(price) == 105.82
+    assert float(debug["mdc_price"]) == 105.82
+    assert debug["applied_list_ids"] == [row.id]
+    assert debug["list_matched"] is True
+    assert debug["list_applied"] is True
+    assert debug["list_changed_final_price"] is True
+    assert debug["selected_competitor_price"] is None
+    assert debug["competitor_candidate_price"] is None
+    assert debug["price_from_competitor"] is None
+    assert float(debug["bend_percent_used"]) == 0
+    assert "competitors and bend were bypassed" in debug["list_effect_message"]
 
 
 def test_min_and_max_markup_lists_apply_bounds():
@@ -584,6 +639,38 @@ def test_min_and_max_price_lists_apply_bounds():
     assert min_debug["applied_list_ids"] == [min_list.id]
     assert float(max_price) == 130.0
     assert max_debug["applied_list_ids"] == [max_list.id]
+
+
+def test_min_price_noop_reports_checked_but_unchanged():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, cost=100)
+    row = _list_item(db, product, "min_price", 50, pf=pf)
+
+    price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
+
+    assert float(price) > 50
+    assert debug["applied_list_ids"] == [row.id]
+    assert debug["list_matched"] is True
+    assert debug["list_applied"] is True
+    assert debug["list_changed_final_price"] is False
+    assert "did not change final price" in debug["list_effect_message"]
+
+
+def test_max_price_noop_reports_checked_but_unchanged():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, cost=100)
+    row = _list_item(db, product, "max_price", 1000, pf=pf)
+
+    price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
+
+    assert float(price) < 1000
+    assert debug["applied_list_ids"] == [row.id]
+    assert debug["list_matched"] is True
+    assert debug["list_applied"] is True
+    assert debug["list_changed_final_price"] is False
+    assert "did not change final price" in debug["list_effect_message"]
 
 
 def test_min_price_1200_clamps_final_price_upward():
@@ -660,6 +747,10 @@ def test_api_payload_keeps_pricing_and_max_price_list_logs_independent():
         "affectedField": "Максимальная финальная цена",
         "action": "Применено ограничение максимальной цены.",
         "ambiguous": False,
+        "listMatched": True,
+        "listApplied": True,
+        "listChangedFinalPrice": True,
+        "listEffectMessage": "Применено ограничение максимальной цены.",
     }
     assert payload["appliedListId"] == row.id
     assert float(payload["finalPrice"]) == 820.0
@@ -936,15 +1027,17 @@ def test_calculate_prices_stores_mdc_markup_diagnostics():
     )
 
     cp = db.query(CalculatedPrice).one()
-    assert float(cp.final_price) == 200
+    assert float(cp.final_price) == 135.4
     assert cp.applied_list_ids == f"[{row.id}]"
     assert cp.applied_list_id == row.id
     assert cp.applied_rule_type == "fixed_markup"
     assert float(cp.applied_rule_value) == 33
     assert float(cp.mdc_markup_percent) == 33
     assert round(float(cp.mdc_price), 2) == 135.4
-    assert float(cp.competitor_candidate_price) == 200
+    assert cp.competitor_candidate_price is None
+    assert cp.chosen_competitor_price is None
     assert "Цена рассчитана" in cp.applied_reason
+    assert "Конкуренты и прогиб не применялись" in cp.applied_reason
     assert "Applied Rule" not in cp.applied_reason
 
 
@@ -988,6 +1081,10 @@ def test_generated_item_payload_exposes_applied_list_rule_details():
         "affectedField": "Финальная цена",
         "action": "Применена фиксированная цена из списка.",
         "ambiguous": False,
+        "listMatched": True,
+        "listApplied": True,
+        "listChangedFinalPrice": True,
+        "listEffectMessage": "Применена фиксированная цена из списка.",
     }
     assert "fixed_price" not in payload["pricingCalculationLog"]
 
@@ -1086,8 +1183,8 @@ def test_generated_item_markup_is_rule_markup_and_actual_margin_is_separate():
     log_by_label = {line["label"]: line["value"] for line in item["log"]}
     assert log_by_label["Маржа (наценка)"] == "10.00%"
     assert log_by_label["Фактическая маржа"] == "16.67%"
-    assert item["zone"] is None
-    assert _export_zone(cp) == ""
+    assert item["zone"] == "no-data"
+    assert _export_zone(cp) == "no-data"
 
 
 def test_legacy_generated_item_recovers_pricing_percent_from_stored_base_price():
@@ -1161,8 +1258,8 @@ def test_analytics_uses_selected_price_list_and_explicit_bend():
     assert no_competitor_analytics["summary"]["withoutCompetitors"] == 1
     assert "noDataZone" not in no_competitor_analytics["summary"]
     assert "noIntersection" not in no_competitor_analytics["summary"]
-    assert [item["name"] for item in no_competitor_analytics["zones"]] == ["left", "optimal", "right"]
-    assert sum(item["value"] for item in no_competitor_analytics["zones"]) == 0
+    assert [item["name"] for item in no_competitor_analytics["zones"]] == ["left", "optimal", "right", "no-data"]
+    assert {item["name"]: item["value"] for item in no_competitor_analytics["zones"]}["no-data"] == 1
 
 
 def test_analytics_splits_right_zone_reasons():

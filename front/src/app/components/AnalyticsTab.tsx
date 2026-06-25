@@ -73,6 +73,7 @@ const zoneColors: Record<string, string> = {
   left: '#0f766e',
   optimal: '#2563eb',
   right: '#c2410c',
+  'no-data': '#475569',
 };
 
 const parseJson = (text: string) => {
@@ -114,9 +115,10 @@ const hasUniversalList = (row: ResultItem) => {
 };
 
 const zoneLabel = (zone: string | null | undefined) => {
-  if (zone === 'left') return 'Левое плечо: ниже конкурента';
-  if (zone === 'optimal') return 'ЗЛ';
+  if (zone === 'left') return 'ЛП';
+  if (zone === 'optimal') return 'Зона логичности';
   if (zone === 'right') return 'ПП';
+  if (zone === 'no-data') return 'Зона без цен';
   return '—';
 };
 
@@ -367,16 +369,17 @@ export function AnalyticsTab({ branch = '', selectedFormatCode = '', initialPric
               <div><span>Percentile</span><strong>{fmt(summary.percentileUsage)}</strong></div>
               <div><span>Substitute</span><strong>{fmt(summary.substituteUsage || repricing.withSubstitute || 0)}</strong></div>
               <div><span>Универсальные списки</span><strong>{fmt(repricing.withUniversalLists)}</strong></div>
-              <div><span>Левое плечо: ниже конкурента</span><strong>{fmt(summary.leftZone)}</strong></div>
-              <div><span>ЗЛ</span><strong>{fmt(summary.optimalZone)}</strong></div>
+              <div><span>ЛП</span><strong>{fmt(summary.leftZone)}</strong></div>
+              <div><span>Зона логичности</span><strong>{fmt(summary.optimalZone)}</strong></div>
               <div><span>ПП</span><strong>{fmt(summary.rightZone)}</strong></div>
+              <div><span>Зона без цен</span><strong>{fmt(summary.withoutCompetitors)}</strong></div>
             </div>
-            <p className="text-sm text-gray-600 mt-3">Зона рассчитывается только при наличии первой цены конкурента. Для товаров без конкурентной цены отображается «—».</p>
+            <p className="text-sm text-gray-600 mt-3">Зона рассчитывается только при наличии первой цены конкурента. Для товаров без конкурентной цены отображается «Зона без цен».</p>
           </section>
 
           <div className="business-grid two-columns">
             <section className="business-panel">
-              <div className="panel-head"><h3>Зоны</h3><span>Левое плечо / ЗЛ / ПП</span></div>
+              <div className="panel-head"><h3>Зоны</h3><span>ЛП / Зона логичности / ПП / Зона без цен</span></div>
               <div className="zone-cards">
                 {payload.zones.map((zone) => (
                   <button key={zone.code} className={`zone-card ${zone.code}`} onClick={() => void openZone(zone.code)}>
@@ -481,7 +484,7 @@ export function AnalyticsTab({ branch = '', selectedFormatCode = '', initialPric
                         <td>{fmt(row.oldPrice)}</td>
                         <td>{fmt(row.newPrice)}</td>
                         <td>{fmt(row.changePercent)}%</td>
-                        <td><span className={`zone-badge ${row.zone}`}>{row.zone}</span></td>
+                        <td><span className={`zone-badge ${row.zone}`}>{zoneLabel(row.zone)}</span></td>
                       </tr>
                     ))}
                   </tbody>
@@ -512,7 +515,7 @@ export function AnalyticsTab({ branch = '', selectedFormatCode = '', initialPric
                 <SelectTrigger><SelectValue placeholder="Зона" /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="__all__">Все зоны</SelectItem>
-                  {['left', 'optimal', 'right'].map((zone) => <SelectItem key={zone} value={zone}>{zoneLabel(zone)}</SelectItem>)}
+                  {['left', 'optimal', 'right', 'no-data'].map((zone) => <SelectItem key={zone} value={zone}>{zoneLabel(zone)}</SelectItem>)}
                 </SelectContent>
               </Select>
               <Select value={ruleFilter} onValueChange={setRuleFilter}>
@@ -567,7 +570,12 @@ export function AnalyticsTab({ branch = '', selectedFormatCode = '', initialPric
                         <td>{change === null ? '—' : `${fmt(change)}%`}</td>
                         <td>{row.bestCompetitorPrice === null ? '—' : fmt(row.bestCompetitorPrice)}</td>
                         <td className="max-w-80">{row.pricingReason || '—'}</td>
-                        <td>{row.zone ? <span className={`zone-badge ${row.zone}`}>{zoneLabel(row.zone)}</span> : '—'}</td>
+                        <td>
+                          <span className="zone-stack">
+                            {row.zone ? <span className={`zone-badge ${row.zone}`}>{zoneLabel(row.zone)}</span> : '—'}
+                            {hasUniversalList(row) ? <span className="zone-badge list">Список</span> : null}
+                          </span>
+                        </td>
                         <td>{row.usedPercentile ? row.percentileSource || 'Да' : '—'}</td>
                         <td>{row.priceSource || '—'}</td>
                         <td>{row.pricingRule || '—'}</td>

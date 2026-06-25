@@ -1099,6 +1099,13 @@
   font-weight: 750;
 }
 
+.zone-stack {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
 .zone-badge.left {
   border: 1px solid #bfdbfe;
   background: #eff6ff;
@@ -1115,6 +1122,18 @@
   border: 1px solid #fecaca;
   background: #fef2f2;
   color: #b91c1c;
+}
+
+.zone-badge.no-data {
+  border: 1px solid #cbd5e1;
+  background: #f8fafc;
+  color: #475569;
+}
+
+.zone-badge.list {
+  border: 1px solid #86efac;
+  background: #dcfce7;
+  color: #166534;
 }
 
 .price-log {
@@ -2332,6 +2351,17 @@
 .zone-badge.right {
   background: #ffedd5;
   color: #c2410c;
+}
+
+.zone-card.no-data,
+.zone-badge.no-data {
+  background: #f8fafc;
+  color: #475569;
+}
+
+.zone-badge.list {
+  background: #dcfce7;
+  color: #166534;
 }
 
 .chart-box {

@@ -680,6 +680,41 @@ def _source_type(source_name: str) -> str:
     return source_name.split(":", 1)[0] if ":" in source_name else "competitor"
 
 
+def _diagnostic_price_before_margin_list(
+    *,
+    db: Session,
+    price_format: PriceFormat,
+    cost: Decimal,
+    markup_percent: Decimal,
+    no_competitor_markup_percent: Decimal,
+    competitor_prices: list[tuple[Decimal, str]],
+    rounding_rule: RoundingRule | None,
+    fallback_bend_percent: Decimal,
+) -> Decimal:
+    mdc = price_from_margin(cost, markup_percent)
+    if not competitor_prices:
+        price = price_from_margin(cost, no_competitor_markup_percent)
+        if price < mdc:
+            price = mdc
+    else:
+        price = mdc
+        for competitor_price, _competitor_source in competitor_prices:
+            bend_percent = get_bend_percent_by_price_range(
+                db,
+                price_format.id,
+                competitor_price,
+                fallback_percent=fallback_bend_percent,
+            )
+            candidate = competitor_price * (Decimal("1") - bend_percent / Decimal("100"))
+            if candidate >= mdc:
+                price = candidate
+                break
+    price = _round_price(price, rounding_rule)
+    if price < mdc:
+        price = _round_price(mdc, rounding_rule, force_up=True)
+    return price
+
+
 def _source_match_type(db: Session, price_format_id: int, product_id: int, source_name: str) -> str:
     if not source_name or source_name.startswith("percentile:"):
         return ""
@@ -728,6 +763,8 @@ def calculate_price_for_product(
         cost,
         fallback=markup_percent,
     )
+    global_markup_percent = markup_percent
+    global_no_competitor_markup_percent = no_competitor_markup_percent
     rounding_rule = db.get(RoundingRule, price_format.rounding_rule_id) if price_format.rounding_rule_id else None
     active_lists = _active_lists_for_format(db, price_format.id, as_of)
     applied_list_effects: list[dict] = []
@@ -762,6 +799,10 @@ def calculate_price_for_product(
             "applied_list_id": list_id,
             "applied_list_name": list_name,
             "applied_rule_ambiguous": False,
+            "list_matched": True,
+            "list_applied": True,
+            "list_changed_final_price": True,
+            "list_effect_message": "fixed_price set final price directly.",
             "excluded_from_pricing": False,
             "bend_percent": Decimal("0"),
             "bend_percent_used": Decimal("0"),
@@ -789,16 +830,67 @@ def calculate_price_for_product(
     if fixed_markup_match is not None:
         fixed_markup, list_id = fixed_markup_match
         markup_percent = _list_percent_as_fraction(fixed_markup)
-        no_competitor_markup_percent = markup_percent
-        applied_list_effects.append(
-            _list_markup_match_effect(
-                list_id,
-                LIST_TYPE_FIXED_MARKUP,
-                fixed_markup,
-                "fixed_markup_mdc",
-                markup_fraction=markup_percent,
-            )
+        fixed_markup_mdc = _round_price(price_from_margin(cost, markup_percent), rounding_rule)
+        list_row = next((row for row in active_lists if int(row.id) == list_id), None)
+        list_name = str(list_row.name or list_row.code or list_id) if list_row is not None else str(list_id)
+        effect = _list_markup_match_effect(
+            list_id,
+            LIST_TYPE_FIXED_MARKUP,
+            fixed_markup,
+            "fixed_markup_final_price",
+            markup_fraction=markup_percent,
         )
+        effect["listName"] = list_name
+        effect["changedFinalPrice"] = True
+        effect["effectMessage"] = "fixed_markup calculated MDC from list margin and used it as final price; competitors and bend were bypassed."
+        markup_percent_used = markup_percent * Decimal("100")
+        branch_id = str(region_id if region_id is not None else (price_format.branch or ""))
+        debug = {
+            "cost": cost,
+            "markup_percent": markup_percent,
+            "base_price": fixed_markup_mdc,
+            "competitor_price": None,
+            "lowest_competitor_price": None,
+            "competitor_source": "",
+            "applied_source_name": "",
+            "applied_source_type": "",
+            "used_percentile": False,
+            "used_substitute": False,
+            "rating_global": _rating_value(db, product.id, "global"),
+            "rating_local": _rating_value(db, product.id, "local", branch_id),
+            "applied_list_effects": [effect],
+            "applied_list_ids": [list_id],
+            "applied_rule_type": LIST_TYPE_FIXED_MARKUP,
+            "applied_rule_value": fixed_markup,
+            "applied_list_id": list_id,
+            "applied_list_name": list_name,
+            "applied_rule_ambiguous": False,
+            "list_matched": True,
+            "list_applied": True,
+            "list_changed_final_price": True,
+            "list_effect_message": effect["effectMessage"],
+            "excluded_from_pricing": False,
+            "bend_percent": Decimal("0"),
+            "bend_percent_used": Decimal("0"),
+            "effective_markup_percent": markup_percent_used,
+            "markup_percent_used": markup_percent_used,
+            "mdc_markup_percent": markup_percent_used,
+            "mdc_price": fixed_markup_mdc,
+            "competitor_candidate_price": None,
+            "chosen_competitor_price": None,
+            "selected_competitor_price": None,
+            "chosen_competitor_source": "",
+            "chosen_competitor_rank": None,
+            "rejected_competitors": [],
+            "price_from_competitor": None,
+            "final_price": fixed_markup_mdc,
+            "reason": "fixed_markup_list_final",
+            "log": "Цена рассчитана по списку фиксированной наценки. МДЦ рассчитана по марже из списка и применена как финальная цена. Конкуренты и прогиб не применялись.",
+            "zone": None,
+            "zone_reference_price": None,
+            "deviation_pct": None,
+        }
+        return fixed_markup_mdc, debug
 
     critical_markup_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_CRITICAL_MARKUP)
     if critical_markup_match is not None:
@@ -989,17 +1081,27 @@ def calculate_price_for_product(
             if min_price_match is not None:
                 min_price, list_id = min_price_match
                 min_price_bound = min_price
+                before_min_price = price
                 price = max(price, min_price)
                 reason = "min_price_floor"
-                applied_list_effects.append(_list_effect(list_id, LIST_TYPE_MIN_PRICE, min_price, reason))
+                effect = _list_effect(list_id, LIST_TYPE_MIN_PRICE, min_price, reason)
+                effect["changedFinalPrice"] = price != before_min_price
+                if not effect["changedFinalPrice"]:
+                    effect["effectMessage"] = "min_price checked but did not change final price because calculated price was already above the minimum."
+                applied_list_effects.append(effect)
 
             max_price_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_MAX_PRICE)
             if max_price_match is not None:
                 max_price, list_id = max_price_match
+                before_max_price = price
                 price = min(price, max_price)
                 reason = "max_price_cap"
                 skip_rounding_floor = True
-                applied_list_effects.append(_list_effect(list_id, LIST_TYPE_MAX_PRICE, max_price, reason))
+                effect = _list_effect(list_id, LIST_TYPE_MAX_PRICE, max_price, reason)
+                effect["changedFinalPrice"] = price != before_max_price
+                if not effect["changedFinalPrice"]:
+                    effect["effectMessage"] = "max_price checked but did not change final price because calculated price was already below the maximum."
+                applied_list_effects.append(effect)
 
     # Округление
     if not skip_rounding_floor:
@@ -1034,6 +1136,27 @@ def calculate_price_for_product(
         if list_id is not None:
             effect["listName"] = list_names.get(int(list_id), str(list_id))
     primary_list_effect = applied_list_effects[-1] if applied_list_effects else {}
+    list_changed_final_price = primary_list_effect.get("changedFinalPrice")
+    if primary_list_effect.get("type") in {LIST_TYPE_FIXED_MARKUP, LIST_TYPE_CRITICAL_MARKUP}:
+        baseline_price = _diagnostic_price_before_margin_list(
+            db=db,
+            price_format=price_format,
+            cost=cost,
+            markup_percent=global_markup_percent,
+            no_competitor_markup_percent=global_no_competitor_markup_percent,
+            competitor_prices=resolved_many.prices,
+            rounding_rule=rounding_rule,
+            fallback_bend_percent=fallback_bend_percent,
+        )
+        list_changed_final_price = price != baseline_price
+        if not list_changed_final_price:
+            primary_list_effect["effectMessage"] = (
+                "margin list changed effective MDC parameters but did not change final price because "
+                "the selected competitor candidate after bend stayed above MDC."
+            )
+    if list_changed_final_price is None and primary_list_effect:
+        list_changed_final_price = True
+    list_effect_message = str(primary_list_effect.get("effectMessage") or primary_list_effect.get("effect") or "")
     calculation_log = _build_calculation_log(
         reason=pricing_reason,
         competitor_prices=resolved_many.prices,
@@ -1069,6 +1192,10 @@ def calculate_price_for_product(
         "applied_list_id": primary_list_effect.get("listId"),
         "applied_list_name": str(primary_list_effect.get("listName") or ""),
         "applied_rule_ambiguous": bool(primary_list_effect.get("ambiguous")),
+        "list_matched": bool(applied_list_effects),
+        "list_applied": bool(applied_list_effects),
+        "list_changed_final_price": list_changed_final_price,
+        "list_effect_message": list_effect_message,
         "excluded_from_pricing": excluded_from_pricing,
         "bend_percent": chosen_bend_percent,
         "bend_percent_used": chosen_bend_percent,
