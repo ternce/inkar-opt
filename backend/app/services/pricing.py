@@ -30,6 +30,7 @@ from .. import data
 from ..timezone import local_iso
 from .competitor_matching import rebuild_competitor_prices_for_selected
 from .competitor_percentiles import recalculate_competitor_percentiles
+from .competitor_percentiles import REGIONAL_SCOPE
 from .competitor_assignments import get_assigned_competitor_price_lists
 from .regions import allowed_provisor_source_names_for_city_id, city_id_from_branch
 
@@ -234,6 +235,46 @@ def zone_reference_price(
     if lowest is not None and lowest > 0:
         return lowest
     return None
+
+
+def lowest_available_competitor_price(
+    db: Session,
+    price_format_id: int,
+    product_id: int,
+) -> Decimal | None:
+    rows = (
+        db.execute(
+            select(CompetitorPrice.source_name, CompetitorPrice.source_price)
+            .where(CompetitorPrice.price_format_id == price_format_id)
+            .where(CompetitorPrice.product_id == product_id)
+            .where(CompetitorPrice.source_price.is_not(None))
+        )
+        .all()
+    )
+    if not rows:
+        return None
+
+    config_rows = (
+        db.execute(
+            select(CompetitorPrice.source_name, CompetitorPrice.coefficient)
+            .where(CompetitorPrice.price_format_id == price_format_id)
+            .where(CompetitorPrice.product_id.is_(None))
+        )
+        .all()
+    )
+    coefficient_by_source = {
+        str(row.source_name or ""): (_as_decimal(row.coefficient, Decimal("1")) or Decimal("1"))
+        for row in config_rows
+    }
+
+    prices: list[Decimal] = []
+    for row in rows:
+        source_price = _as_decimal(row.source_price)
+        if source_price is None or source_price <= 0:
+            continue
+        coefficient = coefficient_by_source.get(str(row.source_name or ""), Decimal("1"))
+        prices.append(source_price * coefficient)
+    return min(prices) if prices else None
 
 
 def calculate_price_zone(
@@ -500,6 +541,7 @@ def resolve_percentile_prices(
             select(CompetitorPricePercentile)
             .where(CompetitorPricePercentile.price_format_id == price_format_id)
             .where(CompetitorPricePercentile.product_id == product_id)
+            .where(CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
             .where(CompetitorPricePercentile.percentile == percentile_number)
             .where(CompetitorPricePercentile.value.is_not(None))
         )
@@ -779,12 +821,17 @@ def calculate_price_for_product(
         markup_percent_used = markup_percent * Decimal("100")
         diagnostic_mdc = price_from_margin(cost, markup_percent)
         branch_id = str(region_id if region_id is not None else (price_format.branch or ""))
+        zone_competitor_price_min = lowest_available_competitor_price(db, price_format.id, product.id)
+        zone, zone_reference, deviation_pct = calculate_price_zone(
+            fixed_price,
+            lowest_competitor_price=zone_competitor_price_min,
+        )
         debug = {
             "cost": cost,
             "markup_percent": markup_percent,
             "base_price": diagnostic_mdc,
             "competitor_price": None,
-            "lowest_competitor_price": None,
+            "lowest_competitor_price": zone_competitor_price_min,
             "competitor_source": "",
             "applied_source_name": "",
             "applied_source_type": "",
@@ -820,9 +867,9 @@ def calculate_price_for_product(
             "final_price": fixed_price,
             "reason": "fixed_price_list",
             "log": "Финальная цена установлена напрямую из фиксированной цены; выбор конкурента и прогиб не применялись.",
-            "zone": None,
-            "zone_reference_price": None,
-            "deviation_pct": None,
+            "zone": zone,
+            "zone_reference_price": zone_reference,
+            "deviation_pct": deviation_pct,
         }
         return fixed_price, debug
 
@@ -1121,10 +1168,14 @@ def calculate_price_for_product(
         reason = "min_price_floor"
 
     # ЛП/ЗЛ/ПП
+    zone_competitor_price_min = competitor_price_min
+    if zone_competitor_price_min is None:
+        zone_competitor_price_min = lowest_available_competitor_price(db, price_format.id, product.id)
+
     zone, zone_reference, deviation_pct = calculate_price_zone(
         price,
         chosen_competitor_price=chosen_competitor,
-        lowest_competitor_price=competitor_price_min,
+        lowest_competitor_price=zone_competitor_price_min,
     )
 
     applied_source = chosen_source or competitor_source_min
@@ -1177,7 +1228,7 @@ def calculate_price_for_product(
         "markup_percent": markup_percent,
         "base_price": base_price,
         "competitor_price": competitor_price_min,
-        "lowest_competitor_price": competitor_price_min,
+        "lowest_competitor_price": zone_competitor_price_min,
         "competitor_source": competitor_source_min or ("нет цен ПЛК" if competitor_price_min is None else ""),
         "applied_source_name": applied_source,
         "applied_source_type": _source_type(applied_source),

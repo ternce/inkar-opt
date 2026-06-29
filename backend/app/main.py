@@ -185,7 +185,11 @@ from .services.competitors.code_mappings import (
     platform_from_value,
     upsert_code_mapping,
 )
-from .services.competitors.percentiles.read_models import list_percentile_sources
+from .services.competitors.percentiles.read_models import (
+    export_percentile_product_rows,
+    list_percentile_product_rows,
+    list_percentile_sources,
+)
 from .services.jobs import create_job, get_active_job, job_to_dict, schedule_job, update_job
 from .services.references.batch import import_reference_batch
 from .services.references.imports import import_reference_excel
@@ -4089,6 +4093,69 @@ def get_competitor_percentile_sources(
     db: Session = Depends(get_db),
 ):
     return list_percentile_sources(db=db, price_format_code=format_code)
+
+
+@app.get("/api/competitors/percentile-rows")
+def get_competitor_percentile_rows(
+    format_code: str = Query(...),
+    region: str = Query(""),
+    competitor: str = Query(""),
+    q: str = Query(""),
+    percentile_filter: str = Query("all"),
+    competitor_filter: str = Query("all"),
+    sort: str = Query("sku"),
+    direction: str = Query("asc"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=20, le=500),
+    db: Session = Depends(get_db),
+):
+    return list_percentile_product_rows(
+        db=db,
+        price_format_code=format_code,
+        region=region,
+        competitor=competitor,
+        q=q,
+        percentile_filter=percentile_filter,
+        competitor_filter=competitor_filter,
+        sort=sort,
+        direction=direction,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@app.get("/api/competitors/percentile-rows/export.{fmt}")
+def export_competitor_percentile_rows_endpoint(
+    fmt: str,
+    format_code: str = Query(...),
+    region: str = Query(""),
+    competitor: str = Query(""),
+    q: str = Query(""),
+    percentile_filter: str = Query("all"),
+    competitor_filter: str = Query("all"),
+    sort: str = Query("sku"),
+    direction: str = Query("asc"),
+    db: Session = Depends(get_db),
+):
+    if fmt not in {"csv", "xlsx"}:
+        raise HTTPException(status_code=400, detail="fmt must be csv or xlsx")
+    filename, content, media_type = export_percentile_product_rows(
+        db=db,
+        price_format_code=format_code,
+        fmt=fmt,
+        region=region,
+        competitor=competitor,
+        q=q,
+        percentile_filter=percentile_filter,
+        competitor_filter=competitor_filter,
+        sort=sort,
+        direction=direction,
+    )
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type=media_type,
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+    )
 
 
 def _assignment_percentile_source_name(source_id: object) -> str:

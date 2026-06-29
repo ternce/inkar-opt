@@ -331,8 +331,9 @@ class CompetitorPricePercentile(Base):
 
     branch_name: Mapped[str] = mapped_column(Text, default="Без филиала", index=True)
     competitor_name: Mapped[str] = mapped_column(Text, default="", index=True)
+    percentile_scope: Mapped[str] = mapped_column(String(32), default="regional", index=True)
     percentile: Mapped[int] = mapped_column(Integer, index=True)
-    value: Mapped[float] = mapped_column(Numeric(18, 4))
+    value: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
     source_count: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
@@ -342,10 +343,11 @@ class CompetitorPricePercentile(Base):
             "product_id",
             "branch_name",
             "competitor_name",
+            "percentile_scope",
             "percentile",
             name="uq_comp_percentile_scope",
         ),
-        Index("ix_comp_percentile_lookup", "price_format_id", "product_id", "percentile"),
+        Index("ix_comp_percentile_lookup", "price_format_id", "product_id", "percentile_scope", "percentile"),
     )
 
 

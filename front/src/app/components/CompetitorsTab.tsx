@@ -65,10 +65,62 @@ type PercentileSource = {
   name: string;
   region: string;
   competitor: string;
+  scope?: string;
   percentile: number;
   skuCount: number;
   sourceCount: number;
   generatedAt: string;
+};
+
+type PercentileBrowserRow = {
+  productId: number;
+  sku: string;
+  productName: string;
+  manufacturer: string;
+  globalRating: number | null;
+  localRating: number | null;
+  percentiles: Record<string, number | null>;
+  branchPrices: Record<string, number | null>;
+  competitorCount: number;
+  status: string;
+  hasPercentile: boolean;
+  hasCompetitors: boolean;
+};
+
+type PercentileGroup = {
+  id: string;
+  region: string;
+  competitor: string;
+  scope?: string;
+  name: string;
+};
+
+type PercentilePriceColumn = {
+  id: number;
+  label: string;
+};
+
+type PercentileSummary = {
+  totalProducts: number;
+  productsWithPercentile: number;
+  productsWithoutPercentile: number;
+  productsWithCompetitors: number;
+  productsWithoutCompetitors: number;
+  coveragePercent: number;
+};
+
+type PercentilePayload = {
+  items: PercentileBrowserRow[];
+  summary: PercentileSummary;
+  total: number;
+  page: number;
+  pageSize: number;
+  pageCount: number;
+  percentiles: number[];
+  groups: PercentileGroup[];
+  selectedRegion: string;
+  selectedCompetitor: string;
+  priceColumns: PercentilePriceColumn[];
 };
 
 type CodeMappingMetric = {
@@ -267,6 +319,209 @@ const statusPillClass = (status: CodeMappingRow['status']) => {
 const candidateQueryForRow = (row: CodeMappingRow) =>
   [row.ourName, row.ourManufacturer].filter(Boolean).join(' ').trim();
 
+function PercentileBrowser({
+  rows,
+  summary,
+  total,
+  page,
+  pageCount,
+  groups,
+  selectedRegion,
+  selectedCompetitor,
+  priceColumns,
+  percentileNumbers,
+  search,
+  percentileFilter,
+  competitorFilter,
+  sort,
+  direction,
+  onSearch,
+  onPercentileFilter,
+  onCompetitorFilter,
+  onSort,
+  onDirection,
+  onRegion,
+  onCompetitor,
+  onPage,
+  onExport,
+}: {
+  rows: PercentileBrowserRow[];
+  summary: PercentileSummary;
+  total: number;
+  page: number;
+  pageCount: number;
+  groups: PercentileGroup[];
+  selectedRegion: string;
+  selectedCompetitor: string;
+  priceColumns: PercentilePriceColumn[];
+  percentileNumbers: number[];
+  search: string;
+  percentileFilter: string;
+  competitorFilter: string;
+  sort: string;
+  direction: 'asc' | 'desc';
+  onSearch: (value: string) => void;
+  onPercentileFilter: (value: string) => void;
+  onCompetitorFilter: (value: string) => void;
+  onSort: (value: string) => void;
+  onDirection: (value: 'asc' | 'desc') => void;
+  onRegion: (value: string) => void;
+  onCompetitor: (value: string) => void;
+  onPage: (value: number | ((current: number) => number)) => void;
+  onExport: (fmt: 'csv' | 'xlsx') => void;
+}) {
+  const cards = [
+    ['Всего товаров', summary.totalProducts],
+    ['Персентиль рассчитан', summary.productsWithPercentile],
+    ['Без данных', summary.productsWithoutPercentile],
+    ['С конкурентами', summary.productsWithCompetitors],
+    ['Без конкурентов', summary.productsWithoutCompetitors],
+    ['Покрытие', `${fmtNumber(summary.coveragePercent)}%`],
+  ];
+  const regions = Array.from(new Set(groups.map((group) => group.region).filter(Boolean)));
+  const competitors = Array.from(
+    new Set(groups.filter((group) => !selectedRegion || group.region === selectedRegion).map((group) => group.competitor).filter(Boolean))
+  );
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-3 xl:grid-cols-6">
+        {cards.map(([label, value]) => (
+          <div key={String(label)} className="admin-card p-4">
+            <div className="text-xs font-medium uppercase tracking-wide text-gray-500">{label}</div>
+            <div className="mt-2 text-2xl font-semibold tabular-nums text-gray-900">{value}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="admin-card p-4">
+        <div className="mb-3 grid grid-cols-1 gap-3 md:grid-cols-2">
+          <Select value={selectedRegion || '__none__'} onValueChange={(value) => onRegion(value === '__none__' ? '' : value)}>
+            <SelectTrigger><SelectValue placeholder="Регион" /></SelectTrigger>
+            <SelectContent>
+              {regions.length ? regions.map((region) => (
+                <SelectItem key={region} value={region}>{region}</SelectItem>
+              )) : <SelectItem value="__none__">Нет регионов</SelectItem>}
+            </SelectContent>
+          </Select>
+          <Select value={selectedCompetitor || '__none__'} onValueChange={(value) => onCompetitor(value === '__none__' ? '' : value)}>
+            <SelectTrigger><SelectValue placeholder="Конкурент" /></SelectTrigger>
+            <SelectContent>
+              {competitors.length ? competitors.map((competitor) => (
+                <SelectItem key={competitor} value={competitor}>{competitor}</SelectItem>
+              )) : <SelectItem value="__none__">Нет конкурентов</SelectItem>}
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(220px,1fr)_180px_180px_180px_140px_auto]">
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-gray-400" />
+            <Input value={search} onChange={(event) => onSearch(event.target.value)} placeholder="SKU или название" className="pl-9" />
+          </div>
+          <Select value={percentileFilter} onValueChange={onPercentileFilter}>
+            <SelectTrigger><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">Все percentile</SelectItem>
+              <SelectItem value="has_percentile">Has percentile</SelectItem>
+              <SelectItem value="no_percentile">No percentile</SelectItem>
+            </SelectContent>
+          </Select>
+          <Select value={competitorFilter} onValueChange={onCompetitorFilter}>
+            <SelectTrigger><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">Все конкуренты</SelectItem>
+              <SelectItem value="has_competitors">Has competitors</SelectItem>
+              <SelectItem value="no_competitors">No competitors</SelectItem>
+            </SelectContent>
+          </Select>
+          <Select value={sort} onValueChange={onSort}>
+            <SelectTrigger><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="sku">SKU</SelectItem>
+              <SelectItem value="name">Название</SelectItem>
+              <SelectItem value="percentile">Percentile</SelectItem>
+              <SelectItem value="competitor_count">Competitor count</SelectItem>
+              <SelectItem value="status">Status</SelectItem>
+            </SelectContent>
+          </Select>
+          <Select value={direction} onValueChange={(value) => onDirection(value as 'asc' | 'desc')}>
+            <SelectTrigger><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="asc">Asc</SelectItem>
+              <SelectItem value="desc">Desc</SelectItem>
+            </SelectContent>
+          </Select>
+          <div className="flex gap-2">
+            <Button variant="outline" onClick={() => onExport('csv')}>
+              <FileDown className="mr-2 h-4 w-4" />
+              CSV
+            </Button>
+            <Button variant="outline" onClick={() => onExport('xlsx')}>
+              <FileDown className="mr-2 h-4 w-4" />
+              XLSX
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      <div className="admin-table-card">
+        <div className="flex items-center justify-between border-b border-gray-100 px-4 py-3 text-sm text-gray-600">
+          <span>Показано {fmtNumber(rows.length)} из {fmtNumber(total)} · {selectedRegion || '—'} / {selectedCompetitor || '—'}</span>
+          <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" disabled={page <= 1} onClick={() => onPage((current) => Math.max(1, current - 1))}>Назад</Button>
+            <span className="tabular-nums">{page} / {Math.max(1, pageCount)}</span>
+            <Button variant="outline" size="sm" disabled={!pageCount || page >= pageCount} onClick={() => onPage((current) => current + 1)}>Вперед</Button>
+          </div>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="admin-table">
+            <thead>
+              <tr>
+                <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">SKU</th>
+                <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Product name</th>
+                <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Manufacturer</th>
+                <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Global rating</th>
+                <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Local rating</th>
+                {priceColumns.map((column) => (
+                  <th key={`price-${column.id}`} className="px-4 py-3 text-left text-sm font-medium text-gray-700">{column.label}</th>
+                ))}
+                {percentileNumbers.map((percentile) => (
+                  <th key={`pct-${percentile}`} className="px-4 py-3 text-left text-sm font-medium text-gray-700">P{percentile}</th>
+                ))}
+                <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Competitor count</th>
+                <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.length ? rows.map((row) => (
+                <tr key={row.productId}>
+                  <td className="px-4 py-3 text-sm font-medium text-gray-900 tabular-nums">{row.sku}</td>
+                  <td className="px-4 py-3 text-sm text-gray-900">{row.productName}</td>
+                  <td className="px-4 py-3 text-sm text-gray-700">{row.manufacturer || '—'}</td>
+                  <td className="px-4 py-3 text-sm text-gray-700 tabular-nums">{fmtNumber(row.globalRating)}</td>
+                  <td className="px-4 py-3 text-sm text-gray-700 tabular-nums">{fmtNumber(row.localRating)}</td>
+                  {priceColumns.map((column) => (
+                    <td key={`price-${row.productId}-${column.id}`} className="px-4 py-3 text-sm text-gray-700 tabular-nums">{fmtNumber(row.branchPrices?.[String(column.id)])}</td>
+                  ))}
+                  {percentileNumbers.map((percentile) => (
+                    <td key={`pct-${row.productId}-${percentile}`} className="px-4 py-3 text-sm text-gray-900 tabular-nums">{fmtNumber(row.percentiles?.[String(percentile)])}</td>
+                  ))}
+                  <td className="px-4 py-3 text-sm text-gray-700 tabular-nums">{fmtNumber(row.competitorCount)}</td>
+                  <td className="px-4 py-3 text-sm"><span className={`status-pill ${row.hasPercentile ? 'ok' : 'warn'}`}>{row.status}</span></td>
+                </tr>
+              )) : (
+                <tr>
+                  <td colSpan={8 + priceColumns.length + percentileNumbers.length} className="px-4 py-8 text-center text-sm text-gray-500">Нет строк percentile</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function CompetitorsTab({ formatCode }: Props) {
   const [sources, setSources] = useState<CompetitorSource[]>([]);
   const [sourceSearch, setSourceSearch] = useState('');
@@ -275,6 +530,29 @@ export function CompetitorsTab({ formatCode }: Props) {
   const [activeListId, setActiveListId] = useState<number | null>(null);
   const [excelFile, setExcelFile] = useState<File | null>(null);
   const [percentiles, setPercentiles] = useState<PercentileSource[]>([]);
+  const [percentileRows, setPercentileRows] = useState<PercentileBrowserRow[]>([]);
+  const [percentileSummary, setPercentileSummary] = useState<PercentileSummary>({
+    totalProducts: 0,
+    productsWithPercentile: 0,
+    productsWithoutPercentile: 0,
+    productsWithCompetitors: 0,
+    productsWithoutCompetitors: 0,
+    coveragePercent: 0,
+  });
+  const [percentileTotal, setPercentileTotal] = useState(0);
+  const [percentilePage, setPercentilePage] = useState(1);
+  const [percentilePageCount, setPercentilePageCount] = useState(0);
+  const [percentileGroups, setPercentileGroups] = useState<PercentileGroup[]>([]);
+  const [percentileRegion, setPercentileRegion] = useState('');
+  const [percentileCompetitor, setPercentileCompetitor] = useState('');
+  const [percentilePriceColumns, setPercentilePriceColumns] = useState<PercentilePriceColumn[]>([]);
+  const [percentileNumbers, setPercentileNumbers] = useState<number[]>([10, 20, 30, 40, 60]);
+  const [percentileSearch, setPercentileSearch] = useState('');
+  const [appliedPercentileSearch, setAppliedPercentileSearch] = useState('');
+  const [percentileFilter, setPercentileFilter] = useState('all');
+  const [percentileCompetitorFilter, setPercentileCompetitorFilter] = useState('all');
+  const [percentileSort, setPercentileSort] = useState('sku');
+  const [percentileDirection, setPercentileDirection] = useState<'asc' | 'desc'>('asc');
   const [provisorDiagnostics, setProvisorDiagnostics] = useState<ProvisorDiagnostics | null>(null);
   const [provisorAccounts, setProvisorAccounts] = useState<ProvisorAccount[]>([]);
   const [selectedProvisorAccountIds, setSelectedProvisorAccountIds] = useState<number[]>([]);
@@ -316,6 +594,42 @@ export function CompetitorsTab({ formatCode }: Props) {
     const data = parseJsonOrNull(text);
     if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить персентили');
     setPercentiles(Array.isArray(data) ? data : []);
+  };
+
+  const loadPercentileRows = async () => {
+    const params = new URLSearchParams({
+      format_code: formatCode,
+      region: percentileRegion,
+      competitor: percentileCompetitor,
+      q: appliedPercentileSearch,
+      percentile_filter: percentileFilter,
+      competitor_filter: percentileCompetitorFilter,
+      sort: percentileSort,
+      direction: percentileDirection,
+      page: String(percentilePage),
+      page_size: '100',
+    });
+    const res = await fetch(`/api/competitors/percentile-rows?${params.toString()}`);
+    const text = await res.text();
+    const data = parseJsonOrNull(text) as PercentilePayload | null;
+    if (!res.ok) throw new Error((data as any)?.detail || text || 'Не удалось загрузить персентили');
+    setPercentileRows(Array.isArray(data?.items) ? data.items : []);
+    setPercentileSummary(data?.summary || {
+      totalProducts: 0,
+      productsWithPercentile: 0,
+      productsWithoutPercentile: 0,
+      productsWithCompetitors: 0,
+      productsWithoutCompetitors: 0,
+      coveragePercent: 0,
+    });
+    setPercentileTotal(Number(data?.total || 0));
+    setPercentilePageCount(Number(data?.pageCount || 0));
+    setPercentileGroups(Array.isArray(data?.groups) ? data.groups : []);
+    setPercentilePriceColumns(Array.isArray(data?.priceColumns) ? data.priceColumns : []);
+    setPercentileNumbers(Array.isArray(data?.percentiles) ? data.percentiles.map(Number) : [10, 20, 30, 40, 60]);
+    if (data?.selectedRegion && data.selectedRegion !== percentileRegion) setPercentileRegion(data.selectedRegion);
+    if (data?.selectedCompetitor && data.selectedCompetitor !== percentileCompetitor) setPercentileCompetitor(data.selectedCompetitor);
+    if (data?.page && data.page !== percentilePage) setPercentilePage(data.page);
   };
 
   const loadProvisorDiagnostics = async () => {
@@ -366,7 +680,7 @@ export function CompetitorsTab({ formatCode }: Props) {
     setIsLoading(true);
     setError(null);
     try {
-      await Promise.all([loadSources(), loadPercentiles(), loadProvisorDiagnostics(), loadProvisorAccounts()]);
+      await Promise.all([loadSources(), loadPercentileRows(), loadProvisorDiagnostics(), loadProvisorAccounts()]);
     } catch (e: any) {
       setError(e?.message || 'Ошибка загрузки');
     } finally {
@@ -378,6 +692,22 @@ export function CompetitorsTab({ formatCode }: Props) {
     void loadAll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [formatCode]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setAppliedPercentileSearch(percentileSearch.trim());
+      setPercentilePage(1);
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [percentileSearch]);
+
+  useEffect(() => {
+    setIsLoading(true);
+    void loadPercentileRows()
+      .catch((e: any) => setError(e?.message || 'Не удалось загрузить персентили'))
+      .finally(() => setIsLoading(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [formatCode, percentileRegion, percentileCompetitor, appliedPercentileSearch, percentileFilter, percentileCompetitorFilter, percentileSort, percentileDirection, percentilePage]);
 
   useEffect(() => {
     mappingRequestRef.current?.abort();
@@ -407,6 +737,20 @@ export function CompetitorsTab({ formatCode }: Props) {
     setAppliedSourceQuery(sourceQuery.trim());
     setAppliedProductQuery(productQuery.trim());
     setMappingPage(1);
+  };
+
+  const exportPercentiles = (fmt: 'csv' | 'xlsx') => {
+    const params = new URLSearchParams({
+      format_code: formatCode,
+      region: percentileRegion,
+      competitor: percentileCompetitor,
+      q: appliedPercentileSearch,
+      percentile_filter: percentileFilter,
+      competitor_filter: percentileCompetitorFilter,
+      sort: percentileSort,
+      direction: percentileDirection,
+    });
+    window.location.href = `/api/competitors/percentile-rows/export.${fmt}?${params.toString()}`;
   };
 
   const pollJob = async (jobId: string) => {
@@ -441,7 +785,7 @@ export function CompetitorsTab({ formatCode }: Props) {
       if (!data?.job_id) throw new Error('Backend не вернул job_id');
       setActiveJob({ id: data.job_id, status: data.status || 'pending', progress: 0, message: data.message || 'Обновляем источники' });
       await pollJob(data.job_id);
-      await Promise.all([loadSources(), loadPercentiles(), loadCodeMappings(), loadProvisorDiagnostics(), loadProvisorAccounts()]);
+      await Promise.all([loadSources(), loadPercentileRows(), loadCodeMappings(), loadProvisorDiagnostics(), loadProvisorAccounts()]);
       toast.success(`${platformLabel(source)} обновлен`);
     } catch (e: any) {
       setError(e?.message || 'Ошибка обновления');
@@ -1346,6 +1690,35 @@ export function CompetitorsTab({ formatCode }: Props) {
         </TabsContent>
 
         <TabsContent value="percentiles" className="m-0 pt-4">
+          <PercentileBrowser
+            rows={percentileRows}
+            summary={percentileSummary}
+            total={percentileTotal}
+            page={percentilePage}
+            pageCount={percentilePageCount}
+            groups={percentileGroups}
+            selectedRegion={percentileRegion}
+            selectedCompetitor={percentileCompetitor}
+            priceColumns={percentilePriceColumns}
+            percentileNumbers={percentileNumbers}
+            search={percentileSearch}
+            percentileFilter={percentileFilter}
+            competitorFilter={percentileCompetitorFilter}
+            sort={percentileSort}
+            direction={percentileDirection}
+            onSearch={setPercentileSearch}
+            onPercentileFilter={(value) => { setPercentileFilter(value); setPercentilePage(1); }}
+            onCompetitorFilter={(value) => { setPercentileCompetitorFilter(value); setPercentilePage(1); }}
+            onSort={(value) => { setPercentileSort(value); setPercentilePage(1); }}
+            onDirection={(value) => { setPercentileDirection(value); setPercentilePage(1); }}
+            onRegion={(value) => { setPercentileRegion(value); setPercentileCompetitor(''); setPercentilePage(1); }}
+            onCompetitor={(value) => { setPercentileCompetitor(value); setPercentilePage(1); }}
+            onPage={setPercentilePage}
+            onExport={exportPercentiles}
+          />
+        </TabsContent>
+
+        <TabsContent value="percentiles-legacy" className="m-0 pt-4">
           <div className="admin-table-card">
             <div className="overflow-x-auto">
               <table className="admin-table">

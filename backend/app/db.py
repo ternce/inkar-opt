@@ -62,6 +62,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _ensure_compatible_columns()
     _ensure_compatible_column_types()
+    _ensure_nullable_percentile_values()
     _ensure_compatible_indexes()
     _backfill_competitor_assignments()
 
@@ -128,6 +129,9 @@ def _ensure_compatible_columns() -> None:
             ("source_goods_id", "BIGINT"),
             ("source_distributor_goods_id", "TEXT DEFAULT ''"),
             ("source_manufacturer", "TEXT DEFAULT ''"),
+        ],
+        "competitor_price_percentiles": [
+            ("percentile_scope", "VARCHAR(32) DEFAULT 'regional'"),
         ],
         "jobs": [
             ("type", "VARCHAR(64)"),
@@ -361,7 +365,7 @@ def _ensure_compatible_column_types() -> None:
             "parsed_dimensions_json",
             "parsed_critical_tokens_json",
         ),
-        "competitor_price_percentiles": ("branch_name", "competitor_name"),
+        "competitor_price_percentiles": ("branch_name", "competitor_name", "percentile_scope"),
         "price_source_accounts": ("login", "status_message"),
         "jobs": ("format_code", "message"),
         "source_goods_matches": ("distributor_goods_id", "distributor_goods_name", "distributor_producer", "match_method"),
@@ -439,6 +443,93 @@ def _ensure_compatible_column_types() -> None:
                 if column not in existing or existing[column] == "TEXT":
                     continue
                 conn.execute(text(f'ALTER TABLE "{table}" ALTER COLUMN "{column}" TYPE TEXT'))
+
+
+def _ensure_nullable_percentile_values() -> None:
+    inspector = inspect(engine)
+    if not inspector.has_table("competitor_price_percentiles"):
+        return
+
+    columns = inspector.get_columns("competitor_price_percentiles")
+    value_column = next((col for col in columns if col["name"] == "value"), None)
+    if value_column is None or not value_column.get("nullable") is False:
+        return
+
+    with engine.begin() as conn:
+        if engine.dialect.name == "postgresql":
+            conn.execute(text('ALTER TABLE competitor_price_percentiles ALTER COLUMN value DROP NOT NULL'))
+            return
+
+        if engine.dialect.name != "sqlite":
+            return
+
+        conn.execute(text("ALTER TABLE competitor_price_percentiles RENAME TO competitor_price_percentiles_old"))
+        conn.execute(
+            text(
+                """
+                CREATE TABLE competitor_price_percentiles (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    price_format_id INTEGER NOT NULL,
+                    product_id INTEGER NOT NULL,
+                    branch_name TEXT NOT NULL,
+                    competitor_name TEXT NOT NULL,
+                    percentile_scope VARCHAR(32) NOT NULL DEFAULT 'regional',
+                    percentile INTEGER NOT NULL,
+                    value NUMERIC(18, 4),
+                    source_count INTEGER NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    FOREIGN KEY(price_format_id) REFERENCES price_formats (id),
+                    FOREIGN KEY(product_id) REFERENCES products (id),
+                    CONSTRAINT uq_comp_percentile_scope UNIQUE (
+                        price_format_id,
+                        product_id,
+                        branch_name,
+                        competitor_name,
+                        percentile_scope,
+                        percentile
+                    )
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO competitor_price_percentiles (
+                    id,
+                    price_format_id,
+                    product_id,
+                    branch_name,
+                    competitor_name,
+                    percentile_scope,
+                    percentile,
+                    value,
+                    source_count,
+                    updated_at
+                )
+                SELECT
+                    id,
+                    price_format_id,
+                    product_id,
+                    branch_name,
+                    competitor_name,
+                    COALESCE(percentile_scope, 'regional'),
+                    percentile,
+                    value,
+                    source_count,
+                    updated_at
+                FROM competitor_price_percentiles_old
+                """
+            )
+        )
+        conn.execute(text("DROP TABLE competitor_price_percentiles_old"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_competitor_price_percentiles_price_format_id ON competitor_price_percentiles (price_format_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_competitor_price_percentiles_product_id ON competitor_price_percentiles (product_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_competitor_price_percentiles_branch_name ON competitor_price_percentiles (branch_name)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_competitor_price_percentiles_competitor_name ON competitor_price_percentiles (competitor_name)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_competitor_price_percentiles_percentile_scope ON competitor_price_percentiles (percentile_scope)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_competitor_price_percentiles_percentile ON competitor_price_percentiles (percentile)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_comp_percentile_lookup ON competitor_price_percentiles (price_format_id, product_id, percentile_scope, percentile)"))
 
 
 def _ensure_compatible_indexes() -> None:
