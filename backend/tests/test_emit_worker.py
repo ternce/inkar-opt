@@ -146,7 +146,7 @@ def test_normal_provisor_refresh_skips_emit_ids_and_keeps_old_data(monkeypatch):
     assert item.name == "Old Item"
 
 
-def test_streaming_parser_and_deduplication_rules(tmp_path):
+def test_streaming_parser_preserves_multiple_prices_per_goods_id(tmp_path):
     source = tmp_path / "emit.json"
     staging = tmp_path / "stage.sqlite"
     source.write_text(
@@ -172,10 +172,10 @@ def test_streaming_parser_and_deduplication_rules(tmp_path):
 
     assert stats.input_rows == 4
     assert stats.zero_price_rows_skipped == 1
-    assert stats.duplicate_rows_removed == 1
+    assert stats.duplicate_rows_removed == 0
     assert stats.rows_without_goodsId == 1
-    assert len(rows) == 2
-    assert next(row for row in rows if row["provisor_goods_id"] == 10)["distributor_price"] == 9.0
+    assert len(rows) == 3
+    assert [row["distributor_price"] for row in rows if row["provisor_goods_id"] == 10] == [12.0, 9.0]
 
 
 def test_parse_100k_synthetic_duplicates_bounded_memory(tmp_path):
@@ -208,8 +208,8 @@ def test_parse_100k_synthetic_duplicates_bounded_memory(tmp_path):
     )
 
     assert stats.input_rows == 100_000
-    assert stats.final_rows_saved == 1000
-    assert stats.duplicate_rows_removed == 99_000
+    assert stats.final_rows_saved == 100_000
+    assert stats.duplicate_rows_removed == 0
     assert stats.stage_db_size_mb > 0
     assert time.perf_counter() - started < 60
 
@@ -239,7 +239,7 @@ def test_deduplicate_prefers_goods_id_positive_price_and_full_name():
     assert next(row for row in rows if row["provisor_goods_id"] == 1)["distributor_price"] == 10
 
 
-def test_sqlite_staging_dedupe_keeps_best_row(tmp_path):
+def test_sqlite_staging_keeps_multiple_positive_prices_for_same_goods_id(tmp_path):
     from backend.app.services.emit_worker import _stage_upsert
 
     stage = tmp_path / "stage.sqlite"
@@ -261,10 +261,10 @@ def test_sqlite_staging_dedupe_keeps_best_row(tmp_path):
         conn.close()
 
     rows = [row for batch in iter_stage_rows(stage, batch_size=10) for row in batch]
-    assert stage_row_count(stage) == 1
-    assert stats.duplicate_rows_removed == 1
-    assert rows[0]["name"] == "Long full name"
-    assert rows[0]["distributor_price"] == 9
+    assert stage_row_count(stage) == 2
+    assert stats.duplicate_rows_removed == 0
+    assert [row["name"] for row in rows] == ["Short", "Long full name"]
+    assert [row["distributor_price"] for row in rows] == [20, 9]
 
 
 def _parse_rows_to_stage(tmp_path, rows):
@@ -400,7 +400,7 @@ def test_same_goods_id_different_pack_size_keep_separate(tmp_path):
     assert stats.key_type_counts["goodsId+pack+producer"] == 2
 
 
-def test_same_goods_id_exact_duplicates_different_prices_keep_lowest(tmp_path):
+def test_same_goods_id_exact_duplicates_different_prices_keep_all(tmp_path):
     stats, rows = _parse_rows_to_stage(
         tmp_path,
         [
@@ -409,12 +409,12 @@ def test_same_goods_id_exact_duplicates_different_prices_keep_lowest(tmp_path):
         ],
     )
 
-    assert len(rows) == 1
-    assert rows[0]["distributor_price"] == 8
-    assert stats.duplicate_rows_removed == 1
+    assert len(rows) == 2
+    assert [row["distributor_price"] for row in rows] == [12.0, 8.0]
+    assert stats.duplicate_rows_removed == 0
 
 
-def test_no_goods_id_same_name_manufacturer_different_prices_keep_lowest(tmp_path):
+def test_no_goods_id_same_name_manufacturer_different_prices_keep_all(tmp_path):
     stats, rows = _parse_rows_to_stage(
         tmp_path,
         [
@@ -423,9 +423,9 @@ def test_no_goods_id_same_name_manufacturer_different_prices_keep_lowest(tmp_pat
         ],
     )
 
-    assert len(rows) == 1
-    assert rows[0]["distributor_price"] == 8
-    assert stats.key_type_counts["fallback"] == 1
+    assert len(rows) == 2
+    assert [row["distributor_price"] for row in rows] == [12.0, 8.0]
+    assert stats.key_type_counts["fallback"] == 2
 
 
 def test_no_goods_id_different_pack_size_keep_separate(tmp_path):
@@ -440,7 +440,7 @@ def test_no_goods_id_different_pack_size_keep_separate(tmp_path):
     assert len(rows) == 2
 
 
-def test_price_is_not_part_of_fallback_key(tmp_path):
+def test_fallback_rows_keep_all_positive_prices(tmp_path):
     stats, _rows = _parse_rows_to_stage(
         tmp_path,
         [
@@ -450,8 +450,8 @@ def test_price_is_not_part_of_fallback_key(tmp_path):
         ],
     )
 
-    assert stats.final_rows_saved == 1
-    assert stats.duplicate_rows_removed == 2
+    assert stats.final_rows_saved == 3
+    assert stats.duplicate_rows_removed == 0
 
 
 def test_stage_audit_reports_suspicious_groups(tmp_path):

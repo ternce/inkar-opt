@@ -1,0 +1,1 @@
+DATABASE_URL=postgresql://apteka:apteka@postgres:5432/apteka

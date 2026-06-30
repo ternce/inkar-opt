@@ -56,6 +56,52 @@ def _price_list(db, pf, *, source_key, filial_id=None):
     return row
 
 
+def test_emit_rematch_keeps_all_prices_for_same_goods_id():
+    db = _session()
+    pf = _price_format(db)
+    product = _product(db, code="163571", name="Emit Product")
+    product.provisor_goods_id = 163571
+    price_list = CompetitorPriceList(
+        price_format_id=pf.id,
+        source_type="provisor",
+        source_key="emit:1106",
+        display_name="Emit International 1106",
+        supplier="Emit International 1106",
+        branch_name="Emit International 1106",
+        competitor_name="Emit International 1106",
+        account_login="emit",
+    )
+    db.add(price_list)
+    db.flush()
+    for price in [8688.26, 8989.73, 9358.46]:
+        db.add(
+            CompetitorPriceListItem(
+                price_list_id=price_list.id,
+                provisor_goods_id=163571,
+                filial_id=1106,
+                name="Emit Product",
+                distributor_goods_name="Emit Product",
+                distributor_price=price,
+            )
+        )
+    db.flush()
+
+    rematch_price_list_items_by_product(db=db, price_list=price_list)
+
+    rows = (
+        db.execute(
+            select(CompetitorPriceListItem)
+            .where(CompetitorPriceListItem.price_list_id == price_list.id)
+            .order_by(CompetitorPriceListItem.id.asc())
+        )
+        .scalars()
+        .all()
+    )
+    assert [float(row.distributor_price) for row in rows] == [8688.26, 8989.73, 9358.46]
+    assert {row.product_id for row in rows} == {product.id}
+    assert {row.matched_sku for row in rows} == {"000000000000163571"}
+
+
 def _item(db, price_list, *, distributor_goods_id, goods_id=None, filial_id=None, name="Supplier Product"):
     item = CompetitorPriceListItem(
         price_list_id=price_list.id,

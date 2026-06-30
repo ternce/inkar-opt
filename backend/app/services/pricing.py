@@ -142,6 +142,9 @@ class CompetitorResolvedMany:
     prices: list[tuple[Decimal, str]]  # (computed_price, source_name)
 
 
+PercentilePriceCache = dict[int, dict[int, list[tuple[Decimal, str]]]]
+
+
 @dataclass(frozen=True)
 class SelectedSourceMeta:
     selected_sources: set[str]
@@ -275,6 +278,24 @@ def lowest_available_competitor_price(
         coefficient = coefficient_by_source.get(str(row.source_name or ""), Decimal("1"))
         prices.append(source_price * coefficient)
     return min(prices) if prices else None
+
+
+def zone_reference_for_product(
+    *,
+    db: Session,
+    price_format: PriceFormat,
+    product_id: int,
+    percentile_price_cache: PercentilePriceCache | None = None,
+) -> Decimal | None:
+    if (price_format.competitor_price_mode or "regular") == "percentile" and percentile_price_cache is not None:
+        zone_percentile_number = int(price_format.percentile_number or 10)
+        zone_resolved = resolve_percentile_prices_from_cache(
+            percentile_price_cache,
+            product_id,
+            percentile_number=zone_percentile_number,
+        )
+        return zone_resolved.prices[0][0] if zone_resolved.prices else None
+    return lowest_available_competitor_price(db, price_format.id, product_id)
 
 
 def calculate_price_zone(
@@ -559,6 +580,48 @@ def resolve_percentile_prices(
     return CompetitorResolvedMany(out)
 
 
+def load_percentile_price_cache(db: Session, price_format_id: int) -> PercentilePriceCache:
+    rows = (
+        db.execute(
+            select(
+                CompetitorPricePercentile.product_id,
+                CompetitorPricePercentile.percentile,
+                CompetitorPricePercentile.value,
+                CompetitorPricePercentile.competitor_name,
+                CompetitorPricePercentile.branch_name,
+            )
+            .where(CompetitorPricePercentile.price_format_id == price_format_id)
+            .where(CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
+            .where(CompetitorPricePercentile.value.is_not(None))
+            .order_by(
+                CompetitorPricePercentile.product_id.asc(),
+                CompetitorPricePercentile.percentile.asc(),
+                CompetitorPricePercentile.value.asc(),
+            )
+        )
+        .all()
+    )
+    cache: PercentilePriceCache = {}
+    for product_id, percentile, value, competitor_name, branch_name in rows:
+        price = _as_decimal(value)
+        if price is None or price <= 0:
+            continue
+        src = f"percentile:{competitor_name}:{branch_name}:p{percentile}"
+        cache.setdefault(int(product_id), {}).setdefault(int(percentile), []).append((price, src))
+    return cache
+
+
+def resolve_percentile_prices_from_cache(
+    cache: PercentilePriceCache,
+    product_id: int,
+    *,
+    percentile_number: int,
+) -> CompetitorResolvedMany:
+    prices = list(cache.get(int(product_id), {}).get(int(percentile_number), []))
+    prices.sort(key=lambda x: x[0])
+    return CompetitorResolvedMany(prices)
+
+
 def _active_lists_query(db: Session, price_format_id: int, as_of: date):
     return (
         select(UniversalList)
@@ -795,6 +858,8 @@ def calculate_price_for_product(
     price_format: PriceFormat,
     as_of: date,
     region_id: int | None = None,
+    active_lists: list[UniversalList] | None = None,
+    percentile_price_cache: PercentilePriceCache | None = None,
 ) -> tuple[Decimal, dict]:
     cost = _as_decimal(product.cost, Decimal("0")) or Decimal("0")
 
@@ -808,7 +873,7 @@ def calculate_price_for_product(
     global_markup_percent = markup_percent
     global_no_competitor_markup_percent = no_competitor_markup_percent
     rounding_rule = db.get(RoundingRule, price_format.rounding_rule_id) if price_format.rounding_rule_id else None
-    active_lists = _active_lists_for_format(db, price_format.id, as_of)
+    active_lists = active_lists if active_lists is not None else _active_lists_for_format(db, price_format.id, as_of)
     applied_list_effects: list[dict] = []
 
     fixed_price_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_FIXED_PRICE)
@@ -821,7 +886,12 @@ def calculate_price_for_product(
         markup_percent_used = markup_percent * Decimal("100")
         diagnostic_mdc = price_from_margin(cost, markup_percent)
         branch_id = str(region_id if region_id is not None else (price_format.branch or ""))
-        zone_competitor_price_min = lowest_available_competitor_price(db, price_format.id, product.id)
+        zone_competitor_price_min = zone_reference_for_product(
+            db=db,
+            price_format=price_format,
+            product_id=product.id,
+            percentile_price_cache=percentile_price_cache,
+        )
         zone, zone_reference, deviation_pct = calculate_price_zone(
             fixed_price,
             lowest_competitor_price=zone_competitor_price_min,
@@ -892,12 +962,22 @@ def calculate_price_for_product(
         effect["effectMessage"] = "fixed_markup calculated MDC from list margin and used it as final price; competitors and bend were bypassed."
         markup_percent_used = markup_percent * Decimal("100")
         branch_id = str(region_id if region_id is not None else (price_format.branch or ""))
+        zone_competitor_price_min = zone_reference_for_product(
+            db=db,
+            price_format=price_format,
+            product_id=product.id,
+            percentile_price_cache=percentile_price_cache,
+        )
+        zone, zone_reference, deviation_pct = calculate_price_zone(
+            fixed_markup_mdc,
+            lowest_competitor_price=zone_competitor_price_min,
+        )
         debug = {
             "cost": cost,
             "markup_percent": markup_percent,
             "base_price": fixed_markup_mdc,
             "competitor_price": None,
-            "lowest_competitor_price": None,
+            "lowest_competitor_price": zone_competitor_price_min,
             "competitor_source": "",
             "applied_source_name": "",
             "applied_source_type": "",
@@ -933,9 +1013,9 @@ def calculate_price_for_product(
             "final_price": fixed_markup_mdc,
             "reason": "fixed_markup_list_final",
             "log": "Цена рассчитана по списку фиксированной наценки. МДЦ рассчитана по марже из списка и применена как финальная цена. Конкуренты и прогиб не применялись.",
-            "zone": None,
-            "zone_reference_price": None,
-            "deviation_pct": None,
+            "zone": zone,
+            "zone_reference_price": zone_reference,
+            "deviation_pct": deviation_pct,
         }
         return fixed_markup_mdc, debug
 
@@ -1005,12 +1085,19 @@ def calculate_price_for_product(
         applied_list_effects.append(_list_effect(list_id, LIST_TYPE_PERCENTILE_OVERRIDE, percentile_value, "percentile_override"))
 
     if (price_format.competitor_price_mode or "regular") == "percentile":
-        resolved_many = resolve_percentile_prices(
-            db,
-            price_format.id,
-            product.id,
-            percentile_number=percentile_number,
-        )
+        if percentile_price_cache is not None:
+            resolved_many = resolve_percentile_prices_from_cache(
+                percentile_price_cache,
+                product.id,
+                percentile_number=percentile_number,
+            )
+        else:
+            resolved_many = resolve_percentile_prices(
+                db,
+                price_format.id,
+                product.id,
+                percentile_number=percentile_number,
+            )
     else:
         resolved_many = resolve_competitor_prices(
             db,
@@ -1476,20 +1563,37 @@ def calculate_prices(
     if not ranges:
         raise ValueError("Markup ranges are required")
 
-    existing_competitor_rows = (
-        db.execute(
-            select(CompetitorPrice.id)
-            .where(CompetitorPrice.price_format_id == pf.id)
-            .where(CompetitorPrice.product_id.is_not(None))
-            .limit(1)
+    percentile_mode = (pf.competitor_price_mode or "regular") == "percentile"
+    if percentile_mode:
+        existing_percentile_rows = (
+            db.execute(
+                select(CompetitorPricePercentile.id)
+                .where(CompetitorPricePercentile.price_format_id == pf.id)
+                .where(CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
+                .where(CompetitorPricePercentile.value.is_not(None))
+                .limit(1)
+            )
+            .scalars()
+            .first()
         )
-        .scalars()
-        .first()
-    )
-    if existing_competitor_rows is None:
-        rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id)
-        recalculate_competitor_percentiles(db=db, price_format_id=pf.id)
-        db.flush()
+        if existing_percentile_rows is None:
+            recalculate_competitor_percentiles(db=db, price_format_id=pf.id)
+            db.flush()
+    else:
+        existing_competitor_rows = (
+            db.execute(
+                select(CompetitorPrice.id)
+                .where(CompetitorPrice.price_format_id == pf.id)
+                .where(CompetitorPrice.product_id.is_not(None))
+                .limit(1)
+            )
+            .scalars()
+            .first()
+        )
+        if existing_competitor_rows is None:
+            rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id)
+            recalculate_competitor_percentiles(db=db, price_format_id=pf.id)
+            db.flush()
 
     pl = db.execute(select(PriceList).where(PriceList.number == price_list_number)).scalars().first()
     if pl is not None and force_new_price_list:
@@ -1524,6 +1628,7 @@ def calculate_prices(
     applied_rule_version = ""
     if rule is not None and getattr(rule, "updated_at", None):
         applied_rule_version = local_iso(rule.updated_at)
+    percentile_price_cache = load_percentile_price_cache(db, pf.id) if percentile_mode else None
 
     # upsert calculated_prices
     count = 0
@@ -1543,6 +1648,8 @@ def calculate_prices(
             price_format=pf,
             as_of=as_of,
             region_id=region_id,
+            active_lists=active_lists,
+            percentile_price_cache=percentile_price_cache,
         )
 
         existing = db.execute(

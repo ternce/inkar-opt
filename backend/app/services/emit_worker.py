@@ -52,6 +52,7 @@ EMIT_NAME_MARKERS = (
     "Р\xadРјРёС‚Рё Р\x98РЅС‚РµСЂРЅРµС€РЅР»",
 )
 MIN_FINAL_ROWS = 1
+DEFAULT_TRACE_SKU = "163571"
 
 
 @dataclass
@@ -120,6 +121,7 @@ class EmitStats:
     parse_dedupe_elapsed_sec: float = 0.0
     db_replace_elapsed_sec: float = 0.0
     cleanup_elapsed_sec: float = 0.0
+    trace: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -144,6 +146,7 @@ class EmitStats:
             "parse_dedupe_elapsed_sec": self.parse_dedupe_elapsed_sec,
             "db_replace_elapsed_sec": self.db_replace_elapsed_sec,
             "cleanup_elapsed_sec": self.cleanup_elapsed_sec,
+            "trace": self.trace,
         }
 
 
@@ -490,6 +493,33 @@ def _dedupe_key(item: dict[str, Any]) -> tuple[str, ...]:
     )
 
 
+def _trace_sku() -> str:
+    return str(os.getenv("EMIT_TRACE_SKU", DEFAULT_TRACE_SKU) or "").strip()
+
+
+def _trace_goods_id() -> int | None:
+    value = _trace_sku()
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _stage_storage_key(item: dict[str, Any]) -> tuple[str, ...]:
+    """Uniquely identify a staged Emit row while preserving all positive prices."""
+
+    return (
+        *_dedupe_key(item),
+        "row",
+        str(item.get("provisor_id") or ""),
+        str(item.get("distributor_price") or ""),
+        str(item.get("stock") or ""),
+        str(item.get("source_timestamp") or ""),
+        str(item.get("_stage_sequence") or ""),
+        str(item.get("raw_json") or ""),
+    )
+
+
 def _dedupe_score(item: dict[str, Any]) -> tuple[int, int, int, int, int, float, str]:
     has_goods = 1 if item.get("provisor_goods_id") else 0
     has_price = 1 if float(item.get("distributor_price") or 0) > 0 else 0
@@ -600,11 +630,12 @@ def open_stage_db(path: Path) -> sqlite3.Connection:
 
 
 def _stage_values(item: dict[str, Any]) -> tuple[Any, ...]:
-    key = _dedupe_key(item)
+    key = _stage_storage_key(item)
+    group_key = _dedupe_key(item)
     price = item.get("distributor_price")
     return (
         json.dumps(key, ensure_ascii=False),
-        key[0],
+        group_key[0],
         _quality_json(item),
         item.get("provisor_id"),
         item.get("provisor_goods_id"),
@@ -633,7 +664,11 @@ def _stage_values(item: dict[str, Any]) -> tuple[Any, ...]:
 
 
 def _stage_upsert(conn: sqlite3.Connection, item: dict[str, Any], stats: EmitStats) -> None:
-    dedupe_key = json.dumps(_dedupe_key(item), ensure_ascii=False)
+    if "_stage_sequence" not in item:
+        sequence = int(getattr(stats, "_stage_sequence", 0) or 0) + 1
+        setattr(stats, "_stage_sequence", sequence)
+        item["_stage_sequence"] = sequence
+    dedupe_key = json.dumps(_stage_storage_key(item), ensure_ascii=False)
     existing = conn.execute("SELECT quality_json FROM stage_items WHERE dedupe_key = ?", (dedupe_key,)).fetchone()
     if existing is None:
         conn.execute(
@@ -1056,6 +1091,8 @@ def parse_normalize_stage(
     _ensure_free_disk(Path(cfg.temp_dir), cfg.min_free_disk_gb)
     conn = open_stage_db(stage_path)
     batch_count = 0
+    trace_goods_id = _trace_goods_id()
+    trace_raw_prices: list[float] = []
     try:
         for row in iter_source_rows(source_path):
             stats.input_rows += 1
@@ -1068,6 +1105,8 @@ def parse_normalize_stage(
             if item is None:
                 _increment_skip(stats, emit_skip_reason(row))
                 continue
+            if trace_goods_id is not None and item.get("provisor_goods_id") == trace_goods_id:
+                trace_raw_prices.append(float(item.get("distributor_price") or 0))
             stats.normalized_rows += 1
             if not item.get("provisor_goods_id"):
                 stats.rows_without_goodsId += 1
@@ -1081,6 +1120,22 @@ def parse_normalize_stage(
         conn.commit()
         stats.final_rows_saved = int(conn.execute("SELECT COUNT(*) FROM stage_items").fetchone()[0] or 0)
         stats.key_type_counts, stats.suspicious_groups = collect_stage_audit(conn)
+        if trace_goods_id is not None:
+            stage_prices = [
+                float(row[0])
+                for row in conn.execute(
+                    "SELECT distributor_price FROM stage_items WHERE provisor_goods_id = ? ORDER BY rowid",
+                    (trace_goods_id,),
+                ).fetchall()
+                if row[0] is not None
+            ]
+            stats.trace = {
+                "sku": _trace_sku(),
+                "raw_rows_found": len(trace_raw_prices),
+                "raw_prices": trace_raw_prices,
+                "items_saved_count": len(stage_prices),
+                "item_prices_in_stage": stage_prices,
+            }
     finally:
         conn.close()
     stats.stage_db_size_mb = _stage_total_size_mb(stage_path)
@@ -1107,6 +1162,8 @@ def parse_normalize_stage(
     )
     if stats.suspicious_groups:
         logger.warning("[EMIT_DEDUPE_SUSPICIOUS_GROUPS] filial_id=%s top=%s", filial_id, stats.suspicious_groups[:20])
+    if stats.trace:
+        logger.info("[EMIT_TRACE] stage=parse filial_id=%s trace=%s", filial_id, stats.trace)
     return stats
 
 
@@ -1242,6 +1299,29 @@ def replace_emit_price_list_from_staging(
     stats.final_rows_saved = final_count
     stats.db_replace_elapsed_sec = round(time.perf_counter() - started, 3)
     db.flush()
+    trace_goods_id = _trace_goods_id()
+    if trace_goods_id is not None:
+        db_prices = [
+            float(price)
+            for price in db.execute(
+                select(CompetitorPriceListItem.distributor_price)
+                .where(CompetitorPriceListItem.price_list_id == row.id)
+                .where(CompetitorPriceListItem.provisor_goods_id == trace_goods_id)
+                .where(CompetitorPriceListItem.distributor_price.is_not(None))
+                .order_by(CompetitorPriceListItem.id.asc())
+            ).scalars().all()
+            if price is not None
+        ]
+        trace = dict(stats.trace or {})
+        trace.update(
+            {
+                "sku": _trace_sku(),
+                "items_saved_count": len(db_prices),
+                "item_prices_in_db": db_prices,
+            }
+        )
+        stats.trace = trace
+        logger.info("[EMIT_TRACE] stage=db_replace filial_id=%s price_list_id=%s trace=%s", filial_id, row.id, trace)
     db.commit()
     logger.info(
         "[EMIT_DB_REPLACE_SUMMARY] filial_id=%s previous_rows=%s final_rows_saved=%s elapsed_sec=%s",

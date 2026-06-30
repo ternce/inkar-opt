@@ -27,7 +27,8 @@ from pathlib import Path
 import os
 from openpyxl import Workbook, load_workbook
 from openpyxl.formatting.rule import CellIsRule
-from openpyxl.styles import PatternFill
+from openpyxl.styles import Alignment, PatternFill
+from openpyxl.utils import get_column_letter
 
 from .config import get_settings
 from . import data
@@ -92,6 +93,7 @@ from .services.pricing import (
     resolve_competitor_price,
     calculate_prices,
     get_markup_percent_by_range,
+    lowest_available_competitor_price,
     margin_percent_from_price,
     normalize_list_type,
 )
@@ -189,6 +191,8 @@ from .services.competitors.percentiles.read_models import (
     export_percentile_product_rows,
     list_percentile_product_rows,
     list_percentile_sources,
+    percentile_coverage_audit,
+    percentile_trace,
 )
 from .services.jobs import create_job, get_active_job, job_to_dict, schedule_job, update_job
 from .services.references.batch import import_reference_batch
@@ -1564,20 +1568,42 @@ def _source_label(source_name: str) -> str:
     return source_name
 
 
-def _calculated_zone(cp: CalculatedPrice) -> str | None:
+def _zone_reference_for_saved_row(
+    db: Session | None,
+    cp: CalculatedPrice,
+    price_format_id: int | None = None,
+    product_id: int | None = None,
+) -> object:
+    stored = cp.lowest_competitor_price if cp.lowest_competitor_price is not None else cp.competitor_price
+    if stored is not None or db is None or price_format_id is None:
+        return stored
+    return lowest_available_competitor_price(db, int(price_format_id), int(product_id or cp.product_id))
+
+
+def _calculated_zone(
+    cp: CalculatedPrice,
+    db: Session | None = None,
+    price_format_id: int | None = None,
+    product_id: int | None = None,
+) -> str | None:
     zone, _reference, _deviation = calculate_price_zone(
         cp.final_price,
         chosen_competitor_price=cp.chosen_competitor_price,
-        lowest_competitor_price=cp.lowest_competitor_price if cp.lowest_competitor_price is not None else cp.competitor_price,
+        lowest_competitor_price=_zone_reference_for_saved_row(db, cp, price_format_id, product_id),
     )
     return zone or "no-data"
 
 
-def _calculated_zone_reference_and_deviation(cp: CalculatedPrice) -> tuple[float | None, float | None]:
+def _calculated_zone_reference_and_deviation(
+    cp: CalculatedPrice,
+    db: Session | None = None,
+    price_format_id: int | None = None,
+    product_id: int | None = None,
+) -> tuple[float | None, float | None]:
     _zone, reference, deviation = calculate_price_zone(
         cp.final_price,
         chosen_competitor_price=cp.chosen_competitor_price,
-        lowest_competitor_price=cp.lowest_competitor_price if cp.lowest_competitor_price is not None else cp.competitor_price,
+        lowest_competitor_price=_zone_reference_for_saved_row(db, cp, price_format_id, product_id),
     )
     return (
         float(reference) if reference is not None else None,
@@ -1773,6 +1799,7 @@ def _generated_item_dict(
     ratings = ratings if ratings is not None else _product_ratings_by_id(db, [int(product.id)], str(pf.branch or "")).get(int(product.id), {})
     global_rating = ratings.get("global")
     local_rating = ratings.get("local")
+    zone_reference = _zone_reference_for_saved_row(db, cp, pf.id, product.id)
     return {
         "sku": product.code,
         "name": product.name,
@@ -1789,7 +1816,7 @@ def _generated_item_dict(
         "basePrice": float(cp.base_price or 0),
         "mdc": float(cp.base_price or 0),
         "bestCompetitorPrice": float(cp.competitor_price) if cp.competitor_price is not None else None,
-        "lowestCompetitorPrice": float(cp.lowest_competitor_price or cp.competitor_price) if (cp.lowest_competitor_price is not None or cp.competitor_price is not None) else None,
+        "lowestCompetitorPrice": float(zone_reference) if zone_reference is not None else None,
         "chosenCompetitorPrice": float(cp.chosen_competitor_price) if cp.chosen_competitor_price is not None else None,
         "selectedCompetitorPrice": float(cp.chosen_competitor_price) if cp.chosen_competitor_price is not None else None,
         "priceAfterBend": float(cp.price_from_competitor) if cp.price_from_competitor is not None else None,
@@ -1802,7 +1829,7 @@ def _generated_item_dict(
         "finalPrice": final,
         "markupPercent": float(cp.markup_percent_used) if cp.markup_percent_used is not None else actual_margin_percent,
         "actualMarginPercent": actual_margin_percent,
-        "zone": _calculated_zone(cp),
+        "zone": _calculated_zone(cp, db, pf.id, product.id),
         "priceSource": source_label,
         "appliedSourceName": cp.applied_source_name or "",
         "appliedSourceType": cp.applied_source_type or "",
@@ -2001,7 +2028,11 @@ def get_generated_price_list_items(
         stmt = stmt.order_by(Product.name.asc(), Product.code.asc())
     all_rows = db.execute(stmt).all()
     if zone and zone != "__all__":
-        all_rows = [(cp, product) for cp, product in all_rows if _calculated_zone(cp) == zone]
+        all_rows = [
+            (cp, product)
+            for cp, product in all_rows
+            if _calculated_zone(cp, db, pf.id, product.id) == zone
+        ]
     ratings_by_product = _product_ratings_by_id(
         db, [int(product.id) for _, product in all_rows], str(pf.branch or "")
     )
@@ -2094,6 +2125,14 @@ def export_generated_price_list(
         ("priceSource", "Источник цены"),
         ("percentileSource", "Percentile source"),
         ("pricingReason", "Причина применения цены"),
+        ("pricingCalculationLog", "Лог расчета цены"),
+        ("listOverrideLogText", "Лог применения списка"),
+        ("listOverrideType", "Тип списка"),
+        ("listOverrideName", "Название списка"),
+        ("listOverrideCode", "Код списка"),
+        ("listOverrideValue", "Значение списка"),
+        ("listOverrideAction", "Диагностика списка"),
+        ("listOverrideChangedFinalPrice", "Список изменил финальную цену"),
         ("pricingRule", "Правило ЦО"),
     ]
     dynamic_headers = [(f"competitor:{column.get('key')}", column.get("title") or column.get("key")) for column in competitor_columns]
@@ -2105,6 +2144,27 @@ def export_generated_price_list(
             cell = (row.get("competitorPrices") or {}).get(column_key) or {}
             price = cell.get("price")
             return "" if _is_missing_price_value(price) else price
+        if key.startswith("listOverride"):
+            log = row.get("listOverrideLog") if isinstance(row.get("listOverrideLog"), dict) else {}
+            if key == "listOverrideLogText":
+                return _list_override_log_text(log)
+            if key == "listOverrideType":
+                return log.get("listType") or ""
+            if key == "listOverrideName":
+                return log.get("listName") or ""
+            if key == "listOverrideCode":
+                return log.get("listCode") or ""
+            if key == "listOverrideValue":
+                return log.get("displayValue") or log.get("value") or ""
+            if key == "listOverrideAction":
+                return log.get("listEffectMessage") or log.get("action") or ""
+            if key == "listOverrideChangedFinalPrice":
+                changed = log.get("listChangedFinalPrice")
+                if changed is True:
+                    return "yes"
+                if changed is False:
+                    return "no"
+                return ""
         value = row.get(key, "")
         mojibake_dash_values = {"\u0432\u0402\u201d", "\u0420\u0406\u0420\u201a\u0432\u0402\u045c"}
         competitor_price_keys = {"bestCompetitorPrice", "lowestCompetitorPrice", "chosenCompetitorPrice"}
@@ -2134,6 +2194,19 @@ def export_generated_price_list(
     ws.append([label for _, label in headers])
     for row in rows_payload:
         ws.append([_export_cell(row, key) for key, _ in headers])
+    long_text_headers = {"Лог расчета цены", "Лог применения списка", "Диагностика списка"}
+    for column_cells in ws.columns:
+        header = str(column_cells[0].value or "")
+        max_len = max(
+            len(line)
+            for cell in column_cells
+            for line in str(cell.value if cell.value is not None else "").splitlines()
+        )
+        width = min(max(max_len + 2, 10), 80 if header in long_text_headers else 32)
+        ws.column_dimensions[get_column_letter(column_cells[0].column)].width = width
+        if header in long_text_headers:
+            for cell in column_cells:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
     bio = io.BytesIO()
     wb.save(bio)
     return StreamingResponse(
@@ -4121,6 +4194,38 @@ def get_competitor_percentile_rows(
         direction=direction,
         page=page,
         page_size=page_size,
+    )
+
+
+@app.get("/api/competitors/percentile-trace")
+def get_competitor_percentile_trace(
+    format_code: str = Query(...),
+    region: str = Query(...),
+    competitor: str = Query(...),
+    sku: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    return percentile_trace(
+        db=db,
+        price_format_code=format_code,
+        region=region,
+        competitor=competitor,
+        sku=sku,
+    )
+
+
+@app.get("/api/competitors/percentile-coverage-audit")
+def get_competitor_percentile_coverage_audit(
+    format_code: str = Query(...),
+    region: str = Query(...),
+    competitor: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    return percentile_coverage_audit(
+        db=db,
+        price_format_code=format_code,
+        region=region,
+        competitor=competitor,
     )
 
 
@@ -6816,7 +6921,12 @@ def _run_generate_price_job_sync(db: Session, job: Job, *, price_format_id: int,
         job.format_code or payload.get("format_code") or payload.get("price_format_code") or "",
         selected_price_lists_count,
     )
-    summary = rebuild_competitor_prices_for_selected(db=db, price_format_id=price_format_id, commit_between_lists=True)
+    pf_for_generation = db.get(PriceFormat, price_format_id)
+    percentile_mode = bool(pf_for_generation and (pf_for_generation.competitor_price_mode or "regular") == "percentile")
+    if percentile_mode:
+        summary = {"percentile_mode": {"skippedRawCompetitorPriceRebuild": True}}
+    else:
+        summary = rebuild_competitor_prices_for_selected(db=db, price_format_id=price_format_id, commit_between_lists=True)
     update_job(db, job, status="running", progress=70, message="Пересборка competitor_prices завершена", result={"summary": summary}, log_level="info")
     recalculate_competitor_percentiles(db=db, price_format_id=price_format_id)
     db.commit()
@@ -6828,6 +6938,16 @@ def _run_generate_price_job_sync(db: Session, job: Job, *, price_format_id: int,
         ).scalar_one()
         or 0
     )
+    if percentile_mode:
+        competitor_prices_loaded = int(
+            db.execute(
+                select(func.count(CompetitorPricePercentile.id))
+                .where(CompetitorPricePercentile.price_format_id == price_format_id)
+                .where(CompetitorPricePercentile.value.is_not(None))
+            ).scalar_one()
+            or 0
+        )
+        logger.info("[GENERATE] percentile_rows_loaded=%s", competitor_prices_loaded)
     coverage_values = [float(row.get("coverage") or row.get("matchRate") or 0) for row in summary.values() if isinstance(row, dict)]
     coverage = round(sum(coverage_values) / len(coverage_values), 2) if coverage_values else 0
     logger.info("[GENERATE] competitor_prices_loaded=%s", competitor_prices_loaded)

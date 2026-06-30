@@ -21,7 +21,7 @@ if not TOKEN:
 BASE_URL = "https://api.provisor.kz"
 
 FILIALS = {
-    149: "Medservice Астана",
+    1108: "Эмити Kostanay",
 
 }
 

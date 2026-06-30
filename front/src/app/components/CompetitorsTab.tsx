@@ -689,6 +689,14 @@ export function CompetitorsTab({ formatCode }: Props) {
   };
 
   useEffect(() => {
+    setPercentileRegion('');
+    setPercentileCompetitor('');
+    setPercentilePage(1);
+    setPercentileRows([]);
+    setPercentilePriceColumns([]);
+  }, [formatCode]);
+
+  useEffect(() => {
     void loadAll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [formatCode]);

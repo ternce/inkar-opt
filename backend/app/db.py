@@ -132,6 +132,9 @@ def _ensure_compatible_columns() -> None:
         ],
         "competitor_price_percentiles": [
             ("percentile_scope", "VARCHAR(32) DEFAULT 'regional'"),
+            ("price_count", "INTEGER DEFAULT 0"),
+            ("used_price_count", "INTEGER DEFAULT 0"),
+            ("status", "VARCHAR(64) DEFAULT ''"),
         ],
         "jobs": [
             ("type", "VARCHAR(64)"),
@@ -553,6 +556,16 @@ def _ensure_compatible_indexes() -> None:
             "ix_competitor_price_list_items_pl_provisor_goods",
             "competitor_price_list_items",
             ("price_list_id", "provisor_goods_id"),
+        ),
+        (
+            "ix_comp_percentile_bulk_generation",
+            "competitor_price_percentiles",
+            ("price_format_id", "percentile_scope", "percentile", "product_id"),
+        ),
+        (
+            "ix_comp_percentile_group_lookup",
+            "competitor_price_percentiles",
+            ("price_format_id", "branch_name", "competitor_name", "percentile_scope", "percentile", "product_id"),
         ),
         (
             "ix_product_substitute_lookup",

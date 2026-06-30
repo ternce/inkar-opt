@@ -33,9 +33,14 @@ from backend.app.models import (
     UniversalListPriceFormat,
 )
 from backend.app.services.competitors.code_mappings import list_catalog_code_mappings
-from backend.app.services.competitors.percentiles.read_models import list_percentile_sources
+from backend.app.services.competitors.percentiles.read_models import (
+    list_percentile_product_rows,
+    list_percentile_sources,
+    percentile_coverage_audit,
+)
 from backend.app.main import _competitor_column_title, _generated_item_dict, app
 from backend.app.services.competitor_percentiles import KAZAKHSTAN_REGION, KAZAKHSTAN_SCOPE, REGIONAL_SCOPE, recalculate_competitor_percentiles
+from backend.app.services.competitor_source_config import MULTI_PRICE_PERCENTILE_MODE
 from backend.app.services.pricing import calculate_price_for_product, calculate_price_zone, calculate_prices
 from backend.app.services.pricing_workflow.analytics import build_workflow_analytics
 from backend.app.services.pricing_workflow.exports import _export_zone
@@ -312,6 +317,35 @@ def test_fixed_price_zone_uses_lowest_available_competitor_when_chosen_is_empty(
     assert debug["zone"] == "left"
 
 
+def test_fixed_markup_zone_uses_lowest_available_competitor_when_list_bypasses_selection():
+    db = _session()
+    rounding = RoundingRule(code="R-FM-ZONE", name="R-FM-ZONE", mode="math", precision=2, step=0.01)
+    db.add(rounding)
+    db.flush()
+    pf = _format(db, rounding=rounding)
+    product = _product(db, cost=100, code="FIXED-MARKUP-ZONE")
+    _list_item(db, product, "fixed_markup", 10, pf=pf)
+    db.add(
+        CompetitorPrice(
+            price_format_id=pf.id,
+            product_id=product.id,
+            source_name="manual:available",
+            supplier="manual:available",
+            source_price=115,
+            coefficient=1,
+        )
+    )
+    db.flush()
+
+    price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
+
+    assert round(float(price), 2) == 111.11
+    assert debug["competitor_price"] is None
+    assert debug["chosen_competitor_price"] is None
+    assert float(debug["lowest_competitor_price"]) == 115.0
+    assert debug["zone"] == "left"
+
+
 def test_fixed_markup_list_overrides_default_markup():
     db = _session()
     pf = _format(db)
@@ -442,9 +476,9 @@ def test_percentile_rebuild_uses_latest_duplicate_row_per_account_sku():
         source_type="manual",
         source_key="pct-dup",
         display_name="Account 1",
-        supplier="Emiti",
+        supplier="Regular Competitor",
         branch_name="Almaty",
-        competitor_name="Emiti",
+        competitor_name="Regular Competitor",
         account_login="Account 1",
     )
     db.add(price_list)
@@ -462,12 +496,254 @@ def test_percentile_rebuild_uses_latest_duplicate_row_per_account_sku():
         .filter(CompetitorPricePercentile.price_format_id == pf.id)
         .filter(CompetitorPricePercentile.product_id == product.id)
         .filter(CompetitorPricePercentile.branch_name == "Almaty")
-        .filter(CompetitorPricePercentile.competitor_name == "Emiti")
+        .filter(CompetitorPricePercentile.competitor_name == "Regular Competitor")
         .filter(CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
         .all()
     )
     assert {float(row.value) for row in rows} == {200.0}
     assert {row.source_count for row in rows} == {1}
+
+
+def test_multi_price_percentile_source_uses_all_rows_for_one_sku():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, code="000000000001015510", cost=100)
+    price_list = CompetitorPriceList(
+        price_format_id=pf.id,
+        source_type="manual",
+        source_key="emit-almaty",
+        display_name="Emit Almaty",
+        supplier="Emit",
+        branch_name="Almaty",
+        competitor_name="Emit",
+        account_login="emit",
+    )
+    db.add(price_list)
+    db.flush()
+    db.add(
+        PriceFormatCompetitorAssignment(
+            price_format_id=pf.id,
+            competitor_price_list_id=price_list.id,
+            is_active=True,
+        )
+    )
+    for price in [7120, 7140, 7090, 7200, 7155, 7105]:
+        db.add(CompetitorPriceListItem(price_list_id=price_list.id, product_id=product.id, distributor_price=price))
+    db.flush()
+
+    recalculate_competitor_percentiles(db=db, price_format_id=pf.id)
+
+    rows = (
+        db.query(CompetitorPricePercentile)
+        .filter(CompetitorPricePercentile.price_format_id == pf.id)
+        .filter(CompetitorPricePercentile.product_id == product.id)
+        .filter(CompetitorPricePercentile.branch_name == "Almaty")
+        .filter(CompetitorPricePercentile.competitor_name == "Emit")
+        .filter(CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
+        .all()
+    )
+    by_percentile = {row.percentile: float(row.value) for row in rows}
+    assert by_percentile == {10: 7097.5, 20: 7105.0, 30: 7112.5, 40: 7120.0, 60: 7140.0}
+    assert set(by_percentile.values()).isdisjoint({7090.0, 7155.0, 7200.0})
+    assert {row.source_count for row in rows} == {1}
+    assert {row.used_price_count for row in rows} == {6}
+    assert {row.status for row in rows} == {"Calculated"}
+
+
+def test_emit_multi_price_same_list_goods_id_keeps_all_prices():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, code="PCT-EMIT-GOODS", cost=100)
+    product.provisor_goods_id = 163571
+    price_list = CompetitorPriceList(
+        price_format_id=pf.id,
+        source_type="provisor",
+        source_key="emit:1106",
+        display_name="Emit International 1106",
+        supplier="Emit International 1106",
+        branch_name="Emit International 1106",
+        competitor_name="Emit International 1106",
+        account_login="emit",
+    )
+    db.add(price_list)
+    db.flush()
+    db.add(PriceFormatCompetitorAssignment(price_format_id=pf.id, competitor_price_list_id=price_list.id, is_active=True))
+    for price in [8688.26, 8989.73, 9358.46]:
+        db.add(
+            CompetitorPriceListItem(
+                price_list_id=price_list.id,
+                product_id=product.id,
+                provisor_goods_id=163571,
+                filial_id=1106,
+                distributor_price=price,
+                matched_sku=product.code,
+            )
+        )
+    db.flush()
+
+    recalculate_competitor_percentiles(db=db, price_format_id=pf.id)
+
+    rows = (
+        db.query(CompetitorPricePercentile)
+        .filter(CompetitorPricePercentile.price_format_id == pf.id)
+        .filter(CompetitorPricePercentile.product_id == product.id)
+        .filter(CompetitorPricePercentile.branch_name == "Emit International 1106")
+        .filter(CompetitorPricePercentile.competitor_name == "Emit International 1106")
+        .filter(CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
+        .all()
+    )
+    by_percentile = {row.percentile: float(row.value) for row in rows}
+    assert {row.used_price_count for row in rows} == {3}
+    assert len(set(round(value, 4) for value in by_percentile.values())) > 1
+    assert round(by_percentile[10], 3) == 8748.554
+    assert round(by_percentile[60], 3) == 9063.476
+
+
+def test_percentile_price_generation_uses_precomputed_rows_without_raw_rebuild(monkeypatch):
+    import backend.app.services.pricing as pricing_service
+
+    db = _session()
+    pf = _format(db)
+    pf.competitor_price_mode = "percentile"
+    pf.percentile_number = 10
+    product = _product(db, code="PCT-PRECOMPUTED", cost=100)
+    db.add(
+        CompetitorPricePercentile(
+            price_format_id=pf.id,
+            product_id=product.id,
+            branch_name="Emit International 1106",
+            competitor_name="Emit International 1106",
+            percentile_scope=REGIONAL_SCOPE,
+            percentile=10,
+            value=120,
+            source_count=1,
+            price_count=3,
+            used_price_count=3,
+            status="Calculated",
+        )
+    )
+    db.flush()
+
+    def fail_raw_rebuild(**_kwargs):
+        raise AssertionError("raw competitor_price_list_items rebuild should not run during percentile generation")
+
+    monkeypatch.setattr(pricing_service, "rebuild_competitor_prices_for_selected", fail_raw_rebuild)
+
+    count = calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="PCT-PRECOMPUTED-PL",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        force_new_price_list=True,
+    )
+
+    assert count == 1
+    calculated = db.query(CalculatedPrice).filter(CalculatedPrice.product_id == product.id).one()
+    assert calculated.used_percentile is True
+    assert float(calculated.lowest_competitor_price) == 120.0
+
+
+def test_multi_price_percentile_ignores_invalid_prices_and_one_price_status():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, code="PCT-MULTI-INVALID", cost=100)
+    price_list = CompetitorPriceList(
+        price_format_id=pf.id,
+        source_type="manual",
+        source_key="future-source",
+        display_name="Future Source",
+        supplier="Future Source",
+        branch_name="Almaty",
+        competitor_name="Future Source",
+    )
+    db.add(price_list)
+    db.flush()
+    db.add(
+        PriceFormatCompetitorAssignment(
+            price_format_id=pf.id,
+            competitor_price_list_id=price_list.id,
+            is_active=True,
+            percentile_mode=MULTI_PRICE_PERCENTILE_MODE,
+        )
+    )
+    for price in [None, 0, -1, 777]:
+        db.add(CompetitorPriceListItem(price_list_id=price_list.id, product_id=product.id, distributor_price=price))
+    db.flush()
+
+    recalculate_competitor_percentiles(db=db, price_format_id=pf.id)
+
+    rows = (
+        db.query(CompetitorPricePercentile)
+        .filter(CompetitorPricePercentile.price_format_id == pf.id)
+        .filter(CompetitorPricePercentile.product_id == product.id)
+        .filter(CompetitorPricePercentile.branch_name == "Almaty")
+        .filter(CompetitorPricePercentile.competitor_name == "Future Source")
+        .filter(CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
+        .all()
+    )
+    assert {float(row.value) for row in rows} == {777.0}
+    assert {row.source_count for row in rows} == {1}
+    assert {row.used_price_count for row in rows} == {1}
+    assert {row.status for row in rows} == {"Calculated from one price"}
+
+
+def test_emit_percentile_coverage_counts_all_matched_positive_products():
+    db = _session()
+    pf = _format(db)
+    products = [_product(db, code=f"PCT-EMIT-COV-{idx}", cost=100) for idx in range(1, 4)]
+    price_list = CompetitorPriceList(
+        price_format_id=pf.id,
+        source_type="provisor",
+        source_key="emit:1108",
+        display_name="Emit International 1108",
+        supplier="Emit International 1108",
+        branch_name="Emit International 1108",
+        competitor_name="Emit International 1108",
+        account_login="emit",
+    )
+    db.add(price_list)
+    db.flush()
+    db.add(PriceFormatCompetitorAssignment(price_format_id=pf.id, competitor_price_list_id=price_list.id, is_active=True))
+    for idx, product in enumerate(products, start=1):
+        product.provisor_goods_id = 200000 + idx
+        db.add(
+            CompetitorPriceListItem(
+                price_list_id=price_list.id,
+                product_id=product.id,
+                provisor_goods_id=product.provisor_goods_id,
+                filial_id=1108,
+                distributor_price=1000 + idx,
+                matched_sku=product.code,
+            )
+        )
+    db.flush()
+
+    recalculate_competitor_percentiles(db=db, price_format_id=pf.id)
+
+    audit = percentile_coverage_audit(
+        db=db,
+        price_format_code=pf.code,
+        region="Emit International 1108",
+        competitor="Emit International 1108",
+    )
+    browser = list_percentile_product_rows(
+        db=db,
+        price_format_code=pf.code,
+        region="Emit International 1108",
+        competitor="Emit International 1108",
+        percentile_filter="has_percentile",
+        page_size=100,
+    )
+
+    assert audit["counts"]["rawEmitRowsImported"] == 3
+    assert audit["counts"]["distinctMatchedProductIdsWithPositivePrice"] == 3
+    assert audit["counts"]["productsPassedIntoPercentileCalculation"] == 3
+    assert audit["counts"]["productsWithStoredPercentileRows"] == 3
+    assert audit["dropReasons"]["positiveMatchedProductsMissingStoredPercentiles"] == 0
+    assert browser["summary"]["productsWithPercentile"] == 3
+    assert browser["total"] == 3
 
 
 def test_kazakhstan_percentiles_are_calculated_from_regional_percentiles():
@@ -532,6 +808,7 @@ def _percentile_client_with_rows():
         pf.code = "PCT-API"
         pf.branch = "BRANCH-1"
         with_competitor = _product(db, code="PCT-API-WITH", cost=100)
+        with_competitor.provisor_goods_id = 163571
         without_competitor = _product(db, code="PCT-API-WITHOUT", cost=100)
         db.add_all(
             [
@@ -566,6 +843,7 @@ def _percentile_client_with_rows():
                 CompetitorPriceListItem(
                     price_list_id=price_list.id,
                     product_id=with_competitor.id,
+                    provisor_goods_id=with_competitor.provisor_goods_id,
                     distributor_price=price,
                 )
             )
@@ -622,6 +900,55 @@ def test_percentile_rows_endpoint_returns_all_rows_and_counters():
         assert astana.status_code == 200
         astana_row = {row["sku"]: row for row in astana.json()["items"]}["PCT-API-WITH"]
         assert astana_row["percentiles"]["10"] == 999
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_percentile_rows_endpoint_falls_back_when_stale_generated_list_filters_are_sent():
+    client = _percentile_client_with_rows()
+    try:
+        response = client.get(
+            "/api/competitors/percentile-rows"
+            "?format_code=PCT-API&region=888_Almaty_2026-07-01_wf44&competitor=888_Almaty_2026-07-01_wf44&page_size=100"
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        by_sku = {row["sku"]: row for row in payload["items"]}
+
+        assert payload["selectedRegion"] == "Almaty"
+        assert payload["selectedCompetitor"] == "Emiti"
+        assert payload["total"] == 2
+        assert len(payload["priceColumns"]) == 5
+        assert round(float(by_sku["PCT-API-WITH"]["percentiles"]["10"]), 3) == 687.0
+        assert by_sku["PCT-API-WITH"]["competitorCount"] == 5
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_percentile_trace_endpoint_returns_raw_prices_used():
+    client = _percentile_client_with_rows()
+    try:
+        response = client.get(
+            "/api/competitors/percentile-trace"
+            "?format_code=PCT-API&region=Almaty&competitor=Emiti&sku=PCT-API-WITH"
+        )
+        assert response.status_code == 200
+        payload = response.json()
+
+        assert payload["found"] is True
+        assert payload["competitor"] == "Emiti"
+        assert payload["region"] == "Almaty"
+        assert payload["sku"] == "PCT-API-WITH"
+        assert payload["productId"] > 0
+        assert payload["rawRowsCount"] == 5
+        assert len(payload["sourceAccountIds"]) == 5
+        assert {row["goodsId"] for row in payload["rawPricesUsed"]} == {163571}
+        assert [row["price"] for row in payload["rawPricesUsed"]] == [705.0, 702.23, 710.0, 685.0, 690.0]
+        assert payload["sortedPrices"] == [685.0, 690.0, 702.23, 705.0, 710.0]
+        assert payload["priceCount"] == 5
+        assert payload["usedPriceCount"] == 5
+        assert round(float(payload["percentiles"]["10"]), 3) == 687.0
+        assert round(float(payload["percentiles"]["60"]), 3) == 703.338
     finally:
         app.dependency_overrides.pop(get_db, None)
 
@@ -1461,6 +1788,44 @@ def test_generated_item_payload_exposes_applied_list_rule_details():
         "listEffectMessage": "Применена фиксированная цена из списка.",
     }
     assert "fixed_price" not in payload["pricingCalculationLog"]
+
+
+def test_generated_item_payload_recomputes_zone_reference_when_saved_best_competitor_is_empty():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, cost=100, code="PAYLOAD-ZONE")
+    _list_item(db, product, "fixed_price", 243.39, pf=pf)
+    db.add(
+        CompetitorPrice(
+            price_format_id=pf.id,
+            product_id=product.id,
+            source_name="manual:available",
+            supplier="manual:available",
+            source_price=244.43,
+            coefficient=1,
+        )
+    )
+    db.flush()
+
+    calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="PL-PAYLOAD-ZONE",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        force_new_price_list=True,
+    )
+
+    cp = db.query(CalculatedPrice).one()
+    cp.competitor_price = None
+    cp.lowest_competitor_price = None
+    db.flush()
+
+    payload = _generated_item_dict(db, cp, product, pf, None)
+    assert payload["bestCompetitorPrice"] is None
+    assert payload["lowestCompetitorPrice"] == 244.43
+    assert payload["zone"] == "left"
 
 
 def test_zone_uses_lowest_competitor_even_when_chosen_competitor_is_different():

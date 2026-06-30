@@ -12,7 +12,7 @@ from sqlalchemy.pool import StaticPool
 from backend.app.db import Base
 from backend.app.deps import get_db
 from backend.app.main import app
-from backend.app.models import CalculatedPrice, PriceFormat, PriceList, Product, ProductRating
+from backend.app.models import CalculatedPrice, PriceFormat, PriceList, Product, ProductRating, UniversalList
 
 
 def _client_with_rating_matrix():
@@ -32,6 +32,9 @@ def _client_with_rating_matrix():
         price_list = PriceList(number="RATING-PL", price_format_id=price_format.id, status="generated")
         db.add(price_list)
         db.flush()
+        universal_list = UniversalList(code="UL-RATING", name="Rating fixed markup", type="fixed_markup", status="active")
+        db.add(universal_list)
+        db.flush()
         products = [
             Product(code="BOTH", name="Both", cost=100, top_rank=999),
             Product(code="GLOBAL", name="Global", cost=100),
@@ -48,6 +51,10 @@ def _client_with_rating_matrix():
                     cost=100,
                     base_price=120,
                     final_price=130 + index,
+                    applied_reason="pricing log for BOTH" if product.code == "BOTH" else "",
+                    applied_list_id=universal_list.id if product.code == "BOTH" else None,
+                    applied_rule_type="fixed_markup" if product.code == "BOTH" else "",
+                    applied_rule_value=10.5 if product.code == "BOTH" else None,
                     rating_global=900 + index,
                     rating_local=800 + index,
                 )
@@ -87,17 +94,39 @@ def test_generated_payload_and_exports_use_global_and_local_product_ratings():
 
     csv_response = client.get("/api/generated-price-lists/RATING-PL/export.csv")
     assert csv_response.status_code == 200
-    csv_header = next(csv.reader(io.StringIO(csv_response.content.decode("utf-8-sig"))))
+    csv_rows = list(csv.DictReader(io.StringIO(csv_response.content.decode("utf-8-sig"))))
+    csv_header = csv_rows[0].keys()
     assert "Рейтинг глобальный" in csv_header
     assert "Рейтинг локальный" in csv_header
     assert not any("PharmCenter Top" in value or "Топ фарм-центра" in value for value in csv_header)
 
+    both_csv = next(row for row in csv_rows if row["SKU"] == "BOTH")
+    assert both_csv["Лог расчета цены"] == "pricing log for BOTH"
+    assert "Rating fixed markup" in both_csv["Лог применения списка"]
+    assert "UL-RATING" in both_csv["Лог применения списка"]
+    assert both_csv["Тип списка"] == "fixed_markup"
+    assert both_csv["Название списка"] == "Rating fixed markup"
+    assert both_csv["Код списка"] == "UL-RATING"
+    assert both_csv["Значение списка"] == "10.5%"
+    assert both_csv["Диагностика списка"]
+
     xlsx_response = client.get("/api/generated-price-lists/RATING-PL/export.xlsx")
     assert xlsx_response.status_code == 200
-    sheet = load_workbook(io.BytesIO(xlsx_response.content), read_only=True).active
-    xlsx_header = [cell.value for cell in next(sheet.iter_rows())]
+    sheet = load_workbook(io.BytesIO(xlsx_response.content)).active
+    xlsx_rows = list(sheet.iter_rows(values_only=True))
+    xlsx_header = list(xlsx_rows[0])
     assert "Рейтинг глобальный" in xlsx_header
     assert "Рейтинг локальный" in xlsx_header
     assert not any(value and ("PharmCenter Top" in value or "Топ фарм-центра" in value) for value in xlsx_header)
+
+    xlsx_dicts = [dict(zip(xlsx_header, row)) for row in xlsx_rows[1:]]
+    both_xlsx = next(row for row in xlsx_dicts if row["SKU"] == "BOTH")
+    assert both_xlsx["Лог расчета цены"] == "pricing log for BOTH"
+    assert "Rating fixed markup" in both_xlsx["Лог применения списка"]
+    assert both_xlsx["Тип списка"] == "fixed_markup"
+    assert both_xlsx["Код списка"] == "UL-RATING"
+    assert both_xlsx["Значение списка"] == "10.5%"
+    log_column = xlsx_header.index("Лог применения списка") + 1
+    assert sheet.column_dimensions[sheet.cell(row=1, column=log_column).column_letter].width >= 20
 
     app.dependency_overrides.pop(get_db, None)

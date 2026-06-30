@@ -30,6 +30,7 @@ from ..models import (
 )
 from .competitors.code_mappings import apply_manual_mappings_to_items
 from .competitor_assignments import get_assigned_competitor_price_lists
+from .competitor_source_config import MULTI_PRICE_PERCENTILE_MODE, default_percentile_mode_for_source
 from .manufacturers import normalize_manufacturer
 from .sku import normalize_external_sku, normalize_sku, normalize_sku_variants
 
@@ -87,6 +88,10 @@ LIQUID_VOLUME_FORMS = frozenset({"СУСП", "СИРОП", "Р-Р", "КАПЛИ"
 def _verbose_debug(message: str, *args: object) -> None:
     if MATCH_DEBUG_VERBOSE:
         logger.debug(message, *args)
+
+
+def _keeps_multi_prices_per_sku(price_list: CompetitorPriceList) -> bool:
+    return default_percentile_mode_for_source(price_list) == MULTI_PRICE_PERCENTILE_MODE
 
 
 def _timing(operation: str, step: str, started_at: float) -> None:
@@ -2753,21 +2758,22 @@ def rematch_price_list_items(
             _bump_reason(stats, "no_sku_match")
             stats["unmatched"] += 1
 
-    for rows in duplicate_bucket.values():
-        if len(rows) <= 1:
-            continue
-        prices = [_price_decimal(x.distributor_price) for x in rows]
-        stocks = [_price_decimal(x.stock) or Decimal("0") for x in rows]
-        min_price = min([x for x in prices if x is not None], default=None)
-        stock_sum = sum(stocks, Decimal("0"))
-        keeper = rows[0]
-        keeper.distributor_price = float(min_price) if min_price is not None else keeper.distributor_price
-        keeper.stock = float(stock_sum)
-        for duplicate in rows[1:]:
-            duplicate.product_id = None
-            duplicate.match_type = "unmatched"
-            duplicate.match_score = None
-            duplicate.matched_sku = ""
+    if not _keeps_multi_prices_per_sku(price_list):
+        for rows in duplicate_bucket.values():
+            if len(rows) <= 1:
+                continue
+            prices = [_price_decimal(x.distributor_price) for x in rows]
+            stocks = [_price_decimal(x.stock) or Decimal("0") for x in rows]
+            min_price = min([x for x in prices if x is not None], default=None)
+            stock_sum = sum(stocks, Decimal("0"))
+            keeper = rows[0]
+            keeper.distributor_price = float(min_price) if min_price is not None else keeper.distributor_price
+            keeper.stock = float(stock_sum)
+            for duplicate in rows[1:]:
+                duplicate.product_id = None
+                duplicate.match_type = "unmatched"
+                duplicate.match_score = None
+                duplicate.matched_sku = ""
     matched_at = time.perf_counter()
 
     actual_matched = sum(1 for item in items if item.product_id is not None and item.matched_sku)
@@ -4304,6 +4310,23 @@ def rematch_price_list_items_by_product(
                 similarity_score=score,
                 match_method=match_type[:64],
             )
+
+    if _keeps_multi_prices_per_sku(price_list):
+        products_by_goods_id = {
+            _to_int(product.provisor_goods_id): product
+            for product in products
+            if _to_int(product.provisor_goods_id)
+        }
+        for item in items:
+            goods_id = _to_int(item.provisor_goods_id or (_raw_payload(item).get("goodsId")))
+            product = products_by_goods_id.get(goods_id or 0)
+            if product is None:
+                continue
+            item.product_id = int(product.id)
+            item.match_type = "provisor_goods_id"
+            item.match_score = 100
+            item.matched_sku = normalize_sku(product.sku) or product.sku
+            item.match_key = _provisor_key("goods_id", goods_id)
 
     matched_at = time.perf_counter()
     matched_items = [item for item in items if item.product_id is not None and item.matched_sku]

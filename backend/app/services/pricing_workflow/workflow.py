@@ -139,7 +139,8 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
         selected_count = len(get_assigned_competitor_price_lists(db=db, price_format_id=int(pf.id)))
         if selected_count <= 0:
             raise ValueError("selected competitor sources are not available for calculation")
-        rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id, commit_between_lists=True)
+        if (pf.competitor_price_mode or "regular") != "percentile":
+            rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id, commit_between_lists=True)
         recalculate_competitor_percentiles(db=db, price_format_id=pf.id)
         db.commit()
 
