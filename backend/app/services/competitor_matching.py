@@ -30,7 +30,7 @@ from ..models import (
 )
 from .competitors.code_mappings import apply_manual_mappings_to_items
 from .competitor_assignments import get_assigned_competitor_price_lists
-from .competitor_source_config import MULTI_PRICE_PERCENTILE_MODE, default_percentile_mode_for_source
+from .competitor_source_config import MULTI_PRICE_PERCENTILE_MODE, default_percentile_mode_for_source, effective_percentile_mode
 from .manufacturers import normalize_manufacturer
 from .sku import normalize_external_sku, normalize_sku, normalize_sku_variants
 
@@ -1749,23 +1749,33 @@ def _add_reference_lookup(lookup: dict[str, set[int]], key: object, product_id: 
         lookup.setdefault(lookup_key, set()).add(product_int)
 
 
-def _sync_provisor_reference_mapping_from_items(db: Session, *, account_id: str = "existing") -> dict[str, object]:
+def _sync_provisor_reference_mapping_from_items(
+    db: Session,
+    *,
+    account_id: str = "existing",
+    price_list_ids: list[int] | None = None,
+) -> dict[str, object]:
     started_at = time.perf_counter()
-    rows = (
-        db.execute(
-            select(
-                CompetitorPriceList.account_id,
-                CompetitorPriceListItem.filial_id,
-                CompetitorPriceListItem.distributor_goods_id,
-                CompetitorPriceListItem.provisor_goods_id,
-            )
-            .join(CompetitorPriceList, CompetitorPriceList.id == CompetitorPriceListItem.price_list_id)
-            .where(CompetitorPriceList.source_type == "provisor")
-            .where(CompetitorPriceListItem.filial_id.in_(PROVISOR_REFERENCE_FILIAL_IDS))
-            .where(CompetitorPriceListItem.provisor_goods_id.is_not(None))
+    stmt = (
+        select(
+            CompetitorPriceList.account_id,
+            CompetitorPriceListItem.filial_id,
+            CompetitorPriceListItem.distributor_goods_id,
+            CompetitorPriceListItem.provisor_goods_id,
         )
-        .all()
+        .join(CompetitorPriceList, CompetitorPriceList.id == CompetitorPriceListItem.price_list_id)
+        .where(CompetitorPriceList.source_type == "provisor")
+        .where(CompetitorPriceListItem.filial_id.in_(PROVISOR_REFERENCE_FILIAL_IDS))
+        .where(CompetitorPriceListItem.provisor_goods_id.is_not(None))
     )
+    if price_list_ids is not None:
+        if not price_list_ids:
+            rows = []
+        else:
+            stmt = stmt.where(CompetitorPriceListItem.price_list_id.in_(price_list_ids))
+            rows = db.execute(stmt).all()
+    else:
+        rows = db.execute(stmt).all()
     products = db.execute(select(Product)).scalars().all()
     products_total = len(products)
     products_with_goods_id_before = sum(1 for product in products if _to_int(product.provisor_goods_id))
@@ -4551,7 +4561,17 @@ def rebuild_competitor_prices_for_selected(
     total_started_at = time.perf_counter()
     operation = f"rebuild_competitor_prices:{price_format_id}"
     _timing(operation, "start_selection/rebuild", total_started_at)
-    selected = [item.price_list for item in get_assigned_competitor_price_lists(db=db, price_format_id=price_format_id)]
+    assigned = get_assigned_competitor_price_lists(db=db, price_format_id=price_format_id)
+    skipped_aggregated = [
+        item
+        for item in assigned
+        if effective_percentile_mode(item.price_list, item.assignment.percentile_mode) == MULTI_PRICE_PERCENTILE_MODE
+    ]
+    selected = [
+        item.price_list
+        for item in assigned
+        if effective_percentile_mode(item.price_list, item.assignment.percentile_mode) != MULTI_PRICE_PERCENTILE_MODE
+    ]
     _timing(operation, "load_selected_price_lists", total_started_at)
 
     summary: dict[str, dict] = {}
@@ -4559,7 +4579,24 @@ def rebuild_competitor_prices_for_selected(
     unmatched_audit_rows: list[dict] = []
     manufacturer_alias_rows: list[dict] = []
     matched_by_source: list[tuple[str, str, object, list[dict]]] = []
-    _sync_provisor_reference_mapping_from_items(db)
+    for item in skipped_aggregated:
+        price_list = item.price_list
+        src = f"{price_list.source_type}:{price_list.source_key}"
+        summary[src] = {
+            "skippedRawMatching": True,
+            "reason": "aggregated_percentile_source",
+            "percentileMode": effective_percentile_mode(price_list, item.assignment.percentile_mode),
+        }
+    _sync_provisor_reference_mapping_from_items(db, price_list_ids=[int(row.id) for row in selected])
+    if not selected:
+        db.execute(
+            delete(CompetitorPrice)
+            .where(CompetitorPrice.price_format_id == price_format_id)
+            .where(CompetitorPrice.product_id.is_not(None))
+        )
+        db.flush()
+        _timing(operation, "skipped_all_aggregated_percentile_sources", total_started_at)
+        return summary
     index_started_at = time.perf_counter()
     product_indexes = _product_indexes(db)
     index_finished_at = time.perf_counter()

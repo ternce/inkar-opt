@@ -581,6 +581,10 @@ def resolve_percentile_prices(
 
 
 def load_percentile_price_cache(db: Session, price_format_id: int) -> PercentilePriceCache:
+    active_groups = {
+        (str(item.price_list.branch_name or ""), str(item.price_list.competitor_name or ""))
+        for item in get_assigned_competitor_price_lists(db=db, price_format_id=price_format_id)
+    }
     rows = (
         db.execute(
             select(
@@ -603,6 +607,8 @@ def load_percentile_price_cache(db: Session, price_format_id: int) -> Percentile
     )
     cache: PercentilePriceCache = {}
     for product_id, percentile, value, competitor_name, branch_name in rows:
+        if active_groups and (str(branch_name or ""), str(competitor_name or "")) not in active_groups:
+            continue
         price = _as_decimal(value)
         if price is None or price <= 0:
             continue
@@ -1577,8 +1583,7 @@ def calculate_prices(
             .first()
         )
         if existing_percentile_rows is None:
-            recalculate_competitor_percentiles(db=db, price_format_id=pf.id)
-            db.flush()
+            raise ValueError("Percentile rows are required before price generation. Refresh/recalculate competitors first.")
     else:
         existing_competitor_rows = (
             db.execute(

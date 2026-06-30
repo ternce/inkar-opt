@@ -6928,7 +6928,8 @@ def _run_generate_price_job_sync(db: Session, job: Job, *, price_format_id: int,
     else:
         summary = rebuild_competitor_prices_for_selected(db=db, price_format_id=price_format_id, commit_between_lists=True)
     update_job(db, job, status="running", progress=70, message="Пересборка competitor_prices завершена", result={"summary": summary}, log_level="info")
-    recalculate_competitor_percentiles(db=db, price_format_id=price_format_id)
+    if not percentile_mode:
+        recalculate_competitor_percentiles(db=db, price_format_id=price_format_id)
     db.commit()
     competitor_prices_loaded = int(
         db.execute(

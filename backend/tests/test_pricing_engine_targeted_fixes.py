@@ -6,7 +6,7 @@ import io
 import pytest
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -41,6 +41,7 @@ from backend.app.services.competitors.percentiles.read_models import (
 from backend.app.main import _competitor_column_title, _generated_item_dict, app
 from backend.app.services.competitor_percentiles import KAZAKHSTAN_REGION, KAZAKHSTAN_SCOPE, REGIONAL_SCOPE, recalculate_competitor_percentiles
 from backend.app.services.competitor_source_config import MULTI_PRICE_PERCENTILE_MODE
+from backend.app.services.competitor_matching import rebuild_competitor_prices_for_selected
 from backend.app.services.pricing import calculate_price_for_product, calculate_price_zone, calculate_prices
 from backend.app.services.pricing_workflow.analytics import build_workflow_analytics
 from backend.app.services.pricing_workflow.exports import _export_zone
@@ -643,6 +644,104 @@ def test_percentile_price_generation_uses_precomputed_rows_without_raw_rebuild(m
     calculated = db.query(CalculatedPrice).filter(CalculatedPrice.product_id == product.id).one()
     assert calculated.used_percentile is True
     assert float(calculated.lowest_competitor_price) == 120.0
+
+
+def test_percentile_price_generation_does_not_recalculate_from_raw_rows(monkeypatch):
+    import backend.app.services.pricing as pricing_service
+
+    db = _session()
+    pf = _format(db)
+    pf.competitor_price_mode = "percentile"
+    pf.percentile_number = 30
+    product = _product(db, code="PCT-NO-RAW-RECALC", cost=100)
+    db.add(
+        CompetitorPricePercentile(
+            price_format_id=pf.id,
+            product_id=product.id,
+            branch_name="Emit International 1106",
+            competitor_name="Emit International 1106",
+            percentile_scope=REGIONAL_SCOPE,
+            percentile=30,
+            value=130,
+            source_count=37,
+            price_count=37,
+            used_price_count=37,
+            status="Calculated",
+        )
+    )
+    db.flush()
+
+    def fail_percentile_recalculation(**_kwargs):
+        raise AssertionError("raw Emit rows must not be read to recalculate percentiles during price generation")
+
+    monkeypatch.setattr(pricing_service, "recalculate_competitor_percentiles", fail_percentile_recalculation)
+
+    count = calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="PCT-NO-RAW-RECALC-PL",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        force_new_price_list=True,
+    )
+
+    assert count == 1
+    calculated = db.query(CalculatedPrice).filter(CalculatedPrice.product_id == product.id).one()
+    assert calculated.used_percentile is True
+    assert float(calculated.lowest_competitor_price) == 130.0
+
+
+def test_rebuild_competitor_prices_skips_multi_price_emit_raw_items():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, code="PCT-RAW-SKIP", cost=100)
+    price_list = CompetitorPriceList(
+        price_format_id=pf.id,
+        source_type="provisor",
+        source_key="emit:1106",
+        display_name="Emit International 1106",
+        supplier="Emit International 1106",
+        branch_name="Emit International 1106",
+        competitor_name="Emit International 1106",
+        account_login="emit",
+    )
+    db.add(price_list)
+    db.flush()
+    db.add(
+        PriceFormatCompetitorAssignment(
+            price_format_id=pf.id,
+            competitor_price_list_id=price_list.id,
+            is_active=True,
+            percentile_mode=MULTI_PRICE_PERCENTILE_MODE,
+        )
+    )
+    for idx, price in enumerate([8933.67, 8952.83, 8973.69], start=1):
+        db.add(
+            CompetitorPriceListItem(
+                price_list_id=price_list.id,
+                product_id=product.id,
+                provisor_goods_id=163571,
+                distributor_goods_id=str(idx),
+                filial_id=1106,
+                distributor_price=price,
+            )
+        )
+    db.flush()
+
+    def fail_on_raw_item_select(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if "competitor_price_list_items" in str(statement).lower():
+            raise AssertionError("raw Emit competitor_price_list_items must not be read during generation rebuild")
+
+    engine = db.get_bind()
+    event.listen(engine, "before_cursor_execute", fail_on_raw_item_select)
+    try:
+        summary = rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id)
+    finally:
+        event.remove(engine, "before_cursor_execute", fail_on_raw_item_select)
+
+    assert summary["provisor:emit:1106"]["skippedRawMatching"] is True
+    assert db.query(CompetitorPrice).filter(CompetitorPrice.price_format_id == pf.id).count() == 0
 
 
 def test_multi_price_percentile_ignores_invalid_prices_and_one_price_status():
