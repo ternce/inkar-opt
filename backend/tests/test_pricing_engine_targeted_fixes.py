@@ -600,6 +600,56 @@ def test_emit_multi_price_same_list_goods_id_keeps_all_prices():
     assert round(by_percentile[60], 3) == 9063.476
 
 
+def test_emit_percentile_rebuild_maps_unmatched_raw_rows_by_goods_id():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, code="163571", cost=100)
+    product.provisor_goods_id = 163571
+    price_list = CompetitorPriceList(
+        price_format_id=pf.id,
+        source_type="provisor",
+        source_key="emit:1106",
+        display_name="Emit International 1106",
+        supplier="Emit International 1106",
+        branch_name="Emit International 1106",
+        competitor_name="Emit International 1106",
+        account_login="emit",
+    )
+    db.add(price_list)
+    db.flush()
+    db.add(PriceFormatCompetitorAssignment(price_format_id=pf.id, competitor_price_list_id=price_list.id, is_active=True))
+    for price in [8688.26, 8989.73, 9358.46]:
+        db.add(
+            CompetitorPriceListItem(
+                price_list_id=price_list.id,
+                product_id=None,
+                provisor_goods_id=163571,
+                filial_id=1106,
+                distributor_price=price,
+                matched_sku="",
+            )
+        )
+    db.flush()
+
+    summary = recalculate_competitor_percentiles(db=db, price_format_id=pf.id)
+
+    rows = (
+        db.query(CompetitorPricePercentile)
+        .filter(CompetitorPricePercentile.price_format_id == pf.id)
+        .filter(CompetitorPricePercentile.product_id == product.id)
+        .filter(CompetitorPricePercentile.branch_name == "Emit International 1106")
+        .filter(CompetitorPricePercentile.competitor_name == "Emit International 1106")
+        .filter(CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
+        .all()
+    )
+    by_percentile = {row.percentile: float(row.value) for row in rows}
+    assert summary["products_with_competitors"] == 1
+    assert {row.used_price_count for row in rows} == {3}
+    assert len(set(round(value, 4) for value in by_percentile.values())) > 1
+    assert round(by_percentile[10], 3) == 8748.554
+    assert round(by_percentile[60], 3) == 9063.476
+
+
 def test_percentile_price_generation_uses_precomputed_rows_without_raw_rebuild(monkeypatch):
     import backend.app.services.pricing as pricing_service
 

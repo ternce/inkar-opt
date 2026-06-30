@@ -90,6 +90,16 @@ def recalculate_competitor_percentiles(*, db: Session, price_format_id: int) -> 
     selected_ids = [int(item.price_list.id) for item in selected]
     product_rows = db.execute(select(Product.id, Product.code, Product.provisor_goods_id)).all()
     product_ids = [int(product_id) for product_id, _code, _goods_id in product_rows]
+    product_id_by_goods_id = {
+        int(goods_id): int(product_id)
+        for product_id, _code, goods_id in product_rows
+        if goods_id is not None
+    }
+    product_id_by_code = {
+        str(code or "").strip(): int(product_id)
+        for product_id, code, _goods_id in product_rows
+        if str(code or "").strip()
+    }
     trace_sku = _trace_sku()
     trace_product_ids = {
         int(product_id)
@@ -101,11 +111,11 @@ def recalculate_competitor_percentiles(*, db: Session, price_format_id: int) -> 
             select(CompetitorPriceList, CompetitorPriceListItem)
             .join(CompetitorPriceListItem, CompetitorPriceListItem.price_list_id == CompetitorPriceList.id)
             .where(CompetitorPriceList.id.in_(selected_ids))
-            .where(CompetitorPriceListItem.product_id.is_not(None))
             .where(CompetitorPriceListItem.distributor_price.is_not(None))
             .order_by(
                 CompetitorPriceList.id.asc(),
                 CompetitorPriceListItem.product_id.asc(),
+                CompetitorPriceListItem.provisor_goods_id.asc(),
                 CompetitorPriceListItem.id.asc(),
             )
         )
@@ -131,6 +141,12 @@ def recalculate_competitor_percentiles(*, db: Session, price_format_id: int) -> 
     multi_price_groups: dict[tuple[int, str, str, int], list[Decimal]] = defaultdict(list)
     for price_list, item in rows:
         product_id = int(item.product_id or 0)
+        if not product_id and item.provisor_goods_id is not None:
+            product_id = int(product_id_by_goods_id.get(int(item.provisor_goods_id)) or 0)
+        if not product_id:
+            matched_sku = str(item.matched_sku or "").strip()
+            distributor_goods_id = str(item.distributor_goods_id or "").strip()
+            product_id = int(product_id_by_code.get(matched_sku) or product_id_by_code.get(distributor_goods_id) or 0)
         price = _as_decimal(item.distributor_price)
         if not product_id or price is None:
             continue
