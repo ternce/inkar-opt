@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ..config import Settings
 from ..models import CompetitorPriceList, CompetitorPriceListItem, PriceFormat, PriceFormatCompetitorAssignment, RefreshJob
+from .competitor_assignments import upsert_assignment
 from .competitor_percentiles import recalculate_competitor_percentiles
 from .competitor_persist import _ensure_price_format
 from .manufacturers import resolve_manufacturer
@@ -1434,16 +1435,90 @@ def _recalculate_percentiles_for_emit_rows(
     price_format_code: str | None = None,
 ) -> dict[str, Any]:
     ids = [int(item) for item in price_list_ids if int(item) > 0]
-    touched_format_ids = {
-        int(row.price_format_id)
-        for row in db.execute(
-            select(PriceFormatCompetitorAssignment.price_format_id)
+    requested_format = str(price_format_code or "").strip()
+    requested_pf: PriceFormat | None = None
+    warnings: list[dict[str, Any]] = []
+
+    if requested_format:
+        requested_pf = db.execute(select(PriceFormat).where(PriceFormat.code == requested_format)).scalars().first()
+        if requested_pf is None:
+            warning = {
+                "code": "emit_format_not_found",
+                "message": f"Emit refresh completed but requested PriceFormat was not found: {requested_format}",
+                "requested_format_code": requested_format,
+                "price_list_ids": ids,
+            }
+            logger.warning(
+                "[EMIT_FORMAT_CONTEXT] requested_format_code=%s price_list_ids=%s warning=%s",
+                requested_format,
+                ids,
+                warning["message"],
+            )
+            return {"summaries": {}, "warnings": [warning], "assigned_price_format_ids": []}
+        for price_list_id in ids:
+            upsert_assignment(
+                db=db,
+                price_format_id=int(requested_pf.id),
+                competitor_price_list_id=price_list_id,
+                coefficient=1.0,
+                is_active=True,
+            )
+        db.flush()
+
+    price_lists = {
+        int(row.id): row
+        for row in db.execute(select(CompetitorPriceList).where(CompetitorPriceList.id.in_(ids))).scalars().all()
+    } if ids else {}
+
+    assignment_rows = list(
+        db.execute(
+            select(
+                PriceFormatCompetitorAssignment.competitor_price_list_id,
+                PriceFormatCompetitorAssignment.price_format_id,
+            )
             .where(PriceFormatCompetitorAssignment.competitor_price_list_id.in_(ids))
             .where(PriceFormatCompetitorAssignment.is_active.is_(True))
         )
-        if row.price_format_id is not None
-    } if ids else set()
-    requested_format = str(price_format_code or "").strip()
+    ) if ids else []
+    assigned_by_price_list: dict[int, list[int]] = {}
+    for row in assignment_rows:
+        if row.price_format_id is None:
+            continue
+        assigned_by_price_list.setdefault(int(row.competitor_price_list_id), []).append(int(row.price_format_id))
+
+    for price_list_id in ids:
+        assigned_ids = sorted(set(assigned_by_price_list.get(price_list_id, [])))
+        price_list = price_lists.get(price_list_id)
+        filial_id = getattr(price_list, "branch_id", "") or getattr(price_list, "external_price_list_id", "") or ""
+        logger.info(
+            "[EMIT_FORMAT_CONTEXT] filial_id=%s requested_format_code=%s price_list_id=%s assigned_price_format_ids=%s",
+            filial_id or "unknown",
+            requested_format or "null",
+            price_list_id,
+            assigned_ids,
+        )
+        if not assigned_ids:
+            warning = {
+                "code": "emit_no_active_format_assignment",
+                "message": "Emit refresh completed but no active PriceFormatCompetitorAssignment found; percentiles were not recalculated",
+                "filial_id": filial_id,
+                "price_list_id": price_list_id,
+                "requested_format_code": requested_format,
+            }
+            warnings.append(warning)
+            logger.warning(
+                "[EMIT_FORMAT_CONTEXT] filial_id=%s requested_format_code=%s price_list_id=%s assigned_price_format_ids=[] warning=%s",
+                filial_id or "unknown",
+                requested_format or "null",
+                price_list_id,
+                warning["message"],
+            )
+
+    touched_format_ids = {
+        format_id
+        for format_ids in assigned_by_price_list.values()
+        for format_id in format_ids
+    }
     summaries: dict[str, Any] = {}
     for price_format_id in sorted(touched_format_ids):
         pf = db.get(PriceFormat, price_format_id)
@@ -1460,7 +1535,11 @@ def _recalculate_percentiles_for_emit_rows(
             summary.get("products_with_competitors"),
         )
     db.commit()
-    return summaries
+    return {
+        "summaries": summaries,
+        "warnings": warnings,
+        "assigned_price_format_ids": sorted(touched_format_ids),
+    }
 
 
 def update_emit_job(db: Session, job: RefreshJob, *, status: str, message: str, metadata: dict[str, Any] | None = None) -> None:

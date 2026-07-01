@@ -577,9 +577,11 @@ def test_emit_percentile_rebuild_uses_assigned_price_format_not_first_format(tmp
     db.add(PriceFormatCompetitorAssignment(price_format_id=selected_pf.id, competitor_price_list_id=row.id, is_active=True))
     db.commit()
 
-    summary = _recalculate_percentiles_for_emit_rows(db, price_list_ids=[row.id], price_format_code=selected_pf.code)
+    result = _recalculate_percentiles_for_emit_rows(db, price_list_ids=[row.id], price_format_code=selected_pf.code)
+    summary = result["summaries"]
 
     assert row.price_format_id == selected_pf.id
+    assert result["assigned_price_format_ids"] == [selected_pf.id]
     assert "SELECTED" in summary
     assert summary["SELECTED"]["products_with_competitors"] == 1
     assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == first_pf.id).count() == 0
@@ -587,6 +589,88 @@ def test_emit_percentile_rebuild_uses_assigned_price_format_not_first_format(tmp
     by_percentile = {item.percentile: float(item.value) for item in rows if item.percentile_scope == "regional"}
     assert round(by_percentile[10], 3) == 8748.554
     assert round(by_percentile[60], 3) == 9063.476
+
+
+def test_emit_percentile_rebuild_explicit_format_creates_assignment(tmp_path):
+    db = _session()
+    pf = PriceFormat(code="888", name="Format 888", branch="Emit International Almaty")
+    product = Product(code="163571", name="163571", cost=100, provisor_goods_id=163571)
+    db.add_all([pf, product])
+    db.flush()
+    staging = tmp_path / "stage.sqlite"
+    source = tmp_path / "emit.ndjson"
+    source.write_text(
+        "\n".join(
+            [
+                json.dumps({"id": 1, "goodsId": 163571, "distributorGoodsName": "A", "distributorGoodsId": "163571", "goodsPrice": 8688.26}),
+                json.dumps({"id": 2, "goodsId": 163571, "distributorGoodsName": "A", "distributorGoodsId": "163571", "goodsPrice": 8989.73}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    stats = parse_normalize_stage(
+        source_path=source,
+        stage_db_path=staging,
+        filial_id=1108,
+        filial_name="Emit International 1108",
+        config=EmitConfig(temp_dir=str(tmp_path), min_free_disk_gb=0, min_final_rows=1),
+    )
+    row = replace_emit_price_list_from_staging(
+        db=db,
+        config=EmitConfig(temp_dir=str(tmp_path), min_free_disk_gb=0, batch_insert_size=10, min_final_rows=1),
+        filial_id=1108,
+        filial_name="Emit International 1108",
+        staging_path=staging,
+        stats=stats,
+        price_format_code=pf.code,
+    )
+
+    result = _recalculate_percentiles_for_emit_rows(db, price_list_ids=[row.id], price_format_code="888")
+
+    assignment = db.execute(
+        select(PriceFormatCompetitorAssignment)
+        .where(PriceFormatCompetitorAssignment.price_format_id == pf.id)
+        .where(PriceFormatCompetitorAssignment.competitor_price_list_id == row.id)
+    ).scalars().one()
+    assert assignment.is_active is True
+    assert result["assigned_price_format_ids"] == [pf.id]
+    assert result["warnings"] == []
+    assert result["summaries"]["888"]["products_with_competitors"] == 1
+
+
+def test_emit_percentile_rebuild_without_assignment_returns_warning(tmp_path):
+    db = _session()
+    pf = PriceFormat(code="FMT", name="Format")
+    db.add(pf)
+    db.flush()
+    staging = tmp_path / "stage.sqlite"
+    source = tmp_path / "emit.ndjson"
+    source.write_text(
+        json.dumps({"id": 1, "goodsId": 1, "distributorGoodsName": "A", "distributorGoodsId": "1", "goodsPrice": 1}) + "\n",
+        encoding="utf-8",
+    )
+    stats = parse_normalize_stage(
+        source_path=source,
+        stage_db_path=staging,
+        filial_id=1108,
+        filial_name="Emit International 1108",
+        config=EmitConfig(temp_dir=str(tmp_path), min_free_disk_gb=0, min_final_rows=1),
+    )
+    row = replace_emit_price_list_from_staging(
+        db=db,
+        config=EmitConfig(temp_dir=str(tmp_path), min_free_disk_gb=0, batch_insert_size=10, min_final_rows=1),
+        filial_id=1108,
+        filial_name="Emit International 1108",
+        staging_path=staging,
+        stats=stats,
+    )
+
+    result = _recalculate_percentiles_for_emit_rows(db, price_list_ids=[row.id])
+
+    assert result["summaries"] == {}
+    assert result["assigned_price_format_ids"] == []
+    assert result["warnings"][0]["code"] == "emit_no_active_format_assignment"
+    assert result["warnings"][0]["price_list_id"] == row.id
 
 
 def test_top_level_object_with_data_items_parsed_streaming(tmp_path):

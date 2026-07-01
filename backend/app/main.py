@@ -5459,6 +5459,10 @@ async def run_emit_refresh_now(payload: dict = Body(default={}), db: Session = D
     if active_or_stale_refresh_job(db) is not None:
         raise HTTPException(status_code=409, detail="Normal Provisor refresh is active or stale; wait before starting Emit refresh.")
     price_format_code = str(payload.get("format_code") or payload.get("formatCode") or "").strip()
+    if price_format_code:
+        pf = db.execute(select(PriceFormat).where(PriceFormat.code == price_format_code)).scalars().first()
+        if pf is None:
+            raise HTTPException(status_code=400, detail=f"Price format not found: {price_format_code}")
     job, blocker, owner_token = worker.create_job(
         mode=mode,
         filial_ids=target_ids,
