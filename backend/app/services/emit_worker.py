@@ -1632,6 +1632,7 @@ class EmitWorker:
                     stats=stats,
                     price_format_code=str((job.metadata_json and _json_loads(job.metadata_json, {}).get("price_format_code")) or ""),
                 )
+                price_list_id = int(price_list.id)
                 job = db.get(RefreshJob, job_id)
                 if job is not None:
                     job.processed_plk = int(job.processed_plk or 0) + 1
@@ -1641,7 +1642,7 @@ class EmitWorker:
                 temp_path.unlink()
             _delete_stage_files(staging_path)
             stats.cleanup_elapsed_sec = 0.0
-            return {"ok": True, "filial_id": filial_id, "price_list_id": int(price_list.id), **stats.to_dict()}
+            return {"ok": True, "filial_id": filial_id, "price_list_id": price_list_id, **stats.to_dict()}
         except Exception as exc:
             logger.exception("Emit filial refresh failed: filial_id=%s", filial_id)
             with self.session_factory() as db:

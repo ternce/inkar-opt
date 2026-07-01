@@ -23,6 +23,7 @@ from backend.app.models import (
     PriceFormatCompetitorAssignment,
     PriceSourceAccount,
     Product,
+    RefreshJob,
 )
 from backend.app.services.emit_worker import (
     EmitConfig,
@@ -785,3 +786,52 @@ def test_status_endpoint(monkeypatch):
         assert job is not None
     finally:
         main.app.dependency_overrides.clear()
+
+
+def test_refresh_filial_returns_primitive_price_list_id_after_session_close(monkeypatch, tmp_path):
+    Session = _session_factory_static()
+    with Session() as db:
+        db.add(PriceFormat(code="FMT", name="Format"))
+        job = RefreshJob(
+            source_type="emit",
+            mode="selected",
+            status="pending",
+            total_plk=1,
+            metadata_json=json.dumps({"filial_ids": [1106], "price_format_code": "FMT"}),
+        )
+        db.add(job)
+        db.commit()
+        job_id = int(job.id)
+
+    async def fake_download_emit_filial(**_kwargs):
+        source = tmp_path / "emit_download.ndjson"
+        source.write_text(
+            json.dumps(
+                {
+                    "id": 1,
+                    "goodsId": 163571,
+                    "distributorGoodsName": "A",
+                    "distributorGoodsId": "SKU",
+                    "goodsPrice": 8688.26,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return source
+
+    monkeypatch.setattr("backend.app.services.emit_worker.download_emit_filial", fake_download_emit_filial)
+    monkeypatch.setattr("backend.app.services.emit_worker._delete_stage_files", lambda _path: None)
+    worker = EmitWorker(
+        session_factory=Session,
+        config=EmitConfig(temp_dir=str(tmp_path), min_free_disk_gb=0, min_final_rows=1, delete_temp_after_success=False),
+    )
+
+    result = asyncio.run(worker.refresh_filial(job_id=job_id, filial_id=1106))
+
+    assert result["ok"] is True
+    assert isinstance(result["price_list_id"], int)
+    with Session() as db:
+        saved = db.get(CompetitorPriceList, result["price_list_id"])
+        assert saved is not None
+        assert saved.source_key == "emit:1106"
