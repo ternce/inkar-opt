@@ -22,7 +22,8 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..config import Settings
-from ..models import CompetitorPriceList, CompetitorPriceListItem, PriceFormat, RefreshJob
+from ..models import CompetitorPriceList, CompetitorPriceListItem, PriceFormat, PriceFormatCompetitorAssignment, RefreshJob
+from .competitor_percentiles import recalculate_competitor_percentiles
 from .competitor_persist import _ensure_price_format
 from .manufacturers import resolve_manufacturer
 from .provisor import get_access_token
@@ -1174,6 +1175,15 @@ def _first_price_format(db: Session) -> PriceFormat:
     return _ensure_price_format(db, "DEFAULT")
 
 
+def _price_format_for_code(db: Session, code: str | None) -> PriceFormat:
+    normalized = str(code or "").strip()
+    if normalized:
+        row = db.execute(select(PriceFormat).where(PriceFormat.code == normalized)).scalars().first()
+        if row is not None:
+            return row
+    return _first_price_format(db)
+
+
 def _row_count_in_staging(staging_path: Path) -> int:
     return stage_row_count(staging_path)
 
@@ -1211,12 +1221,13 @@ def replace_emit_price_list_from_staging(
     filial_name: str,
     staging_path: Path,
     stats: EmitStats,
+    price_format_code: str | None = None,
 ) -> CompetitorPriceList:
     started = time.perf_counter()
     final_count = _row_count_in_staging(staging_path)
     if final_count < config.min_final_rows:
         raise RuntimeError(f"Emit staging produced suspiciously low row count: {final_count} < {config.min_final_rows}")
-    pf = _first_price_format(db)
+    pf = _price_format_for_code(db, price_format_code)
     source_key = f"emit:{filial_id}"
     now = datetime.utcnow()
     row = (
@@ -1333,7 +1344,15 @@ def replace_emit_price_list_from_staging(
     return row
 
 
-def _create_emit_job(db: Session, *, mode: str, filial_ids: list[int], requested_by: str, owner_token: str) -> RefreshJob:
+def _create_emit_job(
+    db: Session,
+    *,
+    mode: str,
+    filial_ids: list[int],
+    requested_by: str,
+    owner_token: str,
+    price_format_code: str | None = None,
+) -> RefreshJob:
     now = datetime.utcnow()
     job = RefreshJob(
         source_type=SOURCE_TYPE,
@@ -1344,7 +1363,7 @@ def _create_emit_job(db: Session, *, mode: str, filial_ids: list[int], requested
         requested_by=requested_by,
         total_plk=len(filial_ids),
         message="Emit refresh queued.",
-        metadata_json=_json_dumps({"owner_token": owner_token, "filial_ids": filial_ids}),
+        metadata_json=_json_dumps({"owner_token": owner_token, "filial_ids": filial_ids, "price_format_code": price_format_code or ""}),
     )
     db.add(job)
     db.commit()
@@ -1408,6 +1427,42 @@ def list_emit_jobs(db: Session, *, limit: int = 50) -> list[dict[str, Any]]:
     return [emit_job_to_dict(row) | {"id": row.id} for row in rows]
 
 
+def _recalculate_percentiles_for_emit_rows(
+    db: Session,
+    *,
+    price_list_ids: list[int],
+    price_format_code: str | None = None,
+) -> dict[str, Any]:
+    ids = [int(item) for item in price_list_ids if int(item) > 0]
+    touched_format_ids = {
+        int(row.price_format_id)
+        for row in db.execute(
+            select(PriceFormatCompetitorAssignment.price_format_id)
+            .where(PriceFormatCompetitorAssignment.competitor_price_list_id.in_(ids))
+            .where(PriceFormatCompetitorAssignment.is_active.is_(True))
+        )
+        if row.price_format_id is not None
+    } if ids else set()
+    requested_format = str(price_format_code or "").strip()
+    summaries: dict[str, Any] = {}
+    for price_format_id in sorted(touched_format_ids):
+        pf = db.get(PriceFormat, price_format_id)
+        if pf is None:
+            continue
+        summary = recalculate_competitor_percentiles(db=db, price_format_id=price_format_id)
+        summaries[str(pf.code or price_format_id)] = {"price_format_id": price_format_id, **summary}
+        logger.info(
+            "[EMIT_PERCENTILE_REBUILD] requested_format_code=%s format_code=%s price_format_id=%s rows_created=%s products_with_competitors=%s",
+            requested_format,
+            pf.code,
+            price_format_id,
+            summary.get("rows_created"),
+            summary.get("products_with_competitors"),
+        )
+    db.commit()
+    return summaries
+
+
 def update_emit_job(db: Session, job: RefreshJob, *, status: str, message: str, metadata: dict[str, Any] | None = None) -> None:
     token = job_owner_token(job)
     if token:
@@ -1430,7 +1485,14 @@ class EmitWorker:
         self.session_factory = session_factory
         self.config = config
 
-    def create_job(self, *, mode: str, filial_ids: list[int], requested_by: str = "manual") -> tuple[RefreshJob | None, RefreshJob | None, str | None]:
+    def create_job(
+        self,
+        *,
+        mode: str,
+        filial_ids: list[int],
+        requested_by: str = "manual",
+        price_format_code: str | None = None,
+    ) -> tuple[RefreshJob | None, RefreshJob | None, str | None]:
         filial_ids = list(dict.fromkeys(int(x) for x in filial_ids if int(x) > 0))
         with self.session_factory() as db:
             blocker = active_emit_job(db)
@@ -1447,7 +1509,14 @@ class EmitWorker:
             ):
                 return None, latest_emit_job(db), None
             try:
-                job = _create_emit_job(db, mode=mode, filial_ids=filial_ids, requested_by=requested_by, owner_token=owner_token)
+                job = _create_emit_job(
+                    db,
+                    mode=mode,
+                    filial_ids=filial_ids,
+                    requested_by=requested_by,
+                    owner_token=owner_token,
+                    price_format_code=price_format_code,
+                )
                 return job, None, owner_token
             except Exception:
                 release_lock(db, name=LOCK_NAME, owner_token=owner_token)
@@ -1491,6 +1560,21 @@ class EmitWorker:
             with self.session_factory() as db:
                 job = db.get(RefreshJob, job_id)
                 if job is not None:
+                    metadata = _json_loads(job.metadata_json, {})
+                    price_format_code = str((metadata or {}).get("price_format_code") or "").strip()
+                    refreshed_price_list_ids = [
+                        int(row.get("price_list_id") or 0)
+                        for row in aggregate.get("filials", [])
+                        if isinstance(row, dict) and int(row.get("price_list_id") or 0) > 0
+                    ]
+                    percentile_rebuild = {}
+                    if status == "success" and refreshed_price_list_ids:
+                        percentile_rebuild = _recalculate_percentiles_for_emit_rows(
+                            db,
+                            price_list_ids=refreshed_price_list_ids,
+                            price_format_code=price_format_code,
+                        )
+                        aggregate["percentile_rebuild"] = percentile_rebuild
                     finish_job(
                         db,
                         job,
@@ -1539,7 +1623,15 @@ class EmitWorker:
                 job = db.get(RefreshJob, job_id)
                 if job is not None:
                     update_emit_job(db, job, status="saving", message=f"Saving Emit filial {filial_id}", metadata=stats.to_dict())
-                replace_emit_price_list_from_staging(db=db, config=self.config, filial_id=filial_id, filial_name=filial_name, staging_path=staging_path, stats=stats)
+                price_list = replace_emit_price_list_from_staging(
+                    db=db,
+                    config=self.config,
+                    filial_id=filial_id,
+                    filial_name=filial_name,
+                    staging_path=staging_path,
+                    stats=stats,
+                    price_format_code=str((job.metadata_json and _json_loads(job.metadata_json, {}).get("price_format_code")) or ""),
+                )
                 job = db.get(RefreshJob, job_id)
                 if job is not None:
                     job.processed_plk = int(job.processed_plk or 0) + 1
@@ -1549,7 +1641,7 @@ class EmitWorker:
                 temp_path.unlink()
             _delete_stage_files(staging_path)
             stats.cleanup_elapsed_sec = 0.0
-            return {"ok": True, "filial_id": filial_id, **stats.to_dict()}
+            return {"ok": True, "filial_id": filial_id, "price_list_id": int(price_list.id), **stats.to_dict()}
         except Exception as exc:
             logger.exception("Emit filial refresh failed: filial_id=%s", filial_id)
             with self.session_factory() as db:

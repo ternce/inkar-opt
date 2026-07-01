@@ -5458,7 +5458,13 @@ async def run_emit_refresh_now(payload: dict = Body(default={}), db: Session = D
         raise HTTPException(status_code=400, detail="No Emit filial IDs requested")
     if active_or_stale_refresh_job(db) is not None:
         raise HTTPException(status_code=409, detail="Normal Provisor refresh is active or stale; wait before starting Emit refresh.")
-    job, blocker, owner_token = worker.create_job(mode=mode, filial_ids=target_ids, requested_by="manual")
+    price_format_code = str(payload.get("format_code") or payload.get("formatCode") or "").strip()
+    job, blocker, owner_token = worker.create_job(
+        mode=mode,
+        filial_ids=target_ids,
+        requested_by="manual",
+        price_format_code=price_format_code,
+    )
     if job is None:
         raise HTTPException(status_code=409, detail={"message": "Emit refresh is already running.", "job": emit_job_to_dict(blocker)})
     asyncio.create_task(worker.run_job(int(job.id), owner_token=owner_token))

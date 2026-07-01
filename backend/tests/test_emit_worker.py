@@ -15,7 +15,15 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from backend.app.db import Base
-from backend.app.models import CompetitorPriceList, CompetitorPriceListItem, PriceFormat, PriceSourceAccount
+from backend.app.models import (
+    CompetitorPriceList,
+    CompetitorPriceListItem,
+    CompetitorPricePercentile,
+    PriceFormat,
+    PriceFormatCompetitorAssignment,
+    PriceSourceAccount,
+    Product,
+)
 from backend.app.services.emit_worker import (
     EmitConfig,
     EmitStats,
@@ -30,6 +38,7 @@ from backend.app.services.emit_worker import (
     parse_normalize_stage,
     replace_emit_price_list_from_staging,
     stage_row_count,
+    _recalculate_percentiles_for_emit_rows,
 )
 from backend.app.services.price_sources import UnifiedPriceItem, UnifiedPriceList
 
@@ -526,6 +535,57 @@ def test_successful_parse_creates_selectable_competitor_price_list(tmp_path):
     assert row.last_refresh_status == "success"
     assert row.account_id == ""
     assert db.scalar(select(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == row.id).with_only_columns(CompetitorPriceListItem.id).limit(1)) is not None
+
+
+def test_emit_percentile_rebuild_uses_assigned_price_format_not_first_format(tmp_path):
+    db = _session()
+    first_pf = PriceFormat(code="FIRST", name="FIRST", branch="Other")
+    selected_pf = PriceFormat(code="SELECTED", name="SELECTED", branch="Emit International Almaty")
+    product = Product(code="163571", name="163571", cost=100, provisor_goods_id=163571)
+    db.add_all([first_pf, selected_pf, product])
+    db.flush()
+    staging = tmp_path / "stage.sqlite"
+    source = tmp_path / "emit.ndjson"
+    source.write_text(
+        "\n".join(
+            [
+                json.dumps({"id": 1, "goodsId": 163571, "distributorGoodsName": "A", "distributorGoodsId": "163571", "goodsPrice": 8688.26}),
+                json.dumps({"id": 2, "goodsId": 163571, "distributorGoodsName": "A", "distributorGoodsId": "163571", "goodsPrice": 8989.73}),
+                json.dumps({"id": 3, "goodsId": 163571, "distributorGoodsName": "A", "distributorGoodsId": "163571", "goodsPrice": 9358.46}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    stats = parse_normalize_stage(
+        source_path=source,
+        stage_db_path=staging,
+        filial_id=1106,
+        filial_name="Emit International Almaty",
+        config=EmitConfig(temp_dir=str(tmp_path), min_free_disk_gb=0, min_final_rows=1),
+    )
+
+    row = replace_emit_price_list_from_staging(
+        db=db,
+        config=EmitConfig(temp_dir=str(tmp_path), min_free_disk_gb=0, batch_insert_size=10, min_final_rows=1),
+        filial_id=1106,
+        filial_name="Emit International Almaty",
+        staging_path=staging,
+        stats=stats,
+        price_format_code=selected_pf.code,
+    )
+    db.add(PriceFormatCompetitorAssignment(price_format_id=selected_pf.id, competitor_price_list_id=row.id, is_active=True))
+    db.commit()
+
+    summary = _recalculate_percentiles_for_emit_rows(db, price_list_ids=[row.id], price_format_code=selected_pf.code)
+
+    assert row.price_format_id == selected_pf.id
+    assert "SELECTED" in summary
+    assert summary["SELECTED"]["products_with_competitors"] == 1
+    assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == first_pf.id).count() == 0
+    rows = db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == selected_pf.id).all()
+    by_percentile = {item.percentile: float(item.value) for item in rows if item.percentile_scope == "regional"}
+    assert round(by_percentile[10], 3) == 8748.554
+    assert round(by_percentile[60], 3) == 9063.476
 
 
 def test_top_level_object_with_data_items_parsed_streaming(tmp_path):
