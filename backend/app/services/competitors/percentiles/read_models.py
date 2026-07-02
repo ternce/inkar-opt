@@ -20,7 +20,13 @@ from ....models import (
     ProductExtra,
     ProductRating,
 )
-from ...competitor_percentiles import KAZAKHSTAN_REGION, KAZAKHSTAN_SCOPE, PERCENTILES, REGIONAL_SCOPE
+from ...competitor_percentiles import (
+    KAZAKHSTAN_REGION,
+    KAZAKHSTAN_SCOPE,
+    PERCENTILES,
+    REGIONAL_SCOPE,
+    emit_percentile_group_keys,
+)
 from ...competitor_source_config import MULTI_PRICE_PERCENTILE_MODE, effective_percentile_mode
 
 logger = logging.getLogger(__name__)
@@ -33,6 +39,7 @@ def list_percentile_sources(*, db: Session, price_format_code: str | None = None
     competitor_price_percentiles. Stage 1 only exposes it as a management view.
     """
 
+    allowed_groups_by_format: dict[int, set[tuple[str, str]]] = {}
     stmt = (
         select(
             CompetitorPricePercentile.price_format_id,
@@ -56,11 +63,27 @@ def list_percentile_sources(*, db: Session, price_format_code: str | None = None
         pf = db.execute(select(PriceFormat).where(PriceFormat.code == price_format_code.strip())).scalars().first()
         if pf is None:
             return []
+        allowed_groups = emit_percentile_group_keys(db=db, price_format_id=int(pf.id))
+        if not allowed_groups:
+            return []
+        allowed_groups_by_format[int(pf.id)] = allowed_groups
         stmt = stmt.where(CompetitorPricePercentile.price_format_id == pf.id)
 
     rows = db.execute(stmt.order_by(CompetitorPricePercentile.branch_name.asc(), CompetitorPricePercentile.competitor_name.asc())).all()
     out: list[dict] = []
     for row in rows:
+        allowed_groups = allowed_groups_by_format.get(int(row.price_format_id))
+        if allowed_groups is None:
+            allowed_groups = emit_percentile_group_keys(db=db, price_format_id=int(row.price_format_id))
+            allowed_groups_by_format[int(row.price_format_id)] = allowed_groups
+        if row.percentile_scope == REGIONAL_SCOPE:
+            if _group_key(row.branch_name, row.competitor_name) not in allowed_groups:
+                continue
+        elif row.percentile_scope == KAZAKHSTAN_SCOPE:
+            if not any(competitor == str(row.competitor_name or "").strip() for _branch, competitor in allowed_groups):
+                continue
+        else:
+            continue
         generated_at = row.generated_at.isoformat() if row.generated_at else ""
         out.append(
             {
@@ -127,21 +150,23 @@ def _assigned_rows_for_group(
     region: str,
     competitor: str,
 ) -> list[tuple[CompetitorPriceList, PriceFormatCompetitorAssignment]]:
-    return (
-        db.execute(
-            select(CompetitorPriceList, PriceFormatCompetitorAssignment)
-            .join(
-                PriceFormatCompetitorAssignment,
-                PriceFormatCompetitorAssignment.competitor_price_list_id == CompetitorPriceList.id,
-            )
-            .where(PriceFormatCompetitorAssignment.price_format_id == pf.id)
-            .where(PriceFormatCompetitorAssignment.is_active.is_(True))
-            .where(CompetitorPriceList.branch_name == region)
-            .where(CompetitorPriceList.competitor_name == competitor)
-            .order_by(CompetitorPriceList.id.asc())
+    rows = db.execute(
+        select(CompetitorPriceList, PriceFormatCompetitorAssignment)
+        .join(
+            PriceFormatCompetitorAssignment,
+            PriceFormatCompetitorAssignment.competitor_price_list_id == CompetitorPriceList.id,
         )
-        .all()
-    )
+        .where(PriceFormatCompetitorAssignment.price_format_id == pf.id)
+        .where(PriceFormatCompetitorAssignment.is_active.is_(True))
+        .where(CompetitorPriceList.branch_name == region)
+        .where(CompetitorPriceList.competitor_name == competitor)
+        .order_by(CompetitorPriceList.id.asc())
+    ).all()
+    return [
+        (row, assignment)
+        for row, assignment in rows
+        if effective_percentile_mode(row, assignment.percentile_mode) == MULTI_PRICE_PERCENTILE_MODE
+    ]
 
 
 def _ratings_by_product(db: Session, product_ids: list[int], branch_id: str) -> dict[int, dict[str, int | None]]:
@@ -178,6 +203,9 @@ def list_percentile_groups(*, db: Session, price_format_code: str) -> list[dict]
     pf = _get_price_format(db, price_format_code)
     if pf is None:
         return []
+    allowed_groups = emit_percentile_group_keys(db=db, price_format_id=int(pf.id))
+    if not allowed_groups:
+        return []
     rows = (
         db.execute(
             select(
@@ -202,6 +230,14 @@ def list_percentile_groups(*, db: Session, price_format_code: str) -> list[dict]
     for row in rows:
         region, competitor = _group_key(row.branch_name, row.competitor_name)
         scope = str(row.percentile_scope or REGIONAL_SCOPE)
+        if scope == REGIONAL_SCOPE:
+            if (region, competitor) not in allowed_groups:
+                continue
+        elif scope == KAZAKHSTAN_SCOPE:
+            if not any(allowed_competitor == competitor for _branch, allowed_competitor in allowed_groups):
+                continue
+        else:
+            continue
         groups.append(
             {
                 "id": f"{scope}::{region}::{competitor}",
@@ -244,22 +280,11 @@ def _selected_group(db: Session, pf: PriceFormat, region: str = "", competitor: 
 def _price_columns_for_group(db: Session, pf: PriceFormat, *, region: str, competitor: str) -> list[dict]:
     if region == KAZAKHSTAN_REGION:
         return []
-    rows = (
-        db.execute(
-            select(CompetitorPriceList)
-            .join(
-                PriceFormatCompetitorAssignment,
-                PriceFormatCompetitorAssignment.competitor_price_list_id == CompetitorPriceList.id,
-            )
-            .where(PriceFormatCompetitorAssignment.price_format_id == pf.id)
-            .where(PriceFormatCompetitorAssignment.is_active.is_(True))
-            .where(CompetitorPriceList.branch_name == region)
-            .where(CompetitorPriceList.competitor_name == competitor)
-            .order_by(CompetitorPriceList.account_login.asc(), CompetitorPriceList.display_name.asc(), CompetitorPriceList.id.asc())
-        )
-        .scalars()
-        .all()
-    )
+    rows = [
+        row
+        for row, _assignment in _assigned_rows_for_group(db=db, pf=pf, region=region, competitor=competitor)
+    ]
+    rows.sort(key=lambda row: (row.account_login or "", row.display_name or "", int(row.id)))
     seen: dict[str, int] = {}
     columns: list[dict] = []
     for row in rows:
@@ -408,7 +433,12 @@ def percentile_trace(
     product = db.execute(select(Product).where(Product.code == sku.strip())).scalars().first()
     if product is None:
         return {"found": False, "reason": "product_not_found"}
+    allowed_groups = emit_percentile_group_keys(db=db, price_format_id=int(pf.id))
+    if not allowed_groups:
+        return {"found": False, "reason": "no_emit_percentile_source_assigned"}
     if region == KAZAKHSTAN_REGION:
+        if not any(allowed_competitor == competitor for _branch, allowed_competitor in allowed_groups):
+            return {"found": False, "reason": "not_emit_percentile_group"}
         rows = (
             db.execute(
                 select(CompetitorPricePercentile)
@@ -439,6 +469,8 @@ def percentile_trace(
         }
 
     assigned_rows = _assigned_rows_for_group(db=db, pf=pf, region=region, competitor=competitor)
+    if not assigned_rows:
+        return {"found": False, "reason": "not_emit_percentile_group"}
     price_list_ids = [int(row.id) for row, _assignment in assigned_rows]
     modes = {
         int(row.id): effective_percentile_mode(row, assignment.percentile_mode)

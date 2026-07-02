@@ -43,7 +43,7 @@ from .competitor_assignments import (
     list_global_competitor_price_lists_for_format,
     set_competitor_assignments,
 )
-from .competitor_percentiles import DEFAULT_BRANCH, recalculate_competitor_percentiles
+from .competitor_percentiles import DEFAULT_BRANCH, recalculate_competitor_percentiles_if_needed
 from .manufacturers import resolve_manufacturer
 from .price_sources import UnifiedPriceItem, UnifiedPriceList
 from .sku import normalize_external_sku, normalize_sku, normalize_sku_variants
@@ -628,7 +628,7 @@ def upsert_provisor_price_list(
         _replace_legacy_price_rows_for_list(db=db, price_list=row)
         sync_selected_competitor_configs(db=db, price_format_id=pf.id)
         rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id)
-        recalculate_competitor_percentiles(db=db, price_format_id=pf.id)
+        recalculate_competitor_percentiles_if_needed(db=db, price_format_id=pf.id)
     db.commit()
     return row
 
@@ -887,7 +887,7 @@ def upsert_unified_price_list(
         _replace_legacy_price_rows_for_list(db=db, price_list=row)
         sync_selected_competitor_configs(db=db, price_format_id=pf.id)
         rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id)
-        recalculate_competitor_percentiles(db=db, price_format_id=pf.id)
+        recalculate_competitor_percentiles_if_needed(db=db, price_format_id=pf.id)
     stage_started_at = time.perf_counter()
     db.commit()
     _db_save_timing(price_list_id=row.id, stage="commit", rows=len(row_mappings), started_at=stage_started_at)
@@ -1149,7 +1149,7 @@ def set_selected_competitor_price_lists(
     db.commit()
     _timing(operation, "flush/commit", commit_started_at)
 
-    recalculate_competitor_percentiles(db=db, price_format_id=pf.id)
+    recalculate_competitor_percentiles_if_needed(db=db, price_format_id=pf.id)
     commit_started_at = time.perf_counter()
     db.commit()
     _timing(operation, "flush/commit", commit_started_at)
@@ -1298,7 +1298,7 @@ def import_manual_price_list_excel(
 
     db.flush()
     _replace_legacy_price_rows_for_list(db=db, price_list=row)
-    recalculate_competitor_percentiles(db=db, price_format_id=pf.id)
+    recalculate_competitor_percentiles_if_needed(db=db, price_format_id=pf.id)
     db.commit()
     return row
 

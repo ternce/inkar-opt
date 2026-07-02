@@ -415,14 +415,12 @@ def test_percentile_rebuild_includes_products_without_competitors():
         .all()
     )
 
-    assert summary["rows_created"] == 20
-    assert summary["products_processed"] == 2
-    assert summary["products_with_competitors"] == 1
-    assert summary["products_without_competitors"] == 1
-    assert len(with_rows) == 5
-    assert len(without_rows) == 5
-    assert {float(row.value) for row in with_rows} == {150.0}
-    assert all(row.value is None for row in without_rows)
+    assert summary["rows_created"] == 0
+    assert summary["rows_skipped"] == 1
+    assert summary["products_processed"] == 0
+    assert summary["products_with_competitors"] == 0
+    assert len(with_rows) == 0
+    assert len(without_rows) == 0
 
 
 def test_percentile_source_sku_count_matches_full_product_scope():
@@ -463,9 +461,7 @@ def test_percentile_source_sku_count_matches_full_product_scope():
     sources = list_percentile_sources(db=db, price_format_code=pf.code)
     regional_sources = [source for source in sources if source.get("scope") == REGIONAL_SCOPE]
 
-    assert len(regional_sources) == 5
-    assert {source["skuCount"] for source in regional_sources} == {2}
-    assert {source["percentile"] for source in regional_sources} == {10, 20, 30, 40, 60}
+    assert regional_sources == []
 
 
 def test_percentile_rebuild_uses_latest_duplicate_row_per_account_sku():
@@ -501,8 +497,7 @@ def test_percentile_rebuild_uses_latest_duplicate_row_per_account_sku():
         .filter(CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
         .all()
     )
-    assert {float(row.value) for row in rows} == {200.0}
-    assert {row.source_count for row in rows} == {1}
+    assert rows == []
 
 
 def test_multi_price_percentile_source_uses_all_rows_for_one_sku():
@@ -658,6 +653,25 @@ def test_percentile_price_generation_uses_precomputed_rows_without_raw_rebuild(m
     pf.competitor_price_mode = "percentile"
     pf.percentile_number = 10
     product = _product(db, code="PCT-PRECOMPUTED", cost=100)
+    emit_source = CompetitorPriceList(
+        price_format_id=pf.id,
+        source_type="emit",
+        source_key="emit:1106",
+        display_name="Emit International 1106",
+        supplier="Emit International 1106",
+        branch_name="Emit International 1106",
+        competitor_name="Emit International 1106",
+    )
+    db.add(emit_source)
+    db.flush()
+    db.add(
+        PriceFormatCompetitorAssignment(
+            price_format_id=pf.id,
+            competitor_price_list_id=emit_source.id,
+            is_active=True,
+            percentile_mode=MULTI_PRICE_PERCENTILE_MODE,
+        )
+    )
     db.add(
         CompetitorPricePercentile(
             price_format_id=pf.id,
@@ -704,6 +718,25 @@ def test_percentile_price_generation_does_not_recalculate_from_raw_rows(monkeypa
     pf.competitor_price_mode = "percentile"
     pf.percentile_number = 30
     product = _product(db, code="PCT-NO-RAW-RECALC", cost=100)
+    emit_source = CompetitorPriceList(
+        price_format_id=pf.id,
+        source_type="emit",
+        source_key="emit:1106",
+        display_name="Emit International 1106",
+        supplier="Emit International 1106",
+        branch_name="Emit International 1106",
+        competitor_name="Emit International 1106",
+    )
+    db.add(emit_source)
+    db.flush()
+    db.add(
+        PriceFormatCompetitorAssignment(
+            price_format_id=pf.id,
+            competitor_price_list_id=emit_source.id,
+            is_active=True,
+            percentile_mode=MULTI_PRICE_PERCENTILE_MODE,
+        )
+    )
     db.add(
         CompetitorPricePercentile(
             price_format_id=pf.id,
@@ -724,7 +757,7 @@ def test_percentile_price_generation_does_not_recalculate_from_raw_rows(monkeypa
     def fail_percentile_recalculation(**_kwargs):
         raise AssertionError("raw Emit rows must not be read to recalculate percentiles during price generation")
 
-    monkeypatch.setattr(pricing_service, "recalculate_competitor_percentiles", fail_percentile_recalculation)
+    monkeypatch.setattr(pricing_service, "recalculate_competitor_percentiles_if_needed", fail_percentile_recalculation)
 
     count = calculate_prices(
         db=db,
@@ -1042,8 +1075,10 @@ def test_percentile_rows_endpoint_returns_all_rows_and_counters():
 
         medservice = client.get("/api/competitors/percentile-rows?format_code=PCT-API&region=Almaty&competitor=Medservice&page_size=100")
         assert medservice.status_code == 200
-        medservice_row = {row["sku"]: row for row in medservice.json()["items"]}["PCT-API-WITH"]
-        assert medservice_row["percentiles"]["10"] == 1
+        medservice_payload = medservice.json()
+        assert medservice_payload["selectedCompetitor"] == "Emiti"
+        medservice_row = {row["sku"]: row for row in medservice_payload["items"]}["PCT-API-WITH"]
+        assert round(float(medservice_row["percentiles"]["10"]), 3) == 687.0
 
         astana = client.get("/api/competitors/percentile-rows?format_code=PCT-API&region=Astana&competitor=Emiti&page_size=100")
         assert astana.status_code == 200

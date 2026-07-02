@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 from datetime import date, timedelta
 
 import pytest
@@ -21,6 +22,7 @@ from backend.app.models import (
     ListItem,
     MarkupRange,
     PriceFormat,
+    PriceList,
     Product,
     UniversalList,
     UniversalListPriceFormat,
@@ -291,6 +293,54 @@ def test_delete_list_removes_items():
     try:
         assert db.scalar(select(BusinessList).where(BusinessList.id == list_id)) is None
         assert db.scalar(select(BusinessListItem).where(BusinessListItem.business_list_id == list_id)) is None
+    finally:
+        db.close()
+
+
+def test_delete_universal_list_cleans_bindings_items_and_calculated_price_refs():
+    client, Session = _client()
+    db = Session()
+    try:
+        price_format = PriceFormat(code="003", name="Format 003", branch="A")
+        product = Product(code="SKU-DEL", name="Delete Product", cost=10)
+        universal_list = UniversalList(code="UL-DEL", name="Delete Me", type="fixed_price", status="active")
+        price_list = PriceList(number="PL-DEL", price_format_id=1, activation_date=date.today(), user="test")
+        db.add_all([price_format, product, universal_list])
+        db.flush()
+        price_list.price_format_id = price_format.id
+        db.add(price_list)
+        db.flush()
+        db.add_all(
+            [
+                UniversalListPriceFormat(universal_list_id=universal_list.id, price_format_id=price_format.id),
+                ListItem(universal_list_id=universal_list.id, product_id=product.id, value=1),
+                CalculatedPrice(
+                    price_list_id=price_list.id,
+                    product_id=product.id,
+                    cost=10,
+                    base_price=10,
+                    final_price=11,
+                    applied_list_id=universal_list.id,
+                    applied_list_ids=json.dumps([universal_list.id, 999]),
+                ),
+            ]
+        )
+        db.commit()
+        list_id = universal_list.id
+    finally:
+        db.close()
+
+    response = client.delete(f"/api/universal-lists/{list_id}")
+
+    assert response.status_code == 200
+    db = Session()
+    try:
+        assert db.get(UniversalList, list_id) is None
+        assert db.scalar(select(func.count(UniversalListPriceFormat.id)).where(UniversalListPriceFormat.universal_list_id == list_id)) == 0
+        assert db.scalar(select(func.count(ListItem.id)).where(ListItem.universal_list_id == list_id)) == 0
+        calculated = db.execute(select(CalculatedPrice)).scalars().one()
+        assert calculated.applied_list_id is None
+        assert json.loads(calculated.applied_list_ids) == [999]
     finally:
         db.close()
 

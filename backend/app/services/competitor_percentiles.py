@@ -4,8 +4,9 @@ from collections import defaultdict
 import logging
 import os
 from decimal import Decimal
+from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from ..models import CompetitorPriceList, CompetitorPriceListItem, CompetitorPricePercentile, Product
@@ -72,21 +73,97 @@ def _status_for_values(values: list[Decimal]) -> str:
     return STATUS_NO_DATA
 
 
+def emit_percentile_assignments(*, db: Session, price_format_id: int):
+    return [
+        item
+        for item in get_assigned_competitor_price_lists(db=db, price_format_id=price_format_id)
+        if effective_percentile_mode(item.price_list, item.assignment.percentile_mode) == MULTI_PRICE_PERCENTILE_MODE
+    ]
+
+
+def emit_percentile_group_keys(*, db: Session, price_format_id: int) -> set[tuple[str, str]]:
+    return {
+        (_branch_name(item.price_list), _competitor_name(item.price_list))
+        for item in emit_percentile_assignments(db=db, price_format_id=price_format_id)
+    }
+
+
 def _trace_sku() -> str:
     return str(os.getenv("EMIT_TRACE_SKU", DEFAULT_TRACE_SKU) or "").strip()
 
 
-def recalculate_competitor_percentiles(*, db: Session, price_format_id: int) -> dict[str, int]:
+def recalculate_competitor_percentiles(*, db: Session, price_format_id: int) -> dict[str, Any]:
+    selected = emit_percentile_assignments(db=db, price_format_id=price_format_id)
+    if not selected:
+        logger.info(
+            "[PERCENTILE_MUTATION] action=skip reason=%s price_format_id=%s source_price_list_id=%s "
+            "source_type=%s percentile_mode=%s rows_before=%s rows_deleted=%s rows_inserted=%s",
+            "No Emit percentile source assigned; percentile rebuild skipped.",
+            price_format_id,
+            "",
+            "",
+            "",
+            0,
+            0,
+            0,
+        )
+        return {
+            "products_processed": 0,
+            "products_with_competitors": 0,
+            "products_without_competitors": 0,
+            "rows_created": 0,
+            "rows_updated": 0,
+            "rows_skipped": 1,
+            "rows_deleted": 0,
+            "message": "No Emit percentile source assigned; percentile rebuild skipped.",
+        }
+
+    regional_group_filters = [
+        (
+            (CompetitorPricePercentile.branch_name == _branch_name(item.price_list))
+            & (CompetitorPricePercentile.competitor_name == _competitor_name(item.price_list))
+            & (CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
+        )
+        for item in selected
+    ]
+    kazakhstan_competitors = sorted({_competitor_name(item.price_list) for item in selected})
+    kazakhstan_group_filters = [
+        (
+            (CompetitorPricePercentile.branch_name == KAZAKHSTAN_REGION)
+            & (CompetitorPricePercentile.competitor_name == competitor)
+            & (CompetitorPricePercentile.percentile_scope == KAZAKHSTAN_SCOPE)
+        )
+        for competitor in kazakhstan_competitors
+    ]
+    scoped_filter = or_(*(regional_group_filters + kazakhstan_group_filters))
     existing_rows = int(
         db.execute(
             select(func.count(CompetitorPricePercentile.id))
             .where(CompetitorPricePercentile.price_format_id == price_format_id)
+            .where(scoped_filter)
         ).scalar_one()
         or 0
     )
-    db.execute(delete(CompetitorPricePercentile).where(CompetitorPricePercentile.price_format_id == price_format_id))
+    delete_result = db.execute(
+        delete(CompetitorPricePercentile)
+        .where(CompetitorPricePercentile.price_format_id == price_format_id)
+        .where(scoped_filter)
+    )
+    deleted_rows = int(delete_result.rowcount or 0)
+    for item in selected:
+        logger.info(
+            "[PERCENTILE_MUTATION] action=delete reason=%s price_format_id=%s source_price_list_id=%s "
+            "source_type=%s percentile_mode=%s rows_before=%s rows_deleted=%s rows_inserted=%s",
+            "emit_percentile_rebuild_scoped",
+            price_format_id,
+            int(item.price_list.id),
+            item.price_list.source_type,
+            MULTI_PRICE_PERCENTILE_MODE,
+            existing_rows,
+            deleted_rows,
+            0,
+        )
 
-    selected = get_assigned_competitor_price_lists(db=db, price_format_id=price_format_id)
     selected_ids = [int(item.price_list.id) for item in selected]
     product_rows = db.execute(select(Product.id, Product.code, Product.provisor_goods_id)).all()
     product_ids = [int(product_id) for product_id, _code, _goods_id in product_rows]
@@ -125,19 +202,11 @@ def recalculate_competitor_percentiles(*, db: Session, price_format_id: int) -> 
     )
 
     source_groups: set[tuple[str, str]] = set()
-    mode_by_price_list_id: dict[int, str] = {}
     for item in selected:
         source_groups.add((_branch_name(item.price_list), _competitor_name(item.price_list)))
-        mode_by_price_list_id[int(item.price_list.id)] = effective_percentile_mode(
-            item.price_list,
-            item.assignment.percentile_mode,
-        )
 
     # Active assignments are the account set. For duplicate rows inside the
-    # same account/SKU, the latest parsed row (largest item id) wins. Equal
-    # prices from different accounts are deliberately preserved. Sources with
-    # multi_price_per_sku enabled keep every valid parsed row for that account/SKU.
-    latest_account_prices: dict[tuple[int, str, str, int], Decimal] = {}
+    # same account/SKU, Emit percentile sources keep every valid parsed row.
     multi_price_groups: dict[tuple[int, str, str, int], list[Decimal]] = defaultdict(list)
     for price_list, item in rows:
         product_id = int(item.product_id or 0)
@@ -154,17 +223,10 @@ def recalculate_competitor_percentiles(*, db: Session, price_format_id: int) -> 
         competitor = _competitor_name(price_list)
         source_groups.add((branch, competitor))
         key = (product_id, branch, competitor, int(price_list.id))
-        if mode_by_price_list_id.get(int(price_list.id)) == MULTI_PRICE_PERCENTILE_MODE:
-            multi_price_groups[key].append(price)
-        else:
-            latest_account_prices[key] = price
+        multi_price_groups[key].append(price)
 
     grouped: dict[tuple[int, str, str], list[Decimal]] = defaultdict(list)
     source_count_by_group: dict[tuple[int, str, str], set[int]] = defaultdict(set)
-    for key, price in latest_account_prices.items():
-        product_id, branch, competitor, _price_list_id = key
-        grouped[(product_id, branch, competitor)].append(price)
-        source_count_by_group[(product_id, branch, competitor)].add(_price_list_id)
     for key, prices in multi_price_groups.items():
         product_id, branch, competitor, price_list_id = key
         grouped[(product_id, branch, competitor)].extend(prices)
@@ -256,8 +318,21 @@ def recalculate_competitor_percentiles(*, db: Session, price_format_id: int) -> 
         "rows_created": inserted,
         "rows_updated": 0,
         "rows_skipped": 0,
-        "rows_deleted": existing_rows,
+        "rows_deleted": deleted_rows,
     }
+    for item in selected:
+        logger.info(
+            "[PERCENTILE_MUTATION] action=insert reason=%s price_format_id=%s source_price_list_id=%s "
+            "source_type=%s percentile_mode=%s rows_before=%s rows_deleted=%s rows_inserted=%s",
+            "emit_percentile_rebuild_scoped",
+            price_format_id,
+            int(item.price_list.id),
+            item.price_list.source_type,
+            MULTI_PRICE_PERCENTILE_MODE,
+            existing_rows,
+            deleted_rows,
+            inserted,
+        )
     logger.info(
         "[PERCENTILE_REBUILD] price_format_id=%s products_processed=%s products_with_competitors=%s "
         "products_without_competitors=%s rows_created=%s rows_updated=%s rows_skipped=%s rows_deleted=%s",
@@ -271,3 +346,30 @@ def recalculate_competitor_percentiles(*, db: Session, price_format_id: int) -> 
         summary["rows_deleted"],
     )
     return summary
+
+
+def recalculate_competitor_percentiles_if_needed(*, db: Session, price_format_id: int) -> dict[str, Any]:
+    if not emit_percentile_assignments(db=db, price_format_id=price_format_id):
+        logger.info(
+            "[PERCENTILE_MUTATION] action=skip reason=%s price_format_id=%s source_price_list_id=%s "
+            "source_type=%s percentile_mode=%s rows_before=%s rows_deleted=%s rows_inserted=%s",
+            "No Emit percentile source assigned; percentile rebuild skipped.",
+            price_format_id,
+            "",
+            "",
+            "",
+            0,
+            0,
+            0,
+        )
+        return {
+            "products_processed": 0,
+            "products_with_competitors": 0,
+            "products_without_competitors": 0,
+            "rows_created": 0,
+            "rows_updated": 0,
+            "rows_skipped": 1,
+            "rows_deleted": 0,
+            "message": "No Emit percentile source assigned; percentile rebuild skipped.",
+        }
+    return recalculate_competitor_percentiles(db=db, price_format_id=price_format_id)

@@ -29,7 +29,7 @@ from ..models import (
 from .. import data
 from ..timezone import local_iso
 from .competitor_matching import rebuild_competitor_prices_for_selected
-from .competitor_percentiles import recalculate_competitor_percentiles
+from .competitor_percentiles import emit_percentile_group_keys, recalculate_competitor_percentiles_if_needed
 from .competitor_percentiles import REGIONAL_SCOPE
 from .competitor_assignments import get_assigned_competitor_price_lists
 from .regions import allowed_provisor_source_names_for_city_id, city_id_from_branch
@@ -557,6 +557,9 @@ def resolve_percentile_prices(
     *,
     percentile_number: int,
 ) -> CompetitorResolvedMany:
+    active_groups = emit_percentile_group_keys(db=db, price_format_id=price_format_id)
+    if not active_groups:
+        return CompetitorResolvedMany([])
     rows = (
         db.execute(
             select(CompetitorPricePercentile)
@@ -571,6 +574,8 @@ def resolve_percentile_prices(
     )
     out: list[tuple[Decimal, str]] = []
     for row in rows:
+        if (str(row.branch_name or ""), str(row.competitor_name or "")) not in active_groups:
+            continue
         value = _as_decimal(row.value)
         if value is None or value <= 0:
             continue
@@ -581,10 +586,9 @@ def resolve_percentile_prices(
 
 
 def load_percentile_price_cache(db: Session, price_format_id: int) -> PercentilePriceCache:
-    active_groups = {
-        (str(item.price_list.branch_name or ""), str(item.price_list.competitor_name or ""))
-        for item in get_assigned_competitor_price_lists(db=db, price_format_id=price_format_id)
-    }
+    active_groups = emit_percentile_group_keys(db=db, price_format_id=price_format_id)
+    if not active_groups:
+        return {}
     rows = (
         db.execute(
             select(
@@ -607,7 +611,7 @@ def load_percentile_price_cache(db: Session, price_format_id: int) -> Percentile
     )
     cache: PercentilePriceCache = {}
     for product_id, percentile, value, competitor_name, branch_name in rows:
-        if active_groups and (str(branch_name or ""), str(competitor_name or "")) not in active_groups:
+        if (str(branch_name or ""), str(competitor_name or "")) not in active_groups:
             continue
         price = _as_decimal(value)
         if price is None or price <= 0:
@@ -1597,7 +1601,7 @@ def calculate_prices(
         )
         if existing_competitor_rows is None:
             rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id)
-            recalculate_competitor_percentiles(db=db, price_format_id=pf.id)
+            recalculate_competitor_percentiles_if_needed(db=db, price_format_id=pf.id)
             db.flush()
 
     pl = db.execute(select(PriceList).where(PriceList.number == price_list_number)).scalars().first()

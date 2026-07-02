@@ -170,7 +170,7 @@ from .services.competitor_matching import (
     provisor_item_variants,
     rebuild_competitor_prices_for_selected,
 )
-from .services.competitor_percentiles import recalculate_competitor_percentiles
+from .services.competitor_percentiles import recalculate_competitor_percentiles_if_needed
 from .services.sku import normalize_external_sku, normalize_sku, normalize_sku_variants
 from .services.competitors.management import list_competitor_sources
 from .services.competitors.mappings.read_models import (
@@ -3340,7 +3340,7 @@ def debug_matching(
     rebuild_summary = None
     if rebuild and pf is not None:
         rebuild_summary = rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id)
-        recalculate_competitor_percentiles(db=db, price_format_id=pf.id)
+        recalculate_competitor_percentiles_if_needed(db=db, price_format_id=pf.id)
         db.commit()
 
     list_stmt = select(CompetitorPriceList)
@@ -6848,7 +6848,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
         rebuild_started_at = time.perf_counter()
         sync_selected_competitor_configs(db=db, price_format_id=pf_for_refresh.id)
         rebuild_summary = rebuild_competitor_prices_for_selected(db=db, price_format_id=pf_for_refresh.id, commit_between_lists=True)
-        recalculate_competitor_percentiles(db=db, price_format_id=pf_for_refresh.id)
+        recalculate_competitor_percentiles_if_needed(db=db, price_format_id=pf_for_refresh.id)
         db.commit()
         _timing(operation, "rebuild_selected_competitor_prices", rebuild_started_at)
     else:
@@ -6939,7 +6939,7 @@ def _run_generate_price_job_sync(db: Session, job: Job, *, price_format_id: int,
         summary = rebuild_competitor_prices_for_selected(db=db, price_format_id=price_format_id, commit_between_lists=True)
     update_job(db, job, status="running", progress=70, message="Пересборка competitor_prices завершена", result={"summary": summary}, log_level="info")
     if not percentile_mode:
-        recalculate_competitor_percentiles(db=db, price_format_id=price_format_id)
+        recalculate_competitor_percentiles_if_needed(db=db, price_format_id=price_format_id)
     db.commit()
     competitor_prices_loaded = int(
         db.execute(
@@ -7949,6 +7949,29 @@ def delete_universal_list(list_id: int, db: Session = Depends(get_db)):
     if not ul:
         raise HTTPException(status_code=404, detail="list not found")
 
+    impacted_prices = (
+        db.execute(
+            select(CalculatedPrice)
+            .where(
+                (CalculatedPrice.applied_list_id == ul.id)
+                | (CalculatedPrice.applied_list_ids.like(f"%{ul.id}%"))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in impacted_prices:
+        if row.applied_list_id == ul.id:
+            row.applied_list_id = None
+        try:
+            raw_ids = json.loads(row.applied_list_ids or "[]")
+            if isinstance(raw_ids, list):
+                cleaned_ids = [item for item in raw_ids if str(item) != str(ul.id)]
+                row.applied_list_ids = json.dumps(cleaned_ids, ensure_ascii=False)
+        except Exception:
+            row.applied_list_ids = "[]"
+
+    db.execute(delete(UniversalListPriceFormat).where(UniversalListPriceFormat.universal_list_id == ul.id))
     db.execute(delete(ListItem).where(ListItem.universal_list_id == ul.id))
     db.execute(delete(UniversalList).where(UniversalList.id == ul.id))
     db.commit()

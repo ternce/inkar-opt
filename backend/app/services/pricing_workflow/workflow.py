@@ -16,7 +16,7 @@ from ...models import (
     Product,
 )
 from ..competitor_matching import rebuild_competitor_prices_for_selected
-from ..competitor_percentiles import recalculate_competitor_percentiles
+from ..competitor_percentiles import recalculate_competitor_percentiles_if_needed
 from ..competitor_price_lists import list_competitor_price_lists, save_selected_competitor_price_lists_only
 from ..competitor_assignments import get_assigned_competitor_price_lists
 from ..pricing import AMBIGUOUS_LIST_TYPES, calculate_price_zone, calculate_prices
@@ -142,7 +142,7 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
         percentile_mode = (pf.competitor_price_mode or "regular") == "percentile"
         if not percentile_mode:
             rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id, commit_between_lists=True)
-            recalculate_competitor_percentiles(db=db, price_format_id=pf.id)
+            recalculate_competitor_percentiles_if_needed(db=db, price_format_id=pf.id)
         db.commit()
 
         activation_date = None
