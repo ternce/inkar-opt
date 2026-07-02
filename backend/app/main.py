@@ -18,7 +18,7 @@ from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, Up
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 import httpx
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 import io
@@ -7949,20 +7949,55 @@ def delete_universal_list(list_id: int, db: Session = Depends(get_db)):
     if not ul:
         raise HTTPException(status_code=404, detail="list not found")
 
+    logger.info("[DELETE_LIST] list_id=%s", ul.id)
+    calculated_prices_before = int(
+        db.scalar(select(func.count(CalculatedPrice.id)).where(CalculatedPrice.applied_list_id == ul.id))
+        or 0
+    )
+    logger.info("[DELETE_LIST] list_id=%s calculated_prices_before=%s", ul.id, calculated_prices_before)
+
+    update_result = db.execute(
+        update(CalculatedPrice)
+        .where(CalculatedPrice.applied_list_id == ul.id)
+        .values(applied_list_id=None)
+        .execution_options(synchronize_session=False)
+    )
+    rows_updated = int(update_result.rowcount or 0)
+    db.flush()
+
+    calculated_prices_after = int(
+        db.scalar(select(func.count(CalculatedPrice.id)).where(CalculatedPrice.applied_list_id == ul.id))
+        or 0
+    )
+    logger.info(
+        "[DELETE_LIST] list_id=%s rows_updated=%s calculated_prices_after=%s",
+        ul.id,
+        rows_updated,
+        calculated_prices_after,
+    )
+    if calculated_prices_after != 0:
+        logger.error(
+            "[DELETE_LIST] list_id=%s delete_started=false calculated_prices_after=%s",
+            ul.id,
+            calculated_prices_after,
+        )
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot delete list {ul.id}: calculated_prices still references it ({calculated_prices_after} rows).",
+        )
+
     impacted_prices = (
         db.execute(
             select(CalculatedPrice)
             .where(
-                (CalculatedPrice.applied_list_id == ul.id)
-                | (CalculatedPrice.applied_list_ids.like(f"%{ul.id}%"))
+                CalculatedPrice.applied_list_ids.like(f"%{ul.id}%")
             )
         )
         .scalars()
         .all()
     )
     for row in impacted_prices:
-        if row.applied_list_id == ul.id:
-            row.applied_list_id = None
         try:
             raw_ids = json.loads(row.applied_list_ids or "[]")
             if isinstance(raw_ids, list):
@@ -7973,6 +8008,7 @@ def delete_universal_list(list_id: int, db: Session = Depends(get_db)):
 
     db.execute(delete(UniversalListPriceFormat).where(UniversalListPriceFormat.universal_list_id == ul.id))
     db.execute(delete(ListItem).where(ListItem.universal_list_id == ul.id))
+    logger.info("[DELETE_LIST] list_id=%s delete_started=true", ul.id)
     db.execute(delete(UniversalList).where(UniversalList.id == ul.id))
     db.commit()
     return {"status": "ok"}
