@@ -391,7 +391,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
       const data = parseJsonOrNull(text);
       const looksLikeProxyFailure = /proxy|econnrefused|etimedout|socket|fetch failed|network error/i.test(text);
       if (!res.ok && looksLikeProxyFailure) {
-        throw new Error('Запрос проверки аккаунта не дошёл до backend. Проверьте proxy/endpoint.');
+        throw new Error('Запрос проверки аккаунта не дошел до сервера. Проверьте прокси или адрес запроса.');
       }
       if (!res.ok) throw new Error((data && data.detail) || text || 'Не удалось проверить подключение');
       await loadAccounts();
@@ -399,7 +399,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
       else toast.error(data?.statusMessage || 'Подключение не установлено');
     } catch (e: any) {
       const message = e?.name === 'AbortError'
-        ? 'Запрос проверки аккаунта не дошёл до backend. Проверьте proxy/endpoint.'
+        ? 'Запрос проверки аккаунта не дошел до сервера. Проверьте прокси или адрес запроса.'
         : e?.message || 'Ошибка проверки подключения';
       setError(message);
       toast.error(message);

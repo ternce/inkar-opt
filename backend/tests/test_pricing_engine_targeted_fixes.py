@@ -1266,6 +1266,14 @@ def test_exact_lists_management_audit_skus_apply_overrides_during_generation():
         list_log = payload["listOverrideLog"]
         log_by_label = {line["label"]: line["value"] for line in payload["log"]}
 
+        if list_type == "critical_markup":
+            assert cp.applied_rule_type == ""
+            assert cp.applied_rule_value is None
+            assert cp.applied_list_id is None
+            assert cp.applied_list_ids == "[]"
+            assert list_log is None
+            continue
+
         assert cp.applied_rule_type == list_type
         assert float(cp.applied_rule_value) == float(expected_value)
         assert list_log["listType"] == list_type
@@ -1328,11 +1336,7 @@ def test_lists_management_active_fixed_markup_m2m_overrides_default_markup():
     assert "Applied Rule" not in debug["log"]
 
 
-@pytest.mark.parametrize(
-    ("critical_margin", "expected_mdc", "expected_price"),
-    [(10, 111.11, 111.12), (35, 153.85, 153.85)],
-)
-def test_critical_markup_overrides_global_margin_for_mdc_and_no_competitor(critical_margin, expected_mdc, expected_price):
+def test_critical_markup_is_ignored_without_competitors_and_uses_global_no_competitor_margin():
     db = _session()
     pf = _format(db)
     db.query(MarkupRange).filter(MarkupRange.price_format_id == pf.id).delete()
@@ -1340,36 +1344,113 @@ def test_critical_markup_overrides_global_margin_for_mdc_and_no_competitor(criti
     db.add(MarkupRange(price_format_id=pf.id, cost_from=0, cost_to=None, markup_percent=0.25))
     db.add(NoCompetitorMarkupRange(price_format_id=pf.id, cost_from=0, cost_to=None, markup_percent=0.25))
     product = _product(db, cost=100)
-    row = _list_item(db, product, "critical_markup", critical_margin, pf=pf)
+    _list_item(db, product, "critical_markup", 2, pf=pf)
 
     price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
 
-    assert round(float(price), 2) == expected_price
-    assert float(debug["effective_markup_percent"]) == critical_margin
-    assert float(debug["mdc_markup_percent"]) == critical_margin
-    assert round(float(debug["mdc_price"]), 2) == expected_mdc
-    assert debug["applied_list_ids"] == [row.id]
+    assert round(float(price), 2) == 133.34
+    assert float(debug["effective_markup_percent"]) == 25.0
+    assert float(debug["mdc_markup_percent"]) == 25.0
+    assert round(float(debug["mdc_price"]), 2) == 133.33
+    assert debug["applied_list_ids"] == []
+    assert debug["reason"] == "mdc_floor_after_rounding"
 
 
-def test_critical_markup_still_uses_competitor_workflow():
+def test_critical_markup_applies_when_competitor_exists_and_passes_mdc():
     db = _session()
     pf = _format(db)
     db.query(BendRange).filter(BendRange.price_format_id == pf.id).delete()
     db.add(BendRange(price_format_id=pf.id, price_from=0, bend_percent=0))
     db.flush()
     product = _product(db, cost=100)
-    row = _list_item(db, product, "critical_markup", 10, pf=pf)
-    _competitor(db, pf, product, "manual:high", 200)
+    row = _list_item(db, product, "critical_markup", 2, pf=pf)
+    _competitor(db, pf, product, "manual:high", 110)
 
     price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
 
-    assert float(price) == 200.0
+    assert float(price) == 110.0
     assert debug["reason"] == "competitor_bend"
     assert debug["applied_list_ids"] == [row.id]
     assert debug["applied_rule_type"] == "critical_markup"
-    assert round(float(debug["mdc_price"]), 2) == 111.11
-    assert float(debug["chosen_competitor_price"]) == 200
-    assert float(debug["competitor_candidate_price"]) == 200
+    assert round(float(debug["mdc_price"]), 2) == 102.04
+    assert float(debug["chosen_competitor_price"]) == 110
+    assert float(debug["competitor_candidate_price"]) == 110
+
+
+def test_critical_markup_applies_when_competitors_exist_but_fail_mdc():
+    db = _session()
+    pf = _format(db)
+    db.query(BendRange).filter(BendRange.price_format_id == pf.id).delete()
+    db.add(BendRange(price_format_id=pf.id, price_from=0, bend_percent=0))
+    db.flush()
+    product = _product(db, cost=100)
+    row = _list_item(db, product, "critical_markup", 2, pf=pf)
+    _competitor(db, pf, product, "manual:low", 101)
+
+    price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
+
+    assert round(float(price), 2) == 102.05
+    assert debug["reason"] == "all_competitors_failed_mdc"
+    assert debug["applied_list_ids"] == [row.id]
+    assert debug["applied_rule_type"] == "critical_markup"
+    assert round(float(debug["mdc_price"]), 2) == 102.04
+    assert debug["chosen_competitor_price"] is None
+    assert len(debug["rejected_competitors"]) == 1
+
+
+@pytest.mark.parametrize("raw_cost", [None, "", "not-a-number", 0, -10])
+def test_missing_or_invalid_cost_blocks_price_calculation(raw_cost):
+    db = _session()
+    pf = _format(db)
+    product = _product(db, cost=100)
+    product.cost = raw_cost
+
+    with db.no_autoflush:
+        price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
+
+    assert float(price) == 0.0
+    assert float(debug["final_price"]) == 0.0
+    assert float(debug["mdc_price"]) == 0.0
+    assert debug["mdc_markup_percent"] is None
+    assert debug["price_from_competitor"] is None
+    assert debug["competitor_price"] is None
+    assert debug["applied_list_ids"] == []
+    assert debug["reason"] == "missing_cost"
+    assert "Нет себестоимости, расчет не выполнен" in debug["log"]
+
+
+def test_missing_cost_blocks_fixed_price_list():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, cost=100)
+    _list_item(db, product, "fixed_price", 999, pf=pf)
+    product.cost = None
+
+    with db.no_autoflush:
+        price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
+
+    assert float(price) == 0.0
+    assert debug["applied_rule_type"] == ""
+    assert debug["applied_list_ids"] == []
+    assert "Нет себестоимости, расчет не выполнен" in debug["log"]
+
+
+def test_missing_cost_ignores_competitor_price():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, cost=100)
+    _competitor(db, pf, product, "manual:high", 200)
+    product.cost = None
+
+    with db.no_autoflush:
+        price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
+
+    assert float(price) == 0.0
+    assert debug["competitor_price"] is None
+    assert debug["chosen_competitor_price"] is None
+    assert debug["price_from_competitor"] is None
+    assert debug["zone"] is None
+    assert "Нет себестоимости, расчет не выполнен" in debug["log"]
 
 
 def test_fixed_markup_bypasses_competitors_and_uses_mdc_as_final_price():

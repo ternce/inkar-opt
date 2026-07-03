@@ -24,6 +24,11 @@ HEADER_ALIASES = {
     "address": ("адрес", "address"),
 }
 
+HEADER_ALIASES["name"] = (*HEADER_ALIASES["name"], "product name")
+HEADER_ALIASES["external_id"] = (*HEADER_ALIASES["external_id"], "external id")
+HEADER_ALIASES["holding_id"] = (*HEADER_ALIASES["holding_id"], "holding id")
+HEADER_ALIASES["counterparty_id"] = (*HEADER_ALIASES["counterparty_id"], "counterparty id")
+
 
 def _norm(value: object) -> str:
     s = str(value or "").strip().lower().replace("ё", "е")

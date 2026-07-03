@@ -188,7 +188,7 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
       const sourcesData = parseJsonOrNull(sourcesText);
       const percentileData = parseJsonOrNull(percentileText);
       if (!sourcesRes.ok) throw new Error(sourcesData?.detail || sourcesText || 'Не удалось загрузить источники цен');
-      if (!percentileRes.ok) throw new Error(percentileData?.detail || percentileText || 'Не удалось загрузить percentile sources');
+      if (!percentileRes.ok) throw new Error(percentileData?.detail || percentileText || 'Не удалось загрузить источники персентилей');
       const rows = [
         ...(Array.isArray(sourcesData) ? sourcesData.map(normalizeSource) : []),
         ...(Array.isArray(percentileData) ? percentileData.map(percentileToSource) : []),

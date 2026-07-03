@@ -160,8 +160,8 @@ const competitorCellTitle = (cell?: CompetitorPriceCell) => {
   if (!cell) return '';
   const parts = [];
   if (cell.matchedBy) parts.push(`matchedBy: ${cell.matchedBy}`);
-  if (cell.isManualMapping) parts.push('manual mapping');
-  if (cell.isSubstitute) parts.push('substitute');
+  if (cell.isManualMapping) parts.push('ручное сопоставление');
+  if (cell.isSubstitute) parts.push('замена товара');
   if (cell.coefficient && cell.coefficient !== 1) parts.push(`coefficient: ${cell.coefficient}`);
   return parts.join(' · ');
 };
@@ -427,9 +427,9 @@ export function PriceListsTab({ formatCode, initialPriceListNumber = '' }: Price
               <Metric label="ПП" value={summary?.rightZone ?? 0} />
               <Metric label="Зона без цен" value={summary?.withoutCompetitors ?? opened.withoutCompetitors} />
               <Metric label="Средняя наценка" value={`${fmtNumber(summary?.averageMarkup)}%`} />
-              <Metric label="Avg final price" value={summary?.minPrice != null && summary?.maxPrice != null ? `${fmtNumber(summary.minPrice)}-${fmtNumber(summary.maxPrice)}` : DASH} />
-              <Metric label="Percentile usage" value={summary?.percentileUsage ?? 0} />
-              <Metric label="Substitute usage" value={opened.analytics?.productsWithSubstituteMatches ?? 0} />
+              <Metric label="Диапазон итоговой цены" value={summary?.minPrice != null && summary?.maxPrice != null ? `${fmtNumber(summary.minPrice)}-${fmtNumber(summary.maxPrice)}` : DASH} />
+              <Metric label="Использовано персентилей" value={summary?.percentileUsage ?? 0} />
+              <Metric label="Использовано замен" value={opened.analytics?.productsWithSubstituteMatches ?? 0} />
             </div>
             <p className="text-sm text-gray-600 mt-3">Зона рассчитывается только при наличии первой цены конкурента. Для товаров без конкурентной цены отображается «Зона без цен».</p>
           </section>
@@ -473,7 +473,7 @@ export function PriceListsTab({ formatCode, initialPriceListNumber = '' }: Price
             </div>
             <CompactTable
               empty="По выбранным фильтрам нет товаров"
-              columns={['SKU', 'Рейтинг глобальный', 'Рейтинг локальный', 'Наименование', 'Производитель', 'Остаток', 'Себестоимость', 'Базовая цена', 'МДЦ', 'Лучший конкурент', ...competitorColumns.map((column) => column.title || column.key), 'После прогиба', 'Финальная цена', 'Наценка %', 'Зона', 'Источник', 'Percentile', 'Причина']}
+              columns={['SKU', 'Рейтинг глобальный', 'Рейтинг локальный', 'Наименование', 'Производитель', 'Остаток', 'Себестоимость', 'Базовая цена', 'МДЦ', 'Лучший конкурент', ...competitorColumns.map((column) => column.title || column.key), 'После прогиба', 'Финальная цена', 'Наценка %', 'Зона', 'Источник', 'Персентиль', 'Причина']}
               rows={items.map((row) => [
                 row.sku,
                 fmtNumber(row.globalRating),
@@ -551,7 +551,7 @@ export function PriceListsTab({ formatCode, initialPriceListNumber = '' }: Price
               </div>
               {selectedItem.listOverrideLog ? (
                 <div className="rounded-md border border-amber-300 bg-amber-50 p-4 text-sm text-amber-950">
-                  <strong className="block mb-2">Лог #2 — Lists Management</strong>
+                  <strong className="block mb-2">Лог #2 — Работа со списками</strong>
                   <p>Позиция найдена в списке:</p>
                   <p>Название: {selectedItem.listOverrideLog.listName || '—'}</p>
                   <p>Код: {selectedItem.listOverrideLog.listCode || '—'}</p>

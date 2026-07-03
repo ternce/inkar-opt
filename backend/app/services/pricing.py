@@ -871,7 +871,56 @@ def calculate_price_for_product(
     active_lists: list[UniversalList] | None = None,
     percentile_price_cache: PercentilePriceCache | None = None,
 ) -> tuple[Decimal, dict]:
-    cost = _as_decimal(product.cost, Decimal("0")) or Decimal("0")
+    cost = _as_decimal(product.cost)
+    if cost is None or cost <= 0:
+        zero = Decimal("0")
+        branch_id = str(region_id if region_id is not None else (price_format.branch or ""))
+        debug = {
+            "cost": zero,
+            "markup_percent": None,
+            "base_price": zero,
+            "competitor_price": None,
+            "lowest_competitor_price": None,
+            "competitor_source": "",
+            "applied_source_name": "",
+            "applied_source_type": "",
+            "used_percentile": False,
+            "used_substitute": False,
+            "rating_global": _rating_value(db, product.id, "global"),
+            "rating_local": _rating_value(db, product.id, "local", branch_id),
+            "applied_list_effects": [],
+            "applied_list_ids": [],
+            "applied_rule_type": "",
+            "applied_rule_value": None,
+            "applied_list_id": None,
+            "applied_list_name": "",
+            "applied_rule_ambiguous": False,
+            "list_matched": False,
+            "list_applied": False,
+            "list_changed_final_price": False,
+            "list_effect_message": "",
+            "excluded_from_pricing": False,
+            "bend_percent": zero,
+            "bend_percent_used": zero,
+            "effective_markup_percent": None,
+            "markup_percent_used": None,
+            "mdc_markup_percent": None,
+            "mdc_price": zero,
+            "competitor_candidate_price": None,
+            "chosen_competitor_price": None,
+            "selected_competitor_price": None,
+            "chosen_competitor_source": "",
+            "chosen_competitor_rank": None,
+            "rejected_competitors": [],
+            "price_from_competitor": None,
+            "final_price": zero,
+            "reason": "missing_cost",
+            "log": "Нет себестоимости, расчет не выполнен",
+            "zone": None,
+            "zone_reference_price": None,
+            "deviation_pct": None,
+        }
+        return zero, debug
 
     markup_percent = get_markup_percent_by_range(db, price_format.id, cost)
     no_competitor_markup_percent = get_no_competitor_markup_percent_by_range(
@@ -1029,12 +1078,45 @@ def calculate_price_for_product(
         }
         return fixed_markup_mdc, debug
 
+    effective_city_id = region_id if region_id is not None else city_id_from_branch(price_format.branch)
+    allowed_provisor_sources = allowed_provisor_source_names_for_city_id(effective_city_id)
+    selected_meta = _selected_source_meta(db, price_format.id)
+
+    percentile_number = int(price_format.percentile_number or 10)
+    percentile_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_PERCENTILE_OVERRIDE)
+    percentile_effect: dict | None = None
+    if percentile_match is not None:
+        percentile_value, list_id = percentile_match
+        percentile_number = max(1, min(99, int(percentile_value)))
+        percentile_effect = _list_effect(list_id, LIST_TYPE_PERCENTILE_OVERRIDE, percentile_value, "percentile_override")
+
+    if (price_format.competitor_price_mode or "regular") == "percentile":
+        if percentile_price_cache is not None:
+            resolved_many = resolve_percentile_prices_from_cache(
+                percentile_price_cache,
+                product.id,
+                percentile_number=percentile_number,
+            )
+        else:
+            resolved_many = resolve_percentile_prices(
+                db,
+                price_format.id,
+                product.id,
+                percentile_number=percentile_number,
+            )
+    else:
+        resolved_many = resolve_competitor_prices(
+            db,
+            price_format.id,
+            product.id,
+            allowed_provisor_sources=allowed_provisor_sources,
+        )
+
     critical_markup_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_CRITICAL_MARKUP)
-    if critical_markup_match is not None:
+    if critical_markup_match is not None and resolved_many.prices:
         critical_markup, list_id = critical_markup_match
         markup_fraction = _list_percent_as_fraction(critical_markup)
         markup_percent = markup_fraction
-        no_competitor_markup_percent = markup_fraction
         applied_list_effects.append(
             _list_markup_match_effect(
                 list_id,
@@ -1077,44 +1159,14 @@ def calculate_price_for_product(
             )
         )
 
+    if percentile_effect is not None:
+        applied_list_effects.append(percentile_effect)
+
     # МДЦ (минимальная допустимая цена) — нижняя граница
     mdc = price_from_margin(cost, markup_percent)
 
     # For UI/debug only (legacy field name): base_price kept as МДЦ.
     base_price = mdc
-
-    effective_city_id = region_id if region_id is not None else city_id_from_branch(price_format.branch)
-    allowed_provisor_sources = allowed_provisor_source_names_for_city_id(effective_city_id)
-    selected_meta = _selected_source_meta(db, price_format.id)
-
-    percentile_number = int(price_format.percentile_number or 10)
-    percentile_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_PERCENTILE_OVERRIDE)
-    if percentile_match is not None:
-        percentile_value, list_id = percentile_match
-        percentile_number = max(1, min(99, int(percentile_value)))
-        applied_list_effects.append(_list_effect(list_id, LIST_TYPE_PERCENTILE_OVERRIDE, percentile_value, "percentile_override"))
-
-    if (price_format.competitor_price_mode or "regular") == "percentile":
-        if percentile_price_cache is not None:
-            resolved_many = resolve_percentile_prices_from_cache(
-                percentile_price_cache,
-                product.id,
-                percentile_number=percentile_number,
-            )
-        else:
-            resolved_many = resolve_percentile_prices(
-                db,
-                price_format.id,
-                product.id,
-                percentile_number=percentile_number,
-            )
-    else:
-        resolved_many = resolve_competitor_prices(
-            db,
-            price_format.id,
-            product.id,
-            allowed_provisor_sources=allowed_provisor_sources,
-        )
 
     no_bend_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_NO_BEND)
     fallback_bend_percent = _as_decimal(price_format.progib, Decimal("0")) or Decimal("0")
@@ -1254,7 +1306,7 @@ def calculate_price_for_product(
         price = _round_price(mdc, rounding_rule, force_up=True)
         if competitor_price_min is None and no_competitor_candidate_below_mdc:
             reason = "no_competitor_markup_bumped_to_mdc"
-        else:
+        elif reason != "all_competitors_failed_mdc":
             reason = "mdc_floor_after_rounding"
         pricing_reason = reason
 

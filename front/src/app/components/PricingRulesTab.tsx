@@ -74,6 +74,13 @@ const parseJsonOrNull = (text: string) => {
   }
 };
 
+const roundingModeLabel = (mode: string) => {
+  if (mode === 'math') return 'Математическое';
+  if (mode === 'up') return 'Вверх';
+  if (mode === 'down') return 'Вниз';
+  return mode;
+};
+
 const emptyTemplate = (kind: 'markup' | 'bend' | 'noCompetitor'): Template => ({
   id: 0,
   code: '',
@@ -606,20 +613,20 @@ function RoundingEditor({ items, onReload }: { items: RoundingRule[]; onReload: 
           <Select value={draft.mode} onValueChange={(mode) => setDraft((prev) => ({ ...prev, mode }))}>
             <SelectTrigger><SelectValue /></SelectTrigger>
             <SelectContent>
-              <SelectItem value="math">math</SelectItem>
-              <SelectItem value="up">up</SelectItem>
-              <SelectItem value="down">down</SelectItem>
+              <SelectItem value="math">Математическое</SelectItem>
+              <SelectItem value="up">Вверх</SelectItem>
+              <SelectItem value="down">Вниз</SelectItem>
             </SelectContent>
           </Select>
-          <Input value={String(draft.precision)} onChange={(e) => setDraft((prev) => ({ ...prev, precision: Number(e.target.value) }))} placeholder="precision" />
-          <Input value={draft.step == null ? '' : String(draft.step)} onChange={(e) => setDraft((prev) => ({ ...prev, step: e.target.value === '' ? null : Number(e.target.value) }))} placeholder="step" />
+          <Input value={String(draft.precision)} onChange={(e) => setDraft((prev) => ({ ...prev, precision: Number(e.target.value) }))} placeholder="Точность" />
+          <Input value={draft.step == null ? '' : String(draft.step)} onChange={(e) => setDraft((prev) => ({ ...prev, step: e.target.value === '' ? null : Number(e.target.value) }))} placeholder="Шаг" />
           <Button onClick={save} className="bg-blue-600 hover:bg-blue-700"><Save className="mr-2 h-4 w-4" />Сохранить</Button>
         </div>
       </div>
       <div className="admin-table-card">
         <table className="admin-table">
-          <thead><tr><th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Код</th><th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Название</th><th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Mode</th><th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Precision</th><th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Step</th></tr></thead>
-          <tbody>{items.map((item) => <tr key={item.id} onClick={() => select(String(item.id))} className="cursor-pointer hover:bg-gray-50"><td className="px-4 py-3 text-sm text-gray-900">{item.code}</td><td className="px-4 py-3 text-sm text-gray-700">{item.name}</td><td className="px-4 py-3 text-sm text-gray-700">{item.mode}</td><td className="px-4 py-3 text-sm text-gray-700">{item.precision}</td><td className="px-4 py-3 text-sm text-gray-700">{item.step ?? '—'}</td></tr>)}</tbody>
+          <thead><tr><th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Код</th><th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Название</th><th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Режим</th><th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Точность</th><th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Шаг</th></tr></thead>
+          <tbody>{items.map((item) => <tr key={item.id} onClick={() => select(String(item.id))} className="cursor-pointer hover:bg-gray-50"><td className="px-4 py-3 text-sm text-gray-900">{item.code}</td><td className="px-4 py-3 text-sm text-gray-700">{item.name}</td><td className="px-4 py-3 text-sm text-gray-700">{roundingModeLabel(item.mode)}</td><td className="px-4 py-3 text-sm text-gray-700">{item.precision}</td><td className="px-4 py-3 text-sm text-gray-700">{item.step ?? '—'}</td></tr>)}</tbody>
         </table>
       </div>
     </div>

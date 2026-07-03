@@ -776,8 +776,8 @@ def export_percentile_product_rows(
     export_columns.extend((f"percentile:{percentile}", f"Персентиль {percentile}_{selected_competitor}") for percentile in PERCENTILES)
     export_columns.extend(
         [
-            ("competitorCount", "Competitor price count"),
-            ("status", "Status"),
+            ("competitorCount", "Количество цен конкурентов"),
+            ("status", "Статус"),
         ]
     )
     safe_code = price_format_code.strip() or "format"
@@ -794,7 +794,7 @@ def export_percentile_product_rows(
     if fmt == "xlsx":
         wb = Workbook()
         ws = wb.active
-        ws.title = "Percentiles"
+        ws.title = "Персентили"
         ws.append([label for _key, label in export_columns])
         for row in rows:
             ws.append([_export_value(row, key) for key, _label in export_columns])

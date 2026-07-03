@@ -10,6 +10,7 @@ import {
   ClipboardList,
   Database,
   FileText,
+  HelpCircle,
   Home,
   ListChecks,
   Plus,
@@ -29,6 +30,7 @@ import { UniversalListsOverviewTab } from './components/UniversalListsOverviewTa
 import { ContractorsTab } from './components/ContractorsTab';
 import { PricingRulesTab } from './components/PricingRulesTab';
 import { AnalyticsTab } from './components/AnalyticsTab';
+import { UserGuideTab } from './components/UserGuideTab';
 
 interface PriceFormat {
   id: string;
@@ -59,7 +61,8 @@ type NavigationKey =
   | 'pricing'
   | 'references'
   | 'competitor-domain'
-  | 'analytics';
+  | 'analytics'
+  | 'help';
 
 type NavigationItem = {
   key: NavigationKey;
@@ -100,6 +103,13 @@ const navigationItems: NavigationItem[] = [
   { key: 'competitor-domain', label: 'Конкуренты', description: 'Прайс-листы конкурентов, персентили и соответствия кодов', icon: Users },
   { key: 'analytics', label: 'Итоги ЦО', description: 'Итоги переоценки, изменения цен и причины расчёта', icon: BarChart3 },
 ];
+
+navigationItems.push({
+  key: 'help',
+  label: 'Помощь',
+  description: 'Руководство пользователя для сотрудников аптеки',
+  icon: HelpCircle,
+});
 
 const defaultBranches = [
   'Алматы',
@@ -387,6 +397,8 @@ export default function App() {
             onNavigate={openSection}
           />
         );
+      case 'help':
+        return <UserGuideTab onNavigate={(section) => openSection(section)} />;
       default:
         return (
           <HomeDashboard

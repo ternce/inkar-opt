@@ -268,40 +268,40 @@ const parseTime = (value?: string) => {
 
 const refreshStatusLabel = (row: CompetitorSource) => {
   const raw = String(row.refreshStatus || row.status || '').split(';', 1)[0].trim().toLowerCase();
-  if (raw === 'updated' || raw === 'ok') return 'Updated with new data';
-  if (raw === 'checked_unchanged') return 'Checked, unchanged';
-  if (raw === 'success_zero_items') return 'Checked, zero response kept';
-  if (raw === 'timeout') return 'Timeout';
-  if (raw === 'auth_error') return 'Auth error';
+  if (raw === 'updated' || raw === 'ok') return 'Обновлено новыми данными';
+  if (raw === 'checked_unchanged') return 'Проверено, без изменений';
+  if (raw === 'success_zero_items') return 'Проверено, пустой ответ сохранен';
+  if (raw === 'timeout') return 'Тайм-аут';
+  if (raw === 'auth_error') return 'Ошибка авторизации';
   const lastSuccess = parseTime(row.lastSuccessAt || row.updatedAt || row.lastUpdatedAt);
-  if (!lastSuccess || Date.now() - lastSuccess > PRICE_LIST_FRESHNESS_MS) return 'Stale / not checked recently';
+  if (!lastSuccess || Date.now() - lastSuccess > PRICE_LIST_FRESHNESS_MS) return 'Устарело или давно не проверялось';
   return raw || 'ok';
 };
 
 const refreshStatusClass = (row: CompetitorSource) => {
   const label = refreshStatusLabel(row);
-  if (label === 'Updated with new data' || label === 'Checked, unchanged' || label === 'Checked, zero response kept') return 'ok';
-  if (label === 'Timeout' || label === 'Stale / not checked recently') return 'warn';
-  if (label === 'Auth error') return 'bad';
+  if (label === 'Обновлено новыми данными' || label === 'Проверено, без изменений' || label === 'Проверено, пустой ответ сохранен') return 'ok';
+  if (label === 'Тайм-аут' || label === 'Устарело или давно не проверялось') return 'warn';
+  if (label === 'Ошибка авторизации') return 'bad';
   return '';
 };
 
 const statusLabel = (status: MappingStatus) => {
-  if (status === 'mapped') return 'Manual/catalog mappings';
-  if (status === 'unmapped') return 'Candidates needing manual review';
+  if (status === 'mapped') return 'Ручные/каталожные сопоставления';
+  if (status === 'unmapped') return 'Кандидаты для ручной проверки';
   if (status === 'rejected') return 'Отклоненные';
-  if (status === 'no_candidates') return 'No mapping candidates';
+  if (status === 'no_candidates') return 'Нет кандидатов';
   return 'Все';
 };
 
 const rowStatusLabel = (status: CodeMappingRow['status']) => {
-  if (status === 'mapped') return 'Manual/catalog mapping';
+  if (status === 'mapped') return 'Ручное/каталожное сопоставление';
   if (status === 'rejected') return 'Отклонен';
-  return 'Needs manual review';
+  return 'Требует ручной проверки';
 };
 
 const catalogStatusLabel = (row: CodeMappingRow) => {
-  if (row.mappingStatus === 'no_candidates') return 'No mapping candidates';
+  if (row.mappingStatus === 'no_candidates') return 'Нет кандидатов';
   return rowStatusLabel(row.status);
 };
 
@@ -421,17 +421,17 @@ function PercentileBrowser({
           <Select value={percentileFilter} onValueChange={onPercentileFilter}>
             <SelectTrigger><SelectValue /></SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">Все percentile</SelectItem>
-              <SelectItem value="has_percentile">Has percentile</SelectItem>
-              <SelectItem value="no_percentile">No percentile</SelectItem>
+              <SelectItem value="all">Все персентили</SelectItem>
+              <SelectItem value="has_percentile">Есть персентиль</SelectItem>
+              <SelectItem value="no_percentile">Нет персентиля</SelectItem>
             </SelectContent>
           </Select>
           <Select value={competitorFilter} onValueChange={onCompetitorFilter}>
             <SelectTrigger><SelectValue /></SelectTrigger>
             <SelectContent>
               <SelectItem value="all">Все конкуренты</SelectItem>
-              <SelectItem value="has_competitors">Has competitors</SelectItem>
-              <SelectItem value="no_competitors">No competitors</SelectItem>
+              <SelectItem value="has_competitors">Есть конкуренты</SelectItem>
+              <SelectItem value="no_competitors">Нет конкурентов</SelectItem>
             </SelectContent>
           </Select>
           <Select value={sort} onValueChange={onSort}>
@@ -439,16 +439,16 @@ function PercentileBrowser({
             <SelectContent>
               <SelectItem value="sku">SKU</SelectItem>
               <SelectItem value="name">Название</SelectItem>
-              <SelectItem value="percentile">Percentile</SelectItem>
-              <SelectItem value="competitor_count">Competitor count</SelectItem>
-              <SelectItem value="status">Status</SelectItem>
+              <SelectItem value="percentile">Персентиль</SelectItem>
+              <SelectItem value="competitor_count">Количество конкурентов</SelectItem>
+              <SelectItem value="status">Статус</SelectItem>
             </SelectContent>
           </Select>
           <Select value={direction} onValueChange={(value) => onDirection(value as 'asc' | 'desc')}>
             <SelectTrigger><SelectValue /></SelectTrigger>
             <SelectContent>
-              <SelectItem value="asc">Asc</SelectItem>
-              <SelectItem value="desc">Desc</SelectItem>
+              <SelectItem value="asc">По возрастанию</SelectItem>
+              <SelectItem value="desc">По убыванию</SelectItem>
             </SelectContent>
           </Select>
           <div className="flex gap-2">
@@ -478,18 +478,18 @@ function PercentileBrowser({
             <thead>
               <tr>
                 <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">SKU</th>
-                <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Product name</th>
-                <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Manufacturer</th>
-                <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Global rating</th>
-                <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Local rating</th>
+                <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Наименование</th>
+                <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Производитель</th>
+                <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Глобальный рейтинг</th>
+                <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Локальный рейтинг</th>
                 {priceColumns.map((column) => (
                   <th key={`price-${column.id}`} className="px-4 py-3 text-left text-sm font-medium text-gray-700">{column.label}</th>
                 ))}
                 {percentileNumbers.map((percentile) => (
                   <th key={`pct-${percentile}`} className="px-4 py-3 text-left text-sm font-medium text-gray-700">P{percentile}</th>
                 ))}
-                <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Competitor count</th>
-                <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Status</th>
+                <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Количество конкурентов</th>
+                <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Статус</th>
               </tr>
             </thead>
             <tbody>
@@ -511,7 +511,7 @@ function PercentileBrowser({
                 </tr>
               )) : (
                 <tr>
-                  <td colSpan={8 + priceColumns.length + percentileNumbers.length} className="px-4 py-8 text-center text-sm text-gray-500">Нет строк percentile</td>
+                  <td colSpan={8 + priceColumns.length + percentileNumbers.length} className="px-4 py-8 text-center text-sm text-gray-500">Нет строк персентилей</td>
                 </tr>
               )}
             </tbody>
@@ -636,7 +636,7 @@ export function CompetitorsTab({ formatCode }: Props) {
     const res = await fetch(`/api/competitors/provisor-diagnostics?format_code=${encodeURIComponent(formatCode)}`);
     const text = await res.text();
     const data = parseJsonOrNull(text);
-    if (!res.ok) throw new Error(data?.detail || text || 'Failed to load Provisor diagnostics');
+    if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить диагностику Provisor');
     setProvisorDiagnostics(data);
   };
 
@@ -644,7 +644,7 @@ export function CompetitorsTab({ formatCode }: Props) {
     const res = await fetch('/api/provisor/accounts');
     const text = await res.text();
     const data = parseJsonOrNull(text);
-    if (!res.ok) throw new Error(data?.detail || text || 'Failed to load Provisor accounts');
+    if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить аккаунты Provisor');
     setProvisorAccounts(Array.isArray(data) ? data : []);
   };
 
@@ -790,7 +790,7 @@ export function CompetitorsTab({ formatCode }: Props) {
       const text = await res.text();
       const data = parseJsonOrNull(text);
       if (!res.ok) throw new Error(data?.detail || text || 'Не удалось обновить источники');
-      if (!data?.job_id) throw new Error('Backend не вернул job_id');
+      if (!data?.job_id) throw new Error('Сервер не вернул идентификатор задачи');
       setActiveJob({ id: data.job_id, status: data.status || 'pending', progress: 0, message: data.message || 'Обновляем источники' });
       await pollJob(data.job_id);
       await Promise.all([loadSources(), loadPercentileRows(), loadCodeMappings(), loadProvisorDiagnostics(), loadProvisorAccounts()]);
@@ -1052,7 +1052,7 @@ export function CompetitorsTab({ formatCode }: Props) {
       return (
         <div className="mt-3 border-t border-gray-100 pt-3">
           <div className="rounded-md border border-dashed border-gray-200 px-3 py-2 text-sm text-gray-500">
-            No Provisor accounts found
+            Аккаунты Provisor не найдены
             <span className="ml-2 text-xs text-gray-400">configured accounts: {provisorAccounts.length} · source rows: {sources.length}</span>
           </div>
         </div>
@@ -1062,9 +1062,9 @@ export function CompetitorsTab({ formatCode }: Props) {
     return (
       <div className="mt-3 flex flex-col gap-2 border-t border-gray-100 pt-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <div className="text-sm font-medium text-gray-900">Provisor accounts</div>
+          <div className="text-sm font-medium text-gray-900">Аккаунты Provisor</div>
           <div className="text-xs text-gray-500">
-            configured: {provisorAccounts.length} · options: {provisorAccountOptions.length} · selected ids: {selectedProvisorAccountIds.length} · filtered: {filteredProvisorAccountOptions.length}
+            настроено: {provisorAccounts.length} · вариантов: {provisorAccountOptions.length} · выбрано ID: {selectedProvisorAccountIds.length} · отфильтровано: {filteredProvisorAccountOptions.length}
           </div>
         </div>
         <Popover open={provisorAccountSelectorOpen} onOpenChange={setProvisorAccountSelectorOpen}>
@@ -1073,7 +1073,7 @@ export function CompetitorsTab({ formatCode }: Props) {
               type="button"
               className="inline-flex h-9 w-full items-center justify-between gap-3 rounded-md border bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 sm:w-[260px]"
             >
-              <span className="truncate">Accounts ({selectedProvisorAccountCount} selected)</span>
+              <span className="truncate">Аккаунты ({selectedProvisorAccountCount} выбрано)</span>
               <ChevronDown className="h-4 w-4 shrink-0 text-gray-500" />
             </button>
           </PopoverTrigger>
@@ -1084,7 +1084,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                 <Input
                   value={provisorAccountSearch}
                   onChange={(e) => setProvisorAccountSearch(e.target.value)}
-                  placeholder="Search account login"
+                  placeholder="Поиск по логину аккаунта"
                   className="h-9 pl-9"
                 />
               </div>
@@ -1096,7 +1096,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                   className="h-8 px-2"
                   onClick={() => setSelectedProvisorAccountIds(provisorAccountOptions.map((account) => account.id))}
                 >
-                  Select All
+                  Выбрать все
                 </Button>
                 <Button
                   type="button"
@@ -1105,14 +1105,14 @@ export function CompetitorsTab({ formatCode }: Props) {
                   className="h-8 px-2"
                   onClick={() => setSelectedProvisorAccountIds([])}
                 >
-                  Clear All
+                  Очистить
                 </Button>
               </div>
             </div>
             <ScrollArea className="h-72">
               <div className="p-2">
                 <div className="mb-2 rounded bg-gray-50 px-2 py-1 text-xs text-gray-500">
-                  configured: {provisorAccounts.length} · options: {provisorAccountOptions.length} · selected ids: {selectedProvisorAccountIds.length} · filtered: {filteredProvisorAccountOptions.length}
+                  настроено: {provisorAccounts.length} · вариантов: {provisorAccountOptions.length} · выбрано ID: {selectedProvisorAccountIds.length} · отфильтровано: {filteredProvisorAccountOptions.length}
                 </div>
                 {filteredProvisorAccountOptions.map((account) => {
                   const checked = selectedProvisorAccountIds.includes(account.id);
@@ -1124,15 +1124,15 @@ export function CompetitorsTab({ formatCode }: Props) {
                       <Checkbox
                         checked={checked}
                         onCheckedChange={(value) => toggleProvisorAccount(account.id, value === true)}
-                        aria-label={`Select ${account.label}`}
+                        aria-label={`Выбрать ${account.label}`}
                       />
                       <span className="min-w-0 flex-1 truncate text-gray-900">{account.label}</span>
-                      <span className="shrink-0 tabular-nums text-gray-500">{account.count} PLK</span>
+                      <span className="shrink-0 tabular-nums text-gray-500">{account.count} ПЛК</span>
                     </label>
                   );
                 })}
                 {!filteredProvisorAccountOptions.length ? (
-                  <div className="px-3 py-8 text-center text-sm text-gray-500">No accounts found</div>
+                  <div className="px-3 py-8 text-center text-sm text-gray-500">Аккаунты не найдены</div>
                 ) : null}
               </div>
             </ScrollArea>
@@ -1177,14 +1177,14 @@ export function CompetitorsTab({ formatCode }: Props) {
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-9">
         {[
           ['Всего товаров нашего каталога', selectedMetric?.total],
-          ['Manual/catalog mappings', selectedMetric?.mapped],
-          ['Candidates needing manual review', selectedMetric?.unmapped],
+          ['Ручные/каталожные сопоставления', selectedMetric?.mapped],
+          ['Кандидаты для ручной проверки', selectedMetric?.unmapped],
           ['Отклонено', selectedMetric?.rejected],
-          ['No mapping candidates', selectedMetric?.noCandidates],
-          ['Manual mapping coverage', `${fmtNumber(selectedMetric?.mappingCoveragePercent ?? selectedMetric?.coveragePercent)}%`],
-          ['Generated competitor coverage', `${fmtNumber(selectedMetric?.generatedPricingCoverage?.coveragePercent)}%`],
-          ['Rows with competitor', selectedMetric?.generatedPricingCoverage?.withCompetitors],
-          ['Rows without competitor', selectedMetric?.generatedPricingCoverage?.withoutCompetitors],
+          ['Нет кандидатов', selectedMetric?.noCandidates],
+          ['Покрытие сопоставлений', `${fmtNumber(selectedMetric?.mappingCoveragePercent ?? selectedMetric?.coveragePercent)}%`],
+          ['Покрытие конкурентными ценами', `${fmtNumber(selectedMetric?.generatedPricingCoverage?.coveragePercent)}%`],
+          ['Строк с конкурентом', selectedMetric?.generatedPricingCoverage?.withCompetitors],
+          ['Строк без конкурента', selectedMetric?.generatedPricingCoverage?.withoutCompetitors],
         ].map(([label, value]) => (
           <div key={String(label)} className="admin-card p-4">
             <div className="text-xs font-medium uppercase tracking-wide text-gray-500">{label}</div>
@@ -1311,7 +1311,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                     >
                       <div className="flex items-center justify-between gap-3">
                         <span className="font-semibold text-gray-900">{row.sourceName || '—'}</span>
-                        <span className="text-xs text-gray-500">confidence: {fmtNumber(row.confidence)}</span>
+                        <span className="text-xs text-gray-500">уверенность: {fmtNumber(row.confidence)}</span>
                       </div>
                       <div className="mt-1 text-xs text-gray-500">{row.sourceManufacturer || 'Производитель не указан'} · {row.priceListName || 'Источник не указан'} · {row.priceDate || 'дата цены не указана'}</div>
                     </button>
@@ -1397,12 +1397,12 @@ export function CompetitorsTab({ formatCode }: Props) {
       {activeJob?.result && !['pending', 'running'].includes(activeJob.status) ? (
         <div className="admin-card p-3 text-sm text-gray-700">
           <div className="flex flex-wrap gap-x-5 gap-y-1">
-            <span><strong>Requested:</strong> {(activeJob.result.accounts_requested || []).join(', ') || 'all'}</span>
-            <span><strong>Processed:</strong> {(activeJob.result.accounts_processed || []).join(', ') || 'none'}</span>
-            <span><strong>Skipped:</strong> {(activeJob.result.accounts_skipped || []).join(', ') || 'none'}</span>
-            <span><strong>Updated:</strong> {activeJob.result.updated_count || 0}</span>
-            <span><strong>Unchanged:</strong> {activeJob.result.skipped_unchanged || 0}</span>
-            <span><strong>Timeout:</strong> {activeJob.result.skipped_timeout || 0}</span>
+            <span><strong>Запрошено:</strong> {(activeJob.result.accounts_requested || []).join(', ') || 'все'}</span>
+            <span><strong>Обработано:</strong> {(activeJob.result.accounts_processed || []).join(', ') || 'нет'}</span>
+            <span><strong>Пропущено:</strong> {(activeJob.result.accounts_skipped || []).join(', ') || 'нет'}</span>
+            <span><strong>Обновлено:</strong> {activeJob.result.updated_count || 0}</span>
+            <span><strong>Без изменений:</strong> {activeJob.result.skipped_unchanged || 0}</span>
+            <span><strong>Тайм-аут:</strong> {activeJob.result.skipped_timeout || 0}</span>
           </div>
         </div>
       ) : null}
@@ -1451,7 +1451,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                     disabled={isLoading || selectedProvisorAccountIds.length === 0}
                   >
                     <RefreshCw className={`mr-2 h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} />
-                    Refresh selected
+                    Обновить выбранные
                   </Button>
                   <Button variant="outline" size="sm" onClick={() => refreshSources('vidman')} disabled={isLoading}>
                     <RefreshCw className={`mr-2 h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} />
@@ -1466,26 +1466,26 @@ export function CompetitorsTab({ formatCode }: Props) {
               <div className="admin-card p-4">
                 <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
                   <div>
-                    <h3 className="text-sm font-semibold text-gray-900">Provisor diagnostics</h3>
+                    <h3 className="text-sm font-semibold text-gray-900">Диагностика Provisor</h3>
                     <p className="mt-1 text-sm text-gray-600">
-                      Format {provisorDiagnostics.formatCode}, branch {provisorDiagnostics.branch || 'all branches'}
+                      ЦФ {provisorDiagnostics.formatCode}, филиал {provisorDiagnostics.branch || 'все филиалы'}
                     </p>
                   </div>
                   <Button variant="outline" size="sm" onClick={() => void loadProvisorDiagnostics()} disabled={isLoading}>
                     <RefreshCw className="mr-2 h-4 w-4" />
-                    Reload diagnostics
+                    Обновить диагностику
                   </Button>
                 </div>
 
                 <div className="mt-4 grid grid-cols-2 gap-3 lg:grid-cols-7">
                   {[
-                    ['Global Provisor PL', provisorDiagnostics.visibility.totalProvisorGlobalPool],
-                    ['Visible here', provisorDiagnostics.visibility.visibleForFormatBranch],
-                    ['Hidden by branch', provisorDiagnostics.visibility.hiddenByBranch],
-                    ['Hidden zero items', provisorDiagnostics.visibility.hiddenZeroItems],
-                    ['Hidden by dedupe', provisorDiagnostics.visibility.hiddenByDedupe],
-                    ['Selected', provisorDiagnostics.visibility.selectedTotal],
-                    ['Active', provisorDiagnostics.visibility.activeTotal],
+                    ['Глобальные ПЛК Provisor', provisorDiagnostics.visibility.totalProvisorGlobalPool],
+                    ['Видимы здесь', provisorDiagnostics.visibility.visibleForFormatBranch],
+                    ['Скрыты по филиалу', provisorDiagnostics.visibility.hiddenByBranch],
+                    ['Скрыты без строк', provisorDiagnostics.visibility.hiddenZeroItems],
+                    ['Скрыты как дубликаты', provisorDiagnostics.visibility.hiddenByDedupe],
+                    ['Выбрано', provisorDiagnostics.visibility.selectedTotal],
+                    ['Активно', provisorDiagnostics.visibility.activeTotal],
                   ].map(([label, value]) => (
                     <div key={String(label)} className="rounded border border-gray-200 bg-white px-3 py-2">
                       <div className="text-xs font-medium uppercase text-gray-500">{label}</div>
@@ -1496,42 +1496,42 @@ export function CompetitorsTab({ formatCode }: Props) {
 
                 <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-3">
                   <div className="rounded border border-gray-200 bg-white p-3">
-                    <div className="text-xs font-medium uppercase text-gray-500">Coverage</div>
+                    <div className="text-xs font-medium uppercase text-gray-500">Покрытие</div>
                     <div className="mt-2 space-y-1 text-sm text-gray-700">
-                      <div className="flex justify-between gap-3"><span>Total products</span><strong>{fmtNumber(provisorDiagnostics.coverage.totalProducts)}</strong></div>
-                      <div className="flex justify-between gap-3"><span>With goodsId</span><strong>{fmtNumber(provisorDiagnostics.coverage.productsWithProvisorGoodsId)}</strong></div>
-                      <div className="flex justify-between gap-3"><span>Without goodsId</span><strong>{fmtNumber(provisorDiagnostics.coverage.productsWithoutProvisorGoodsId)}</strong></div>
-                      <div className="flex justify-between gap-3"><span>Unmatched rows with goodsId</span><strong>{fmtNumber(provisorDiagnostics.coverage.unmatchedRowsWithGoodsId)}</strong></div>
-                      <div className="flex justify-between gap-3"><span>Unmatched goodsId exists</span><strong>{fmtNumber(provisorDiagnostics.coverage.unmatchedRowsWhoseGoodsIdExistsInProduct)}</strong></div>
+                      <div className="flex justify-between gap-3"><span>Всего товаров</span><strong>{fmtNumber(provisorDiagnostics.coverage.totalProducts)}</strong></div>
+                      <div className="flex justify-between gap-3"><span>С goodsId</span><strong>{fmtNumber(provisorDiagnostics.coverage.productsWithProvisorGoodsId)}</strong></div>
+                      <div className="flex justify-between gap-3"><span>Без goodsId</span><strong>{fmtNumber(provisorDiagnostics.coverage.productsWithoutProvisorGoodsId)}</strong></div>
+                      <div className="flex justify-between gap-3"><span>Несопоставленные строки с goodsId</span><strong>{fmtNumber(provisorDiagnostics.coverage.unmatchedRowsWithGoodsId)}</strong></div>
+                      <div className="flex justify-between gap-3"><span>Несопоставленные goodsId есть в товарах</span><strong>{fmtNumber(provisorDiagnostics.coverage.unmatchedRowsWhoseGoodsIdExistsInProduct)}</strong></div>
                     </div>
                   </div>
 
                   <div className="rounded border border-gray-200 bg-white p-3">
-                    <div className="text-xs font-medium uppercase text-gray-500">Active Provisor PL</div>
+                    <div className="text-xs font-medium uppercase text-gray-500">Активные ПЛК Provisor</div>
                     <div className="mt-2 max-h-32 space-y-1 overflow-auto text-sm text-gray-700">
                       {provisorDiagnostics.coverage.activeProvisorPriceLists.length ? provisorDiagnostics.coverage.activeProvisorPriceLists.map((row) => (
                         <div key={row.id} className="flex justify-between gap-3">
                           <span className="truncate">{row.branchName || row.sourceKey}</span>
                           <strong className="tabular-nums">{fmtNumber(row.itemsCount)}</strong>
                         </div>
-                      )) : <span>No active Provisor PL</span>}
+                      )) : <span>Нет активных ПЛК Provisor</span>}
                     </div>
                   </div>
 
                   <div className="rounded border border-gray-200 bg-white p-3">
-                    <div className="text-xs font-medium uppercase text-gray-500">Reference filial {provisorDiagnostics.referenceFilialCoverage.referenceFilialId}</div>
+                    <div className="text-xs font-medium uppercase text-gray-500">Справочный филиал {provisorDiagnostics.referenceFilialCoverage.referenceFilialId}</div>
                     <div className="mt-2 space-y-1 text-sm text-gray-700">
-                      <div className="flex justify-between gap-3"><span>Rows</span><strong>{fmtNumber(provisorDiagnostics.referenceFilialCoverage.rowsTotal)}</strong></div>
-                      <div className="flex justify-between gap-3"><span>Rows with goodsId</span><strong>{fmtNumber(provisorDiagnostics.referenceFilialCoverage.rowsWithGoodsId)}</strong></div>
-                      <div className="flex justify-between gap-3"><span>SKU matched</span><strong>{fmtNumber(provisorDiagnostics.referenceFilialCoverage.distributorGoodsIdMatchedProducts)}</strong></div>
-                      <div className="flex justify-between gap-3"><span>SKU not found</span><strong>{fmtNumber(provisorDiagnostics.referenceFilialCoverage.skuNotFound)}</strong></div>
+                      <div className="flex justify-between gap-3"><span>Строк</span><strong>{fmtNumber(provisorDiagnostics.referenceFilialCoverage.rowsTotal)}</strong></div>
+                      <div className="flex justify-between gap-3"><span>Строк с goodsId</span><strong>{fmtNumber(provisorDiagnostics.referenceFilialCoverage.rowsWithGoodsId)}</strong></div>
+                      <div className="flex justify-between gap-3"><span>SKU сопоставлено</span><strong>{fmtNumber(provisorDiagnostics.referenceFilialCoverage.distributorGoodsIdMatchedProducts)}</strong></div>
+                      <div className="flex justify-between gap-3"><span>SKU не найдено</span><strong>{fmtNumber(provisorDiagnostics.referenceFilialCoverage.skuNotFound)}</strong></div>
                     </div>
                   </div>
                 </div>
 
                 <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-2">
                   <div className="rounded border border-gray-200 bg-white p-3">
-                    <div className="text-xs font-medium uppercase text-gray-500">Match types</div>
+                    <div className="text-xs font-medium uppercase text-gray-500">Типы сопоставления</div>
                     <div className="mt-2 max-h-36 space-y-1 overflow-auto text-sm text-gray-700">
                       {provisorDiagnostics.coverage.matchTypeDistribution.map((row) => (
                         <div key={row.matchType} className="flex justify-between gap-3">
@@ -1543,15 +1543,15 @@ export function CompetitorsTab({ formatCode }: Props) {
                   </div>
 
                   <div className="rounded border border-gray-200 bg-white p-3">
-                    <div className="text-xs font-medium uppercase text-gray-500">Reference SKU not found examples</div>
+                    <div className="text-xs font-medium uppercase text-gray-500">Примеры ненайденных SKU</div>
                     <div className="mt-2 max-h-36 space-y-1 overflow-auto text-sm text-gray-700">
                       {provisorDiagnostics.referenceFilialCoverage.topSkuNotFoundExamples.length ? provisorDiagnostics.referenceFilialCoverage.topSkuNotFoundExamples.map((row, index) => (
                         <div key={`${row.sourceKey}-${row.distributorGoodsId}-${index}`} className="grid grid-cols-[120px_120px_minmax(0,1fr)] gap-2">
-                          <span className="tabular-nums">{row.goodsId || 'no goodsId'}</span>
-                          <span className="truncate">{row.distributorGoodsId || 'no SKU'}</span>
+                          <span className="tabular-nums">{row.goodsId || 'нет goodsId'}</span>
+                          <span className="truncate">{row.distributorGoodsId || 'нет SKU'}</span>
                           <span className="truncate">{row.name}</span>
                         </div>
-                      )) : <span>No examples</span>}
+                      )) : <span>Нет примеров</span>}
                     </div>
                   </div>
                 </div>
@@ -1563,7 +1563,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                 <Input type="file" accept=".xlsx,.csv" onChange={(e) => setExcelFile(e.target.files?.[0] ?? null)} />
                 <Button variant="outline" size="sm" onClick={uploadManualPriceList} disabled={isLoading}>
                   <FileUp className="mr-2 h-4 w-4" />
-                  Загрузить manual Excel
+                  Загрузить ручной Excel
                 </Button>
               </div>
             </div>
@@ -1584,7 +1584,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Статус</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Последнее обновление</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Ошибки / timeout</th>
-                      <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">Actions</th>
+                      <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">Действия</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1673,7 +1673,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                           <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Производитель</th>
                           <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Цена</th>
                           <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Остаток</th>
-                          <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Match type</th>
+                          <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Тип сопоставления</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -1685,7 +1685,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                             <td className="px-4 py-3 text-sm text-gray-700">{item.manufacturer || '—'}</td>
                             <td className="px-4 py-3 text-sm text-gray-900 tabular-nums">{fmtNumber(item.distributor_price)}</td>
                             <td className="px-4 py-3 text-sm text-gray-700 tabular-nums">{fmtNumber(item.stock)}</td>
-                            <td className="px-4 py-3 text-sm text-gray-700">{item.match_type || 'unmatched'}</td>
+                            <td className="px-4 py-3 text-sm text-gray-700">{item.match_type || 'не сопоставлено'}</td>
                           </tr>
                         ))}
                       </tbody>
@@ -1735,10 +1735,10 @@ export function CompetitorsTab({ formatCode }: Props) {
                     <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Источник</th>
                     <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Регион</th>
                     <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Конкурент</th>
-                    <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Percentile</th>
+                    <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Персентиль</th>
                     <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">SKU</th>
-                    <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Source count</th>
-                    <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">generated_at</th>
+                    <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Количество источников</th>
+                    <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Дата расчета</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1781,7 +1781,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                       <span>Всего: <strong className="text-gray-900">{fmtNumber(metric?.total)}</strong></span>
                       <span>ОК: <strong className="text-gray-900">{fmtNumber(metric?.mapped)}</strong></span>
                       <span>Нет: <strong className="text-gray-900">{fmtNumber(metric?.unmapped)}</strong></span>
-                      <span>Reject: <strong className="text-gray-900">{fmtNumber(metric?.rejected)}</strong></span>
+                      <span>Отклонено: <strong className="text-gray-900">{fmtNumber(metric?.rejected)}</strong></span>
                     </div>
                   </button>
                 );
@@ -1880,8 +1880,8 @@ export function CompetitorsTab({ formatCode }: Props) {
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Наш SKU</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Наш товар</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Источник</th>
-                      <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Match type</th>
-                      <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">Actions</th>
+                      <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Тип сопоставления</th>
+                      <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">Действия</th>
                     </tr>
                   </thead>
                   <tbody>

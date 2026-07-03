@@ -98,10 +98,10 @@ const pct = (part: unknown, total: unknown) => {
 };
 
 const rightReasonLabels: Record<string, string> = {
-  right_due_to_mdc_floor: 'ПП: MDC floor',
-  right_due_to_chosen_higher_competitor: 'ПП: chosen higher competitor',
-  right_due_to_universal_override: 'ПП: universal override',
-  right_other: 'ПП: other',
+  right_due_to_mdc_floor: 'ПП: ограничение МДЦ',
+  right_due_to_chosen_higher_competitor: 'ПП: выбран более высокий конкурент',
+  right_due_to_universal_override: 'ПП: переопределено списком',
+  right_other: 'ПП: другое',
 };
 
 const changePercent = (row: ResultItem) => {
@@ -366,8 +366,8 @@ export function AnalyticsTab({ branch = '', selectedFormatCode = '', initialPric
               <div><span>Без изменений</span><strong>{fmt(repricing.unchangedCount)}</strong></div>
               <div><span>Без конкурентной цены</span><strong>{fmt(summary.withoutCompetitors)}</strong></div>
               <div><span>Применена логика без конкурентов</span><strong>{fmt(summary.noCompetitorRuleApplied)}</strong></div>
-              <div><span>Percentile</span><strong>{fmt(summary.percentileUsage)}</strong></div>
-              <div><span>Substitute</span><strong>{fmt(summary.substituteUsage || repricing.withSubstitute || 0)}</strong></div>
+              <div><span>Использовано персентилей</span><strong>{fmt(summary.percentileUsage)}</strong></div>
+              <div><span>Использовано замен</span><strong>{fmt(summary.substituteUsage || repricing.withSubstitute || 0)}</strong></div>
               <div><span>Универсальные списки</span><strong>{fmt(repricing.withUniversalLists)}</strong></div>
               <div><span>ЛП</span><strong>{fmt(summary.leftZone)}</strong></div>
               <div><span>Зона логичности</span><strong>{fmt(summary.optimalZone)}</strong></div>
@@ -416,10 +416,10 @@ export function AnalyticsTab({ branch = '', selectedFormatCode = '', initialPric
                 <div><span>Средний прогиб</span><strong>{fmt(repricing.averageBendPercent)}%</strong></div>
                 <div><span>% изменений</span><strong>{pct(repricing.changedCount, summary.skuTotal)}%</strong></div>
                 <div><span>% без конкурентной цены</span><strong>{pct(summary.withoutCompetitors, summary.skuTotal)}%</strong></div>
-                <div><span>% percentile</span><strong>{pct(summary.percentileUsage, summary.skuTotal)}%</strong></div>
+                <div><span>% персентилей</span><strong>{pct(summary.percentileUsage, summary.skuTotal)}%</strong></div>
                 <div><span>% списков</span><strong>{pct(repricing.withUniversalLists, summary.skuTotal)}%</strong></div>
-                <div><span>Max increase</span><strong>{fmt(repricing.maxIncrease)}%</strong></div>
-                <div><span>Max decrease</span><strong>{fmt(repricing.maxDecrease)}%</strong></div>
+                <div><span>Максимальное повышение</span><strong>{fmt(repricing.maxIncrease)}%</strong></div>
+                <div><span>Максимальное снижение</span><strong>{fmt(repricing.maxDecrease)}%</strong></div>
               </div>
             </section>
           </div>
@@ -456,7 +456,7 @@ export function AnalyticsTab({ branch = '', selectedFormatCode = '', initialPric
 
           <div className="business-grid two-columns">
             <section className="business-panel">
-              <div className="panel-head"><h3>Percentile / без конкурентной цены</h3></div>
+              <div className="panel-head"><h3>Персентили / без конкурентной цены</h3></div>
               <div className="split-mini-charts">
                 <ResponsiveContainer width="50%" height={220}>
                   <BarChart data={payload.charts.percentileUsage}>
@@ -472,7 +472,7 @@ export function AnalyticsTab({ branch = '', selectedFormatCode = '', initialPric
             </section>
 
             <section className="business-panel">
-              <div className="panel-head"><h3>Top changed products</h3></div>
+              <div className="panel-head"><h3>Товары с наибольшими изменениями</h3></div>
               <div className="table-scroll compact">
                 <table className="business-table">
                   <thead><tr><th>SKU</th><th>Наименование</th><th>Старая</th><th>Новая</th><th>Изм. %</th><th>Зона</th></tr></thead>
@@ -536,7 +536,7 @@ export function AnalyticsTab({ branch = '', selectedFormatCode = '', initialPric
             <div className="flex flex-wrap gap-2">
               <Button variant={onlyChanged ? 'default' : 'outline'} size="sm" onClick={() => setOnlyChanged((value) => !value)}>Только измененные</Button>
               <Button variant={onlyNoCompetitors ? 'default' : 'outline'} size="sm" onClick={() => setOnlyNoCompetitors((value) => !value)}>Без конкурентной цены</Button>
-              <Button variant={onlyPercentile ? 'default' : 'outline'} size="sm" onClick={() => setOnlyPercentile((value) => !value)}>Percentile</Button>
+              <Button variant={onlyPercentile ? 'default' : 'outline'} size="sm" onClick={() => setOnlyPercentile((value) => !value)}>Персентиль</Button>
               <Button variant={onlyUniversalLists ? 'default' : 'outline'} size="sm" onClick={() => setOnlyUniversalLists((value) => !value)}>Универсальные списки</Button>
             </div>
             <div className="table-scroll compact">
@@ -547,15 +547,15 @@ export function AnalyticsTab({ branch = '', selectedFormatCode = '', initialPric
                     <th>Старая цена</th>
                     <th>Новая цена</th>
                     <th>Изм. %</th>
-                    <th>Competitor price</th>
-                    <th>Pricing reason</th>
-                    <th>Zone</th>
-                    <th>Percentile</th>
-                    <th>Source</th>
-                    <th>Applied rule</th>
-                    <th>Universal list effect</th>
+                    <th>Цена конкурента</th>
+                    <th>Причина расчета</th>
+                    <th>Зона</th>
+                    <th>Персентиль</th>
+                    <th>Источник</th>
+                    <th>Примененное правило</th>
+                    <th>Влияние списка</th>
                     <th>Без конкурентной цены</th>
-                    <th>Substitute</th>
+                    <th>Замена</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -616,9 +616,9 @@ export function AnalyticsTab({ branch = '', selectedFormatCode = '', initialPric
               <div className="rounded-md border border-gray-200 p-3 text-sm">
                 <div><strong>Правило:</strong> {selectedItem.pricingRule || '—'}</div>
                 <div><strong>Источник:</strong> {selectedItem.priceSource || '—'}</div>
-                <div><strong>Percentile:</strong> {selectedItem.usedPercentile ? selectedItem.percentileSource || 'использован' : 'не использовался'}</div>
+                <div><strong>Персентиль:</strong> {selectedItem.usedPercentile ? selectedItem.percentileSource || 'использован' : 'не использовался'}</div>
                 <div><strong>Универсальные списки:</strong> {hasUniversalList(selectedItem) ? `сработали (${selectedItem.appliedListIds})` : 'не применялись'}</div>
-                <div><strong>Substitute:</strong> {selectedItem.usedSubstitute ? 'использован' : 'не использовался'}</div>
+                <div><strong>Замена:</strong> {selectedItem.usedSubstitute ? 'использована' : 'не использовалась'}</div>
               </div>
               <div className="rounded-md border border-blue-200 bg-blue-50 p-3 text-sm text-blue-900">
                 <strong className="block mb-1">Лог #1 — причина расчёта цены</strong>
@@ -626,7 +626,7 @@ export function AnalyticsTab({ branch = '', selectedFormatCode = '', initialPric
               </div>
               {selectedItem.listOverrideLog ? (
                 <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950">
-                  <strong className="block mb-1">Лог #2 — Lists Management</strong>
+                  <strong className="block mb-1">Лог #2 — Работа со списками</strong>
                   <div>Позиция найдена в списке:</div>
                   <div>Название: {selectedItem.listOverrideLog.listName || '—'}</div>
                   <div>Код: {selectedItem.listOverrideLog.listCode || '—'}</div>
@@ -651,7 +651,7 @@ export function AnalyticsTab({ branch = '', selectedFormatCode = '', initialPric
 
       <Dialog open={Boolean(zoneDrilldown)} onOpenChange={(open) => !open && setZoneDrilldown(null)}>
         <DialogContent className="max-w-5xl">
-          <DialogHeader><DialogTitle>Drilldown зоны {zoneDrilldown}</DialogTitle></DialogHeader>
+          <DialogHeader><DialogTitle>Детализация зоны {zoneDrilldown}</DialogTitle></DialogHeader>
           <div className="business-search full">
             <Search className="h-4 w-4" />
             <Input placeholder="Поиск товара в зоне" value={search} onChange={(e) => setSearch(e.target.value)} />

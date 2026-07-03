@@ -55,6 +55,20 @@ const parseJson = (text: string) => {
   }
 };
 
+const statusText = (status: string) => {
+  const value = String(status || '').toLowerCase();
+  if (value === 'active') return 'Активен';
+  if (value === 'inactive') return 'Неактивен';
+  if (value === 'success') return 'Успешно';
+  if (value === 'partial') return 'Частично';
+  if (value === 'error') return 'Ошибка';
+  if (value === 'running') return 'Выполняется';
+  if (value === 'updated') return 'Обновлено';
+  if (value === 'checked') return 'Проверено';
+  if (value === 'timeout') return 'Тайм-аут';
+  return status || '—';
+};
+
 export function ContractorsTab({ branch = '', selectedFormatCode = '', priceFormats = [], onNavigate }: Props) {
   const [rows, setRows] = useState<ContractorRow[]>([]);
   const [opened, setOpened] = useState<ContractorCard | null>(null);
@@ -134,12 +148,12 @@ export function ContractorsTab({ branch = '', selectedFormatCode = '', priceForm
       <div className="business-toolbar">
         <div>
           <h2>Контрагенты</h2>
-          <p>Lightweight ERP-структура: холдинг → контрагент → аптека/точка → филиал → ЦФ.</p>
+          <p>Упрощенная ERP-структура: холдинг → контрагент → аптека/точка → филиал → ЦФ.</p>
         </div>
         <div className="business-actions">
           <label className="file-button">
             <FileUp className="h-4 w-4" />
-            Excel import
+            Импорт Excel
             <input type="file" accept=".xlsx,.xls" onChange={(e) => void importContractors(e.target.files?.[0] || null)} />
           </label>
           <Button variant="outline" onClick={() => void loadRows()} disabled={isLoading}>Обновить</Button>
@@ -202,7 +216,7 @@ export function ContractorsTab({ branch = '', selectedFormatCode = '', priceForm
                       <button className="link-button" onClick={() => void openCard(row.id)}>{row.formatCode}</button>
                       <div className="muted">{row.formatName}</div>
                     </td>
-                    <td><span className={`status-pill ${row.status === 'active' ? 'ok' : 'muted'}`}>{row.status}</span></td>
+                    <td><span className={`status-pill ${row.status === 'active' ? 'ok' : 'muted'}`}>{statusText(row.status)}</span></td>
                     <td>{row.updatedAt || '—'}</td>
                     <td>
                       <div className="row-actions">
@@ -268,7 +282,7 @@ export function ContractorsTab({ branch = '', selectedFormatCode = '', priceForm
                         <tr key={row.number}>
                           <td>{row.number}</td>
                           <td>{row.date}</td>
-                          <td>{row.status}</td>
+                          <td>{statusText(row.status)}</td>
                           <td>{row.skuCount}</td>
                         </tr>
                       ))}
@@ -284,7 +298,7 @@ export function ContractorsTab({ branch = '', selectedFormatCode = '', priceForm
                   {(opened.references || []).map((row) => (
                     <div key={row.type}>
                       <span>{row.type}</span>
-                      <strong>{row.status}</strong>
+                      <strong>{statusText(row.status)}</strong>
                       <small>{row.lastUpdatedAt || '—'} · {row.rows} строк</small>
                     </div>
                   ))}

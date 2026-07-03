@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { toast } from 'sonner';
-import { FileUp, RefreshCw, Search, UploadCloud } from 'lucide-react';
+import { Download, FileUp, RefreshCw, Search, UploadCloud } from 'lucide-react';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
@@ -106,6 +106,8 @@ const parseBranchIds = (value: string) => {
   }
 };
 
+const isTemplateSupported = (type: string) => type !== 'rating_global' && type !== 'rating_local';
+
 export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) {
   const [types, setTypes] = useState<ReferenceType[]>([]);
   const [branches, setBranches] = useState<Branch[]>([]);
@@ -175,8 +177,13 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
     setter((prev) => (prev.includes(value) ? prev.filter((id) => id !== value) : [...prev, value]));
   };
 
+  const downloadTemplate = (type: string) => {
+    if (!type || !isTemplateSupported(type)) return;
+    window.location.href = `/api/references/template?data_type=${encodeURIComponent(type)}`;
+  };
+
   const upload = async () => {
-    if (isReadOnly) return setError('Роль viewer: импорт справочников доступен только для просмотра');
+    if (isReadOnly) return setError('Роль просмотра: импорт справочников доступен только для просмотра');
     if (!selectedType) return setError('Выберите тип данных');
     if (!selectedBranchIds.length) return setError('Выберите один или несколько филиалов');
     if (!file) return setError('Выберите Excel-файл');
@@ -225,9 +232,9 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
   };
 
   const uploadBatch = async () => {
-    if (isReadOnly) return setError('Роль viewer: batch import доступен только для просмотра');
-    if (!batchTypeIds.length) return setError('Выберите типы данных для batch import');
-    if (!batchBranchIds.length) return setError('Выберите филиалы для batch import');
+    if (isReadOnly) return setError('Роль просмотра: массовая загрузка доступна только для просмотра');
+    if (!batchTypeIds.length) return setError('Выберите типы данных для массовой загрузки');
+    if (!batchBranchIds.length) return setError('Выберите филиалы для массовой загрузки');
     const missingFiles = batchTypeIds.filter((type) => !batchFiles[type]);
     if (missingFiles.length) return setError(`Прикрепите Excel для: ${missingFiles.map((type) => typeName[type] || type).join(', ')}`);
 
@@ -255,14 +262,14 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
       const res = await fetch('/api/references/import/batch', { method: 'POST', body: fd });
       const text = await res.text();
       const data = parseJsonOrNull(text);
-      if (!res.ok) throw new Error(data?.detail || text || 'Не удалось выполнить batch import');
+      if (!res.ok) throw new Error(data?.detail || text || 'Не удалось выполнить массовую загрузку');
       setActiveBatch(data);
       await loadAll();
-      if (data?.status === 'error') toast.error('Batch import завершился с ошибками');
-      else if (data?.status === 'partial') toast.warning('Batch import завершен частично');
-      else toast.success('Batch import завершен');
+      if (data?.status === 'error') toast.error('Массовая загрузка завершилась с ошибками');
+      else if (data?.status === 'partial') toast.warning('Массовая загрузка завершена частично');
+      else toast.success('Массовая загрузка завершена');
     } catch (e: any) {
-      setError(e?.message || 'Ошибка batch import');
+      setError(e?.message || 'Ошибка массовой загрузки');
     } finally {
       setIsLoading(false);
     }
@@ -279,19 +286,19 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
   return (
     <div className="space-y-4">
       {error ? <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</div> : null}
-      {isReadOnly ? <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">Роль viewer: справочники доступны только для просмотра.</div> : null}
+      {isReadOnly ? <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">Роль просмотра: справочники доступны только для просмотра.</div> : null}
 
       {activeBatch ? (
         <div className="admin-card p-4">
           <div className="mb-2 flex items-center justify-between gap-3">
-            <div className="text-sm font-medium text-gray-900">Batch import · {activeBatch.sourceType}</div>
+            <div className="text-sm font-medium text-gray-900">Массовая загрузка · Excel</div>
             <div className="text-sm font-semibold text-blue-700">{activeBatch.status}</div>
           </div>
           <div className="grid grid-cols-2 gap-2 text-sm text-gray-700 md:grid-cols-4">
-            <div>jobs: {activeBatch.jobsTotal}</div>
-            <div className="text-green-700">success: {activeBatch.jobsSuccess}</div>
-            <div className="text-amber-700">partial: {activeBatch.jobsPartial}</div>
-            <div className="text-red-700">error: {activeBatch.jobsError}</div>
+            <div>Заданий: {activeBatch.jobsTotal}</div>
+            <div className="text-green-700">Успешно: {activeBatch.jobsSuccess}</div>
+            <div className="text-amber-700">Частично: {activeBatch.jobsPartial}</div>
+            <div className="text-red-700">Ошибок: {activeBatch.jobsError}</div>
           </div>
         </div>
       ) : null}
@@ -330,7 +337,7 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
           <div className="grid grid-cols-1 gap-4 2xl:grid-cols-[minmax(420px,1fr)_minmax(520px,1.15fr)]">
             <div className="admin-card p-4">
               <div className="mb-4 flex items-center justify-between gap-3">
-                <div className="text-sm font-semibold text-gray-900">Одиночный импорт</div>
+                <div className="text-sm font-semibold text-gray-900">Одиночная загрузка</div>
                 <FileUp className="h-4 w-4 text-gray-400" />
               </div>
               <div className="grid grid-cols-1 gap-4 lg:grid-cols-[280px_minmax(320px,1fr)] 2xl:grid-cols-1">
@@ -351,12 +358,18 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
                     </Select>
                   </div>
                   <div>
-                    <div className="mb-2 text-sm font-semibold text-gray-900">Excel-файл</div>
+                    <div className="mb-2 text-sm font-semibold text-gray-900">Файл для загрузки</div>
                     <Input type="file" accept=".xlsx" onChange={(event) => setFile(event.target.files?.[0] ?? null)} />
                   </div>
+                  {isTemplateSupported(selectedType) ? (
+                    <Button type="button" variant="outline" onClick={() => downloadTemplate(selectedType)} className="w-full">
+                      <Download className="mr-2 h-4 w-4" />
+                      Скачать шаблон
+                    </Button>
+                  ) : null}
                   <Button onClick={upload} disabled={isLoading || isReadOnly} className="w-full bg-blue-600 hover:bg-blue-700">
                     <FileUp className="mr-2 h-4 w-4" />
-                    Загрузить
+                    Загрузить файл
                   </Button>
                 </div>
                 <BranchPicker
@@ -371,7 +384,7 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
 
             <div className="admin-card p-4">
               <div className="mb-4 flex items-center justify-between gap-3">
-                <div className="text-sm font-semibold text-gray-900">Batch Excel import</div>
+                <div className="text-sm font-semibold text-gray-900">Массовая загрузка Excel</div>
                 <UploadCloud className="h-4 w-4 text-gray-400" />
               </div>
               <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(260px,0.85fr)_minmax(320px,1fr)]">
@@ -397,11 +410,19 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
                     </div>
                   </div>
                   <div className="space-y-3">
-                    <div className="text-sm font-semibold text-gray-900">Excel по выбранным типам</div>
+                    <div className="text-sm font-semibold text-gray-900">Файлы для загрузки</div>
                     {batchTypeIds.length ? (
                       batchTypeIds.map((type) => (
                         <div key={type} className="rounded-md border border-gray-200 p-3">
-                          <div className="mb-2 text-xs font-semibold text-gray-600">{typeName[type] || type}</div>
+                          <div className="mb-2 flex items-center justify-between gap-2">
+                            <div className="text-xs font-semibold text-gray-600">{typeName[type] || type}</div>
+                            {isTemplateSupported(type) ? (
+                              <Button type="button" variant="outline" size="sm" className="h-7 px-2 text-xs" onClick={() => downloadTemplate(type)}>
+                                <Download className="mr-1 h-3 w-3" />
+                                Скачать шаблон
+                              </Button>
+                            ) : null}
+                          </div>
                           <Input
                             type="file"
                             accept=".xlsx"
@@ -415,7 +436,7 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
                   </div>
                   <Button onClick={uploadBatch} disabled={isLoading || isReadOnly} className="w-full bg-blue-600 hover:bg-blue-700">
                     <UploadCloud className="mr-2 h-4 w-4" />
-                    Запустить batch import
+                    Загрузить файлы
                   </Button>
                 </div>
                 <BranchPicker
@@ -466,7 +487,7 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
                             <div className={`rounded-md border p-2 ${freshnessClass(cell?.freshness || 'missing')}`} title={cell?.error || ''}>
                               <div className="font-medium">{freshnessLabel(cell?.freshness || 'missing')}</div>
                               <div className="text-xs">{fmtDate(cell?.lastUpdatedAt || '')}</div>
-                              <div className="text-xs">rows: {cell?.rowsCount || 0}</div>
+                              <div className="text-xs">Строк: {cell?.rowsCount || 0}</div>
                             </div>
                           </td>
                         );
@@ -497,11 +518,11 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
                     <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Файл</th>
                     <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Пользователь</th>
                     <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Статус</th>
-                    <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">rows_total</th>
-                    <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">rows_success</th>
-                    <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">rows_failed</th>
+                    <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Всего строк</th>
+                    <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Успешно</th>
+                    <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Ошибок</th>
                     <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Ошибка</th>
-                    <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">Actions</th>
+                    <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">Действия</th>
                   </tr>
                 </thead>
                 <tbody>
