@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { toast } from 'sonner';
-import { Download, FileUp, RefreshCw, Search, UploadCloud } from 'lucide-react';
+import { Download, FileUp, RefreshCw, Search } from 'lucide-react';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
@@ -334,7 +334,7 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
         </TabsList>
 
         <TabsContent value="upload" className="m-0 pt-4">
-          <div className="grid grid-cols-1 gap-4 2xl:grid-cols-[minmax(420px,1fr)_minmax(520px,1.15fr)]">
+          <div className="grid grid-cols-1 gap-4">
             <div className="admin-card p-4">
               <div className="mb-4 flex items-center justify-between gap-3">
                 <div className="text-sm font-semibold text-gray-900">Одиночная загрузка</div>
@@ -378,73 +378,6 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
                   onToggle={(id) => toggleValue(id, setSelectedBranchIds)}
                   onAll={() => setSelectedBranchIds(branches.map((branch) => branch.id))}
                   onReset={() => setSelectedBranchIds([])}
-                />
-              </div>
-            </div>
-
-            <div className="admin-card p-4">
-              <div className="mb-4 flex items-center justify-between gap-3">
-                <div className="text-sm font-semibold text-gray-900">Массовая загрузка Excel</div>
-                <UploadCloud className="h-4 w-4 text-gray-400" />
-              </div>
-              <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(260px,0.85fr)_minmax(320px,1fr)]">
-                <div className="space-y-4">
-                  <div>
-                    <div className="mb-2 text-sm font-semibold text-gray-900">Типы данных</div>
-                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-1">
-                      {types.map((type) => {
-                        const checked = batchTypeIds.includes(type.code);
-                        return (
-                          <button
-                            type="button"
-                            key={type.code}
-                            onClick={() => toggleValue(type.code, setBatchTypeIds)}
-                            className={`rounded-md border px-3 py-2 text-left text-sm transition-colors ${
-                              checked ? 'border-blue-300 bg-blue-50 text-blue-800' : 'border-gray-200 bg-white text-gray-700 hover:bg-gray-50'
-                            }`}
-                          >
-                            {type.name}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-                  <div className="space-y-3">
-                    <div className="text-sm font-semibold text-gray-900">Файлы для загрузки</div>
-                    {batchTypeIds.length ? (
-                      batchTypeIds.map((type) => (
-                        <div key={type} className="rounded-md border border-gray-200 p-3">
-                          <div className="mb-2 flex items-center justify-between gap-2">
-                            <div className="text-xs font-semibold text-gray-600">{typeName[type] || type}</div>
-                            {isTemplateSupported(type) ? (
-                              <Button type="button" variant="outline" size="sm" className="h-7 px-2 text-xs" onClick={() => downloadTemplate(type)}>
-                                <Download className="mr-1 h-3 w-3" />
-                                Скачать шаблон
-                              </Button>
-                            ) : null}
-                          </div>
-                          <Input
-                            type="file"
-                            accept=".xlsx"
-                            onChange={(event) => setBatchFiles((prev) => ({ ...prev, [type]: event.target.files?.[0] ?? null }))}
-                          />
-                        </div>
-                      ))
-                    ) : (
-                      <div className="rounded-md border border-gray-200 bg-gray-50 p-3 text-sm text-gray-500">Сначала выберите типы данных</div>
-                    )}
-                  </div>
-                  <Button onClick={uploadBatch} disabled={isLoading || isReadOnly} className="w-full bg-blue-600 hover:bg-blue-700">
-                    <UploadCloud className="mr-2 h-4 w-4" />
-                    Загрузить файлы
-                  </Button>
-                </div>
-                <BranchPicker
-                  branches={branches}
-                  selected={batchBranchIds}
-                  onToggle={(id) => toggleValue(id, setBatchBranchIds)}
-                  onAll={() => setBatchBranchIds(branches.map((branch) => branch.id))}
-                  onReset={() => setBatchBranchIds([])}
                 />
               </div>
             </div>

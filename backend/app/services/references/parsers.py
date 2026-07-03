@@ -10,10 +10,19 @@ from openpyxl import load_workbook
 
 HEADER_ALIASES = {
     "sku": ("sku", "код", "код товара", "материал", "номенклатура код"),
-    "name": ("название", "наименование", "товар", "краткий текст материала", "номенклатура", "name"),
+    "name": ("название", "наименование", "артикул", "товар", "краткий текст материала", "номенклатура", "name"),
     "manufacturer": ("производитель", "manufacturer", "бренд"),
-    "stock": ("остаток", "остатки", "количество", "stock"),
-    "cost": ("себестоимость", "учетная себестоимость", "учётная себестоимость", "cost", "cost price"),
+    "stock": ("остаток", "остатки", "кол-во", "кол во", "количество", "stock"),
+    "cost": (
+        "учетная себ",
+        "учётная себ",
+        "себестоимость",
+        "себестоимость/себестоимость",
+        "учетная себестоимость",
+        "учётная себестоимость",
+        "cost",
+        "cost price",
+    ),
     "rating_global": ("рейтинг общий", "общий рейтинг", "rating global", "global rating", "top"),
     "rating_local": ("рейтинг локальный", "локальный рейтинг", "rating local", "local rating"),
     "branch_id": ("branch_id", "филиал id", "id филиала", "код филиала", "регион id"),
@@ -35,6 +44,10 @@ def _norm(value: object) -> str:
     return re.sub(r"\s+", " ", s)
 
 
+def _stock_header_base(value: object) -> str:
+    return re.sub(r"\s*\([^)]*\)\s*$", "", _norm(value)).strip()
+
+
 def _first_nonempty_row(ws, max_scan: int = 30) -> int | None:
     for row in range(1, min(ws.max_row, max_scan) + 1):
         if any(ws.cell(row=row, column=col).value not in (None, "") for col in range(1, ws.max_column + 1)):
@@ -53,6 +66,12 @@ def _header_map(ws) -> tuple[int, dict[str, int]]:
             key = _norm(alias)
             if key in raw_headers:
                 out[canonical] = raw_headers[key]
+                break
+    if "stock" not in out:
+        stock_aliases = {_norm(alias) for alias in HEADER_ALIASES["stock"]}
+        for raw_header, column in raw_headers.items():
+            if _stock_header_base(raw_header) in stock_aliases:
+                out["stock"] = column
                 break
     return header_row, out
 
