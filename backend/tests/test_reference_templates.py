@@ -136,3 +136,23 @@ def test_stock_import_accepts_stock_header_with_optional_warehouse_suffix(stock_
 def test_rating_templates_are_not_generated(data_type):
     with pytest.raises(ValueError):
         build_reference_template(data_type)
+
+
+@pytest.mark.parametrize("stock_header", ["Остаток", "Остатки", "Кол-во", "Кол-во(MB-52)", "Кол-во(MB-17)", "Кол-во(Основной склад)"])
+def test_stock_import_accepts_cyrillic_stock_headers(stock_header):
+    rows, headers = parse_excel_rows(
+        _xlsx(["Материал", "Артикул", "Производитель", stock_header], ["000000000001234567", "Товар", "Производитель", 24])
+    )
+
+    assert "stock" in headers
+    assert rows[0]["stock"] == 24
+
+
+@pytest.mark.parametrize("cost_header", ["Учетная себ", "Учетная себестоимость", "Себестоимость"])
+def test_cost_import_accepts_cyrillic_cost_headers(cost_header):
+    rows, headers = parse_excel_rows(
+        _xlsx(["Материал", "Артикул", "Производитель", cost_header], ["000000000001234567", "Товар", "Производитель", 1250.75])
+    )
+
+    assert "cost" in headers
+    assert rows[0]["cost"] == 1250.75

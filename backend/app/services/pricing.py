@@ -9,6 +9,8 @@ from sqlalchemy import select, delete
 from sqlalchemy.orm import Session
 
 from ..models import (
+    BranchCost,
+    BranchStock,
     Product,
     PriceFormat,
     MarkupRange,
@@ -1670,7 +1672,28 @@ def calculate_prices(
         db.add(pl)
         db.flush()
 
-    products = db.execute(select(Product)).scalars().all()
+    branch_id = str(region_id if region_id is not None else (pf.branch or "")).strip()
+    stock_product_ids = select(BranchStock.product_id).where(BranchStock.branch_id == branch_id)
+    cost_product_ids = select(BranchCost.product_id).where(BranchCost.branch_id == branch_id)
+    reference_filter_active = bool(branch_id) and (
+        db.execute(select(BranchStock.id).where(BranchStock.branch_id == branch_id).limit(1)).scalar() is not None
+        or db.execute(select(BranchCost.id).where(BranchCost.branch_id == branch_id).limit(1)).scalar() is not None
+    )
+    if reference_filter_active:
+        db.execute(
+            delete(CalculatedPrice)
+            .where(CalculatedPrice.price_list_id == pl.id)
+            .where(
+                CalculatedPrice.product_id.not_in(stock_product_ids)
+                | CalculatedPrice.product_id.not_in(cost_product_ids)
+            )
+        )
+
+    product_stmt = select(Product)
+    if reference_filter_active:
+        product_stmt = product_stmt.where(Product.id.in_(stock_product_ids)).where(Product.id.in_(cost_product_ids))
+
+    products = db.execute(product_stmt).scalars().all()
     if not products:
         # MVP: allow creating a price list before importing products.
         db.commit()

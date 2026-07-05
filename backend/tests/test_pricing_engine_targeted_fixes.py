@@ -14,6 +14,8 @@ from backend.app.db import Base
 from backend.app.deps import get_db
 from backend.app.models import (
     BendRange,
+    BranchCost,
+    BranchStock,
     CalculatedPrice,
     CompetitorPrice,
     CompetitorPriceList,
@@ -81,6 +83,16 @@ def _competitor(db, pf, product, source, price):
     db.flush()
 
 
+def _branch_stock(db, product, *, branch_id="1", stock=1):
+    db.add(BranchStock(branch_id=branch_id, product_id=product.id, sku=product.code, stock=stock))
+    db.flush()
+
+
+def _branch_cost(db, product, *, branch_id="1", cost=100):
+    db.add(BranchCost(branch_id=branch_id, product_id=product.id, sku=product.code, cost=cost))
+    db.flush()
+
+
 def _list_item(db, product, list_type, value, *, pf=None, status="active", start_date=None, end_date=None):
     row = UniversalList(
         code=f"UL-{list_type}-{product.code}",
@@ -122,6 +134,40 @@ def test_bend_is_selected_by_competitor_price_not_product_cost():
     assert float(debug["bend_percent_used"]) == 0.1
     assert float(debug["chosen_competitor_price"]) == 9000
     assert float(price) == 8991.0
+
+
+def test_price_generation_uses_only_products_present_in_stock_and_cost_references():
+    db = _session()
+    pf = _format(db)
+    in_both = _product(db, code="REF-BOTH", cost=100)
+    cost_only = _product(db, code="REF-COST-ONLY", cost=100)
+    stock_only = _product(db, code="REF-STOCK-ONLY", cost=100)
+    _product(db, code="REF-MISSING-BOTH", cost=100)
+
+    _branch_stock(db, in_both, branch_id="1")
+    _branch_cost(db, in_both, branch_id="1")
+    _branch_cost(db, cost_only, branch_id="1")
+    _branch_stock(db, stock_only, branch_id="1")
+
+    count = calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="REF-FILTER-PL",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        region_id=1,
+        force_new_price_list=True,
+    )
+
+    generated_skus = {
+        sku
+        for (sku,) in db.query(Product.code)
+        .join(CalculatedPrice, CalculatedPrice.product_id == Product.id)
+        .all()
+    }
+    assert count == 1
+    assert generated_skus == {"REF-BOTH"}
 
 
 def test_competitor_iteration_chooses_first_candidate_at_or_above_mdc():

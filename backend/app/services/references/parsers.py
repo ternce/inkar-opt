@@ -37,6 +37,39 @@ HEADER_ALIASES["name"] = (*HEADER_ALIASES["name"], "product name")
 HEADER_ALIASES["external_id"] = (*HEADER_ALIASES["external_id"], "external id")
 HEADER_ALIASES["holding_id"] = (*HEADER_ALIASES["holding_id"], "holding id")
 HEADER_ALIASES["counterparty_id"] = (*HEADER_ALIASES["counterparty_id"], "counterparty id")
+HEADER_ALIASES["sku"] = (
+    *HEADER_ALIASES["sku"],
+    "код",
+    "код товара",
+    "материал",
+    "номенклатура код",
+)
+HEADER_ALIASES["name"] = (
+    *HEADER_ALIASES["name"],
+    "название",
+    "наименование",
+    "артикул",
+    "товар",
+    "краткий текст материала",
+    "номенклатура",
+)
+HEADER_ALIASES["manufacturer"] = (*HEADER_ALIASES["manufacturer"], "производитель", "бренд")
+HEADER_ALIASES["stock"] = (
+    *HEADER_ALIASES["stock"],
+    "остаток",
+    "остатки",
+    "кол-во",
+    "кол во",
+    "количество",
+)
+HEADER_ALIASES["cost"] = (
+    *HEADER_ALIASES["cost"],
+    "учетная себ",
+    "учётная себ",
+    "учетная себестоимость",
+    "учётная себестоимость",
+    "себестоимость",
+)
 
 
 def _norm(value: object) -> str:
