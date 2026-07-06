@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from ...models import Product, ProductRating, ReferenceImportJob, ReferenceUpdateStatus
 from ...timezone import local_iso, now_kz_naive
 from ..sku import normalize_external_sku, normalize_sku
-from .types import BRANCH_BY_ID
+from .types import branch_display_name, canonical_branch_id
 
 
 RATING_DATA_TYPES = {"rating_global": "global", "rating_local": "local"}
@@ -156,7 +156,8 @@ def import_top_rating_excel(
     rating_type = RATING_DATA_TYPES.get(data_type)
     if rating_type is None:
         raise ValueError("Тип рейтинга должен быть rating_global или rating_local")
-    branch_ids = list(dict.fromkeys(str(value).strip() for value in branch_ids if str(value).strip()))
+    branch_ids = list(dict.fromkeys(canonical_branch_id(value) for value in branch_ids if str(value).strip()))
+    branch_ids = [value for value in branch_ids if value]
     if not branch_ids:
         raise ValueError("branch_ids is required")
 
@@ -235,7 +236,7 @@ def import_top_rating_excel(
             if reference_status is None:
                 reference_status = ReferenceUpdateStatus(branch_id=branch_id, data_type=data_type)
                 db.add(reference_status)
-            reference_status.branch_name = BRANCH_BY_ID.get(branch_id, {}).get("name", branch_id)
+            reference_status.branch_name = branch_display_name(branch_id)
             reference_status.last_updated_at = updated_at
             reference_status.rows_count = summary["updated"]
             reference_status.status = status

@@ -33,3 +33,51 @@ BRANCHES = [
 
 BRANCH_BY_ID = {row["id"]: row for row in BRANCHES}
 
+BRANCH_ALIASES = {
+    "almaty": "1",
+    "astana": "2",
+    "nur-sultan": "2",
+    "nursultan": "2",
+    "aktau": "3",
+    "aktobe": "4",
+    "atyrau": "5",
+    "karaganda": "6",
+    "kostanay": "8",
+    "kyzylorda": "9",
+    "pavlodar": "10",
+    "petropavlovsk": "11",
+    "taldykorgan": "13",
+    "uralsk": "15",
+    "oral": "15",
+    "ust-kamenogorsk": "16",
+    "shymkent": "17",
+}
+
+
+def _branch_lookup_key(value: object) -> str:
+    return " ".join(str(value or "").strip().casefold().split())
+
+
+def canonical_branch_id(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text in BRANCH_BY_ID:
+        return text
+    if text.isdigit():
+        normalized = str(int(text))
+        if normalized in BRANCH_BY_ID:
+            return normalized
+    lookup = _branch_lookup_key(text)
+    alias = BRANCH_ALIASES.get(lookup)
+    if alias:
+        return alias
+    for branch in BRANCHES:
+        if _branch_lookup_key(branch.get("name")) == lookup:
+            return str(branch["id"])
+    return text
+
+
+def branch_display_name(branch_id: object) -> str:
+    canonical = canonical_branch_id(branch_id)
+    return BRANCH_BY_ID.get(canonical, {}).get("name", str(branch_id or "").strip())

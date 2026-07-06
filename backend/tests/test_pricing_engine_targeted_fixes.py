@@ -170,6 +170,26 @@ def test_price_generation_uses_only_products_present_in_stock_and_cost_reference
     assert generated_skus == {"REF-BOTH"}
 
 
+def test_price_generation_raises_when_references_exist_under_different_branch_key():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, code="REF-WRONG-BRANCH", cost=100)
+    _branch_stock(db, product, branch_id="2")
+    _branch_cost(db, product, branch_id="2")
+
+    with pytest.raises(ValueError, match="Reference branch mismatch"):
+        calculate_prices(
+            db=db,
+            price_format_code=pf.code,
+            price_list_number="REF-MISMATCH-PL",
+            as_of=date.today(),
+            activation_date=None,
+            user="test",
+            region_id=1,
+            force_new_price_list=True,
+        )
+
+
 def test_competitor_iteration_chooses_first_candidate_at_or_above_mdc():
     db = _session()
     rounding = RoundingRule(code="R01", name="R01", mode="math", precision=2, step=0.01)

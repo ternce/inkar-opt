@@ -22,12 +22,12 @@ from ...models import (
 from ...timezone import now_kz_naive
 from ..sku import normalize_sku
 from .parsers import as_decimal, as_int, parse_excel_rows
-from .types import BRANCH_BY_ID, REFERENCE_TYPE_BY_CODE
+from .types import REFERENCE_TYPE_BY_CODE, branch_display_name, canonical_branch_id
 from .validators import required_columns_for
 
 
 def _branch_name(branch_id: str) -> str:
-    return BRANCH_BY_ID.get(str(branch_id), {}).get("name", str(branch_id))
+    return branch_display_name(branch_id)
 
 
 def _get_or_create_product(db: Session, sku: str, name: str | None = None) -> Product:
@@ -81,9 +81,7 @@ def _upsert_status(
 def _branch_ids_from_request(branch_ids: list[str], row: dict) -> list[str]:
     raw_branch = row.get("branch_id") or row.get("branch_name")
     if raw_branch not in (None, ""):
-        text = str(raw_branch).strip()
-        matched = next((branch["id"] for branch in BRANCH_BY_ID.values() if branch["name"].casefold() == text.casefold()), None)
-        return [matched or text]
+        return [canonical_branch_id(raw_branch)]
     return branch_ids
 
 
@@ -148,7 +146,8 @@ def import_reference_excel(
     if not branch_ids:
         raise ValueError("branch_ids is required")
 
-    branch_ids = [str(x).strip() for x in branch_ids if str(x).strip()]
+    branch_ids = [canonical_branch_id(x) for x in branch_ids if str(x).strip()]
+    branch_ids = list(dict.fromkeys(x for x in branch_ids if x))
     job = ReferenceImportJob(
         data_type=data_type,
         branch_ids_json=json.dumps(branch_ids, ensure_ascii=False),

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, func
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -34,6 +35,7 @@ from .competitor_matching import rebuild_competitor_prices_for_selected
 from .competitor_percentiles import emit_percentile_group_keys, recalculate_competitor_percentiles_if_needed
 from .competitor_percentiles import REGIONAL_SCOPE
 from .competitor_assignments import get_assigned_competitor_price_lists
+from .references.types import canonical_branch_id
 from .regions import allowed_provisor_source_names_for_city_id, city_id_from_branch
 
 LIST_TYPE_FIXED_PRICE = "fixed_price"
@@ -90,6 +92,9 @@ LIST_TYPE_MAX_PRICE = "Максимальная цена"
 LIST_TYPE_MIN_MARGIN = "Минимальная наценка"
 LIST_TYPE_CRITICAL_MARGIN = "Критичка"
 LIST_TYPE_MAX_MARGIN = "Максимальная наценка"
+
+
+logger = logging.getLogger(__name__)
 
 
 # Canonical code values override the legacy label constants above. Pricing
@@ -1672,13 +1677,56 @@ def calculate_prices(
         db.add(pl)
         db.flush()
 
-    branch_id = str(region_id if region_id is not None else (pf.branch or "")).strip()
+    branch_source = pf.branch if str(pf.branch or "").strip() else region_id
+    branch_id = canonical_branch_id(branch_source)
     stock_product_ids = select(BranchStock.product_id).where(BranchStock.branch_id == branch_id)
     cost_product_ids = select(BranchCost.product_id).where(BranchCost.branch_id == branch_id)
-    reference_filter_active = bool(branch_id) and (
-        db.execute(select(BranchStock.id).where(BranchStock.branch_id == branch_id).limit(1)).scalar() is not None
-        or db.execute(select(BranchCost.id).where(BranchCost.branch_id == branch_id).limit(1)).scalar() is not None
+    products_before_filter = int(db.execute(select(func.count(Product.id))).scalar() or 0)
+    stock_rows_found = int(db.execute(select(func.count(BranchStock.id)).where(BranchStock.branch_id == branch_id)).scalar() or 0)
+    cost_rows_found = int(db.execute(select(func.count(BranchCost.id)).where(BranchCost.branch_id == branch_id)).scalar() or 0)
+    stock_product_count = int(
+        db.execute(select(func.count(func.distinct(BranchStock.product_id))).where(BranchStock.branch_id == branch_id)).scalar()
+        or 0
     )
+    cost_product_count = int(
+        db.execute(select(func.count(func.distinct(BranchCost.product_id))).where(BranchCost.branch_id == branch_id)).scalar()
+        or 0
+    )
+    all_stock_branch_ids = [str(value or "") for value in db.execute(select(BranchStock.branch_id).distinct()).scalars().all()]
+    all_cost_branch_ids = [str(value or "") for value in db.execute(select(BranchCost.branch_id).distinct()).scalars().all()]
+    missing_stock_for_branch = stock_rows_found == 0 and bool(all_stock_branch_ids)
+    missing_cost_for_branch = cost_rows_found == 0 and bool(all_cost_branch_ids)
+    reference_filter_active = bool(branch_id) and (stock_rows_found > 0 or cost_rows_found > 0)
+    references_exist_elsewhere = bool(set(all_stock_branch_ids) | set(all_cost_branch_ids))
+
+    product_stmt = select(Product)
+    if missing_stock_for_branch or missing_cost_for_branch or (not reference_filter_active and references_exist_elsewhere):
+        logger.warning(
+            "[REFERENCE_FILTER] branch_key_mismatch requested_region_id=%s price_format_id=%s price_format_code=%s "
+            "price_format_branch=%s resolved_branch_id=%s stock_rows_found=%s cost_rows_found=%s "
+            "stock_product_count=%s cost_product_count=%s products_before_filter=%s products_after_filter=%s "
+            "available_stock_branch_ids=%s available_cost_branch_ids=%s",
+            region_id,
+            pf.id,
+            pf.code,
+            pf.branch,
+            branch_id,
+            stock_rows_found,
+            cost_rows_found,
+            stock_product_count,
+            cost_product_count,
+            products_before_filter,
+            0,
+            all_stock_branch_ids,
+            all_cost_branch_ids,
+        )
+        raise ValueError(
+            "Reference branch mismatch: Stock/Cost references exist, but not all required references were found for "
+            f"price format branch '{pf.branch or ''}' (resolved branch_id='{branch_id}'). "
+            f"Available Stock branch_ids: {all_stock_branch_ids or []}; "
+            f"available Cost branch_ids: {all_cost_branch_ids or []}."
+        )
+
     if reference_filter_active:
         db.execute(
             delete(CalculatedPrice)
@@ -1688,12 +1736,25 @@ def calculate_prices(
                 | CalculatedPrice.product_id.not_in(cost_product_ids)
             )
         )
-
-    product_stmt = select(Product)
-    if reference_filter_active:
         product_stmt = product_stmt.where(Product.id.in_(stock_product_ids)).where(Product.id.in_(cost_product_ids))
 
     products = db.execute(product_stmt).scalars().all()
+    logger.info(
+        "[REFERENCE_FILTER] requested_region_id=%s price_format_id=%s price_format_code=%s price_format_branch=%s "
+        "resolved_branch_id=%s stock_rows_found=%s cost_rows_found=%s stock_product_count=%s cost_product_count=%s "
+        "products_before_filter=%s products_after_filter=%s",
+        region_id,
+        pf.id,
+        pf.code,
+        pf.branch,
+        branch_id,
+        stock_rows_found,
+        cost_rows_found,
+        stock_product_count,
+        cost_product_count,
+        products_before_filter,
+        len(products),
+    )
     if not products:
         # MVP: allow creating a price list before importing products.
         db.commit()
