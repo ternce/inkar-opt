@@ -937,6 +937,102 @@ def test_multi_price_percentile_ignores_invalid_prices_and_one_price_status():
     assert {row.status for row in rows} == {"Calculated from one price"}
 
 
+def test_emit_percentile_matches_excel_percentile_inc_customer_example():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, code="000000000001004334", cost=100)
+    product.provisor_goods_id = 55562
+    price_list = CompetitorPriceList(
+        price_format_id=pf.id,
+        source_type="provisor",
+        source_key="emit:1108",
+        display_name="Emit International 1108",
+        supplier="Emit International 1108",
+        branch_name="Emit International 1108",
+        competitor_name="Emit International 1108",
+    )
+    db.add(price_list)
+    db.flush()
+    db.add(
+        PriceFormatCompetitorAssignment(
+            price_format_id=pf.id,
+            competitor_price_list_id=price_list.id,
+            is_active=True,
+            percentile_mode=MULTI_PRICE_PERCENTILE_MODE,
+        )
+    )
+    prices = [
+        1437.32,
+        1437.8,
+        1448.97,
+        1525.19,
+        1631.64,
+        1412.37,
+        1466.65,
+        1481.63,
+        1448.82,
+        1444.96,
+        1437.39,
+        1426.42,
+        1468.7,
+        1412.43,
+        1445.08,
+        1430.61,
+        1431.54,
+        1443.02,
+        1432.06,
+        1437.95,
+        1441.98,
+        1447.2,
+        1468.04,
+        1436.83,
+        1444.93,
+        1438.76,
+        1441.76,
+        1503.08,
+        1428.2,
+        1436.13,
+        1428.81,
+        1464.88,
+        1409.33,
+        1454.94,
+        1480.1,
+        1435.69,
+        1438.23,
+    ]
+    for price in prices:
+        db.add(
+            CompetitorPriceListItem(
+                price_list_id=price_list.id,
+                product_id=product.id,
+                provisor_goods_id=product.provisor_goods_id,
+                distributor_price=price,
+            )
+        )
+    db.flush()
+
+    recalculate_competitor_percentiles(db=db, price_format_id=pf.id)
+
+    rows = (
+        db.query(CompetitorPricePercentile)
+        .filter(CompetitorPricePercentile.price_format_id == pf.id)
+        .filter(CompetitorPricePercentile.product_id == product.id)
+        .filter(CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
+        .filter(CompetitorPricePercentile.branch_name == "Emit International 1108")
+        .filter(CompetitorPricePercentile.competitor_name == "Emit International 1108")
+        .all()
+    )
+    by_percentile = {row.percentile: row for row in rows}
+
+    assert by_percentile[10].price_count == 37
+    assert by_percentile[10].used_price_count == 37
+    assert round(float(by_percentile[10].value), 3) == 1427.488
+    assert round(float(by_percentile[20].value), 3) == 1431.644
+    assert round(float(by_percentile[30].value), 3) == 1436.690
+    assert round(float(by_percentile[40].value), 3) == 1437.860
+    assert round(float(by_percentile[60].value), 3) == 1444.948
+
+
 def test_emit_percentile_coverage_counts_all_matched_positive_products():
     db = _session()
     pf = _format(db)

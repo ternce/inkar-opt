@@ -26,6 +26,7 @@ from ...competitor_percentiles import (
     PERCENTILES,
     REGIONAL_SCOPE,
     emit_percentile_group_keys,
+    percentile_inc_linear,
 )
 from ...competitor_source_config import MULTI_PRICE_PERCENTILE_MODE, effective_percentile_mode
 
@@ -124,19 +125,6 @@ def _as_decimal(value: object) -> Decimal | None:
 def _positive_decimal(value: object) -> Decimal | None:
     dec = _as_decimal(value)
     return dec if dec is not None and dec > 0 else None
-
-
-def _percentile(values: list[Decimal], percentile: int) -> Decimal | None:
-    if not values:
-        return None
-    if len(values) == 1:
-        return values[0]
-    ordered = sorted(values)
-    pos = (Decimal(percentile) / Decimal(100)) * Decimal(len(ordered) - 1)
-    lower = int(pos)
-    upper = min(lower + 1, len(ordered) - 1)
-    fraction = pos - Decimal(lower)
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
 
 def _get_price_format(db: Session, price_format_code: str) -> PriceFormat | None:
@@ -514,7 +502,7 @@ def percentile_trace(
     sorted_values = sorted(values)
     percentiles = {
         str(percentile): (float(value) if value is not None else None)
-        for percentile, value in ((pct, _percentile(sorted_values, pct)) for pct in PERCENTILES)
+        for percentile, value in ((pct, percentile_inc_linear(sorted_values, pct)) for pct in PERCENTILES)
     }
     item_prices_in_db = [
         float(price)

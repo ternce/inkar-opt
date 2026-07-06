@@ -39,15 +39,31 @@ def _as_decimal(value: object) -> Decimal | None:
     return dec if dec > 0 else None
 
 
-def _percentile(values: list[Decimal], percentile: int) -> Decimal:
-    if len(values) == 1:
-        return values[0]
+def percentile_inc_linear(values: list[Decimal], percentile: int) -> Decimal | None:
+    """Excel PERCENTILE/PERCENTILE.INC compatible linear interpolation.
+
+    `percentile` is passed as 10, 20, ... and converted to k=0.10, 0.20, ...
+    before applying the inclusive `(n - 1) * k` rank used by Excel and NumPy's
+    default `method="linear"`.
+    """
+    if not values:
+        return None
     ordered = sorted(values)
-    pos = (Decimal(percentile) / Decimal(100)) * Decimal(len(ordered) - 1)
+    if len(ordered) == 1:
+        return ordered[0]
+    k = Decimal(percentile) / Decimal(100)
+    pos = k * Decimal(len(ordered) - 1)
     lower = int(pos)
     upper = min(lower + 1, len(ordered) - 1)
     fraction = pos - Decimal(lower)
     return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def _percentile(values: list[Decimal], percentile: int) -> Decimal:
+    value = percentile_inc_linear(values, percentile)
+    if value is None:
+        raise ValueError("percentile requires at least one value")
+    return value
 
 
 def _branch_name(price_list: CompetitorPriceList) -> str:
