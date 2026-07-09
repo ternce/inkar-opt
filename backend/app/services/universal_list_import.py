@@ -22,6 +22,7 @@ SUPPORTED_LIST_TYPES = {"critical", "markup", "exclusion"}
 UNIVERSAL_MARKUP_TYPES = {"critical_markup", "min_markup", "max_markup", "fixed_markup", "markup", "percentile_override"}
 UNIVERSAL_FIXED_PRICE_TYPES = {"fixed_price", "min_price", "max_price"}
 UNIVERSAL_EXCLUSION_TYPES = {"exclusion", "exclude_from_pricing", "no_bend"}
+CRITICAL_MARKUP_NO_OVERRIDE = "-"
 UNIVERSAL_TYPE_LABELS = {
     "фиксированная цена": "fixed_price",
     "минимальная цена": "min_price",
@@ -151,6 +152,7 @@ class ParsedListItem:
 class ParsedUniversalListItem:
     product: Product
     value: Decimal
+    special_value: str
     source_row: int
     source_identifier: str
 
@@ -337,6 +339,19 @@ def _normalize_universal_value(list_type: str, raw_value: object) -> tuple[Decim
 
 def normalize_universal_list_value(list_type: str, raw_value: object) -> tuple[Decimal | None, str | None]:
     return _normalize_universal_value(list_type, raw_value)
+
+
+def normalize_universal_list_item_value(
+    list_type: str, raw_value: object
+) -> tuple[Decimal | None, str, str | None]:
+    normalized_type = str(list_type or "").strip().casefold()
+    normalized_type = UNIVERSAL_TYPE_LABELS.get(normalized_type, normalized_type)
+    if normalized_type == "critical_markup" and _cell_text(raw_value) == CRITICAL_MARKUP_NO_OVERRIDE:
+        # The numeric column remains populated only for storage compatibility;
+        # special_value is the authoritative domain value.
+        return Decimal("0"), CRITICAL_MARKUP_NO_OVERRIDE, None
+    value, error = _normalize_universal_value(list_type, raw_value)
+    return value, "", error
 
 
 def _summary(total_rows: int = 0) -> dict[str, int]:
@@ -548,7 +563,9 @@ def import_universal_list_excel(
             continue
 
         raw_value = row[value_idx] if value_idx is not None and value_idx < len(row) else None
-        value, error = _normalize_universal_value(str(universal_list.type or ""), raw_value)
+        value, special_value, error = normalize_universal_list_item_value(
+            str(universal_list.type or ""), raw_value
+        )
         if error or value is None:
             summary["invalid_rows"] += 1
             summary["errors"] += 1
@@ -576,6 +593,7 @@ def import_universal_list_excel(
         items_by_product[product.id] = ParsedUniversalListItem(
             product=product,
             value=value,
+            special_value=special_value,
             source_row=excel_row_number,
             source_identifier=identifier,
         )
@@ -599,8 +617,16 @@ def import_universal_list_excel(
             ).scalars().first()
             if existing:
                 existing.value = item.value
+                existing.special_value = item.special_value
             else:
-                db.add(ListItem(universal_list_id=universal_list.id, product_id=item.product.id, value=item.value))
+                db.add(
+                    ListItem(
+                        universal_list_id=universal_list.id,
+                        product_id=item.product.id,
+                        value=item.value,
+                        special_value=item.special_value,
+                    )
+                )
         db.commit()
     except SQLAlchemyError:
         db.rollback()

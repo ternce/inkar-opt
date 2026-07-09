@@ -1560,6 +1560,42 @@ def test_critical_markup_applies_when_competitors_exist_but_fail_mdc():
     assert len(debug["rejected_competitors"]) == 1
 
 
+def test_critical_markup_dash_prices_exactly_as_if_override_were_absent():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, cost=100)
+    _competitor(db, pf, product, "manual:competitor", 150)
+
+    expected_price, expected_debug = calculate_price_for_product(
+        db=db, product=product, price_format=pf, as_of=date.today()
+    )
+
+    critical_list = _list_item(db, product, "critical_markup", 0, pf=pf)
+    item = db.query(ListItem).filter(
+        ListItem.universal_list_id == critical_list.id
+    ).one()
+    item.special_value = "-"
+    db.flush()
+
+    actual_price, actual_debug = calculate_price_for_product(
+        db=db, product=product, price_format=pf, as_of=date.today()
+    )
+
+    assert actual_price == expected_price
+    for key in (
+        "reason",
+        "final_price",
+        "mdc_price",
+        "mdc_markup_percent",
+        "chosen_competitor_price",
+        "competitor_candidate_price",
+        "applied_rule_type",
+        "applied_rule_value",
+        "applied_list_ids",
+    ):
+        assert actual_debug.get(key) == expected_debug.get(key)
+
+
 @pytest.mark.parametrize("raw_cost", [None, "", "not-a-number", 0, -10])
 def test_missing_or_invalid_cost_blocks_price_calculation(raw_cost):
     db = _session()

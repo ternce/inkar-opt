@@ -477,6 +477,68 @@ def test_lists_management_import_excel_adds_items_to_existing_list():
     assert card["itemsCount"] == 2
     values = {item["sku"]: item["value"] for item in card["items"]}
     assert values == {"12345": 20.0, "A-77": 30.0}
+
+
+def test_critical_markup_manual_save_accepts_dash_and_keeps_empty_invalid():
+    client, Session = _client()
+    _seed_products(Session)
+    created = client.post(
+        "/api/lists-management",
+        json={"name": "Critical", "type": "critical_markup", "active": True},
+    )
+    list_id = created.json()["id"]
+
+    saved = client.post(
+        f"/api/lists-management/{list_id}/items",
+        json={"sku": "12345", "value": "-"},
+    )
+    assert saved.status_code == 200
+    card = client.get(f"/api/lists-management/{list_id}").json()
+    assert card["items"][0]["value"] == "-"
+    assert card["items"][0]["valueDisplay"] == "-"
+
+    numeric = client.post(
+        f"/api/lists-management/{list_id}/items",
+        json={"sku": "12345", "value": "7.5"},
+    )
+    assert numeric.status_code == 200
+    assert client.get(f"/api/lists-management/{list_id}").json()["items"][0]["value"] == 7.5
+
+    empty = client.post(
+        f"/api/lists-management/{list_id}/items",
+        json={"sku": "A-77", "value": ""},
+    )
+    assert empty.status_code == 400
+
+
+def test_critical_markup_excel_import_accepts_dash():
+    client, Session = _client()
+    _seed_products(Session)
+    created = client.post(
+        "/api/lists-management",
+        json={"name": "Critical", "type": "critical_markup", "active": True},
+    )
+    list_id = created.json()["id"]
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "critical.xlsx",
+                _xlsx([["SKU", "Value"], ["12345", "-"], ["A-77", 5]]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["summary"]["processed"] == 2
+    assert response.json()["summary"]["invalid_rows"] == 0
+    values = {
+        item["sku"]: item["value"]
+        for item in client.get(f"/api/lists-management/{list_id}").json()["items"]
+    }
+    assert values == {"12345": "-", "A-77": 5.0}
     db = Session()
     try:
         assert db.scalar(select(func.count(BusinessList.id))) == 0

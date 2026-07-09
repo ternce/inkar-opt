@@ -70,6 +70,9 @@ def init_db() -> None:
 def _ensure_compatible_columns() -> None:
     """Small create_all companion for existing SQLite/Postgres databases."""
     additions = {
+        "list_items": [
+            ("special_value", "TEXT DEFAULT ''"),
+        ],
         "price_formats": [
             ("competitor_price_mode", "VARCHAR(32) DEFAULT 'regular'"),
             ("percentile_number", "INTEGER DEFAULT 10"),

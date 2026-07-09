@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 
-from sqlalchemy import select, delete, func
+from sqlalchemy import select, delete, func, or_
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -699,13 +699,18 @@ def _find_item_match(
     if not list_ids:
         return None
 
-    rows = db.execute(
+    stmt = (
         select(ListItem)
         .where(ListItem.universal_list_id.in_(list_ids))
         .where(ListItem.product_id == product_id)
         .order_by(ListItem.universal_list_id.asc(), ListItem.id.asc())
         .limit(2)
-    ).scalars().all()
+    )
+    if list_type == LIST_TYPE_CRITICAL_MARKUP:
+        stmt = stmt.where(
+            or_(ListItem.special_value.is_(None), ListItem.special_value != "-")
+        )
+    rows = db.execute(stmt).scalars().all()
 
     if not rows:
         return None

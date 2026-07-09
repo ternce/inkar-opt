@@ -609,6 +609,10 @@ class ListItem(Base):
     # - гос цена: government price
     # - фикс наценка: fixed markup percent (0.50 == 50%)
     value: Mapped[float] = mapped_column(Numeric(18, 6))
+    # Some list types support an explicit non-numeric domain value.  Keep it
+    # separate from the numeric value so it can never be confused with NULL or
+    # zero (currently used by Critical Markup for the literal "-").
+    special_value: Mapped[str] = mapped_column(Text, default="", server_default="")
 
     __table_args__ = (
         UniqueConstraint("universal_list_id", "product_id", name="uq_list_items_list_product"),

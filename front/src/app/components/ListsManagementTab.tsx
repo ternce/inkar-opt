@@ -38,7 +38,7 @@ type ListCard = ListRow & {
     sku: string;
     name: string;
     manufacturer: string;
-    value: number | null;
+    value: number | '-' | null;
     comment: string;
   }>;
 };

@@ -157,6 +157,7 @@ from .services.universal_list_import import (
     is_exclude_from_pricing_type,
     max_upload_size_bytes,
     normalize_universal_list_value,
+    normalize_universal_list_item_value,
     parse_list_decimal,
 )
 from .timezone import local_display, local_iso, now_kz_naive
@@ -2287,7 +2288,9 @@ def _list_type_label(value: str | None) -> str:
     return LIST_TYPE_LABELS.get(code, value or "")
 
 
-def _format_list_item_value(list_type: str | None, value: object) -> str:
+def _format_list_item_value(list_type: str | None, value: object, special_value: str = "") -> str:
+    if _list_type_code(list_type) == "critical_markup" and special_value == "-":
+        return "-"
     if value is None:
         return ""
     try:
@@ -2552,8 +2555,8 @@ def get_lists_management_card(list_id: int, db: Session = Depends(get_db)):
             "sku": p.code,
             "name": p.name,
             "manufacturer": extra.manufacturer if extra else "",
-            "value": float(item.value) if item.value is not None else None,
-            "valueDisplay": _format_list_item_value(ul.type, item.value),
+            "value": "-" if item.special_value == "-" else (float(item.value) if item.value is not None else None),
+            "valueDisplay": _format_list_item_value(ul.type, item.value, item.special_value),
             "comment": "",
         }
         for item, p, extra in items
@@ -2626,7 +2629,14 @@ def copy_lists_management(list_id: int, db: Session = Depends(get_db)):
     for link in db.execute(select(UniversalListPriceFormat).where(UniversalListPriceFormat.universal_list_id == ul.id)).scalars().all():
         db.add(UniversalListPriceFormat(universal_list_id=copied.id, price_format_id=link.price_format_id))
     for item in db.execute(select(ListItem).where(ListItem.universal_list_id == ul.id)).scalars().all():
-        db.add(ListItem(universal_list_id=copied.id, product_id=item.product_id, value=item.value))
+        db.add(
+            ListItem(
+                universal_list_id=copied.id,
+                product_id=item.product_id,
+                value=item.value,
+                special_value=item.special_value,
+            )
+        )
     db.commit()
     return {"id": copied.id}
 
@@ -2641,10 +2651,13 @@ def upsert_lists_management_item(list_id: int, payload: dict = Body(...), db: Se
     if not product:
         raise HTTPException(status_code=404, detail="product not found")
     raw_value = payload.get("value")
-    if is_exclude_from_pricing_type(str(ul.type or "")):
+    if _list_type_code(ul.type) == "critical_markup" and str(raw_value or "").strip() == "-":
+        value, special_value, value_error = Decimal("0"), "-", None
+    elif is_exclude_from_pricing_type(str(ul.type or "")):
         value, value_error = normalize_universal_list_value(str(ul.type or ""), raw_value)
+        special_value = ""
     else:
-        value, value_error = parse_list_decimal(raw_value), None
+        value, special_value, value_error = parse_list_decimal(raw_value), "", None
     if value is None:
         raise HTTPException(status_code=400, detail=value_error or "invalid numeric value")
     item = db.execute(
@@ -2652,8 +2665,16 @@ def upsert_lists_management_item(list_id: int, payload: dict = Body(...), db: Se
     ).scalars().first()
     if item:
         item.value = value
+        item.special_value = special_value
     else:
-        db.add(ListItem(universal_list_id=ul.id, product_id=product.id, value=value))
+        db.add(
+            ListItem(
+                universal_list_id=ul.id,
+                product_id=product.id,
+                value=value,
+                special_value=special_value,
+            )
+        )
     db.commit()
     return {"status": "ok"}
 
@@ -2679,10 +2700,13 @@ async def import_lists_management_items(list_id: int, file: UploadFile = File(..
         if not product:
             continue
         raw_value = row[value_idx] if value_idx is not None and value_idx < len(row) else None
-        if exclusion_by_presence:
+        if _list_type_code(ul.type) == "critical_markup" and str(raw_value or "").strip() == "-":
+            value, special_value = Decimal("0"), "-"
+        elif exclusion_by_presence:
             value, _value_error = normalize_universal_list_value(str(ul.type or ""), raw_value)
+            special_value = ""
         else:
-            value = parse_list_decimal(raw_value)
+            value, special_value = parse_list_decimal(raw_value), ""
         if value is None:
             continue
         item = db.execute(
@@ -2690,8 +2714,16 @@ async def import_lists_management_items(list_id: int, file: UploadFile = File(..
         ).scalars().first()
         if item:
             item.value = value
+            item.special_value = special_value
         else:
-            db.add(ListItem(universal_list_id=ul.id, product_id=product.id, value=value))
+            db.add(
+                ListItem(
+                    universal_list_id=ul.id,
+                    product_id=product.id,
+                    value=value,
+                    special_value=special_value,
+                )
+            )
         imported += 1
     db.commit()
     return {"status": "ok", "imported": imported}
