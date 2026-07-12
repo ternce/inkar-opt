@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import sys
+import types
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -14,6 +18,7 @@ from backend.app.models import (
     PriceFormatCompetitorAssignment,
     PriceSourceAccount,
     RefreshJob,
+    RefreshLock,
 )
 from backend.app.services import provisor_auto_refresh as svc
 
@@ -82,6 +87,122 @@ def test_lock_prevents_overlapping_refresh_jobs():
     assert second_blocker.id == first.id
 
 
+def test_global_refresh_lock_allows_only_one_owner(tmp_path):
+    Session = _session_factory(tmp_path / "global-lock.db")
+
+    def acquire(source: str):
+        db = Session()
+        try:
+            token = svc.new_owner_token()
+            return svc.try_acquire_global_refresh_lock(db, owner_token=token, source=source, requested_by="test"), token
+        finally:
+            db.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda source: acquire(source), ["emit", "provisor"]))
+
+    assert sum(1 for acquired, _token in results if acquired) == 1
+
+
+def test_global_refresh_lock_released_after_finish():
+    db = _session()
+    job, _, token = svc.try_create_refresh_job(db, mode="selected", requested_by="test")
+    assert job is not None and token is not None
+    svc.start_job(db, job, total_accounts=1, total_plk=1, metadata={}, owner_token=token)
+
+    assert svc.finish_job(db, job, status="success", message="done", owner_token=token, release_refresh=True, release_global=True)
+
+    next_token = svc.new_owner_token()
+    assert svc.try_acquire_global_refresh_lock(db, owner_token=next_token, source="emit", requested_by="test") is True
+
+
+def test_generic_refresh_mutex_released_after_exception(monkeypatch, tmp_path):
+    import backend.app.main as main
+
+    Session = _session_factory(tmp_path / "generic-wrapper-failure.db")
+    with Session() as db:
+        token = svc.new_owner_token()
+        assert svc.try_acquire_global_refresh_lock(db, owner_token=token, source="provisor", requested_by="test") is True
+        job = main.create_job(db=db, job_type="refresh_price_lists:provisor", format_code="FMT", message="test")
+
+        async def fail_refresh(*_args, **_kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(main, "_run_refresh_price_lists_job", fail_refresh)
+        try:
+            asyncio.run(
+                main._run_refresh_price_lists_job_with_mutex(
+                    db,
+                    job,
+                    format_code="FMT",
+                    payload={"source": "provisor"},
+                    global_owner_token=token,
+                )
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("Expected wrapped refresh failure")
+
+        next_token = svc.new_owner_token()
+        assert svc.try_acquire_global_refresh_lock(db, owner_token=next_token, source="emit", requested_by="test") is True
+
+
+def test_scheduler_provisor_skips_when_emit_job_active(monkeypatch, tmp_path):
+    import backend.app.main as main
+
+    Session = _session_factory(tmp_path / "scheduler-skip.db")
+    with Session() as db:
+        db.add(
+            RefreshJob(
+                source_type="emit",
+                mode="selected",
+                status="running",
+                started_at=datetime.utcnow(),
+                heartbeat_at=datetime.utcnow(),
+                requested_by="test",
+            )
+        )
+        db.commit()
+
+    monkeypatch.setattr(main, "SessionLocal", Session)
+    asyncio.run(main._start_provisor_refresh_background(mode="selected", requested_by="scheduler"))
+
+    with Session() as db:
+        rows = db.query(RefreshJob).filter(RefreshJob.source_type == "provisor").all()
+        assert len(rows) == 1
+        assert rows[0].status == "skipped"
+        assert "Emit refresh is currently running" in rows[0].message
+
+
+def test_manual_provisor_returns_409_when_emit_active(monkeypatch, tmp_path):
+    import backend.app.main as main
+
+    Session = _session_factory(tmp_path / "manual-provisor-conflict.db")
+    with Session() as db:
+        db.add(
+            RefreshJob(
+                source_type="emit",
+                mode="selected",
+                status="running",
+                started_at=datetime.utcnow(),
+                heartbeat_at=datetime.utcnow(),
+                requested_by="test",
+            )
+        )
+        db.commit()
+
+    monkeypatch.setattr(main, "SessionLocal", Session)
+    main.app.dependency_overrides[main.get_db] = lambda: Session()
+    try:
+        client = TestClient(main.app)
+        response = client.post("/api/price-sources/refresh/provisor/auto/run-now", json={"mode": "selected"})
+        assert response.status_code == 409
+        assert "Emit refresh is currently running" in response.json()["detail"]
+    finally:
+        main.app.dependency_overrides.clear()
+
+
 def test_concurrent_run_now_style_creation_only_creates_one_job(tmp_path):
     Session = _session_factory(tmp_path / "locks.db")
 
@@ -130,6 +251,188 @@ def test_multiple_scheduler_ownership_only_one_wins(tmp_path):
     finally:
         db1.close()
         db2.close()
+
+
+def test_emit_scheduler_lease_allows_only_one_owner(tmp_path):
+    Session = _session_factory(tmp_path / "emit-scheduler.db")
+    db1 = Session()
+    db2 = Session()
+    try:
+        token1 = svc.new_owner_token()
+        token2 = svc.new_owner_token()
+
+        assert svc.try_acquire_emit_scheduler_lock(db1, owner_token=token1) is True
+        assert svc.try_acquire_emit_scheduler_lock(db2, owner_token=token2) is False
+    finally:
+        db1.close()
+        db2.close()
+
+
+def test_expired_emit_scheduler_lease_can_be_reacquired(tmp_path):
+    Session = _session_factory(tmp_path / "emit-scheduler-expired.db")
+    with Session() as db:
+        token1 = svc.new_owner_token()
+        assert svc.try_acquire_emit_scheduler_lock(db, owner_token=token1) is True
+        lock = db.get(RefreshLock, svc.EMIT_SCHEDULER_LOCK_NAME)
+        assert lock is not None
+        lock.lease_until = datetime.utcnow() - timedelta(seconds=1)
+        db.commit()
+
+    with Session() as db:
+        token2 = svc.new_owner_token()
+        assert svc.try_acquire_emit_scheduler_lock(db, owner_token=token2) is True
+        lock = db.get(RefreshLock, svc.EMIT_SCHEDULER_LOCK_NAME)
+        assert lock is not None
+        db.refresh(lock)
+        assert lock.owner_token == token2
+
+
+def test_emit_scheduler_lease_renewal_keeps_ownership(tmp_path):
+    Session = _session_factory(tmp_path / "emit-scheduler-renew.db")
+    with Session() as db:
+        token1 = svc.new_owner_token()
+        token2 = svc.new_owner_token()
+
+        assert svc.try_acquire_emit_scheduler_lock(db, owner_token=token1) is True
+        assert svc.renew_emit_scheduler_lock(db, owner_token=token1) is True
+        assert svc.try_acquire_emit_scheduler_lock(db, owner_token=token2) is False
+
+        lock = db.get(RefreshLock, svc.EMIT_SCHEDULER_LOCK_NAME)
+        assert lock is not None
+        assert lock.owner_token == token1
+        assert lock.lease_until > datetime.utcnow()
+
+
+def test_concurrent_emit_scheduler_acquisition_only_one_wins(tmp_path):
+    Session = _session_factory(tmp_path / "emit-scheduler-concurrent.db")
+
+    def acquire():
+        db = Session()
+        try:
+            return svc.try_acquire_emit_scheduler_lock(db, owner_token=svc.new_owner_token())
+        finally:
+            db.close()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: acquire(), range(8)))
+
+    assert sum(1 for acquired in results if acquired) == 1
+
+
+class _FakeEmitConfig:
+    enabled = True
+    cron = "0 3 * * *"
+    timezone = "UTC"
+
+
+class _FakeScheduler:
+    instances: list["_FakeScheduler"] = []
+
+    def __init__(self, timezone):
+        self.timezone = timezone
+        self.jobs = []
+        self.started = False
+        self.shutdown_calls: list[bool] = []
+        self.__class__.instances.append(self)
+
+    def add_job(self, *args, **kwargs):
+        self.jobs.append((args, kwargs))
+
+    def start(self):
+        self.started = True
+
+    def shutdown(self, wait=False):
+        self.shutdown_calls.append(wait)
+
+
+class _FakeTask:
+    def __init__(self):
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+
+def _install_fake_emit_scheduler(monkeypatch, Session):
+    import backend.app.main as main
+
+    def fake_create_task(coro):
+        if hasattr(coro, "close"):
+            coro.close()
+        return _FakeTask()
+
+    scheduler_module = types.ModuleType("apscheduler.schedulers.asyncio")
+    scheduler_module.AsyncIOScheduler = _FakeScheduler
+    trigger_module = types.ModuleType("apscheduler.triggers.cron")
+    trigger_module.CronTrigger = types.SimpleNamespace(from_crontab=lambda cron: ("cron", cron))
+
+    _FakeScheduler.instances = []
+    monkeypatch.setitem(sys.modules, "apscheduler.schedulers.asyncio", scheduler_module)
+    monkeypatch.setitem(sys.modules, "apscheduler.triggers.cron", trigger_module)
+    monkeypatch.setattr(main, "SessionLocal", Session)
+    monkeypatch.setattr(main.EmitConfig, "from_settings", staticmethod(lambda _settings: _FakeEmitConfig()))
+    monkeypatch.setattr(main.asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(main, "_emit_refresh_scheduler", None)
+    monkeypatch.setattr(main, "_emit_refresh_scheduler_token", None)
+    monkeypatch.setattr(main, "_emit_refresh_scheduler_renew_task", None)
+    return main
+
+
+def test_emit_scheduler_registers_job_only_when_lease_owned(monkeypatch, tmp_path):
+    Session = _session_factory(tmp_path / "emit-scheduler-start.db")
+    main = _install_fake_emit_scheduler(monkeypatch, Session)
+
+    main._start_emit_refresh_scheduler()
+
+    assert len(_FakeScheduler.instances) == 1
+    scheduler = _FakeScheduler.instances[0]
+    assert scheduler.started is True
+    assert scheduler.timezone == "UTC"
+    assert len(scheduler.jobs) == 1
+    assert scheduler.jobs[0][1]["id"] == "emit_refresh"
+    assert main._emit_refresh_scheduler is scheduler
+    assert main._emit_refresh_scheduler_token is not None
+
+
+def test_emit_scheduler_does_not_register_without_lease(monkeypatch, tmp_path):
+    Session = _session_factory(tmp_path / "emit-scheduler-denied.db")
+    with Session() as db:
+        assert svc.try_acquire_emit_scheduler_lock(db, owner_token="other-owner") is True
+    main = _install_fake_emit_scheduler(monkeypatch, Session)
+
+    main._start_emit_refresh_scheduler()
+
+    assert _FakeScheduler.instances == []
+    assert main._emit_refresh_scheduler is None
+    assert main._emit_refresh_scheduler_token is None
+
+
+def test_emit_scheduler_does_not_duplicate_jobs(monkeypatch, tmp_path):
+    Session = _session_factory(tmp_path / "emit-scheduler-duplicate.db")
+    main = _install_fake_emit_scheduler(monkeypatch, Session)
+
+    main._start_emit_refresh_scheduler()
+    main._start_emit_refresh_scheduler()
+
+    assert len(_FakeScheduler.instances) == 1
+    assert len(_FakeScheduler.instances[0].jobs) == 1
+
+
+def test_emit_scheduler_starts_after_previous_owner_expires(monkeypatch, tmp_path):
+    Session = _session_factory(tmp_path / "emit-scheduler-expired-start.db")
+    with Session() as db:
+        assert svc.try_acquire_emit_scheduler_lock(db, owner_token="old-owner") is True
+        lock = db.get(RefreshLock, svc.EMIT_SCHEDULER_LOCK_NAME)
+        assert lock is not None
+        lock.lease_until = datetime.utcnow() - timedelta(seconds=1)
+        db.commit()
+    main = _install_fake_emit_scheduler(monkeypatch, Session)
+
+    main._start_emit_refresh_scheduler()
+
+    assert len(_FakeScheduler.instances) == 1
+    assert main._emit_refresh_scheduler_token is not None
+    assert main._emit_refresh_scheduler_token != "old-owner"
 
 
 def test_status_endpoint_shape_for_running_job():

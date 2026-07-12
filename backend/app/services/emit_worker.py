@@ -18,7 +18,7 @@ from typing import Any, Iterable
 
 import httpx
 from openpyxl import load_workbook
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..config import Settings
@@ -34,8 +34,11 @@ from .provisor_auto_refresh import (
     job_owner_token,
     new_owner_token,
     refresh_job_to_status,
+    release_global_refresh_lock,
     release_lock,
+    renew_global_refresh_lock,
     renew_lock,
+    try_acquire_global_refresh_lock,
     try_acquire_lock,
 )
 
@@ -44,6 +47,8 @@ logger = logging.getLogger(__name__)
 SOURCE_TYPE = "emit"
 COMPAT_SOURCE_TYPE = "provisor"
 LOCK_NAME = "emit_refresh"
+ACTIVE_STATUSES = ("pending", "downloading", "parsing", "normalizing", "saving", "running")
+DEFAULT_STALE_TIMEOUT_SECONDS = 14_400
 EMIT_NAME_MARKERS = (
     "emit",
     "amity",
@@ -55,6 +60,7 @@ EMIT_NAME_MARKERS = (
 )
 MIN_FINAL_ROWS = 1
 DEFAULT_TRACE_SKU = "163571"
+_emit_stale_recovery_before_mark_hook = None
 
 
 @dataclass
@@ -71,6 +77,7 @@ class EmitConfig:
     max_concurrent_filials: int = 1
     min_final_rows: int = 100
     min_row_ratio: float = 0.5
+    stale_timeout_seconds: int = DEFAULT_STALE_TIMEOUT_SECONDS
     cron: str = "0 3 * * *"
     timezone: str = "Asia/Qyzylorda"
     provisor_base_url: str = "https://api.provisor.kz"
@@ -92,6 +99,7 @@ class EmitConfig:
             max_concurrent_filials=settings.emit_max_concurrent_filials,
             min_final_rows=settings.emit_min_final_rows,
             min_row_ratio=settings.emit_min_row_ratio,
+            stale_timeout_seconds=settings.emit_refresh_stale_timeout_seconds,
             cron=settings.emit_cron,
             timezone=settings.emit_timezone,
             provisor_base_url=settings.provisor_base_url,
@@ -1372,12 +1380,151 @@ def _create_emit_job(
     return job
 
 
-def active_emit_job(db: Session) -> RefreshJob | None:
+def _emit_stale_timeout_seconds(config: EmitConfig | None = None) -> int:
+    if config is not None:
+        return max(1, int(config.stale_timeout_seconds or DEFAULT_STALE_TIMEOUT_SECONDS))
+    raw = os.getenv("EMIT_REFRESH_STALE_TIMEOUT_SECONDS")
+    if raw is not None:
+        try:
+            return max(1, int(raw))
+        except Exception:
+            return DEFAULT_STALE_TIMEOUT_SECONDS
+    return DEFAULT_STALE_TIMEOUT_SECONDS
+
+
+def _collect_emit_temp_paths(metadata: dict[str, Any]) -> list[str]:
+    paths: list[str] = []
+    for key in ("temp_file_path", "staging_file_path", "stage_db_path"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            paths.append(value.strip())
+    for item in metadata.get("filials") or []:
+        if not isinstance(item, dict):
+            continue
+        for key in ("temp_file_path", "staging_file_path", "stage_db_path"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                paths.append(value.strip())
+    return list(dict.fromkeys(paths))
+
+
+def cleanup_stale_emit_temp_files(config: EmitConfig, metadata: dict[str, Any]) -> dict[str, Any]:
+    temp_dir = Path(config.temp_dir).resolve()
+    deleted = 0
+    failed: list[str] = []
+    for raw_path in _collect_emit_temp_paths(metadata):
+        try:
+            path = Path(raw_path).resolve()
+            if path != temp_dir and temp_dir not in path.parents:
+                continue
+            candidates = [path]
+            if path.suffix == ".sqlite":
+                candidates.extend([Path(str(path) + "-wal"), Path(str(path) + "-shm")])
+            for candidate in candidates:
+                if not candidate.exists():
+                    continue
+                if not candidate.name.startswith("emit_"):
+                    continue
+                candidate.unlink()
+                deleted += 1
+        except Exception:
+            failed.append(raw_path)
+            logger.exception("[EMIT_STALE_RECOVERY] action=temp_cleanup_failed path=%s", raw_path)
+    logger.info("[EMIT_STALE_RECOVERY] action=temp_cleanup files_deleted=%s files_failed=%s", deleted, len(failed))
+    return {"files_deleted": deleted, "files_failed": failed}
+
+
+def mark_stale_emit_jobs(db: Session, *, config: EmitConfig | None = None, now: datetime | None = None) -> list[RefreshJob]:
+    now = now or datetime.utcnow()
+    timeout_seconds = _emit_stale_timeout_seconds(config)
+    stale_before = now - timedelta(seconds=timeout_seconds)
+    rows = (
+        db.execute(
+            select(RefreshJob)
+            .where(RefreshJob.source_type == SOURCE_TYPE)
+            .where(RefreshJob.status.in_(ACTIVE_STATUSES))
+            .where(RefreshJob.heartbeat_at < stale_before)
+            .order_by(RefreshJob.started_at.asc().nullsfirst(), RefreshJob.id.asc())
+        )
+        .scalars()
+        .all()
+    )
+    recovered: list[RefreshJob] = []
+    for row in rows:
+        metadata = _json_loads(row.metadata_json, {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        token = str(metadata.get("owner_token") or "")
+        old_metadata_json = row.metadata_json
+        old_heartbeat = row.heartbeat_at
+        age_seconds = int((now - old_heartbeat).total_seconds()) if old_heartbeat else timeout_seconds
+        logger.warning(
+            "[EMIT_STALE_RECOVERY] job_id=%s action=detected last_heartbeat=%s age_seconds=%s",
+            row.id,
+            old_heartbeat.isoformat() if old_heartbeat else "",
+            age_seconds,
+        )
+        metadata.update(
+            {
+                "stale_reason": "stale_timeout",
+                "recovered_at": now.isoformat(),
+                "stale_age_seconds": age_seconds,
+                "locks_released": [],
+            }
+        )
+        hook = _emit_stale_recovery_before_mark_hook
+        if callable(hook):
+            hook(row.id)
+        result = db.execute(
+            update(RefreshJob)
+            .where(RefreshJob.id == row.id)
+            .where(RefreshJob.source_type == SOURCE_TYPE)
+            .where(RefreshJob.status.in_(ACTIVE_STATUSES))
+            .where(RefreshJob.heartbeat_at == old_heartbeat)
+            .where(RefreshJob.metadata_json == old_metadata_json)
+            .values(
+                status="stale",
+                finished_at=now,
+                heartbeat_at=now,
+                message=f"Emit refresh marked stale: no heartbeat for {age_seconds} seconds.",
+                error_message=f"Emit refresh marked stale: no heartbeat for {age_seconds} seconds.",
+                metadata_json=_json_dumps(metadata),
+            )
+        )
+        if int(result.rowcount or 0) != 1:
+            db.rollback()
+            logger.info("[EMIT_STALE_RECOVERY] job_id=%s action=skip reason=race_recheck_failed", row.id)
+            continue
+        db.commit()
+        cleanup_summary = cleanup_stale_emit_temp_files(config or EmitConfig(), metadata)
+        metadata["temp_cleanup"] = cleanup_summary
+        locks_released: list[str] = []
+        if token:
+            if release_lock(db, name=LOCK_NAME, owner_token=token):
+                locks_released.append(LOCK_NAME)
+            if release_global_refresh_lock(db, owner_token=token):
+                locks_released.append("competitor_refresh_global")
+        metadata["locks_released"] = locks_released
+        db.execute(
+            update(RefreshJob)
+            .where(RefreshJob.id == row.id)
+            .where(RefreshJob.status == "stale")
+            .values(metadata_json=_json_dumps(metadata))
+        )
+        db.commit()
+        db.refresh(row)
+        logger.warning("[EMIT_STALE_RECOVERY] job_id=%s action=marked_stale locks_released=%s", row.id, locks_released)
+        recovered.append(row)
+    return recovered
+
+
+def active_emit_job(db: Session, *, config: EmitConfig | None = None) -> RefreshJob | None:
+    mark_stale_emit_jobs(db, config=config)
     return (
         db.execute(
             select(RefreshJob)
             .where(RefreshJob.source_type == SOURCE_TYPE)
-            .where(RefreshJob.status.in_(("pending", "downloading", "parsing", "normalizing", "saving", "running", "stale")))
+            .where(RefreshJob.status.in_(ACTIVE_STATUSES))
             .order_by(RefreshJob.started_at.desc().nullslast(), RefreshJob.id.desc())
         )
         .scalars()
@@ -1385,8 +1532,8 @@ def active_emit_job(db: Session) -> RefreshJob | None:
     )
 
 
-def latest_emit_job(db: Session) -> RefreshJob | None:
-    active = active_emit_job(db)
+def latest_emit_job(db: Session, *, config: EmitConfig | None = None) -> RefreshJob | None:
+    active = active_emit_job(db, config=config)
     if active is not None:
         return active
     return (
@@ -1413,13 +1560,19 @@ def emit_job_to_dict(job: RefreshJob | None) -> dict[str, Any]:
                 "final_rows_saved": meta.get("final_rows_saved", 0),
                 "duplicates_removed": meta.get("duplicate_rows_removed", 0),
                 "temp_file_path": meta.get("temp_file_path", ""),
+                "stale_reason": meta.get("stale_reason", ""),
+                "recovered_at": meta.get("recovered_at", ""),
+                "stale_age_seconds": meta.get("stale_age_seconds", 0),
+                "locks_released": meta.get("locks_released", []),
+                "temp_cleanup": meta.get("temp_cleanup", {}),
                 "metadata": {k: v for k, v in meta.items() if k != "owner_token"},
             }
         )
     return base
 
 
-def list_emit_jobs(db: Session, *, limit: int = 50) -> list[dict[str, Any]]:
+def list_emit_jobs(db: Session, *, limit: int = 50, config: EmitConfig | None = None) -> list[dict[str, Any]]:
+    mark_stale_emit_jobs(db, config=config)
     rows = (
         db.execute(select(RefreshJob).where(RefreshJob.source_type == SOURCE_TYPE).order_by(RefreshJob.id.desc()).limit(limit))
         .scalars()
@@ -1544,8 +1697,14 @@ def _recalculate_percentiles_for_emit_rows(
 
 def update_emit_job(db: Session, job: RefreshJob, *, status: str, message: str, metadata: dict[str, Any] | None = None) -> None:
     token = job_owner_token(job)
+    db.expire(job)
+    if job.status not in ACTIVE_STATUSES:
+        return
     if token:
-        renew_lock(db, name=LOCK_NAME, owner_token=token, lease=REFRESH_LOCK_LEASE)
+        if not renew_global_refresh_lock(db, owner_token=token):
+            return
+        if not renew_lock(db, name=LOCK_NAME, owner_token=token, lease=REFRESH_LOCK_LEASE):
+            return
     existing = _json_loads(job.metadata_json, {})
     if not isinstance(existing, dict):
         existing = {}
@@ -1574,10 +1733,17 @@ class EmitWorker:
     ) -> tuple[RefreshJob | None, RefreshJob | None, str | None]:
         filial_ids = list(dict.fromkeys(int(x) for x in filial_ids if int(x) > 0))
         with self.session_factory() as db:
-            blocker = active_emit_job(db)
+            blocker = active_emit_job(db, config=self.config)
             if blocker is not None:
                 return None, blocker, None
             owner_token = new_owner_token()
+            if not try_acquire_global_refresh_lock(
+                db,
+                owner_token=owner_token,
+                source=SOURCE_TYPE,
+                requested_by=requested_by,
+            ):
+                return None, latest_emit_job(db), None
             if not try_acquire_lock(
                 db,
                 name=LOCK_NAME,
@@ -1586,6 +1752,7 @@ class EmitWorker:
                 lease=REFRESH_LOCK_LEASE,
                 metadata={"requested_by": requested_by},
             ):
+                release_global_refresh_lock(db, owner_token=owner_token)
                 return None, latest_emit_job(db), None
             try:
                 job = _create_emit_job(
@@ -1599,6 +1766,7 @@ class EmitWorker:
                 return job, None, owner_token
             except Exception:
                 release_lock(db, name=LOCK_NAME, owner_token=owner_token)
+                release_global_refresh_lock(db, owner_token=owner_token)
                 raise
 
     async def run_job(self, job_id: int, *, owner_token: str | None = None) -> None:
@@ -1664,10 +1832,12 @@ class EmitWorker:
                         error=error,
                         metadata=aggregate,
                         owner_token=token,
+                        allowed_statuses=set(ACTIVE_STATUSES),
                         release_refresh=False,
                     )
                     if token:
                         release_lock(db, name=LOCK_NAME, owner_token=token)
+                        release_global_refresh_lock(db, owner_token=token)
 
     async def refresh_filial(self, *, job_id: int, filial_id: int, owner_token: str | None = None) -> dict[str, Any]:
         filial_name = f"Emit International {filial_id}"

@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import time
+from datetime import datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -29,11 +30,13 @@ from backend.app.services.emit_worker import (
     EmitConfig,
     EmitStats,
     EmitWorker,
+    active_emit_job,
     cleanup_temp,
     deduplicate_emit_items,
     download_emit_filial,
     iter_stage_rows,
     is_emit_plk,
+    mark_stale_emit_jobs,
     normalize_emit_item,
     open_stage_db,
     parse_normalize_stage,
@@ -41,6 +44,7 @@ from backend.app.services.emit_worker import (
     stage_row_count,
     _recalculate_percentiles_for_emit_rows,
 )
+from backend.app.services import provisor_auto_refresh as refresh_svc
 from backend.app.services.price_sources import UnifiedPriceItem, UnifiedPriceList
 
 
@@ -849,6 +853,255 @@ def test_no_concurrent_emit_jobs():
     assert blocker is None
     assert second is None
     assert second_blocker is not None
+
+
+def test_global_refresh_lock_blocks_emit_job_start():
+    Session = _session_factory_static()
+    with Session() as db:
+        token = refresh_svc.new_owner_token()
+        assert refresh_svc.try_acquire_global_refresh_lock(db, owner_token=token, source="provisor", requested_by="test") is True
+
+    worker = EmitWorker(session_factory=Session, config=EmitConfig(temp_dir="unused"))
+    job, blocker, owner_token = worker.create_job(mode="selected", filial_ids=[1106])
+
+    assert job is None
+    assert blocker is None
+    assert owner_token is None
+
+
+def test_recent_emit_job_not_marked_stale():
+    Session = _session_factory_static()
+    with Session() as db:
+        token = refresh_svc.new_owner_token()
+        job = RefreshJob(
+            source_type="emit",
+            mode="selected",
+            status="running",
+            started_at=datetime.utcnow(),
+            heartbeat_at=datetime.utcnow(),
+            metadata_json=json.dumps({"owner_token": token}),
+        )
+        db.add(job)
+        db.commit()
+
+        recovered = mark_stale_emit_jobs(db, config=EmitConfig(stale_timeout_seconds=60))
+        db.refresh(job)
+
+        assert recovered == []
+        assert job.status == "running"
+
+
+def test_stale_emit_job_marked_and_locks_released(tmp_path):
+    Session = _session_factory_static()
+    stale_time = datetime.utcnow() - timedelta(seconds=120)
+    with Session() as db:
+        token = refresh_svc.new_owner_token()
+        assert refresh_svc.try_acquire_global_refresh_lock(db, owner_token=token, source="emit", requested_by="test")
+        assert refresh_svc.try_acquire_lock(
+            db,
+            name="emit_refresh",
+            lock_type="refresh",
+            owner_token=token,
+            lease=refresh_svc.REFRESH_LOCK_LEASE,
+        )
+        job = RefreshJob(
+            source_type="emit",
+            mode="selected",
+            status="running",
+            started_at=stale_time,
+            heartbeat_at=stale_time,
+            metadata_json=json.dumps({"owner_token": token}),
+        )
+        db.add(job)
+        db.commit()
+
+        recovered = mark_stale_emit_jobs(db, config=EmitConfig(temp_dir=str(tmp_path), stale_timeout_seconds=60))
+        db.refresh(job)
+
+        assert [row.id for row in recovered] == [job.id]
+        assert job.status == "stale"
+        assert job.finished_at is not None
+        metadata = json.loads(job.metadata_json)
+        assert set(metadata["locks_released"]) == {"emit_refresh", "competitor_refresh_global"}
+        next_token = refresh_svc.new_owner_token()
+        assert refresh_svc.try_acquire_global_refresh_lock(db, owner_token=next_token, source="emit", requested_by="test")
+
+
+def test_stale_global_lock_not_released_when_owner_differs(tmp_path):
+    Session = _session_factory_static()
+    stale_time = datetime.utcnow() - timedelta(seconds=120)
+    with Session() as db:
+        stale_token = refresh_svc.new_owner_token()
+        live_token = refresh_svc.new_owner_token()
+        assert refresh_svc.try_acquire_global_refresh_lock(db, owner_token=live_token, source="provisor", requested_by="test")
+        job = RefreshJob(
+            source_type="emit",
+            mode="selected",
+            status="running",
+            started_at=stale_time,
+            heartbeat_at=stale_time,
+            metadata_json=json.dumps({"owner_token": stale_token}),
+        )
+        db.add(job)
+        db.commit()
+
+        mark_stale_emit_jobs(db, config=EmitConfig(temp_dir=str(tmp_path), stale_timeout_seconds=60))
+
+        next_token = refresh_svc.new_owner_token()
+        assert not refresh_svc.try_acquire_global_refresh_lock(db, owner_token=next_token, source="emit", requested_by="test")
+
+
+def test_emit_start_succeeds_after_stale_recovery(tmp_path):
+    Session = _session_factory_static()
+    stale_time = datetime.utcnow() - timedelta(seconds=120)
+    with Session() as db:
+        token = refresh_svc.new_owner_token()
+        assert refresh_svc.try_acquire_global_refresh_lock(db, owner_token=token, source="emit", requested_by="test")
+        assert refresh_svc.try_acquire_lock(
+            db,
+            name="emit_refresh",
+            lock_type="refresh",
+            owner_token=token,
+            lease=refresh_svc.REFRESH_LOCK_LEASE,
+        )
+        db.add(
+            RefreshJob(
+                source_type="emit",
+                mode="selected",
+                status="running",
+                started_at=stale_time,
+                heartbeat_at=stale_time,
+                metadata_json=json.dumps({"owner_token": token}),
+            )
+        )
+        db.commit()
+
+    worker = EmitWorker(session_factory=Session, config=EmitConfig(temp_dir=str(tmp_path), stale_timeout_seconds=60))
+    job, blocker, owner_token = worker.create_job(mode="selected", filial_ids=[1106])
+
+    assert job is not None
+    assert blocker is None
+    assert owner_token
+
+
+def test_stale_recovery_race_recheck_keeps_fresh_job(monkeypatch, tmp_path):
+    Session = _session_factory_static()
+    stale_time = datetime.utcnow() - timedelta(seconds=120)
+    with Session() as db:
+        job = RefreshJob(
+            source_type="emit",
+            mode="selected",
+            status="running",
+            started_at=stale_time,
+            heartbeat_at=stale_time,
+            metadata_json=json.dumps({"owner_token": refresh_svc.new_owner_token()}),
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+        def make_fresh(_job_id):
+            db.execute(
+                RefreshJob.__table__.update()
+                .where(RefreshJob.id == job_id)
+                .values(heartbeat_at=datetime.utcnow())
+            )
+            db.commit()
+
+        monkeypatch.setattr("backend.app.services.emit_worker._emit_stale_recovery_before_mark_hook", make_fresh)
+        recovered = mark_stale_emit_jobs(db, config=EmitConfig(temp_dir=str(tmp_path), stale_timeout_seconds=60))
+        saved = db.get(RefreshJob, job_id)
+
+        assert recovered == []
+        assert saved.status == "running"
+
+
+def test_stale_recovery_cleans_known_temp_files(tmp_path):
+    Session = _session_factory_static()
+    stale_time = datetime.utcnow() - timedelta(seconds=120)
+    temp_file = tmp_path / "emit_old.json"
+    stage_file = tmp_path / "emit_stage_old.sqlite"
+    temp_file.write_text("{}", encoding="utf-8")
+    stage_file.write_text("db", encoding="utf-8")
+    with Session() as db:
+        job = RefreshJob(
+            source_type="emit",
+            mode="selected",
+            status="running",
+            started_at=stale_time,
+            heartbeat_at=stale_time,
+            metadata_json=json.dumps(
+                {
+                    "owner_token": refresh_svc.new_owner_token(),
+                    "temp_file_path": str(temp_file),
+                    "stage_db_path": str(stage_file),
+                }
+            ),
+        )
+        db.add(job)
+        db.commit()
+
+        mark_stale_emit_jobs(db, config=EmitConfig(temp_dir=str(tmp_path), stale_timeout_seconds=60))
+        db.refresh(job)
+        metadata = json.loads(job.metadata_json)
+
+        assert not temp_file.exists()
+        assert not stage_file.exists()
+        assert metadata["temp_cleanup"]["files_deleted"] == 2
+
+
+def test_stale_recovery_cleanup_failure_does_not_block(monkeypatch, tmp_path):
+    Session = _session_factory_static()
+    stale_time = datetime.utcnow() - timedelta(seconds=120)
+    temp_file = tmp_path / "emit_old.json"
+    temp_file.write_text("{}", encoding="utf-8")
+    with Session() as db:
+        token = refresh_svc.new_owner_token()
+        assert refresh_svc.try_acquire_global_refresh_lock(db, owner_token=token, source="emit", requested_by="test")
+        job = RefreshJob(
+            source_type="emit",
+            mode="selected",
+            status="running",
+            started_at=stale_time,
+            heartbeat_at=stale_time,
+            metadata_json=json.dumps({"owner_token": token, "temp_file_path": str(temp_file)}),
+        )
+        db.add(job)
+        db.commit()
+
+        def fail_unlink(self):
+            raise OSError("cannot delete")
+
+        monkeypatch.setattr("pathlib.Path.unlink", fail_unlink)
+        mark_stale_emit_jobs(db, config=EmitConfig(temp_dir=str(tmp_path), stale_timeout_seconds=60))
+        db.refresh(job)
+        metadata = json.loads(job.metadata_json)
+
+        assert job.status == "stale"
+        assert "competitor_refresh_global" in metadata["locks_released"]
+        assert metadata["temp_cleanup"]["files_failed"] == [str(temp_file)]
+
+
+def test_manual_emit_returns_409_when_provisor_active(monkeypatch):
+    import backend.app.main as main
+
+    Session = _session_factory_static()
+    with Session() as db:
+        job, _, token = refresh_svc.try_create_refresh_job(db, mode="selected", requested_by="test")
+        assert job is not None and token is not None
+        refresh_svc.start_job(db, job, total_accounts=1, total_plk=1, metadata={}, owner_token=token)
+
+    worker = EmitWorker(session_factory=Session, config=EmitConfig(temp_dir="unused"))
+    monkeypatch.setattr(main, "SessionLocal", Session)
+    monkeypatch.setattr(main, "_emit_worker", worker)
+    main.app.dependency_overrides[main.get_db] = lambda: Session()
+    try:
+        client = TestClient(main.app)
+        response = client.post("/api/emit/refresh/run-now", json={"mode": "selected", "filialIds": [1106]})
+        assert response.status_code == 409
+        assert "Provisor refresh is currently running" in response.json()["detail"]
+    finally:
+        main.app.dependency_overrides.clear()
 
 
 def test_status_endpoint(monkeypatch):

@@ -219,18 +219,24 @@ from .services.provisor_auto_refresh import (
     active_or_stale_refresh_job,
     all_refresh_targets,
     create_skipped_job,
+    emit_scheduler_lock_owner,
     finish_job as finish_refresh_job,
     heartbeat as refresh_job_heartbeat,
     job_owner_token as refresh_job_owner_token,
     latest_refresh_job,
     normalize_mode as normalize_refresh_mode,
     new_owner_token as new_refresh_owner_token,
+    release_emit_scheduler_lock,
     release_scheduler_lock,
+    renew_emit_scheduler_lock,
     renew_scheduler_lock,
     refresh_job_to_status,
+    release_global_refresh_lock,
     selected_refresh_targets,
     start_job as start_refresh_job,
     target_counts as refresh_target_counts,
+    try_acquire_emit_scheduler_lock,
+    try_acquire_global_refresh_lock,
     try_acquire_scheduler_lock,
     try_create_refresh_job,
     update_progress_from_result as update_refresh_job_progress,
@@ -238,11 +244,13 @@ from .services.provisor_auto_refresh import (
 from .services.emit_worker import (
     EmitConfig,
     EmitWorker,
+    active_emit_job,
     configured_filial_ids_for_mode,
     emit_job_to_dict,
     is_emit_plk,
     latest_emit_job,
     list_emit_jobs,
+    mark_stale_emit_jobs,
 )
 
 
@@ -262,6 +270,8 @@ _provisor_auto_refresh_scheduler = None
 _provisor_auto_refresh_scheduler_token: str | None = None
 _provisor_auto_refresh_scheduler_renew_task = None
 _emit_refresh_scheduler = None
+_emit_refresh_scheduler_token: str | None = None
+_emit_refresh_scheduler_renew_task = None
 _emit_worker: EmitWorker | None = None
 
 settings = get_settings()
@@ -424,6 +434,8 @@ async def _startup() -> None:
     try:
         init_db()
         _seed_price_formats_if_missing()
+        with SessionLocal() as db:
+            mark_stale_emit_jobs(db, config=EmitConfig.from_settings(settings))
         _start_provisor_auto_refresh_scheduler()
         _start_emit_refresh_scheduler()
     except Exception:
@@ -535,17 +547,24 @@ def _emit_worker_instance() -> EmitWorker:
 
 
 def _start_emit_refresh_scheduler() -> None:
-    global _emit_refresh_scheduler
+    global _emit_refresh_scheduler, _emit_refresh_scheduler_token, _emit_refresh_scheduler_renew_task
     config = EmitConfig.from_settings(settings)
     if not config.enabled:
         logger.info("[EMIT_REFRESH] scheduler disabled")
         return
     if _emit_refresh_scheduler is not None:
         return
+    owner_token = new_refresh_owner_token()
+    with SessionLocal() as db:
+        if not try_acquire_emit_scheduler_lock(db, owner_token=owner_token):
+            logger.info("[EMIT_SCHEDULER] action=lease_denied owner=%s", emit_scheduler_lock_owner(db))
+            return
     try:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
         from apscheduler.triggers.cron import CronTrigger
     except Exception:
+        with SessionLocal() as db:
+            release_emit_scheduler_lock(db, owner_token=owner_token)
         logger.exception("[EMIT_REFRESH] APScheduler is not installed; scheduler not started")
         return
     scheduler = AsyncIOScheduler(timezone=config.timezone)
@@ -560,15 +579,48 @@ def _start_emit_refresh_scheduler() -> None:
     )
     scheduler.start()
     _emit_refresh_scheduler = scheduler
+    _emit_refresh_scheduler_token = owner_token
+    try:
+        _emit_refresh_scheduler_renew_task = asyncio.create_task(_renew_emit_scheduler_ownership(owner_token))
+    except RuntimeError:
+        logger.warning("[EMIT_SCHEDULER] action=renew_task_not_started reason=no_running_event_loop")
+    logger.info("[EMIT_SCHEDULER] action=lease_acquired owner=%s", owner_token)
     logger.info("[EMIT_REFRESH] scheduler started cron=%s timezone=%s", config.cron, config.timezone)
 
 
+async def _renew_emit_scheduler_ownership(owner_token: str) -> None:
+    global _emit_refresh_scheduler, _emit_refresh_scheduler_token, _emit_refresh_scheduler_renew_task
+    while True:
+        await asyncio.sleep(30)
+        with SessionLocal() as db:
+            renewed = renew_emit_scheduler_lock(db, owner_token=owner_token)
+        if renewed:
+            logger.debug("[EMIT_SCHEDULER] action=lease_renewed owner=%s", owner_token)
+            continue
+        logger.error("[EMIT_SCHEDULER] action=lease_expired owner=%s", owner_token)
+        scheduler = _emit_refresh_scheduler
+        if scheduler is not None:
+            scheduler.shutdown(wait=False)
+            _emit_refresh_scheduler = None
+        if _emit_refresh_scheduler_token == owner_token:
+            _emit_refresh_scheduler_token = None
+        _emit_refresh_scheduler_renew_task = None
+        return
+
+
 def _shutdown_emit_refresh_scheduler() -> None:
-    global _emit_refresh_scheduler
+    global _emit_refresh_scheduler, _emit_refresh_scheduler_token, _emit_refresh_scheduler_renew_task
+    if _emit_refresh_scheduler_renew_task is not None:
+        _emit_refresh_scheduler_renew_task.cancel()
+        _emit_refresh_scheduler_renew_task = None
     if _emit_refresh_scheduler is not None:
         _emit_refresh_scheduler.shutdown(wait=False)
         _emit_refresh_scheduler = None
         logger.info("[EMIT_REFRESH] scheduler shutdown")
+    if _emit_refresh_scheduler_token:
+        with SessionLocal() as db:
+            release_emit_scheduler_lock(db, owner_token=_emit_refresh_scheduler_token)
+        _emit_refresh_scheduler_token = None
 
 
 async def _start_emit_refresh_background(*, mode: str, requested_by: str, filial_ids: list[int] | None = None) -> None:
@@ -578,12 +630,17 @@ async def _start_emit_refresh_background(*, mode: str, requested_by: str, filial
         logger.warning("[EMIT_REFRESH] skipped: no filial IDs requested")
         return
     with SessionLocal() as db:
-        if active_or_stale_refresh_job(db) is not None:
-            logger.warning("[EMIT_REFRESH] skipped: normal Provisor refresh is active or stale")
+        provisor_blocker = active_or_stale_refresh_job(db)
+        if provisor_blocker is not None:
+            logger.warning(
+                "[REFRESH_MUTEX] source=emit action=skip reason=provisor_refresh_active active_job_id=%s",
+                provisor_blocker.id,
+            )
             return
     job, blocker, owner_token = worker.create_job(mode=mode, filial_ids=target_ids, requested_by=requested_by)
     if job is None:
-        logger.warning("[EMIT_REFRESH] skipped: another Emit job is active blocker_id=%s", getattr(blocker, "id", None))
+        reason = "emit_refresh_active" if blocker is not None else "global_refresh_lock_owned"
+        logger.warning("[REFRESH_MUTEX] source=emit action=skip reason=%s active_job_id=%s", reason, getattr(blocker, "id", None))
         return
     asyncio.create_task(worker.run_job(int(job.id), owner_token=owner_token))
 
@@ -5342,13 +5399,13 @@ async def _run_provisor_refresh_job(job_id: int, *, mode: str, requested_by: str
                 if mode == "selected"
                 else "No active Provisor accounts configured for auto-refresh."
             )
-            finish_refresh_job(db, job, status="failed", message=message, error=message, owner_token=owner_token, release_refresh=True)
+            finish_refresh_job(db, job, status="failed", message=message, error=message, owner_token=owner_token, release_refresh=True, release_global=True)
             logger.warning("[PROVISOR_AUTO_REFRESH] job failed before start: %s", message)
             return
         total_accounts, total_plk = refresh_target_counts(targets, db, mode=mode)
         if mode == "selected" and total_plk <= 0:
             message = "No selected Provisor PLK configured for auto-refresh."
-            finish_refresh_job(db, job, status="failed", message=message, error=message, owner_token=owner_token, release_refresh=True)
+            finish_refresh_job(db, job, status="failed", message=message, error=message, owner_token=owner_token, release_refresh=True, release_global=True)
             logger.warning("[PROVISOR_AUTO_REFRESH] job failed before start: %s", message)
             return
         started = start_refresh_job(
@@ -5422,6 +5479,7 @@ async def _run_provisor_refresh_job(job_id: int, *, mode: str, requested_by: str
                 owner_token=owner_token,
                 allowed_statuses={"running"},
                 release_refresh=True,
+                release_global=True,
             )
             if not finished:
                 logger.warning("[PROVISOR_AUTO_REFRESH] final status skipped because token/status no longer match: job_id=%s", job_id)
@@ -5440,10 +5498,13 @@ async def _run_provisor_refresh_job(job_id: int, *, mode: str, requested_by: str
                 owner_token=owner_token,
                 allowed_statuses={"pending", "running"},
                 release_refresh=True,
+                release_global=True,
             )
     finally:
         if heartbeat_task is not None:
             heartbeat_task.cancel()
+        if owner_token:
+            release_global_refresh_lock(db, owner_token=owner_token)
         db.close()
 
 
@@ -5460,6 +5521,13 @@ async def run_provisor_auto_refresh_now(payload: dict = Body(default={}), db: Se
         message = "Обновление Provisor уже выполняется." if blocker.status != "stale" else "Обновление Provisor зависло; завершите его перед запуском новой задачи."
         create_skipped_job(db, mode=mode, requested_by="manual", message=message)
         raise HTTPException(status_code=409, detail=message)
+    emit_blocker = active_emit_job(db, config=EmitConfig.from_settings(settings))
+    if emit_blocker is not None:
+        logger.warning(
+            "[REFRESH_MUTEX] source=provisor action=skip reason=emit_refresh_active active_job_id=%s",
+            emit_blocker.id,
+        )
+        raise HTTPException(status_code=409, detail="Emit refresh is currently running. Provisor refresh cannot start at the same time.")
     job, blocker, owner_token = try_create_refresh_job(db, mode=mode, requested_by="manual")
     if job is None:
         message = "Обновление Provisor уже выполняется."
@@ -5486,6 +5554,7 @@ def resolve_stale_provisor_auto_refresh(db: Session = Depends(get_db)):
         owner_token=refresh_job_owner_token(blocker),
         allowed_statuses={"stale"},
         release_refresh=True,
+        release_global=True,
     )
     logger.warning("[PROVISOR_AUTO_REFRESH] stale job marked failed id=%s", blocker.id)
     return refresh_job_to_status(blocker)
@@ -5493,7 +5562,7 @@ def resolve_stale_provisor_auto_refresh(db: Session = Depends(get_db)):
 
 @app.get("/api/emit/refresh/status")
 def get_emit_refresh_status(db: Session = Depends(get_db)):
-    return emit_job_to_dict(latest_emit_job(db))
+    return emit_job_to_dict(latest_emit_job(db, config=_emit_worker_instance().config))
 
 
 @app.post("/api/emit/refresh/run-now", status_code=202)
@@ -5506,6 +5575,13 @@ async def run_emit_refresh_now(payload: dict = Body(default={}), db: Session = D
     target_ids = configured_filial_ids_for_mode(worker.config, mode=mode, filial_ids=filial_ids)
     if not target_ids:
         raise HTTPException(status_code=400, detail="No Emit filial IDs requested")
+    provisor_blocker = active_or_stale_refresh_job(db)
+    if provisor_blocker is not None:
+        logger.warning(
+            "[REFRESH_MUTEX] source=emit action=skip reason=provisor_refresh_active active_job_id=%s",
+            provisor_blocker.id,
+        )
+        raise HTTPException(status_code=409, detail="Provisor refresh is currently running. Emit refresh cannot start at the same time.")
     if active_or_stale_refresh_job(db) is not None:
         raise HTTPException(status_code=409, detail="Обычное обновление Provisor выполняется или зависло; дождитесь завершения перед запуском обновления Emit.")
     price_format_code = str(payload.get("format_code") or payload.get("formatCode") or "").strip()
@@ -5520,6 +5596,8 @@ async def run_emit_refresh_now(payload: dict = Body(default={}), db: Session = D
         price_format_code=price_format_code,
     )
     if job is None:
+        if blocker is None:
+            raise HTTPException(status_code=409, detail="Another competitor refresh is currently running. Emit refresh cannot start at the same time.")
         raise HTTPException(status_code=409, detail={"message": "Emit refresh is already running.", "job": emit_job_to_dict(blocker)})
     asyncio.create_task(worker.run_job(int(job.id), owner_token=owner_token))
     return {"job_id": job.id, **emit_job_to_dict(job)}
@@ -5527,7 +5605,7 @@ async def run_emit_refresh_now(payload: dict = Body(default={}), db: Session = D
 
 @app.get("/api/emit/refresh/jobs")
 def get_emit_refresh_jobs(limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(get_db)):
-    return {"items": list_emit_jobs(db, limit=limit)}
+    return {"items": list_emit_jobs(db, limit=limit, config=_emit_worker_instance().config)}
 
 
 @app.get("/api/emit/refresh/jobs/{job_id}")
@@ -5541,6 +5619,15 @@ def get_emit_refresh_job(job_id: int, db: Session = Depends(get_db)):
 async def _start_provisor_refresh_background(*, mode: str, requested_by: str) -> None:
     db = SessionLocal()
     try:
+        emit_blocker = active_emit_job(db, config=EmitConfig.from_settings(settings))
+        if emit_blocker is not None:
+            message = "Emit refresh is currently running. Provisor refresh cannot start at the same time."
+            create_skipped_job(db, mode=mode, requested_by=requested_by, message=message)
+            logger.warning(
+                "[REFRESH_MUTEX] source=provisor action=skip reason=emit_refresh_active active_job_id=%s",
+                emit_blocker.id,
+            )
+            return
         job, blocker, owner_token = try_create_refresh_job(db, mode=mode, requested_by=requested_by)
         if blocker is not None:
             message = "Обновление Provisor уже выполняется." if blocker.status != "stale" else "Обновление Provisor зависло; завершите его перед запуском новой задачи."
@@ -5549,7 +5636,7 @@ async def _start_provisor_refresh_background(*, mode: str, requested_by: str) ->
             return
         if job is None:
             create_skipped_job(db, mode=mode, requested_by=requested_by, message="Обновление Provisor уже выполняется.")
-            logger.warning("[PROVISOR_AUTO_REFRESH] skipped new job: refresh lock is owned by another process")
+            logger.warning("[REFRESH_MUTEX] source=provisor action=skip reason=global_refresh_lock_owned active_job_id=%s", getattr(blocker, "id", None))
             return
         assert owner_token is not None
         asyncio.create_task(_run_provisor_refresh_job(int(job.id), mode=job.mode, requested_by=requested_by, owner_token=owner_token))
@@ -5563,8 +5650,26 @@ async def refresh_competitor_price_lists(format_code: str, payload: dict = Body(
     refresh_job_type = _refresh_job_type(refresh_source)
     job_key = _refresh_job_key(format_code, refresh_source)
     logger.info("[SOURCE_REFRESH_JOB] job_key=%s source=%s format_code=%s", job_key, refresh_source, format_code)
+    global_owner_token: str | None = None
+    if refresh_source in {"provisor", "all"}:
+        provisor_blocker = active_or_stale_refresh_job(db)
+        if provisor_blocker is not None:
+            raise HTTPException(status_code=409, detail="Provisor refresh is currently running.")
+        emit_blocker = active_emit_job(db, config=EmitConfig.from_settings(settings))
+        if emit_blocker is not None:
+            logger.warning(
+                "[REFRESH_MUTEX] source=provisor action=skip reason=emit_refresh_active active_job_id=%s",
+                emit_blocker.id,
+            )
+            raise HTTPException(status_code=409, detail="Emit refresh is currently running. Provisor refresh cannot start at the same time.")
+        global_owner_token = new_refresh_owner_token()
+        if not try_acquire_global_refresh_lock(db, owner_token=global_owner_token, source=refresh_source, requested_by="manual"):
+            logger.warning("[REFRESH_MUTEX] source=%s action=skip reason=global_refresh_lock_owned active_job_id=%s", refresh_source, None)
+            raise HTTPException(status_code=409, detail="Another competitor refresh is currently running.")
     existing = get_active_job(db=db, job_type=refresh_job_type, format_code=format_code)
     if existing is not None:
+        if global_owner_token:
+            release_global_refresh_lock(db, owner_token=global_owner_token)
         return {"job_id": existing.id, "status": existing.status, "source": refresh_source, "message": "Такая задача уже выполняется"}
     pf = db.execute(select(PriceFormat).where(PriceFormat.code == format_code)).scalars().first()
     job = create_job(
@@ -5574,7 +5679,16 @@ async def refresh_competitor_price_lists(format_code: str, payload: dict = Body(
         price_format_id=int(pf.id) if pf else None,
         message="Создана задача обновления прайс-листов",
     )
-    schedule_job(job.id, lambda job_db, job_row: _run_refresh_price_lists_job(job_db, job_row, format_code=format_code, payload=payload or {}))
+    schedule_job(
+        job.id,
+        lambda job_db, job_row: _run_refresh_price_lists_job_with_mutex(
+            job_db,
+            job_row,
+            format_code=format_code,
+            payload=payload or {},
+            global_owner_token=global_owner_token,
+        ),
+    )
     return {"job_id": job.id, "status": job.status, "source": refresh_source}
 
 
@@ -6950,6 +7064,22 @@ async def _run_refresh_price_lists_job(db: Session, job: Job, *, format_code: st
         )
         update_job(db, job, status="running", progress=100, message=message, result=result, log_level="warning" if skipped_timeout else "info")
     return result
+
+
+async def _run_refresh_price_lists_job_with_mutex(
+    db: Session,
+    job: Job,
+    *,
+    format_code: str,
+    payload: dict,
+    global_owner_token: str | None,
+) -> dict:
+    try:
+        return await _run_refresh_price_lists_job(db, job, format_code=format_code, payload=payload)
+    finally:
+        if global_owner_token:
+            release_global_refresh_lock(db, owner_token=global_owner_token)
+            logger.info("[REFRESH_MUTEX] source=%s action=released", _refresh_source_from_payload(payload or {}))
 
 
 async def _run_generate_price_job(db: Session, job: Job, *, price_format_id: int, payload: dict | None = None) -> dict:

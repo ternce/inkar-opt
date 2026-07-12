@@ -25,6 +25,8 @@ SOURCE_TYPE = "provisor"
 STALE_AFTER = timedelta(minutes=10)
 REFRESH_LOCK_NAME = "provisor_auto_refresh"
 SCHEDULER_LOCK_NAME = "provisor_auto_refresh_scheduler"
+EMIT_SCHEDULER_LOCK_NAME = "emit_auto_refresh_scheduler"
+GLOBAL_REFRESH_LOCK_NAME = "competitor_refresh_global"
 REFRESH_LOCK_LEASE = timedelta(hours=12)
 SCHEDULER_LOCK_LEASE = timedelta(seconds=90)
 
@@ -164,12 +166,60 @@ def try_acquire_scheduler_lock(db: Session, *, owner_token: str) -> bool:
     )
 
 
+def try_acquire_emit_scheduler_lock(db: Session, *, owner_token: str) -> bool:
+    return try_acquire_lock(
+        db,
+        name=EMIT_SCHEDULER_LOCK_NAME,
+        lock_type="scheduler",
+        owner_token=owner_token,
+        lease=SCHEDULER_LOCK_LEASE,
+    )
+
+
+def emit_scheduler_lock_owner(db: Session) -> str | None:
+    row = db.get(RefreshLock, EMIT_SCHEDULER_LOCK_NAME)
+    return row.owner_token if row is not None else None
+
+
+def try_acquire_global_refresh_lock(db: Session, *, owner_token: str, source: str, requested_by: str) -> bool:
+    acquired = try_acquire_lock(
+        db,
+        name=GLOBAL_REFRESH_LOCK_NAME,
+        lock_type="heavy_refresh",
+        owner_token=owner_token,
+        lease=REFRESH_LOCK_LEASE,
+        metadata={"source": source, "requested_by": requested_by},
+    )
+    if acquired:
+        logger.info("[REFRESH_MUTEX] source=%s action=acquired", source)
+    return acquired
+
+
 def renew_scheduler_lock(db: Session, *, owner_token: str) -> bool:
     return renew_lock(db, name=SCHEDULER_LOCK_NAME, owner_token=owner_token, lease=SCHEDULER_LOCK_LEASE)
 
 
+def renew_emit_scheduler_lock(db: Session, *, owner_token: str) -> bool:
+    return renew_lock(db, name=EMIT_SCHEDULER_LOCK_NAME, owner_token=owner_token, lease=SCHEDULER_LOCK_LEASE)
+
+
+def renew_global_refresh_lock(db: Session, *, owner_token: str) -> bool:
+    return renew_lock(db, name=GLOBAL_REFRESH_LOCK_NAME, owner_token=owner_token, lease=REFRESH_LOCK_LEASE)
+
+
 def release_scheduler_lock(db: Session, *, owner_token: str) -> bool:
     return release_lock(db, name=SCHEDULER_LOCK_NAME, owner_token=owner_token)
+
+
+def release_emit_scheduler_lock(db: Session, *, owner_token: str) -> bool:
+    return release_lock(db, name=EMIT_SCHEDULER_LOCK_NAME, owner_token=owner_token)
+
+
+def release_global_refresh_lock(db: Session, *, owner_token: str) -> bool:
+    released = release_lock(db, name=GLOBAL_REFRESH_LOCK_NAME, owner_token=owner_token)
+    if released:
+        logger.info("[REFRESH_MUTEX] action=released")
+    return released
 
 
 def release_refresh_lock(db: Session, *, owner_token: str) -> bool:
@@ -311,7 +361,10 @@ def try_create_refresh_job(db: Session, *, mode: str, requested_by: str) -> tupl
     if blocker is not None:
         return None, blocker, None
     owner_token = new_owner_token()
+    if not try_acquire_global_refresh_lock(db, owner_token=owner_token, source=SOURCE_TYPE, requested_by=requested_by):
+        return None, latest_refresh_job(db), None
     if not try_acquire_refresh_lock(db, owner_token=owner_token, requested_by=requested_by):
+        release_global_refresh_lock(db, owner_token=owner_token)
         return None, latest_refresh_job(db), None
     now = datetime.utcnow()
     job = RefreshJob(
@@ -332,6 +385,7 @@ def try_create_refresh_job(db: Session, *, mode: str, requested_by: str) -> tupl
     except Exception:
         db.rollback()
         release_refresh_lock(db, owner_token=owner_token)
+        release_global_refresh_lock(db, owner_token=owner_token)
         raise
 
 
@@ -343,6 +397,8 @@ def job_owner_token(job: RefreshJob) -> str:
 def heartbeat(db: Session, job: RefreshJob, *, message: str | None = None, owner_token: str | None = None) -> bool:
     token = owner_token or job_owner_token(job)
     if not token:
+        return False
+    if not renew_global_refresh_lock(db, owner_token=token):
         return False
     if not renew_refresh_lock(db, owner_token=token):
         return False
@@ -402,6 +458,7 @@ def finish_job(
     require_running: bool = False,
     allowed_statuses: set[str] | None = None,
     release_refresh: bool = False,
+    release_global: bool = False,
 ) -> bool:
     token = owner_token or job_owner_token(job)
     db.expire(job)
@@ -429,6 +486,8 @@ def finish_job(
     db.commit()
     if release_refresh and token:
         release_refresh_lock(db, owner_token=token)
+    if release_global and token:
+        release_global_refresh_lock(db, owner_token=token)
     return True
 
 

@@ -38,6 +38,7 @@ class Settings(BaseModel):
     emit_max_concurrent_filials: int
     emit_min_final_rows: int
     emit_min_row_ratio: float
+    emit_refresh_stale_timeout_seconds: int
     emit_cron: str
     emit_timezone: str
     vidman_base_url: str
@@ -113,6 +114,7 @@ def get_settings() -> Settings:
         emit_max_concurrent_filials=max(1, int(os.getenv("EMIT_MAX_CONCURRENT_FILIALS", "1"))),
         emit_min_final_rows=max(1, int(os.getenv("EMIT_MIN_FINAL_ROWS", "100"))),
         emit_min_row_ratio=max(0.0, float(os.getenv("EMIT_MIN_ROW_RATIO", "0.5"))),
+        emit_refresh_stale_timeout_seconds=max(1, int(os.getenv("EMIT_REFRESH_STALE_TIMEOUT_SECONDS", "14400"))),
         emit_cron=os.getenv("EMIT_CRON", "0 3 * * *"),
         emit_timezone=os.getenv("EMIT_TIMEZONE", os.getenv("TZ", "Asia/Qyzylorda")).strip() or "Asia/Qyzylorda",
         vidman_base_url=os.getenv("VIDMAN_BASE_URL", "https://1.provizor.kz"),
