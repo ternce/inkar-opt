@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
+import logging
+
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -12,7 +14,12 @@ from ..models import (
     PriceFormat,
     PriceFormatCompetitorAssignment,
 )
-from .competitor_source_config import default_percentile_mode_for_source
+from .competitor_source_config import MULTI_PRICE_PERCENTILE_MODE, default_percentile_mode_for_source
+
+
+logger = logging.getLogger(__name__)
+
+INACTIVE_REFRESH_STATUSES = {"failed", "error", "stale"}
 
 
 def source_name(row: CompetitorPriceList) -> str:
@@ -222,6 +229,80 @@ def upsert_assignment(
         row.is_active = is_active
         row.updated_at = now
     return row
+
+
+def _is_active_emit_price_list(row: CompetitorPriceList) -> bool:
+    if default_percentile_mode_for_source(row) != MULTI_PRICE_PERCENTILE_MODE:
+        return False
+    status = str(row.last_refresh_status or "").strip().casefold()
+    return status not in INACTIVE_REFRESH_STATUSES
+
+
+def propagate_emit_assignments_to_new_price_format(*, db: Session, price_format_id: int) -> int:
+    price_format_id = int(price_format_id)
+    price_format = db.get(PriceFormat, price_format_id)
+    if price_format is None:
+        return 0
+    existing_ids = {
+        int(row.competitor_price_list_id)
+        for row in db.execute(
+            select(PriceFormatCompetitorAssignment.competitor_price_list_id)
+            .where(PriceFormatCompetitorAssignment.price_format_id == price_format_id)
+        )
+    }
+    emit_rows = list_global_competitor_price_lists_for_format(
+        db=db,
+        price_format=price_format,
+    )
+    emit_rows = [row for row in emit_rows if _is_active_emit_price_list(row)]
+    target_ids = [int(row.id) for row in emit_rows if int(row.id) not in existing_ids]
+    if not target_ids:
+        return 0
+
+    metadata_by_price_list_id: dict[int, PriceFormatCompetitorAssignment] = {}
+    metadata_rows = (
+        db.execute(
+            select(PriceFormatCompetitorAssignment)
+            .where(PriceFormatCompetitorAssignment.competitor_price_list_id.in_(target_ids))
+            .where(PriceFormatCompetitorAssignment.is_active.is_(True))
+            .order_by(PriceFormatCompetitorAssignment.updated_at.desc(), PriceFormatCompetitorAssignment.id.desc())
+        )
+        .scalars()
+        .all()
+    )
+    for assignment in metadata_rows:
+        metadata_by_price_list_id.setdefault(int(assignment.competitor_price_list_id), assignment)
+
+    now = datetime.utcnow()
+    by_id = {int(row.id): row for row in emit_rows}
+    created = 0
+    for price_list_id in target_ids:
+        template = metadata_by_price_list_id.get(price_list_id)
+        price_list = by_id.get(price_list_id)
+        db.add(
+            PriceFormatCompetitorAssignment(
+                price_format_id=price_format_id,
+                competitor_price_list_id=price_list_id,
+                is_active=True,
+                coefficient=float(template.coefficient) if template is not None else 1.0,
+                percentile_mode=(
+                    str(template.percentile_mode or "").strip()
+                    if template is not None and str(template.percentile_mode or "").strip()
+                    else default_percentile_mode_for_source(price_list) if price_list is not None else MULTI_PRICE_PERCENTILE_MODE
+                ),
+                source_mode=str(template.source_mode or "").strip() if template is not None else "",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        created += 1
+    logger.info(
+        "[EMIT_ASSIGNMENT_PROPAGATION] price_format_id=%s emit_price_list_ids=%s assignments_created=%s",
+        price_format_id,
+        target_ids,
+        created,
+    )
+    return created
 
 
 def set_competitor_assignments(

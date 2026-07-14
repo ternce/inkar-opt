@@ -117,6 +117,7 @@ from .services.competitor_assignments import (
     get_assigned_competitor_price_lists,
     get_assignment,
     price_format_branch_matches,
+    propagate_emit_assignments_to_new_price_format,
     upsert_assignment,
 )
 from .services.price_source_accounts import (
@@ -1099,6 +1100,8 @@ def create_price_format(
             except ValueError:
                 raise HTTPException(status_code=400, detail="pricing rule not found")
     db.add(row)
+    db.flush()
+    propagate_emit_assignments_to_new_price_format(db=db, price_format_id=int(row.id))
     db.commit()
     db.refresh(row)
     return {"id": row.id, "name": row.name, "code": row.code, "branch": row.branch}
@@ -2964,6 +2967,7 @@ async def import_contractors(file: UploadFile = File(...), db: Session = Depends
             pf = PriceFormat(code=format_code, name=format_code, branch=str(row[branch_i] or "").strip())
             db.add(pf)
             db.flush()
+            propagate_emit_assignments_to_new_price_format(db=db, price_format_id=int(pf.id))
         holding_name = str(row[holding_i] or "").strip() or "Без холдинга"
         cp_name = str(row[cp_i] or "").strip() or "Не указан"
         point_name = str(row[pharmacy_i] or "").strip()
@@ -3729,6 +3733,7 @@ def set_competitors_assigned(format_code: str, payload: dict, db: Session = Depe
         pf = PriceFormat(code=format_code, name=format_code)
         db.add(pf)
         db.flush()
+        propagate_emit_assignments_to_new_price_format(db=db, price_format_id=int(pf.id))
 
     selected = [x for x in data.COMPETITORS_AVAILABLE if x.get("id") in ids]
     selected_source_names = {str(x.get("name") or "").strip() for x in selected if str(x.get("name") or "").strip()}
@@ -7272,6 +7277,7 @@ def put_settings_for_format(
         pf = PriceFormat(code=format_code, name=payload.get("name") or format_code)
         db.add(pf)
         db.flush()
+        propagate_emit_assignments_to_new_price_format(db=db, price_format_id=int(pf.id))
 
     if isinstance(payload.get("branch"), str):
         pf.branch = payload["branch"]

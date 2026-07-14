@@ -1586,6 +1586,7 @@ def _recalculate_percentiles_for_emit_rows(
     *,
     price_list_ids: list[int],
     price_format_code: str | None = None,
+    scope_to_price_list_ids: bool = False,
 ) -> dict[str, Any]:
     ids = [int(item) for item in price_list_ids if int(item) > 0]
     requested_format = str(price_format_code or "").strip()
@@ -1677,7 +1678,11 @@ def _recalculate_percentiles_for_emit_rows(
         pf = db.get(PriceFormat, price_format_id)
         if pf is None:
             continue
-        summary = recalculate_competitor_percentiles(db=db, price_format_id=price_format_id)
+        summary = recalculate_competitor_percentiles(
+            db=db,
+            price_format_id=price_format_id,
+            source_price_list_ids=ids if scope_to_price_list_ids else None,
+        )
         summaries[str(pf.code or price_format_id)] = {"price_format_id": price_format_id, **summary}
         logger.info(
             "[EMIT_PERCENTILE_REBUILD] requested_format_code=%s format_code=%s price_format_id=%s rows_created=%s products_with_competitors=%s",
@@ -1770,6 +1775,7 @@ class EmitWorker:
                 raise
 
     async def run_job(self, job_id: int, *, owner_token: str | None = None) -> None:
+        total_started = time.perf_counter()
         with self.session_factory() as db:
             job = db.get(RefreshJob, job_id)
             if job is None:
@@ -1783,6 +1789,7 @@ class EmitWorker:
             job.total_plk = len(filial_ids)
             job.message = "Emit refresh started."
             db.commit()
+        logger.info("[EMIT_REFRESH] job_id=%s requested_filials=%s", job_id, filial_ids)
         status = "success"
         error = ""
         aggregate = {"success": 0, "failed": 0, "filials": []}
@@ -1797,6 +1804,14 @@ class EmitWorker:
                         aggregate["success"] += 1
                     else:
                         aggregate["failed"] += 1
+                    logger.info(
+                        "[EMIT_REFRESH] job_id=%s filial_id=%s ok=%s duration_sec=%s price_list_id=%s",
+                        job_id,
+                        result.get("filial_id"),
+                        bool(result.get("ok")),
+                        result.get("duration_sec"),
+                        result.get("price_list_id"),
+                    )
             if aggregate["failed"]:
                 status = "failed" if not aggregate["success"] else "success"
         except Exception as exc:
@@ -1820,8 +1835,33 @@ class EmitWorker:
                             db,
                             price_list_ids=refreshed_price_list_ids,
                             price_format_code=price_format_code,
+                            scope_to_price_list_ids=not bool(price_format_code),
                         )
                         aggregate["percentile_rebuild"] = percentile_rebuild
+                    aggregate["requested_filials"] = filial_ids
+                    aggregate["refreshed_filials"] = [
+                        int(row.get("filial_id") or 0)
+                        for row in aggregate.get("filials", [])
+                        if isinstance(row, dict) and row.get("ok") and int(row.get("filial_id") or 0) > 0
+                    ]
+                    aggregate["duration_sec"] = round(time.perf_counter() - total_started, 3)
+                    aggregate["percentile_rebuild_formats"] = sorted((percentile_rebuild.get("summaries") or {}).keys())
+                    logger.info(
+                        "[EMIT_REFRESH] job_id=%s requested_filials=%s refreshed_filials=%s success_count=%s "
+                        "failed_count=%s percentile_rebuild_formats=%s filial_durations=%s total_duration_sec=%s",
+                        job_id,
+                        aggregate["requested_filials"],
+                        aggregate["refreshed_filials"],
+                        aggregate["success"],
+                        aggregate["failed"],
+                        aggregate["percentile_rebuild_formats"],
+                        {
+                            int(row.get("filial_id") or 0): row.get("duration_sec")
+                            for row in aggregate.get("filials", [])
+                            if isinstance(row, dict) and int(row.get("filial_id") or 0) > 0
+                        },
+                        aggregate["duration_sec"],
+                    )
                     finish_job(
                         db,
                         job,
@@ -1840,6 +1880,7 @@ class EmitWorker:
                         release_global_refresh_lock(db, owner_token=token)
 
     async def refresh_filial(self, *, job_id: int, filial_id: int, owner_token: str | None = None) -> dict[str, Any]:
+        filial_started = time.perf_counter()
         filial_name = f"Emit International {filial_id}"
         temp_path: Path | None = None
         staging_path: Path | None = None
@@ -1891,7 +1932,13 @@ class EmitWorker:
                 temp_path.unlink()
             _delete_stage_files(staging_path)
             stats.cleanup_elapsed_sec = 0.0
-            return {"ok": True, "filial_id": filial_id, "price_list_id": price_list_id, **stats.to_dict()}
+            return {
+                "ok": True,
+                "filial_id": filial_id,
+                "price_list_id": price_list_id,
+                "duration_sec": round(time.perf_counter() - filial_started, 3),
+                **stats.to_dict(),
+            }
         except Exception as exc:
             logger.exception("Emit filial refresh failed: filial_id=%s", filial_id)
             with self.session_factory() as db:
@@ -1904,7 +1951,13 @@ class EmitWorker:
             if temp_path is not None and temp_path.exists() and temp_path.stat().st_size > max_bytes:
                 temp_path.unlink()
             _delete_stage_files(staging_path)
-            return {"ok": False, "filial_id": filial_id, "error": str(exc), **stats.to_dict()}
+            return {
+                "ok": False,
+                "filial_id": filial_id,
+                "error": str(exc),
+                "duration_sec": round(time.perf_counter() - filial_started, 3),
+                **stats.to_dict(),
+            }
 
 
 def cleanup_temp(config: EmitConfig) -> int:

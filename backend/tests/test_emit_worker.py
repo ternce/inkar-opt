@@ -44,6 +44,7 @@ from backend.app.services.emit_worker import (
     stage_row_count,
     _recalculate_percentiles_for_emit_rows,
 )
+from backend.app.services.competitor_assignments import propagate_emit_assignments_to_new_price_format
 from backend.app.services import provisor_auto_refresh as refresh_svc
 from backend.app.services.price_sources import UnifiedPriceItem, UnifiedPriceList
 
@@ -675,6 +676,188 @@ def test_emit_percentile_rebuild_without_assignment_returns_warning(tmp_path):
     assert result["assigned_price_format_ids"] == []
     assert result["warnings"][0]["code"] == "emit_no_active_format_assignment"
     assert result["warnings"][0]["price_list_id"] == row.id
+
+
+def test_scheduled_emit_percentile_rebuild_scopes_each_refreshed_region():
+    db = _session()
+    pf = PriceFormat(code="FMT", name="Format")
+    product = Product(code="SKU1", name="Product", cost=100, provisor_goods_id=1)
+    db.add_all([pf, product])
+    db.flush()
+    almaty = CompetitorPriceList(
+        price_format_id=pf.id,
+        source_type="provisor",
+        source_key="emit:1108",
+        display_name="Emit International 1108",
+        supplier="Emit International 1108",
+        branch_id="1108",
+        branch_code="1108",
+        branch_name="Emit International 1108",
+        competitor_name="Emit International 1108",
+        external_price_list_id="1108",
+        account_login="emit",
+    )
+    astana = CompetitorPriceList(
+        price_format_id=pf.id,
+        source_type="provisor",
+        source_key="emit:1107",
+        display_name="Emit International 1107",
+        supplier="Emit International 1107",
+        branch_id="1107",
+        branch_code="1107",
+        branch_name="Emit International 1107",
+        competitor_name="Emit International 1107",
+        external_price_list_id="1107",
+        account_login="emit",
+    )
+    db.add_all([almaty, astana])
+    db.flush()
+    db.add_all(
+        [
+            PriceFormatCompetitorAssignment(price_format_id=pf.id, competitor_price_list_id=almaty.id, is_active=True),
+            PriceFormatCompetitorAssignment(price_format_id=pf.id, competitor_price_list_id=astana.id, is_active=True),
+            CompetitorPriceListItem(price_list_id=almaty.id, provisor_goods_id=1, filial_id=1108, name="A", distributor_price=100),
+            CompetitorPriceListItem(price_list_id=almaty.id, provisor_goods_id=1, filial_id=1108, name="A", distributor_price=120),
+            CompetitorPriceListItem(price_list_id=astana.id, provisor_goods_id=1, filial_id=1107, name="A", distributor_price=200),
+            CompetitorPriceListItem(price_list_id=astana.id, provisor_goods_id=1, filial_id=1107, name="A", distributor_price=240),
+        ]
+    )
+    db.commit()
+
+    first = _recalculate_percentiles_for_emit_rows(
+        db,
+        price_list_ids=[almaty.id],
+        scope_to_price_list_ids=True,
+    )
+
+    assert first["assigned_price_format_ids"] == [pf.id]
+    rows_after_first = db.query(CompetitorPricePercentile).filter(
+        CompetitorPricePercentile.price_format_id == pf.id,
+        CompetitorPricePercentile.percentile_scope == "regional",
+    ).all()
+    assert {row.branch_name for row in rows_after_first} == {"Emit International 1108"}
+
+    second = _recalculate_percentiles_for_emit_rows(
+        db,
+        price_list_ids=[astana.id],
+        scope_to_price_list_ids=True,
+    )
+
+    assert second["assigned_price_format_ids"] == [pf.id]
+    rows = db.query(CompetitorPricePercentile).filter(
+        CompetitorPricePercentile.price_format_id == pf.id,
+        CompetitorPricePercentile.product_id == product.id,
+        CompetitorPricePercentile.percentile_scope == "regional",
+        CompetitorPricePercentile.percentile == 10,
+    ).all()
+    by_branch = {row.branch_name: float(row.value) for row in rows}
+    assert round(by_branch["Emit International 1108"], 3) == 102.0
+    assert round(by_branch["Emit International 1107"], 3) == 204.0
+
+
+def test_new_price_format_gets_active_emit_assignments_for_scheduler():
+    db = _session()
+    existing_pf = PriceFormat(code="OLD", name="Old")
+    new_pf = PriceFormat(code="NEW", name="New")
+    product = Product(code="SKU1", name="Product", cost=100, provisor_goods_id=1)
+    db.add_all([existing_pf, new_pf, product])
+    db.flush()
+    emit_1108 = CompetitorPriceList(
+        price_format_id=existing_pf.id,
+        source_type="provisor",
+        source_key="emit:1108",
+        display_name="Emit International 1108",
+        supplier="Emit International 1108",
+        branch_id="1108",
+        branch_code="1108",
+        branch_name="Emit International 1108",
+        competitor_name="Emit International 1108",
+        external_price_list_id="1108",
+        account_login="emit",
+        last_refresh_status="success",
+    )
+    emit_1107 = CompetitorPriceList(
+        price_format_id=existing_pf.id,
+        source_type="provisor",
+        source_key="emit:1107",
+        display_name="Emit International 1107",
+        supplier="Emit International 1107",
+        branch_id="1107",
+        branch_code="1107",
+        branch_name="Emit International 1107",
+        competitor_name="Emit International 1107",
+        external_price_list_id="1107",
+        account_login="emit",
+        last_refresh_status="success",
+    )
+    non_emit = CompetitorPriceList(
+        price_format_id=existing_pf.id,
+        source_type="phcenter",
+        source_key="phcenter:1",
+        display_name="Regular competitor",
+        supplier="Regular competitor",
+        branch_name="Regular branch",
+        competitor_name="Regular competitor",
+        last_refresh_status="success",
+    )
+    db.add_all([emit_1108, emit_1107, non_emit])
+    db.flush()
+    db.add_all(
+        [
+            CompetitorPriceListItem(price_list_id=emit_1108.id, provisor_goods_id=1, filial_id=1108, name="A", distributor_price=100),
+            CompetitorPriceListItem(price_list_id=emit_1108.id, provisor_goods_id=1, filial_id=1108, name="A", distributor_price=120),
+            CompetitorPriceListItem(price_list_id=emit_1107.id, provisor_goods_id=1, filial_id=1107, name="A", distributor_price=200),
+            CompetitorPriceListItem(price_list_id=emit_1107.id, provisor_goods_id=1, filial_id=1107, name="A", distributor_price=240),
+            CompetitorPriceListItem(price_list_id=non_emit.id, provisor_goods_id=1, name="A", distributor_price=50),
+            PriceFormatCompetitorAssignment(
+                price_format_id=existing_pf.id,
+                competitor_price_list_id=emit_1108.id,
+                is_active=True,
+                coefficient=1.25,
+                percentile_mode="multi_price_per_sku",
+                source_mode="regional-template",
+            ),
+        ]
+    )
+    db.commit()
+
+    created = propagate_emit_assignments_to_new_price_format(db=db, price_format_id=int(new_pf.id))
+    created_again = propagate_emit_assignments_to_new_price_format(db=db, price_format_id=int(new_pf.id))
+
+    assert created == 2
+    assert created_again == 0
+    assignments = db.execute(
+        select(PriceFormatCompetitorAssignment)
+        .where(PriceFormatCompetitorAssignment.price_format_id == new_pf.id)
+        .order_by(PriceFormatCompetitorAssignment.competitor_price_list_id.asc())
+    ).scalars().all()
+    assigned_ids = {int(row.competitor_price_list_id) for row in assignments}
+    assert assigned_ids == {int(emit_1108.id), int(emit_1107.id)}
+    assert db.scalar(
+        select(func.count(PriceFormatCompetitorAssignment.id))
+        .where(PriceFormatCompetitorAssignment.price_format_id == new_pf.id)
+        .where(PriceFormatCompetitorAssignment.competitor_price_list_id == non_emit.id)
+    ) == 0
+    copied = next(row for row in assignments if int(row.competitor_price_list_id) == int(emit_1108.id))
+    assert copied.is_active is True
+    assert float(copied.coefficient) == 1.25
+    assert copied.percentile_mode == "multi_price_per_sku"
+    assert copied.source_mode == "regional-template"
+
+    result = _recalculate_percentiles_for_emit_rows(
+        db,
+        price_list_ids=[emit_1107.id],
+        scope_to_price_list_ids=True,
+    )
+
+    assert int(new_pf.id) in result["assigned_price_format_ids"]
+    assert result["summaries"]["NEW"]["products_with_competitors"] == 1
+    rows = db.query(CompetitorPricePercentile).filter(
+        CompetitorPricePercentile.price_format_id == new_pf.id,
+        CompetitorPricePercentile.percentile_scope == "regional",
+        CompetitorPricePercentile.percentile == 10,
+    ).all()
+    assert {row.branch_name for row in rows} == {"Emit International 1107"}
 
 
 def test_top_level_object_with_data_items_parsed_streaming(tmp_path):

@@ -34,7 +34,7 @@ from ..timezone import local_iso
 from .competitor_matching import rebuild_competitor_prices_for_selected
 from .competitor_percentiles import emit_percentile_group_keys, recalculate_competitor_percentiles_if_needed
 from .competitor_percentiles import REGIONAL_SCOPE
-from .competitor_assignments import get_assigned_competitor_price_lists
+from .competitor_assignments import get_assigned_competitor_price_lists, propagate_emit_assignments_to_new_price_format
 from .references.types import canonical_branch_id
 from .regions import allowed_provisor_source_names_for_city_id, city_id_from_branch
 
@@ -1532,6 +1532,7 @@ def calculate_prices(
 
         db.add(pf)
         db.flush()
+        propagate_emit_assignments_to_new_price_format(db=db, price_format_id=int(pf.id))
 
     def _get_defaults() -> dict:
         return data.PRICING_SETTINGS_BY_FORMAT.get(price_format_code) or data.PRICING_SETTINGS_BY_FORMAT.get(

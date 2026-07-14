@@ -108,8 +108,20 @@ def _trace_sku() -> str:
     return str(os.getenv("EMIT_TRACE_SKU", DEFAULT_TRACE_SKU) or "").strip()
 
 
-def recalculate_competitor_percentiles(*, db: Session, price_format_id: int) -> dict[str, Any]:
+def recalculate_competitor_percentiles(
+    *,
+    db: Session,
+    price_format_id: int,
+    source_price_list_ids: list[int] | None = None,
+) -> dict[str, Any]:
     selected = emit_percentile_assignments(db=db, price_format_id=price_format_id)
+    scoped_ids = {
+        int(item)
+        for item in (source_price_list_ids or [])
+        if int(item) > 0
+    }
+    if scoped_ids:
+        selected = [item for item in selected if int(item.price_list.id) in scoped_ids]
     if not selected:
         logger.info(
             "[PERCENTILE_MUTATION] action=skip reason=%s price_format_id=%s source_price_list_id=%s "

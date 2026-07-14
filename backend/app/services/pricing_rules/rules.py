@@ -20,6 +20,7 @@ from ...models import (
 )
 from .common import touch
 from .templates import rounding_to_dict, template_to_dict
+from ..competitor_assignments import propagate_emit_assignments_to_new_price_format
 from ...timezone import local_iso, now_kz_naive
 
 
@@ -220,6 +221,7 @@ def apply_pricing_rule_to_format(*, db: Session, format_code: str, rule_id: int)
         pf = PriceFormat(code=format_code, name=format_code)
         db.add(pf)
         db.flush()
+        propagate_emit_assignments_to_new_price_format(db=db, price_format_id=int(pf.id))
     rule = get_pricing_rule(db=db, rule_id=rule_id)
     pf.pricing_rule_id = rule.id
     pf.pricing_rule = rule.code

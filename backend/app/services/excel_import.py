@@ -17,6 +17,7 @@ from ..models import (
     ListItem,
     CompetitorPrice,
 )
+from .competitor_assignments import propagate_emit_assignments_to_new_price_format
 from .sku import normalize_sku
 
 
@@ -192,6 +193,7 @@ def import_excel(*, db: Session, content: bytes) -> dict[str, int]:
                     pf = PriceFormat(code=code_s, name=str(name).strip() if name else code_s)
                     db.add(pf)
                     db.flush()
+                    propagate_emit_assignments_to_new_price_format(db=db, price_format_id=int(pf.id))
 
                 if name not in (None, ""):
                     pf.name = str(name).strip()
