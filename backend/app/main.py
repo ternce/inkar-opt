@@ -568,17 +568,23 @@ def _start_emit_refresh_scheduler() -> None:
             release_emit_scheduler_lock(db, owner_token=owner_token)
         logger.exception("[EMIT_REFRESH] APScheduler is not installed; scheduler not started")
         return
-    scheduler = AsyncIOScheduler(timezone=config.timezone)
-    scheduler.add_job(
-        lambda: asyncio.create_task(_start_emit_refresh_background(mode="all", requested_by="scheduler")),
-        trigger=CronTrigger.from_crontab(config.cron),
-        id="emit_refresh",
-        name="Emit/Amity International refresh",
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=300,
-    )
-    scheduler.start()
+    try:
+        scheduler = AsyncIOScheduler(timezone=config.timezone)
+        scheduler.add_job(
+            lambda: asyncio.create_task(_start_emit_refresh_background(mode="all", requested_by="scheduler")),
+            trigger=CronTrigger.from_crontab(config.cron),
+            id="emit_refresh",
+            name="Emit/Amity International refresh",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=300,
+        )
+        scheduler.start()
+    except Exception:
+        with SessionLocal() as db:
+            release_emit_scheduler_lock(db, owner_token=owner_token)
+        logger.exception("[EMIT_REFRESH] scheduler setup failed; scheduler lease released")
+        return
     _emit_refresh_scheduler = scheduler
     _emit_refresh_scheduler_token = owner_token
     try:
@@ -4367,6 +4373,10 @@ def _selected_competitor_rows(db: Session, pf: PriceFormat) -> list[CompetitorPr
 
 
 def _assignment_row_from_price_list(row: CompetitorPriceList, items_count: int = 0, assignment: object | None = None) -> dict:
+    last_checked_at = row.last_checked_at.isoformat() if row.last_checked_at else ""
+    last_success_at = row.last_success_at.isoformat() if row.last_success_at else ""
+    updated_at = row.updated_at.isoformat() if row.updated_at else ""
+    source_updated_at = row.source_updated_at or ""
     return {
         "id": str(row.id),
         "sourceId": row.id,
@@ -4380,6 +4390,11 @@ def _assignment_row_from_price_list(row: CompetitorPriceList, items_count: int =
         "accountLogin": row.account_login or "",
         "coefficient": float(getattr(assignment, "coefficient", row.coefficient) or 1.0),
         "priceDate": row.price_date.isoformat() if row.price_date else "",
+        "sourceUpdatedAt": source_updated_at,
+        "updatedAt": updated_at,
+        "lastCheckedAt": last_checked_at,
+        "lastSuccessAt": last_success_at,
+        "lastUpdatedAt": last_success_at or last_checked_at or updated_at or source_updated_at,
         "itemsCount": int(items_count or 0),
         "active": bool(getattr(assignment, "is_active", row.is_selected)),
         "isPercentile": False,
@@ -4388,6 +4403,7 @@ def _assignment_row_from_price_list(row: CompetitorPriceList, items_count: int =
 
 def _assignment_row_from_percentile(source: dict, cfg: CompetitorPrice | None = None) -> dict:
     source_id = str(source.get("id") or "")
+    generated_at = source.get("generatedAt") or ""
     return {
         "id": _assignment_percentile_source_name(source_id),
         "sourceId": source_id,
@@ -4400,7 +4416,12 @@ def _assignment_row_from_percentile(source: dict, cfg: CompetitorPrice | None = 
         "accountId": "percentile",
         "accountLogin": f"Персентиль {source.get('percentile') or ''}".strip(),
         "coefficient": float(cfg.coefficient if cfg is not None and cfg.coefficient is not None else 1.0),
-        "priceDate": str(source.get("generatedAt") or "")[:10],
+        "priceDate": str(generated_at)[:10],
+        "sourceUpdatedAt": generated_at,
+        "updatedAt": generated_at,
+        "lastCheckedAt": generated_at,
+        "lastSuccessAt": generated_at,
+        "lastUpdatedAt": generated_at,
         "itemsCount": int(source.get("skuCount") or 0),
         "active": True,
         "isPercentile": True,

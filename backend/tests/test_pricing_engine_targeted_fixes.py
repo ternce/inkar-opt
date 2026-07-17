@@ -1,11 +1,12 @@
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 import csv
 import io
+import json
 
 import pytest
 from fastapi.testclient import TestClient
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -30,6 +31,8 @@ from backend.app.models import (
     Product,
     ProductExtra,
     ProductRating,
+    ReferenceImportJob,
+    ReferenceUpdateStatus,
     RoundingRule,
     UniversalList,
     UniversalListPriceFormat,
@@ -44,7 +47,13 @@ from backend.app.main import _competitor_column_title, _generated_item_dict, app
 from backend.app.services.competitor_percentiles import KAZAKHSTAN_REGION, KAZAKHSTAN_SCOPE, REGIONAL_SCOPE, recalculate_competitor_percentiles
 from backend.app.services.competitor_source_config import MULTI_PRICE_PERCENTILE_MODE
 from backend.app.services.competitor_matching import rebuild_competitor_prices_for_selected
-from backend.app.services.pricing import calculate_price_for_product, calculate_price_zone, calculate_prices
+from backend.app.services.pricing import (
+    MISSING_STOCK_REFERENCE_ERROR,
+    calculate_price_for_product,
+    calculate_price_zone,
+    calculate_prices,
+)
+from backend.app.services.references.imports import import_reference_excel
 from backend.app.services.pricing_workflow.analytics import build_workflow_analytics
 from backend.app.services.pricing_workflow.exports import _export_zone
 
@@ -93,6 +102,88 @@ def _branch_cost(db, product, *, branch_id="1", cost=100):
     db.flush()
 
 
+def _active_stock_reference(db, *, branch_id="1", rows_count=None):
+    row = ReferenceUpdateStatus(
+        branch_id=str(branch_id),
+        branch_name=str(branch_id),
+        data_type="stock",
+        status="success",
+        rows_count=rows_count if rows_count is not None else db.query(BranchStock).filter(BranchStock.branch_id == str(branch_id)).count(),
+        last_updated_at=datetime(2026, 1, 1, 8, 0, 0),
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def _active_cost_reference(db, *, branch_id="1", rows_count=None):
+    row = ReferenceUpdateStatus(
+        branch_id=str(branch_id),
+        branch_name=str(branch_id),
+        data_type="cost",
+        status="success",
+        rows_count=rows_count if rows_count is not None else db.query(BranchCost).filter(BranchCost.branch_id == str(branch_id)).count(),
+        last_updated_at=datetime(2026, 1, 1, 8, 0, 0),
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def _activate_all_products_for_generation(db, *, branch_id="1"):
+    products = db.query(Product).all()
+    for product in products:
+        if db.query(BranchStock).filter(BranchStock.branch_id == str(branch_id), BranchStock.product_id == product.id).one_or_none() is None:
+            _branch_stock(db, product, branch_id=str(branch_id))
+        if db.query(BranchCost).filter(BranchCost.branch_id == str(branch_id), BranchCost.product_id == product.id).one_or_none() is None:
+            _branch_cost(db, product, branch_id=str(branch_id), cost=float(product.cost or 0))
+    existing = db.query(ReferenceUpdateStatus).filter(
+        ReferenceUpdateStatus.branch_id == str(branch_id),
+        ReferenceUpdateStatus.data_type == "stock",
+    ).one_or_none()
+    if existing is None:
+        _active_stock_reference(db, branch_id=str(branch_id), rows_count=len(products))
+    else:
+        existing.status = "success"
+        existing.rows_count = len(products)
+        existing.last_updated_at = datetime(2026, 1, 1, 8, 0, 0)
+        db.flush()
+    cost_existing = db.query(ReferenceUpdateStatus).filter(
+        ReferenceUpdateStatus.branch_id == str(branch_id),
+        ReferenceUpdateStatus.data_type == "cost",
+    ).one_or_none()
+    if cost_existing is None:
+        _active_cost_reference(db, branch_id=str(branch_id), rows_count=len(products))
+    else:
+        cost_existing.status = "success"
+        cost_existing.rows_count = len(products)
+        cost_existing.last_updated_at = datetime(2026, 1, 1, 8, 0, 0)
+        db.flush()
+
+
+def _xlsx_bytes(rows):
+    workbook = Workbook()
+    worksheet = workbook.active
+    for row in rows:
+        worksheet.append(row)
+    bio = io.BytesIO()
+    workbook.save(bio)
+    return bio.getvalue()
+
+
+def _stock_rows(prefix: str, count: int):
+    return [["Материал", "Наименование", "Остаток"]] + [[f"{prefix}-{idx:05d}", f"{prefix} {idx}", 1] for idx in range(count)]
+
+
+def _generated_codes(db):
+    return {
+        code
+        for (code,) in db.query(Product.code)
+        .join(CalculatedPrice, CalculatedPrice.product_id == Product.id)
+        .all()
+    }
+
+
 def _list_item(db, product, list_type, value, *, pf=None, status="active", start_date=None, end_date=None):
     row = UniversalList(
         code=f"UL-{list_type}-{product.code}",
@@ -136,7 +227,7 @@ def test_bend_is_selected_by_competitor_price_not_product_cost():
     assert float(price) == 8991.0
 
 
-def test_price_generation_uses_only_products_present_in_stock_and_cost_references():
+def test_price_generation_uses_stock_membership_and_keeps_missing_cost_rows():
     db = _session()
     pf = _format(db)
     in_both = _product(db, code="REF-BOTH", cost=100)
@@ -148,6 +239,8 @@ def test_price_generation_uses_only_products_present_in_stock_and_cost_reference
     _branch_cost(db, in_both, branch_id="1")
     _branch_cost(db, cost_only, branch_id="1")
     _branch_stock(db, stock_only, branch_id="1")
+    _active_stock_reference(db, branch_id="1")
+    _active_cost_reference(db, branch_id="1")
 
     count = calculate_prices(
         db=db,
@@ -166,28 +259,427 @@ def test_price_generation_uses_only_products_present_in_stock_and_cost_reference
         .join(CalculatedPrice, CalculatedPrice.product_id == Product.id)
         .all()
     }
-    assert count == 1
-    assert generated_skus == {"REF-BOTH"}
+    assert count == 2
+    assert generated_skus == {"REF-BOTH", "REF-STOCK-ONLY"}
+    stock_only_row = db.query(CalculatedPrice).filter(CalculatedPrice.product_id == stock_only.id).one()
+    assert float(stock_only_row.final_price) == 0.0
+    assert float(stock_only_row.mdc_price) == 0.0
+    assert stock_only_row.competitor_price is None
+    assert stock_only_row.applied_reason == "Нет себестоимости, расчет не выполнен"
 
 
-def test_price_generation_raises_when_references_exist_under_different_branch_key():
+def test_stock_200_cost_190_generates_200_rows_with_10_zero_prices():
     db = _session()
     pf = _format(db)
-    product = _product(db, code="REF-WRONG-BRANCH", cost=100)
-    _branch_stock(db, product, branch_id="2")
-    _branch_cost(db, product, branch_id="2")
+    products = [_product(db, code=f"STOCK200-{idx:03d}", cost=999) for idx in range(200)]
+    for product in products:
+        _branch_stock(db, product, branch_id="1")
+    for product in products[:190]:
+        _branch_cost(db, product, branch_id="1", cost=100)
+    _active_stock_reference(db, branch_id="1")
+    _active_cost_reference(db, branch_id="1")
 
-    with pytest.raises(ValueError, match="Reference branch mismatch"):
+    count = calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="PL-STOCK-200-COST-190",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        region_id=1,
+        force_new_price_list=True,
+    )
+
+    assert count == 200
+    assert db.query(CalculatedPrice).count() == 200
+    assert db.query(CalculatedPrice).filter(CalculatedPrice.final_price == 0).count() == 10
+
+
+def test_successful_new_stock_import_replaces_old_scope_and_generation_uses_new_scope():
+    db = _session()
+    pf = _format(db)
+    old_rows = [["Материал", "Наименование", "Остаток"]] + [[f"OLD-{idx:03d}", f"Old {idx}", 1] for idx in range(200)]
+    old_job = import_reference_excel(
+        db=db,
+        data_type="stock",
+        branch_ids=["1"],
+        content=_xlsx_bytes(old_rows),
+        filename="old-stock.xlsx",
+    )
+    assert old_job.status == "success"
+    assert db.query(BranchStock).filter(BranchStock.branch_id == "1").count() == 200
+
+    new_rows = [["Материал", "Наименование", "Остаток"]] + [[f"NEW-{idx:04d}", f"New {idx}", 1] for idx in range(4000)]
+    new_job = import_reference_excel(
+        db=db,
+        data_type="stock",
+        branch_ids=["1"],
+        content=_xlsx_bytes(new_rows),
+        filename="new-stock.xlsx",
+    )
+    assert new_job.status == "success"
+    assert db.query(BranchStock).filter(BranchStock.branch_id == "1").count() == 4000
+
+    count = calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="PL-STOCK-4000",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        region_id=1,
+        force_new_price_list=True,
+    )
+
+    generated_codes = {
+        code
+        for (code,) in db.query(Product.code)
+        .join(CalculatedPrice, CalculatedPrice.product_id == Product.id)
+        .all()
+    }
+    assert count == 4000
+    assert len(generated_codes) == 4000
+    assert not any(code.startswith("OLD-") for code in generated_codes)
+
+
+def test_running_stock_import_preserves_previous_successful_snapshot_for_generation():
+    db = _session()
+    pf = _format(db)
+    job = import_reference_excel(db=db, data_type="stock", branch_ids=["1"], content=_xlsx_bytes(_stock_rows("RUNOLD", 200)), filename="old.xlsx")
+    assert job.status == "success"
+    running = ReferenceImportJob(data_type="stock", branch_ids_json='["1"]', filename="running.xlsx", status="running", started_at=datetime(2026, 1, 2, 8, 0, 0))
+    db.add(running)
+    status = db.query(ReferenceUpdateStatus).filter(ReferenceUpdateStatus.branch_id == "1", ReferenceUpdateStatus.data_type == "stock").one()
+    status.current_import_status = "running"
+    status.current_import_started_at = running.started_at
+    db.flush()
+
+    count = calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="PL-RUNNING-STOCK",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        region_id=1,
+        force_new_price_list=True,
+    )
+
+    assert count == 200
+
+
+def test_failed_stock_import_preserves_previous_successful_snapshot_for_generation():
+    db = _session()
+    pf = _format(db)
+    old_job = import_reference_excel(db=db, data_type="stock", branch_ids=["1"], content=_xlsx_bytes(_stock_rows("ERROLD", 200)), filename="old.xlsx")
+    assert old_job.status == "success"
+    failed_job = import_reference_excel(
+        db=db,
+        data_type="stock",
+        branch_ids=["1"],
+        content=_xlsx_bytes([["Wrong"], ["ERRNEW00001"]]),
+        filename="bad.xlsx",
+    )
+    assert failed_job.status == "error"
+
+    count = calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="PL-FAILED-STOCK",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        region_id=1,
+        force_new_price_list=True,
+    )
+
+    status = db.query(ReferenceUpdateStatus).filter(ReferenceUpdateStatus.branch_id == "1", ReferenceUpdateStatus.data_type == "stock").one()
+    assert status.status == "success"
+    assert status.current_import_status == "error"
+    assert count == 200
+
+
+def test_partial_stock_import_preserves_exact_previous_snapshot_without_mixed_rows():
+    db = _session()
+    pf = _format(db)
+    old_job = import_reference_excel(db=db, data_type="stock", branch_ids=["1"], content=_xlsx_bytes(_stock_rows("PARTOLD", 200)), filename="old.xlsx")
+    assert old_job.status == "success"
+    partial_job = import_reference_excel(
+        db=db,
+        data_type="stock",
+        branch_ids=["1"],
+        content=_xlsx_bytes([["Материал", "Наименование", "Остаток"], ["PARTNEW00001", "New", 1], ["", "Bad", 1]]),
+        filename="partial.xlsx",
+    )
+    assert partial_job.status == "partial"
+
+    active_codes = {row.sku for row in db.query(BranchStock).filter(BranchStock.branch_id == "1").all()}
+    count = calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="PL-PARTIAL-STOCK",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        region_id=1,
+        force_new_price_list=True,
+    )
+
+    assert count == 200
+    assert len(active_codes) == 200
+    assert "PARTNEW00001" not in active_codes
+
+
+def test_regeneration_removes_stale_calculated_rows_absent_from_new_stock_scope():
+    db = _session()
+    pf = _format(db)
+    old_only = _product(db, code="STALE-OLD-ONLY", cost=100)
+    still_present = _product(db, code="STALE-STILL", cost=100)
+    _branch_stock(db, old_only, branch_id="1")
+    _branch_cost(db, old_only, branch_id="1", cost=100)
+    _branch_stock(db, still_present, branch_id="1")
+    _branch_cost(db, still_present, branch_id="1", cost=100)
+    _active_stock_reference(db, branch_id="1")
+    _active_cost_reference(db, branch_id="1")
+
+    initial_count = calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="PL-STALE-REGEN",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        region_id=1,
+    )
+    assert initial_count == 2
+
+    db.query(BranchStock).filter(BranchStock.branch_id == "1", BranchStock.product_id == old_only.id).delete()
+    status = db.query(ReferenceUpdateStatus).filter(
+        ReferenceUpdateStatus.branch_id == "1",
+        ReferenceUpdateStatus.data_type == "stock",
+    ).one()
+    status.rows_count = 1
+    status.last_updated_at = datetime(2026, 1, 2, 8, 0, 0)
+    db.flush()
+
+    regenerated_count = calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="PL-STALE-REGEN",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        region_id=1,
+    )
+    pl = db.query(PriceList).filter(PriceList.number == "PL-STALE-REGEN").one()
+    reconciliation = json.loads(pl.run_reference_versions_json)["generationReconciliation"]
+
+    assert regenerated_count == 1
+    assert db.query(CalculatedPrice).filter(CalculatedPrice.product_id == old_only.id).one_or_none() is None
+    assert db.query(CalculatedPrice).filter(CalculatedPrice.product_id == still_present.id).one_or_none() is not None
+    assert reconciliation["stale_calculated_rows_removed"] == 1
+
+
+def test_duplicate_stock_sku_rows_generate_distinct_mapped_products_only():
+    db = _session()
+    pf = _format(db)
+    rows = [
+        ["Материал", "Наименование", "Остаток"],
+        ["DUP-1", "Duplicate", 1],
+        ["DUP-1", "Duplicate", 2],
+        ["DUP-2", "Second", 3],
+    ]
+    job = import_reference_excel(
+        db=db,
+        data_type="stock",
+        branch_ids=["1"],
+        content=_xlsx_bytes(rows),
+        filename="duplicates.xlsx",
+    )
+    assert job.status == "success"
+
+    count = calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="PL-DUP-STOCK",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        region_id=1,
+        force_new_price_list=True,
+    )
+    pl = db.query(PriceList).filter(PriceList.number == "PL-DUP-STOCK").one()
+    reconciliation = json.loads(pl.run_reference_versions_json)["generationReconciliation"]
+
+    assert count == 2
+    assert db.query(CalculatedPrice).count() == 2
+    assert reconciliation["duplicate_stock_skus"] == 1
+
+
+def test_empty_successful_stock_import_activates_empty_snapshot_and_blocks_generation():
+    db = _session()
+    pf = _format(db)
+    old_job = import_reference_excel(db=db, data_type="stock", branch_ids=["1"], content=_xlsx_bytes(_stock_rows("EMPTYOLD", 200)), filename="old.xlsx")
+    assert old_job.status == "success"
+    empty_job = import_reference_excel(
+        db=db,
+        data_type="stock",
+        branch_ids=["1"],
+        content=_xlsx_bytes([["Материал", "Наименование", "Остаток"]]),
+        filename="empty.xlsx",
+    )
+    assert empty_job.status == "success"
+    assert db.query(BranchStock).filter(BranchStock.branch_id == "1").count() == 0
+
+    with pytest.raises(ValueError, match=MISSING_STOCK_REFERENCE_ERROR):
         calculate_prices(
             db=db,
             price_format_code=pf.code,
-            price_list_number="REF-MISMATCH-PL",
+            price_list_number="PL-EMPTY-STOCK",
             as_of=date.today(),
             activation_date=None,
             user="test",
             region_id=1,
             force_new_price_list=True,
         )
+
+
+def test_stock_activation_commit_failure_keeps_previous_snapshot_active(monkeypatch):
+    db = _session()
+    old_job = import_reference_excel(db=db, data_type="stock", branch_ids=["1"], content=_xlsx_bytes(_stock_rows("FAILOLD", 200)), filename="old.xlsx")
+    assert old_job.status == "success"
+    original_commit = db.commit
+    calls = {"count": 0}
+
+    def fail_second_commit():
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise RuntimeError("activation commit failed")
+        return original_commit()
+
+    monkeypatch.setattr(db, "commit", fail_second_commit)
+    failed_job = import_reference_excel(db=db, data_type="stock", branch_ids=["1"], content=_xlsx_bytes(_stock_rows("FAILNEW", 4000)), filename="new.xlsx")
+
+    assert failed_job.status == "error"
+    assert db.query(BranchStock).filter(BranchStock.branch_id == "1").count() == 200
+    status = db.query(ReferenceUpdateStatus).filter(ReferenceUpdateStatus.branch_id == "1", ReferenceUpdateStatus.data_type == "stock").one()
+    assert status.status == "success"
+    assert status.current_import_status == "error"
+
+
+def test_generation_blocks_without_successful_active_stock_reference():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, code="NO-ACTIVE-STOCK", cost=100)
+    _branch_stock(db, product, branch_id="1")
+
+    with pytest.raises(ValueError, match=MISSING_STOCK_REFERENCE_ERROR):
+        calculate_prices(
+            db=db,
+            price_format_code=pf.code,
+            price_list_number="REF-NO-STOCK-PL",
+            as_of=date.today(),
+            activation_date=None,
+            user="test",
+            region_id=1,
+            force_new_price_list=True,
+        )
+
+
+def test_missing_branch_cost_keeps_product_and_skips_competitor_and_list_pricing():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, code="MISSING-BRANCH-COST", cost=1000)
+    _branch_stock(db, product, branch_id="1")
+    _active_stock_reference(db, branch_id="1")
+    _competitor(db, pf, product, "manual:competitor", 50)
+    fixed_list = _list_item(db, product, "fixed_price", 123, pf=pf)
+
+    count = calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="PL-MISSING-BRANCH-COST",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        region_id=1,
+        force_new_price_list=True,
+    )
+
+    cp = db.query(CalculatedPrice).one()
+    assert count == 1
+    assert float(cp.final_price) == 0.0
+    assert float(cp.mdc_price) == 0.0
+    assert cp.competitor_price is None
+    assert cp.applied_list_id is None
+    assert str(fixed_list.id) not in cp.applied_list_ids
+    assert cp.applied_reason == "Нет себестоимости, расчет не выполнен"
+
+
+def test_explicit_exclude_from_pricing_removes_stock_product_and_reports_reconciliation():
+    db = _session()
+    pf = _format(db)
+    excluded = _product(db, code="STOCK-EXCLUDED", cost=100)
+    included = _product(db, code="STOCK-INCLUDED", cost=100)
+    for product in (excluded, included):
+        _branch_stock(db, product, branch_id="1")
+        _branch_cost(db, product, branch_id="1", cost=100)
+    _active_stock_reference(db, branch_id="1")
+    _active_cost_reference(db, branch_id="1")
+    _list_item(db, excluded, "exclude_from_pricing", 1, pf=pf)
+
+    count = calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="PL-STOCK-EXCLUSION",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        region_id=1,
+        force_new_price_list=True,
+    )
+    pl = db.query(PriceList).filter(PriceList.number == "PL-STOCK-EXCLUSION").one()
+    reconciliation = json.loads(pl.run_reference_versions_json)["generationReconciliation"]
+
+    assert count == 1
+    assert [row.product_id for row in db.query(CalculatedPrice).all()] == [included.id]
+    assert reconciliation["excluded_by_universal_lists"] == 1
+    assert reconciliation["calculated_rows"] == 1
+
+
+def test_stock_branch_isolation_for_generation():
+    db = _session()
+    pf = _format(db)
+    branch_one = _product(db, code="BRANCH-1-SKU", cost=100)
+    branch_two = _product(db, code="BRANCH-2-SKU", cost=100)
+    _branch_stock(db, branch_one, branch_id="1")
+    _branch_cost(db, branch_one, branch_id="1", cost=100)
+    _branch_stock(db, branch_two, branch_id="2")
+    _branch_cost(db, branch_two, branch_id="2", cost=100)
+    _active_stock_reference(db, branch_id="1")
+    _active_cost_reference(db, branch_id="1")
+    _active_stock_reference(db, branch_id="2")
+    _active_cost_reference(db, branch_id="2")
+
+    count = calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="PL-BRANCH-ONE-ONLY",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        region_id=1,
+        force_new_price_list=True,
+    )
+
+    generated_codes = {
+        code
+        for (code,) in db.query(Product.code)
+        .join(CalculatedPrice, CalculatedPrice.product_id == Product.id)
+        .all()
+    }
+    assert count == 1
+    assert generated_codes == {"BRANCH-1-SKU"}
 
 
 def test_competitor_iteration_chooses_first_candidate_at_or_above_mdc():
@@ -275,6 +767,7 @@ def test_no_competitor_list_override_keeps_percentage_only_in_second_log():
     pf = _format(db)
     product = _product(db, cost=100)
     row = _list_item(db, product, "fixed_markup", 10.5, pf=pf)
+    _activate_all_products_for_generation(db)
 
     calculate_prices(
         db=db,
@@ -754,6 +1247,7 @@ def test_percentile_price_generation_uses_precomputed_rows_without_raw_rebuild(m
         )
     )
     db.flush()
+    _activate_all_products_for_generation(db)
 
     def fail_raw_rebuild(**_kwargs):
         raise AssertionError("raw competitor_price_list_items rebuild should not run during percentile generation")
@@ -819,6 +1313,7 @@ def test_percentile_price_generation_does_not_recalculate_from_raw_rows(monkeypa
         )
     )
     db.flush()
+    _activate_all_products_for_generation(db)
 
     def fail_percentile_recalculation(**_kwargs):
         raise AssertionError("raw Emit rows must not be read to recalculate percentiles during price generation")
@@ -1341,6 +1836,7 @@ def test_fixed_markup_5_5_overrides_global_20_and_is_persisted_in_logs():
     db.add(MarkupRange(price_format_id=pf.id, cost_from=0, cost_to=None, markup_percent=0.20))
     product = _product(db, code="FIXED-5-5", cost=1000)
     row = _list_item(db, product, "fixed_markup", 5.5, pf=pf)
+    _activate_all_products_for_generation(db)
 
     calculate_prices(
         db=db,
@@ -1406,6 +1902,7 @@ def test_exact_lists_management_audit_skus_apply_overrides_during_generation():
         db.add(UniversalListPriceFormat(universal_list_id=ul.id, price_format_id=pf.id))
         db.add(ListItem(universal_list_id=ul.id, product_id=product.id, value=value))
     db.flush()
+    _activate_all_products_for_generation(db)
 
     calculate_prices(
         db=db,
@@ -1888,6 +2385,7 @@ def test_api_payload_keeps_pricing_and_max_price_list_logs_independent():
     product = _product(db, code="DUAL-LOG-MAX", cost=100)
     row = _list_item(db, product, "max_price", 820, pf=pf)
     _competitor(db, pf, product, "manual:first", 900)
+    _activate_all_products_for_generation(db)
 
     calculate_prices(
         db=db,
@@ -1956,6 +2454,7 @@ def test_excluded_product_is_absent_from_generated_price_rows():
     excluded = _product(db, code="EXCLUDED", cost=100)
     included = _product(db, code="INCLUDED", cost=100)
     _list_item(db, excluded, "exclude_from_pricing", 1, pf=pf)
+    _activate_all_products_for_generation(db)
 
     count = calculate_prices(
         db=db,
@@ -1977,6 +2476,7 @@ def test_exclusion_removes_existing_row_when_price_list_is_regenerated():
     pf = _format(db)
     excluded = _product(db, code="LATE-EXCLUDED", cost=100)
     included = _product(db, code="STILL-INCLUDED", cost=100)
+    _activate_all_products_for_generation(db)
 
     initial_count = calculate_prices(
         db=db,
@@ -2030,6 +2530,7 @@ def test_same_type_list_conflict_aborts_generation_with_clear_message():
     product = _product(db, code="CONFLICT-SKU", cost=100)
     first = _list_item(db, product, "fixed_price", 111, pf=pf)
     second = _list_item(db, product, "fixed_price", 222, pf=pf)
+    _activate_all_products_for_generation(db)
 
     with pytest.raises(ValueError) as exc_info:
         calculate_prices(
@@ -2055,6 +2556,7 @@ def test_unconfirmed_rule_is_explicitly_marked_ambiguous_in_diagnostics_and_api(
     pf = _format(db)
     product = _product(db, code="AMBIGUOUS", cost=100)
     row = _list_item(db, product, "min_markup", 25, pf=pf)
+    _activate_all_products_for_generation(db)
 
     calculate_prices(
         db=db,
@@ -2126,6 +2628,7 @@ def test_calculate_prices_stores_explicit_competitor_fields():
     product = _product(db, cost=2500)
     _competitor(db, pf, product, "manual:low", 2900)
     _competitor(db, pf, product, "manual:second", 3000)
+    _activate_all_products_for_generation(db)
 
     calculate_prices(
         db=db,
@@ -2151,6 +2654,7 @@ def test_calculate_prices_stores_applied_list_diagnostics():
     pf = _format(db)
     product = _product(db, cost=100)
     row = _list_item(db, product, "fixed_price", 333, pf=pf)
+    _activate_all_products_for_generation(db)
 
     calculate_prices(
         db=db,
@@ -2179,6 +2683,7 @@ def test_calculate_prices_stores_mdc_markup_diagnostics():
     product = _product(db, cost=90.72)
     row = _list_item(db, product, "fixed_markup", 33, pf=pf)
     _competitor(db, pf, product, "manual:high", 200)
+    _activate_all_products_for_generation(db)
 
     calculate_prices(
         db=db,
@@ -2210,6 +2715,7 @@ def test_generated_item_payload_exposes_applied_list_rule_details():
     pf = _format(db)
     product = _product(db, cost=100)
     row = _list_item(db, product, "fixed_price", 2500, pf=pf)
+    _activate_all_products_for_generation(db)
 
     calculate_prices(
         db=db,
@@ -2269,6 +2775,7 @@ def test_generated_item_payload_recomputes_zone_reference_when_saved_best_compet
         )
     )
     db.flush()
+    _activate_all_products_for_generation(db)
 
     calculate_prices(
         db=db,

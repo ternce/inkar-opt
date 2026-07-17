@@ -44,7 +44,11 @@ from backend.app.services.emit_worker import (
     stage_row_count,
     _recalculate_percentiles_for_emit_rows,
 )
-from backend.app.services.competitor_assignments import propagate_emit_assignments_to_new_price_format
+from backend.app.services.competitor_assignments import (
+    propagate_emit_assignments_to_new_price_format,
+    propagate_emit_assignments_to_price_formats,
+)
+from backend.app.services.competitors.percentiles.read_models import list_percentile_sources
 from backend.app.services import provisor_auto_refresh as refresh_svc
 from backend.app.services.price_sources import UnifiedPriceItem, UnifiedPriceList
 
@@ -586,10 +590,11 @@ def test_emit_percentile_rebuild_uses_assigned_price_format_not_first_format(tmp
     summary = result["summaries"]
 
     assert row.price_format_id == selected_pf.id
-    assert result["assigned_price_format_ids"] == [selected_pf.id]
+    assert result["assigned_price_format_ids"] == [first_pf.id, selected_pf.id]
+    assert "FIRST" in summary
     assert "SELECTED" in summary
     assert summary["SELECTED"]["products_with_competitors"] == 1
-    assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == first_pf.id).count() == 0
+    assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == first_pf.id).count() > 0
     rows = db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == selected_pf.id).all()
     by_percentile = {item.percentile: float(item.value) for item in rows if item.percentile_scope == "regional"}
     assert round(by_percentile[10], 3) == 8748.554
@@ -643,10 +648,11 @@ def test_emit_percentile_rebuild_explicit_format_creates_assignment(tmp_path):
     assert result["summaries"]["888"]["products_with_competitors"] == 1
 
 
-def test_emit_percentile_rebuild_without_assignment_returns_warning(tmp_path):
+def test_emit_percentile_rebuild_without_assignment_propagates_to_all_formats(tmp_path):
     db = _session()
-    pf = PriceFormat(code="FMT", name="Format")
-    db.add(pf)
+    pf = PriceFormat(code="003", name="Format 003")
+    product = Product(code="SKU1", name="Product", cost=100, provisor_goods_id=1)
+    db.add_all([pf, product])
     db.flush()
     staging = tmp_path / "stage.sqlite"
     source = tmp_path / "emit.ndjson"
@@ -672,10 +678,18 @@ def test_emit_percentile_rebuild_without_assignment_returns_warning(tmp_path):
 
     result = _recalculate_percentiles_for_emit_rows(db, price_list_ids=[row.id])
 
-    assert result["summaries"] == {}
-    assert result["assigned_price_format_ids"] == []
-    assert result["warnings"][0]["code"] == "emit_no_active_format_assignment"
-    assert result["warnings"][0]["price_list_id"] == row.id
+    assignment = db.execute(
+        select(PriceFormatCompetitorAssignment)
+        .where(PriceFormatCompetitorAssignment.price_format_id == pf.id)
+        .where(PriceFormatCompetitorAssignment.competitor_price_list_id == row.id)
+    ).scalars().one()
+    assert assignment.is_active is True
+    assert assignment.percentile_mode == "multi_price_per_sku"
+    assert result["assigned_price_format_ids"] == [pf.id]
+    assert result["warnings"] == []
+    assert result["summaries"]["003"]["products_with_competitors"] == 1
+    sources = list_percentile_sources(db=db, price_format_code="003")
+    assert {source["region"] for source in sources if source["scope"] == "regional"} == {"Emit International 1108"}
 
 
 def test_scheduled_emit_percentile_rebuild_scopes_each_refreshed_region():
@@ -753,6 +767,115 @@ def test_scheduled_emit_percentile_rebuild_scopes_each_refreshed_region():
     by_branch = {row.branch_name: float(row.value) for row in rows}
     assert round(by_branch["Emit International 1108"], 3) == 102.0
     assert round(by_branch["Emit International 1107"], 3) == 204.0
+
+
+def test_emit_global_propagation_assigns_new_region_to_all_existing_formats():
+    db = _session()
+    pf003 = PriceFormat(code="003", name="Format 003")
+    pf004 = PriceFormat(code="004", name="Format 004")
+    product = Product(code="SKU1", name="Product", cost=100, provisor_goods_id=1)
+    db.add_all([pf003, pf004, product])
+    db.flush()
+    emit_8371 = CompetitorPriceList(
+        price_format_id=pf003.id,
+        source_type="provisor",
+        source_key="emit:8371",
+        display_name="Emit International 8371",
+        supplier="Emit International 8371",
+        branch_id="8371",
+        branch_code="8371",
+        branch_name="Emit International 8371",
+        competitor_name="Emit International 8371",
+        external_price_list_id="8371",
+        account_login="emit",
+        last_refresh_status="success",
+    )
+    db.add(emit_8371)
+    db.flush()
+    db.add_all(
+        [
+            CompetitorPriceListItem(price_list_id=emit_8371.id, provisor_goods_id=1, filial_id=8371, name="A", distributor_price=300),
+            CompetitorPriceListItem(price_list_id=emit_8371.id, provisor_goods_id=1, filial_id=8371, name="A", distributor_price=330),
+        ]
+    )
+    db.commit()
+
+    first = _recalculate_percentiles_for_emit_rows(db, price_list_ids=[emit_8371.id], scope_to_price_list_ids=True)
+    second = propagate_emit_assignments_to_price_formats(db=db, emit_price_list_ids=[emit_8371.id])
+    db.commit()
+
+    assert set(first["assigned_price_format_ids"]) == {pf003.id, pf004.id}
+    assert first["assignment_propagation"]["created_count"] == 2
+    assert second.created_count == 0
+    assert second.reused_count == 2
+    assert db.scalar(
+        select(func.count(PriceFormatCompetitorAssignment.id))
+        .where(PriceFormatCompetitorAssignment.competitor_price_list_id == emit_8371.id)
+    ) == 2
+    for pf in (pf003, pf004):
+        rows = db.query(CompetitorPricePercentile).filter(
+            CompetitorPricePercentile.price_format_id == pf.id,
+            CompetitorPricePercentile.branch_name == "Emit International 8371",
+            CompetitorPricePercentile.percentile_scope == "regional",
+        ).all()
+        assert rows
+
+
+def test_emit_global_propagation_reuses_reactivates_and_skips_incompatible():
+    db = _session()
+    pf_reuse = PriceFormat(code="REUSE", name="Reuse")
+    pf_reactivate = PriceFormat(code="REACT", name="Reactivate")
+    pf_skip = PriceFormat(code="SKIP", name="Skip")
+    db.add_all([pf_reuse, pf_reactivate, pf_skip])
+    db.flush()
+    emit_row = CompetitorPriceList(
+        price_format_id=pf_reuse.id,
+        source_type="provisor",
+        source_key="emit:1108",
+        display_name="Emit International 1108",
+        supplier="Emit International 1108",
+        branch_id="1108",
+        branch_name="Emit International 1108",
+        competitor_name="Emit International 1108",
+        account_login="emit",
+        last_refresh_status="success",
+    )
+    db.add(emit_row)
+    db.flush()
+    reuse = PriceFormatCompetitorAssignment(
+        price_format_id=pf_reuse.id,
+        competitor_price_list_id=emit_row.id,
+        is_active=True,
+        percentile_mode="multi_price_per_sku",
+    )
+    reactivate = PriceFormatCompetitorAssignment(
+        price_format_id=pf_reactivate.id,
+        competitor_price_list_id=emit_row.id,
+        is_active=False,
+        percentile_mode="",
+    )
+    skip = PriceFormatCompetitorAssignment(
+        price_format_id=pf_skip.id,
+        competitor_price_list_id=emit_row.id,
+        is_active=False,
+        percentile_mode="single_latest",
+    )
+    db.add_all([reuse, reactivate, skip])
+    db.commit()
+
+    result = propagate_emit_assignments_to_price_formats(db=db, emit_price_list_ids=[emit_row.id])
+    db.commit()
+
+    assert result.created_count == 0
+    assert result.reused_assignment_ids == [reuse.id]
+    assert result.reactivated_assignment_ids == [reactivate.id]
+    assert result.skipped_incompatible_assignment_ids == [skip.id]
+    db.refresh(reactivate)
+    db.refresh(skip)
+    assert reactivate.is_active is True
+    assert reactivate.percentile_mode == "multi_price_per_sku"
+    assert skip.is_active is False
+    assert skip.percentile_mode == "single_latest"
 
 
 def test_new_price_format_gets_active_emit_assignments_for_scheduler():
@@ -1050,6 +1173,51 @@ def test_global_refresh_lock_blocks_emit_job_start():
     assert job is None
     assert blocker is None
     assert owner_token is None
+
+
+def test_emit_run_job_mixed_filials_finishes_partial_success(monkeypatch):
+    Session = _session_factory_static()
+    worker = EmitWorker(session_factory=Session, config=EmitConfig(temp_dir="unused"))
+    job, _blocker, token = worker.create_job(mode="selected", filial_ids=[1106, 1107])
+    assert job is not None
+
+    async def fake_refresh_filial(*, job_id, filial_id, owner_token=None):
+        if filial_id == 1106:
+            return {"ok": True, "filial_id": filial_id, "price_list_id": 0, "duration_sec": 0.1}
+        return {"ok": False, "filial_id": filial_id, "error": "download failed", "duration_sec": 0.1}
+
+    monkeypatch.setattr(worker, "refresh_filial", fake_refresh_filial)
+
+    asyncio.run(worker.run_job(int(job.id), owner_token=token))
+
+    with Session() as db:
+        saved = db.get(RefreshJob, int(job.id))
+        assert saved.status == "partial_success"
+        metadata = json.loads(saved.metadata_json)
+        assert metadata["success"] == 1
+        assert metadata["failed"] == 1
+        assert metadata["refreshed_filials"] == [1106]
+
+
+def test_emit_run_job_no_success_finishes_error(monkeypatch):
+    Session = _session_factory_static()
+    worker = EmitWorker(session_factory=Session, config=EmitConfig(temp_dir="unused"))
+    job, _blocker, token = worker.create_job(mode="selected", filial_ids=[1106])
+    assert job is not None
+
+    async def fake_refresh_filial(*, job_id, filial_id, owner_token=None):
+        return {"ok": False, "filial_id": filial_id, "error": "download failed", "duration_sec": 0.1}
+
+    monkeypatch.setattr(worker, "refresh_filial", fake_refresh_filial)
+
+    asyncio.run(worker.run_job(int(job.id), owner_token=token))
+
+    with Session() as db:
+        saved = db.get(RefreshJob, int(job.id))
+        assert saved.status == "error"
+        metadata = json.loads(saved.metadata_json)
+        assert metadata["success"] == 0
+        assert metadata["failed"] == 1
 
 
 def test_recent_emit_job_not_marked_stale():

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 
 from sqlalchemy import select, delete, func, or_
@@ -27,6 +27,8 @@ from ..models import (
     CalculatedPrice,
     ProductRating,
     PricingRule,
+    ReferenceImportJob,
+    ReferenceUpdateStatus,
     RoundingRule,
 )
 from .. import data
@@ -96,6 +98,11 @@ LIST_TYPE_MAX_MARGIN = "Максимальная наценка"
 
 logger = logging.getLogger(__name__)
 
+MISSING_STOCK_REFERENCE_ERROR = (
+    "Актуальный справочник остатков отсутствует. "
+    "Загрузите остатки перед формированием прайс-листа."
+)
+
 
 # Canonical code values override the legacy label constants above. Pricing
 # logic must not depend on UI labels because DB rows may contain either form.
@@ -158,6 +165,14 @@ class SelectedSourceMeta:
     labels: dict[str, str]
 
 
+@dataclass(frozen=True)
+class StockGenerationSnapshot:
+    branch_id: str
+    product_ids: set[int]
+    cost_by_product_id: dict[int, Decimal]
+    reconciliation: dict
+
+
 def _as_decimal(value: object, default: Decimal | None = None) -> Decimal | None:
     if value is None:
         return default
@@ -165,6 +180,96 @@ def _as_decimal(value: object, default: Decimal | None = None) -> Decimal | None
         return Decimal(str(value))
     except Exception:
         return default
+
+
+def _latest_reference_job(db: Session, data_type: str, branch_id: str) -> ReferenceImportJob | None:
+    branch_token = f'"{branch_id}"'
+    return (
+        db.execute(
+            select(ReferenceImportJob)
+            .where(ReferenceImportJob.data_type == data_type)
+            .where(ReferenceImportJob.status == "success")
+            .where(ReferenceImportJob.branch_ids_json.like(f"%{branch_token}%"))
+            .order_by(ReferenceImportJob.finished_at.desc(), ReferenceImportJob.created_at.desc(), ReferenceImportJob.id.desc())
+            .limit(1)
+        )
+        .scalars()
+        .first()
+    )
+
+
+def _successful_reference_status(db: Session, data_type: str, branch_id: str) -> ReferenceUpdateStatus | None:
+    return (
+        db.execute(
+            select(ReferenceUpdateStatus)
+            .where(ReferenceUpdateStatus.branch_id == branch_id)
+            .where(ReferenceUpdateStatus.data_type == data_type)
+            .where(ReferenceUpdateStatus.status == "success")
+        )
+        .scalars()
+        .first()
+    )
+
+
+def _load_stock_generation_snapshot(db: Session, branch_id: str) -> StockGenerationSnapshot:
+    stock_status = _successful_reference_status(db, "stock", branch_id)
+    stock_rows = (
+        db.execute(
+            select(BranchStock.product_id, BranchStock.sku)
+            .where(BranchStock.branch_id == branch_id)
+            .where(BranchStock.product_id.is_not(None))
+        )
+        .all()
+    )
+    product_ids = {int(product_id) for product_id, _sku in stock_rows if product_id is not None}
+    if stock_status is None or not product_ids:
+        raise ValueError(MISSING_STOCK_REFERENCE_ERROR)
+
+    cost_status = _successful_reference_status(db, "cost", branch_id)
+    cost_rows = []
+    if cost_status is not None:
+        cost_rows = (
+            db.execute(
+                select(BranchCost.product_id, BranchCost.cost)
+                .where(BranchCost.branch_id == branch_id)
+                .where(BranchCost.product_id.is_not(None))
+            )
+            .all()
+        )
+    cost_by_product_id: dict[int, Decimal] = {}
+    for product_id, raw_cost in cost_rows:
+        cost = _as_decimal(raw_cost)
+        if product_id is not None and cost is not None and cost > 0:
+            cost_by_product_id[int(product_id)] = cost
+
+    stock_job = _latest_reference_job(db, "stock", branch_id)
+    uploaded_at = stock_status.last_updated_at
+    expires_at = uploaded_at + timedelta(hours=24) if uploaded_at else None
+    stock_file_rows = int(stock_job.rows_total if stock_job is not None else stock_status.rows_count or len(stock_rows) or 0)
+    invalid_stock_skus = int(stock_job.rows_failed if stock_job is not None else 0)
+    stock_distinct_skus = len({str(sku or "").strip() for _product_id, sku in stock_rows if str(sku or "").strip()})
+    duplicate_stock_skus = max(0, stock_file_rows - invalid_stock_skus - stock_distinct_skus)
+    products_with_cost = len(product_ids & set(cost_by_product_id))
+    reconciliation = {
+        "stock_source_uploaded_at": local_iso(uploaded_at) if uploaded_at else "",
+        "stock_source_expires_at": local_iso(expires_at) if expires_at else "",
+        "stock_file_rows": stock_file_rows,
+        "stock_distinct_skus": stock_distinct_skus,
+        "stock_mapped_products": len(product_ids),
+        "duplicate_stock_skus": duplicate_stock_skus,
+        "invalid_stock_skus": invalid_stock_skus,
+        "products_with_cost": products_with_cost,
+        "products_without_cost": max(0, len(product_ids) - products_with_cost),
+        "excluded_by_universal_lists": 0,
+        "stale_calculated_rows_removed": 0,
+        "calculated_rows": 0,
+    }
+    return StockGenerationSnapshot(
+        branch_id=branch_id,
+        product_ids=product_ids,
+        cost_by_product_id=cost_by_product_id,
+        reconciliation=reconciliation,
+    )
 
 
 def normalize_list_type(value: object) -> str:
@@ -882,8 +987,9 @@ def calculate_price_for_product(
     region_id: int | None = None,
     active_lists: list[UniversalList] | None = None,
     percentile_price_cache: PercentilePriceCache | None = None,
+    cost_override: object = None,
 ) -> tuple[Decimal, dict]:
-    cost = _as_decimal(product.cost)
+    cost = _as_decimal(cost_override if cost_override is not None else product.cost)
     if cost is None or cost <= 0:
         zero = Decimal("0")
         branch_id = str(region_id if region_id is not None else (price_format.branch or ""))
@@ -1685,30 +1791,21 @@ def calculate_prices(
 
     branch_source = pf.branch if str(pf.branch or "").strip() else region_id
     branch_id = canonical_branch_id(branch_source)
-    stock_product_ids = select(BranchStock.product_id).where(BranchStock.branch_id == branch_id)
-    cost_product_ids = select(BranchCost.product_id).where(BranchCost.branch_id == branch_id)
+    stock_snapshot = _load_stock_generation_snapshot(db, branch_id)
+    stock_product_ids = list(stock_snapshot.product_ids)
     products_before_filter = int(db.execute(select(func.count(Product.id))).scalar() or 0)
     stock_rows_found = int(db.execute(select(func.count(BranchStock.id)).where(BranchStock.branch_id == branch_id)).scalar() or 0)
     cost_rows_found = int(db.execute(select(func.count(BranchCost.id)).where(BranchCost.branch_id == branch_id)).scalar() or 0)
-    stock_product_count = int(
-        db.execute(select(func.count(func.distinct(BranchStock.product_id))).where(BranchStock.branch_id == branch_id)).scalar()
-        or 0
-    )
-    cost_product_count = int(
-        db.execute(select(func.count(func.distinct(BranchCost.product_id))).where(BranchCost.branch_id == branch_id)).scalar()
-        or 0
-    )
+    stock_product_count = len(stock_snapshot.product_ids)
+    cost_product_count = len(stock_snapshot.cost_by_product_id)
     all_stock_branch_ids = [str(value or "") for value in db.execute(select(BranchStock.branch_id).distinct()).scalars().all()]
     all_cost_branch_ids = [str(value or "") for value in db.execute(select(BranchCost.branch_id).distinct()).scalars().all()]
-    missing_stock_for_branch = stock_rows_found == 0 and bool(all_stock_branch_ids)
-    missing_cost_for_branch = cost_rows_found == 0 and bool(all_cost_branch_ids)
-    reference_filter_active = bool(branch_id) and (stock_rows_found > 0 or cost_rows_found > 0)
-    references_exist_elsewhere = bool(set(all_stock_branch_ids) | set(all_cost_branch_ids))
+    missing_stock_for_branch = stock_rows_found == 0
 
     product_stmt = select(Product)
-    if missing_stock_for_branch or missing_cost_for_branch or (not reference_filter_active and references_exist_elsewhere):
+    if missing_stock_for_branch:
         logger.warning(
-            "[REFERENCE_FILTER] branch_key_mismatch requested_region_id=%s price_format_id=%s price_format_code=%s "
+            "[REFERENCE_FILTER] missing_stock requested_region_id=%s price_format_id=%s price_format_code=%s "
             "price_format_branch=%s resolved_branch_id=%s stock_rows_found=%s cost_rows_found=%s "
             "stock_product_count=%s cost_product_count=%s products_before_filter=%s products_after_filter=%s "
             "available_stock_branch_ids=%s available_cost_branch_ids=%s",
@@ -1726,23 +1823,15 @@ def calculate_prices(
             all_stock_branch_ids,
             all_cost_branch_ids,
         )
-        raise ValueError(
-            "Reference branch mismatch: Stock/Cost references exist, but not all required references were found for "
-            f"price format branch '{pf.branch or ''}' (resolved branch_id='{branch_id}'). "
-            f"Available Stock branch_ids: {all_stock_branch_ids or []}; "
-            f"available Cost branch_ids: {all_cost_branch_ids or []}."
-        )
+        raise ValueError(MISSING_STOCK_REFERENCE_ERROR)
 
-    if reference_filter_active:
-        db.execute(
-            delete(CalculatedPrice)
-            .where(CalculatedPrice.price_list_id == pl.id)
-            .where(
-                CalculatedPrice.product_id.not_in(stock_product_ids)
-                | CalculatedPrice.product_id.not_in(cost_product_ids)
-            )
-        )
-        product_stmt = product_stmt.where(Product.id.in_(stock_product_ids)).where(Product.id.in_(cost_product_ids))
+    stale_result = db.execute(
+        delete(CalculatedPrice)
+        .where(CalculatedPrice.price_list_id == pl.id)
+        .where(CalculatedPrice.product_id.not_in(stock_product_ids))
+    )
+    stock_snapshot.reconciliation["stale_calculated_rows_removed"] = int(stale_result.rowcount or 0)
+    product_stmt = product_stmt.where(Product.id.in_(stock_product_ids))
 
     products = db.execute(product_stmt).scalars().all()
     logger.info(
@@ -1783,9 +1872,11 @@ def calculate_prices(
 
     # upsert calculated_prices
     count = 0
+    excluded_by_universal_lists = 0
     for p in products:
         exclude_match = _find_item_match(db, active_lists, p.id, LIST_TYPE_EXCLUDE_FROM_PRICING)
         if exclude_match is not None and exclude_match[0] != 0:
+            excluded_by_universal_lists += 1
             db.execute(
                 delete(CalculatedPrice)
                 .where(CalculatedPrice.price_list_id == pl.id)
@@ -1801,6 +1892,7 @@ def calculate_prices(
             region_id=region_id,
             active_lists=active_lists,
             percentile_price_cache=percentile_price_cache,
+            cost_override=stock_snapshot.cost_by_product_id.get(int(p.id), Decimal("0")),
         )
 
         existing = db.execute(
@@ -1861,6 +1953,27 @@ def calculate_prices(
             db.add(cp)
 
         count += 1
+
+    stock_snapshot.reconciliation["excluded_by_universal_lists"] = excluded_by_universal_lists
+    stock_snapshot.reconciliation["calculated_rows"] = count
+    reference_versions = {}
+    try:
+        reference_versions = json.loads(pl.run_reference_versions_json or "{}")
+    except Exception:
+        reference_versions = {}
+    if not isinstance(reference_versions, dict):
+        reference_versions = {}
+    reference_versions["generationReconciliation"] = stock_snapshot.reconciliation
+    pl.run_reference_versions_json = json.dumps(reference_versions, ensure_ascii=False, default=str)
+
+    snapshot = {}
+    try:
+        snapshot = json.loads(pl.run_snapshot_json or "{}")
+    except Exception:
+        snapshot = {}
+    if isinstance(snapshot, dict) and snapshot:
+        snapshot["generationReconciliation"] = stock_snapshot.reconciliation
+        pl.run_snapshot_json = json.dumps(snapshot, ensure_ascii=False, default=str)
 
     db.commit()
     return count

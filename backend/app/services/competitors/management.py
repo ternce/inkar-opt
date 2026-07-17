@@ -37,7 +37,7 @@ def list_competitor_sources(
                 **row,
                 "sourceName": source_name or str(row.get("name") or row.get("sourceKey") or row.get("id")),
                 "sourceKind": row.get("sourceType") or "",
-                "lastUpdatedAt": row.get("lastCheckedAt") or row.get("updatedAt") or row.get("sourceUpdatedAt") or "",
+                "lastUpdatedAt": row.get("lastSuccessAt") or row.get("lastCheckedAt") or "",
                 "errorSummary": error_summary,
             }
         )

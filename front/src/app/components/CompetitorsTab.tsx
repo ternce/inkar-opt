@@ -8,6 +8,16 @@ import { Popover, PopoverContent, PopoverTrigger } from './ui/popover';
 import { ScrollArea } from './ui/scroll-area';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './ui/tabs';
+import {
+  competitorFreshnessClassName,
+  competitorFreshnessLabel,
+  competitorLastDataReplacement,
+  competitorLastSuccessfulCheck,
+  competitorPriceDate,
+  formatLocalDate,
+  formatLocalDateTime,
+  usefulSourceTimestamp,
+} from '../competitorTimestamps';
 
 type Platform = 'provisor' | 'vidman';
 type MappingStatus = 'all' | 'mapped' | 'unmapped' | 'rejected' | 'no_candidates';
@@ -268,12 +278,12 @@ const parseTime = (value?: string) => {
 
 const refreshStatusLabel = (row: CompetitorSource) => {
   const raw = String(row.refreshStatus || row.status || '').split(';', 1)[0].trim().toLowerCase();
-  if (raw === 'updated' || raw === 'ok') return 'Обновлено новыми данными';
+  if (raw === 'updated' || raw === 'ok' || raw === 'success') return 'Обновлено новыми данными';
   if (raw === 'checked_unchanged') return 'Проверено, без изменений';
   if (raw === 'success_zero_items') return 'Проверено, пустой ответ сохранен';
   if (raw === 'timeout') return 'Тайм-аут';
   if (raw === 'auth_error') return 'Ошибка авторизации';
-  const lastSuccess = parseTime(row.lastSuccessAt || row.updatedAt || row.lastUpdatedAt);
+  const lastSuccess = parseTime(row.lastSuccessAt || row.lastCheckedAt);
   if (!lastSuccess || Date.now() - lastSuccess > PRICE_LIST_FRESHNESS_MS) return 'Устарело или давно не проверялось';
   return raw || 'ok';
 };
@@ -1582,7 +1592,10 @@ export function CompetitorsTab({ formatCode }: Props) {
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Дата цен</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Позиций</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Статус</th>
-                      <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Последнее обновление</th>
+                      <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Актуальность</th>
+                      <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Последняя успешная проверка</th>
+                      <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Последняя замена данных</th>
+                      <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Время источника</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Ошибки / timeout</th>
                       <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">Действия</th>
                     </tr>
@@ -1603,14 +1616,17 @@ export function CompetitorsTab({ formatCode }: Props) {
                             {row.visibleForFormatBranch === false ? 'Другой' : 'Совпадает'}
                           </span>
                         </td>
-                        <td className="px-4 py-3 text-sm text-gray-700 whitespace-nowrap">{row.priceDate || '—'}</td>
+                        <td className="px-4 py-3 text-sm text-gray-700 whitespace-nowrap">{formatLocalDate(competitorPriceDate(row))}</td>
                         <td className="px-4 py-3 text-sm text-gray-700 tabular-nums">{fmtNumber(row.itemsCount)}</td>
                         <td className="px-4 py-3 text-sm text-gray-700">
                           <span className={`status-pill ${refreshStatusClass(row)}`} title={row.refreshMessage || row.status || ''}>
                             {refreshStatusLabel(row)}
                           </span>
                         </td>
-                        <td className="px-4 py-3 text-sm text-gray-700 whitespace-nowrap">{row.lastCheckedAt || row.lastSuccessAt || row.lastUpdatedAt || row.updatedAt || row.sourceUpdatedAt || '—'}</td>
+                        <td className="px-4 py-3 text-sm text-gray-700"><span className={`status-pill ${competitorFreshnessClassName(row)}`}>{competitorFreshnessLabel(row)}</span></td>
+                        <td className="px-4 py-3 text-sm text-gray-700 whitespace-nowrap">{formatLocalDateTime(competitorLastSuccessfulCheck(row))}</td>
+                        <td className="px-4 py-3 text-sm text-gray-700 whitespace-nowrap">{formatLocalDateTime(competitorLastDataReplacement(row))}</td>
+                        <td className="px-4 py-3 text-sm text-gray-700 whitespace-nowrap">{formatLocalDateTime(usefulSourceTimestamp(row))}</td>
                         <td className="px-4 py-3 text-sm text-gray-700">{row.errorSummary || row.refreshMessage || '—'}</td>
                         <td className="px-4 py-3 text-sm">
                           <div className="flex items-center justify-end gap-2">

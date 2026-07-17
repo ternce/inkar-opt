@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ...models import (
@@ -58,6 +58,7 @@ def _upsert_status(
     rows_count: int,
     status: str,
     error: str = "",
+    job_id: int | None = None,
 ) -> None:
     row = (
         db.execute(
@@ -76,6 +77,40 @@ def _upsert_status(
     row.rows_count = rows_count
     row.status = status
     row.error = error
+    if status == "success":
+        row.current_import_status = status
+        row.current_import_finished_at = row.last_updated_at
+        row.last_successful_import_job_id = job_id
+        row.active_snapshot_product_count = rows_count
+
+
+def _upsert_current_import_status(
+    *,
+    db: Session,
+    branch_id: str,
+    data_type: str,
+    status: str,
+    job: ReferenceImportJob | None = None,
+    error: str = "",
+) -> None:
+    row = (
+        db.execute(
+            select(ReferenceUpdateStatus)
+            .where(ReferenceUpdateStatus.branch_id == branch_id)
+            .where(ReferenceUpdateStatus.data_type == data_type)
+        )
+        .scalars()
+        .first()
+    )
+    if row is None:
+        row = ReferenceUpdateStatus(branch_id=branch_id, data_type=data_type, status="missing")
+        db.add(row)
+    row.branch_name = _branch_name(branch_id)
+    row.current_import_status = status
+    row.current_import_started_at = job.started_at if job is not None else row.current_import_started_at
+    row.current_import_finished_at = job.finished_at if job is not None else None
+    if error:
+        row.error = error
 
 
 def _branch_ids_from_request(branch_ids: list[str], row: dict) -> list[str]:
@@ -160,11 +195,13 @@ def import_reference_excel(
     db.add(job)
     db.flush()
     for branch_id in branch_ids:
-        _upsert_status(db=db, branch_id=branch_id, data_type=data_type, rows_count=0, status="running")
+        _upsert_current_import_status(db=db, branch_id=branch_id, data_type=data_type, status="running", job=job)
     db.commit()
 
     logs: list[dict] = []
     success_by_branch = {branch_id: 0 for branch_id in branch_ids}
+    staged_stock_by_branch: dict[str, dict[int, tuple[Product, str, Decimal | None]]] = {}
+    staged_cost_by_branch: dict[str, dict[int, tuple[Product, str, Decimal | None]]] = {}
     try:
         rows, headers = parse_excel_rows(content)
         required = required_columns_for(data_type)
@@ -200,19 +237,14 @@ def import_reference_excel(
                     elif data_type == "stock":
                         stock = as_decimal(raw.get("stock"))
                         for branch_id in row_branch_ids:
-                            _upsert_branch_stock(db, branch_id=branch_id, product=product, sku=sku, stock=stock)
-                            if len(row_branch_ids) == 1:
-                                extra.stock = float(stock) if stock is not None else None
-                                extra.updated_at = now_kz_naive()
+                            staged_stock_by_branch.setdefault(branch_id, {})[int(product.id)] = (product, sku, stock)
                             success_by_branch.setdefault(branch_id, 0)
                             success_by_branch[branch_id] += 1
 
                     elif data_type == "cost":
                         cost = as_decimal(raw.get("cost"))
-                        if cost is not None:
-                            product.cost = float(cost)
                         for branch_id in row_branch_ids:
-                            _upsert_branch_cost(db, branch_id=branch_id, product=product, sku=sku, cost=cost)
+                            staged_cost_by_branch.setdefault(branch_id, {})[int(product.id)] = (product, sku, cost)
                             success_by_branch.setdefault(branch_id, 0)
                             success_by_branch[branch_id] += 1
 
@@ -287,8 +319,85 @@ def import_reference_excel(
         job.status = "success" if failed == 0 else "partial"
         job.log_json = json.dumps(logs[:500], ensure_ascii=False)
         job.finished_at = now_kz_naive()
-        for branch_id, count in success_by_branch.items():
-            _upsert_status(db=db, branch_id=branch_id, data_type=data_type, rows_count=count, status=job.status)
+        if data_type in {"stock", "cost"} and job.status != "success":
+            job_id = job.id
+            rows_total = job.rows_total
+            rows_success = job.rows_success
+            rows_failed = job.rows_failed
+            status = job.status
+            log_json = job.log_json
+            finished_at = job.finished_at
+            db.rollback()
+            job = db.get(ReferenceImportJob, job_id)
+            if job is None:
+                raise RuntimeError("reference import job disappeared during rollback")
+            job.rows_total = rows_total
+            job.rows_success = rows_success
+            job.rows_failed = rows_failed
+            job.status = status
+            job.log_json = log_json
+            job.finished_at = finished_at
+            for branch_id in branch_ids:
+                _upsert_current_import_status(db=db, branch_id=branch_id, data_type=data_type, status=status, job=job)
+            db.commit()
+            db.refresh(job)
+            return job
+
+        if job.status == "success" and data_type == "stock":
+            activation_branch_ids = set(branch_ids) | set(staged_stock_by_branch)
+            for branch_id in activation_branch_ids:
+                db.execute(delete(BranchStock).where(BranchStock.branch_id == branch_id))
+                for _product_id, (product, sku, stock) in staged_stock_by_branch.get(branch_id, {}).items():
+                    db.add(
+                        BranchStock(
+                            branch_id=branch_id,
+                            product_id=product.id,
+                            sku=sku,
+                            stock=float(stock) if stock is not None else None,
+                            source_type="excel",
+                            updated_at=now_kz_naive(),
+                        )
+                    )
+                    if len(activation_branch_ids) == 1:
+                        extra = _get_extra(db, product.id)
+                        extra.stock = float(stock) if stock is not None else None
+                        extra.updated_at = now_kz_naive()
+                _upsert_status(
+                    db=db,
+                    branch_id=branch_id,
+                    data_type=data_type,
+                    rows_count=len(staged_stock_by_branch.get(branch_id, {})),
+                    status="success",
+                    job_id=job.id,
+                )
+        elif job.status == "success" and data_type == "cost":
+            activation_branch_ids = set(branch_ids) | set(staged_cost_by_branch)
+            for branch_id in activation_branch_ids:
+                db.execute(delete(BranchCost).where(BranchCost.branch_id == branch_id))
+                for _product_id, (product, sku, cost) in staged_cost_by_branch.get(branch_id, {}).items():
+                    if cost is not None:
+                        product.cost = float(cost)
+                    db.add(
+                        BranchCost(
+                            branch_id=branch_id,
+                            product_id=product.id,
+                            sku=sku,
+                            cost=float(cost) if cost is not None else None,
+                            source_type="excel",
+                            updated_at=now_kz_naive(),
+                        )
+                    )
+                _upsert_status(
+                    db=db,
+                    branch_id=branch_id,
+                    data_type=data_type,
+                    rows_count=len(staged_cost_by_branch.get(branch_id, {})),
+                    status="success",
+                    job_id=job.id,
+                )
+        else:
+            for branch_id, count in success_by_branch.items():
+                _upsert_status(db=db, branch_id=branch_id, data_type=data_type, rows_count=count, status=job.status, job_id=job.id)
         db.commit()
         db.refresh(job)
         return job
@@ -301,7 +410,14 @@ def import_reference_excel(
             job.finished_at = now_kz_naive()
             job.log_json = json.dumps(logs[:500], ensure_ascii=False)
         for branch_id in branch_ids:
-            _upsert_status(db=db, branch_id=branch_id, data_type=data_type, rows_count=0, status="error", error=str(exc))
+            _upsert_current_import_status(
+                db=db,
+                branch_id=branch_id,
+                data_type=data_type,
+                status="error",
+                job=job,
+                error=str(exc),
+            )
         db.commit()
         if job is None:
             raise

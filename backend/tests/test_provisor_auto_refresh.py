@@ -418,6 +418,25 @@ def test_emit_scheduler_does_not_duplicate_jobs(monkeypatch, tmp_path):
     assert len(_FakeScheduler.instances[0].jobs) == 1
 
 
+def test_emit_scheduler_releases_lease_when_cron_is_invalid(monkeypatch, tmp_path):
+    Session = _session_factory(tmp_path / "emit-scheduler-invalid-cron.db")
+    main = _install_fake_emit_scheduler(monkeypatch, Session)
+
+    class RaisingCronTrigger:
+        @staticmethod
+        def from_crontab(_cron):
+            raise ValueError("invalid cron")
+
+    monkeypatch.setitem(sys.modules, "apscheduler.triggers.cron", types.SimpleNamespace(CronTrigger=RaisingCronTrigger))
+
+    main._start_emit_refresh_scheduler()
+
+    with Session() as db:
+        assert db.get(RefreshLock, svc.EMIT_SCHEDULER_LOCK_NAME) is None
+    assert main._emit_refresh_scheduler is None
+    assert main._emit_refresh_scheduler_token is None
+
+
 def test_emit_scheduler_starts_after_previous_owner_expires(monkeypatch, tmp_path):
     Session = _session_factory(tmp_path / "emit-scheduler-expired-start.db")
     with Session() as db:
@@ -621,4 +640,6 @@ def test_full_mode_targets_active_accounts_and_excluded_filials_env(monkeypatch)
     import backend.app.main as main
 
     assert svc.all_refresh_targets(db) == {"FMT": {"3": set()}}
-    assert main._provisor_excluded_filial_ids() == {"1052", "1106"}
+    excluded = main._provisor_excluded_filial_ids()
+    assert {"1052", "1106"}.issubset(excluded)
+    assert {"1107", "1108", "1111", "1114", "1149", "8371"}.issubset(excluded)

@@ -4,6 +4,14 @@ import { ExternalLink, Percent, PlusCircle, RefreshCw, Search, Trash2, Users, X 
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
+import {
+  competitorFreshnessClassName,
+  competitorFreshnessLabel,
+  competitorLastDataReplacement,
+  competitorLastSuccessfulCheck,
+  formatLocalDate,
+  formatLocalDateTime,
+} from '../competitorTimestamps';
 
 type PriceFormat = {
   id?: string;
@@ -25,6 +33,11 @@ type SourceRow = {
   accountId?: string;
   accountLogin: string;
   priceDate: string;
+  updatedAt?: string;
+  sourceUpdatedAt?: string;
+  lastCheckedAt?: string;
+  lastSuccessAt?: string;
+  lastUpdatedAt?: string;
   generatedAt?: string;
   itemsCount: number;
   skuCount?: number;
@@ -107,6 +120,11 @@ const normalizeSource = (row: any): SourceRow => ({
   accountId: String(row.accountId || ''),
   accountLogin: String(row.accountLogin || row.accountId || ''),
   priceDate: String(row.priceDate || row.generatedAt || ''),
+  updatedAt: String(row.updatedAt || ''),
+  sourceUpdatedAt: String(row.sourceUpdatedAt || ''),
+  lastCheckedAt: String(row.lastCheckedAt || ''),
+  lastSuccessAt: String(row.lastSuccessAt || ''),
+  lastUpdatedAt: String(row.lastUpdatedAt || ''),
   generatedAt: String(row.generatedAt || ''),
   itemsCount: Number(row.itemsCount ?? row.skuCount ?? 0),
   skuCount: Number(row.skuCount ?? row.itemsCount ?? 0),
@@ -129,6 +147,10 @@ const percentileToSource = (row: any): SourceRow =>
     competitorName: row.competitor || 'Эмити',
     accountLogin: `Персентиль ${row.percentile}`,
     priceDate: row.generatedAt,
+    lastSuccessAt: row.generatedAt,
+    lastCheckedAt: row.generatedAt,
+    updatedAt: row.generatedAt,
+    sourceUpdatedAt: row.generatedAt,
     generatedAt: row.generatedAt,
     itemsCount: row.skuCount,
     skuCount: row.skuCount,
@@ -471,16 +493,18 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
             </div>
             <CompactTable
               empty="Для выбранного филиала нет доступных источников цен"
-              columns={['Источник', 'Регион', 'Конкурент', 'Клиент / логин', 'Тип', 'Дата цен', 'Позиций', 'Актуальность', '']}
+              columns={['Источник', 'Регион', 'Конкурент', 'Клиент / логин', 'Тип', 'Дата цен', 'Последняя успешная проверка', 'Последняя замена данных', 'Позиций', 'Актуальность', '']}
               rows={filteredSources.map((row) => [
                 row.sourceName || row.name || '—',
                 row.branchName || row.region || '—',
                 row.competitorName || '—',
                 row.accountLogin || row.accountId || '—',
                 <span key={`${row.id}-type`} className="status-pill">{row.sourceType}</span>,
-                fmtDate(row.priceDate),
+                formatLocalDate(row.priceDate),
+                formatLocalDateTime(competitorLastSuccessfulCheck(row)),
+                formatLocalDateTime(competitorLastDataReplacement(row)),
                 Number(row.itemsCount || 0).toLocaleString('ru-RU'),
-                <span key={`${row.id}-fresh`} className={`status-pill ${freshnessClassName(row.priceDate)}`}>{freshness(row.priceDate)}</span>,
+                <span key={`${row.id}-fresh`} className={`status-pill ${competitorFreshnessClassName(row)}`}>{competitorFreshnessLabel(row)}</span>,
                 <Button key={`${row.id}-add`} variant="ghost" size="sm" onClick={() => addSource(row)} disabled={isLoading || row.isSelected}>
                   <PlusCircle className="mr-1 h-4 w-4" />
                   {row.isSelected ? 'Назначен' : 'Добавить'}
@@ -496,7 +520,7 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
             </div>
             <CompactTable
               empty="Нет назначенных ПЛК"
-              columns={['Источник', 'Конкурент', 'Регион', 'Клиент / логин', 'Коэффициент', 'Дата цен', 'Активен', 'Действия']}
+              columns={['Источник', 'Конкурент', 'Регион', 'Клиент / логин', 'Коэффициент', 'Дата цен', 'Последняя успешная проверка', 'Последняя замена данных', 'Актуальность', 'Активен', 'Действия']}
               rows={assignments.map((row) => [
                 row.sourceName || row.name || '—',
                 row.competitorName || '—',
@@ -508,7 +532,10 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
                   defaultValue={String(row.coefficient ?? 1)}
                   onBlur={(event) => saveAssignment(row, { coefficient: Number(event.target.value || 1) })}
                 />,
-                fmtDate(row.priceDate),
+                formatLocalDate(row.priceDate),
+                formatLocalDateTime(competitorLastSuccessfulCheck(row)),
+                formatLocalDateTime(competitorLastDataReplacement(row)),
+                <span key={`${row.id}-fresh`} className={`status-pill ${competitorFreshnessClassName(row)}`}>{competitorFreshnessLabel(row)}</span>,
                 <input
                   key={`${row.id}-active`}
                   type="checkbox"

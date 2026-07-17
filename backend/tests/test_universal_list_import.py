@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import io
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -18,12 +18,15 @@ from backend.app.main import _generated_price_export_rows, app
 from backend.app.models import (
     BusinessList,
     BusinessListItem,
+    BranchCost,
+    BranchStock,
     CalculatedPrice,
     ListItem,
     MarkupRange,
     PriceFormat,
     PriceList,
     Product,
+    ReferenceUpdateStatus,
     UniversalList,
     UniversalListPriceFormat,
 )
@@ -58,6 +61,44 @@ def _xlsx(rows: list[list[object]]) -> bytes:
     bio = io.BytesIO()
     workbook.save(bio)
     return bio.getvalue()
+
+
+def _activate_all_products_for_generation(db, *, branch_id="1"):
+    products = db.query(Product).all()
+    for product in products:
+        if db.execute(
+            select(BranchStock).where(BranchStock.branch_id == branch_id).where(BranchStock.product_id == product.id)
+        ).scalars().first() is None:
+            db.add(BranchStock(branch_id=branch_id, product_id=product.id, sku=product.code, stock=1))
+        if db.execute(
+            select(BranchCost).where(BranchCost.branch_id == branch_id).where(BranchCost.product_id == product.id)
+        ).scalars().first() is None:
+            db.add(BranchCost(branch_id=branch_id, product_id=product.id, sku=product.code, cost=float(product.cost or 0)))
+    status = db.execute(
+        select(ReferenceUpdateStatus)
+        .where(ReferenceUpdateStatus.branch_id == branch_id)
+        .where(ReferenceUpdateStatus.data_type == "stock")
+    ).scalars().first()
+    if status is None:
+        status = ReferenceUpdateStatus(branch_id=branch_id, data_type="stock")
+        db.add(status)
+    status.branch_name = branch_id
+    status.status = "success"
+    status.rows_count = len(products)
+    status.last_updated_at = datetime(2026, 1, 1, 8, 0, 0)
+    cost_status = db.execute(
+        select(ReferenceUpdateStatus)
+        .where(ReferenceUpdateStatus.branch_id == branch_id)
+        .where(ReferenceUpdateStatus.data_type == "cost")
+    ).scalars().first()
+    if cost_status is None:
+        cost_status = ReferenceUpdateStatus(branch_id=branch_id, data_type="cost")
+        db.add(cost_status)
+    cost_status.branch_name = branch_id
+    cost_status.status = "success"
+    cost_status.rows_count = len(products)
+    cost_status.last_updated_at = datetime(2026, 1, 1, 8, 0, 0)
+    db.flush()
 
 
 def _upload(client: TestClient, rows: list[list[object]], list_type: str):
@@ -846,6 +887,7 @@ def test_exclude_from_pricing_sku_only_excel_is_absent_from_generation_and_expor
             .where(Product.code == "EXCLUDED-SKU")
         ).scalars().one()
         assert float(imported_item.value) == 1.0
+        _activate_all_products_for_generation(db)
 
         count = calculate_prices(
             db=db,
@@ -893,6 +935,7 @@ def test_generated_csv_and_xlsx_export_keep_only_pricing_log_without_list():
         db.add_all([price_format, product])
         db.flush()
         db.add(MarkupRange(price_format_id=price_format.id, cost_from=0, cost_to=None, markup_percent=0.15))
+        _activate_all_products_for_generation(db)
         calculate_prices(
             db=db,
             price_format_code="PF-EXPORT-NO-LIST",
@@ -937,6 +980,7 @@ def test_generated_csv_and_xlsx_export_append_list_log_when_list_applies():
         db.add(universal_list)
         db.flush()
         db.add(ListItem(universal_list_id=universal_list.id, product_id=product.id, value=5.5))
+        _activate_all_products_for_generation(db)
         calculate_prices(
             db=db,
             price_format_code="PF-EXPORT-LIST",

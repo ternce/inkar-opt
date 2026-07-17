@@ -777,6 +777,11 @@ class ReferenceUpdateStatus(Base):
     rows_count: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(32), default="missing")
     error: Mapped[str] = mapped_column(Text, default="")
+    current_import_status: Mapped[str] = mapped_column(String(32), default="")
+    current_import_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    current_import_finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_successful_import_job_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    active_snapshot_product_count: Mapped[int] = mapped_column(Integer, default=0)
 
     __table_args__ = (
         UniqueConstraint("branch_id", "data_type", name="uq_reference_update_branch_type"),

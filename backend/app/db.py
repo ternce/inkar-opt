@@ -235,6 +235,13 @@ def _ensure_compatible_columns() -> None:
             ("run_percentile_config_json", "TEXT DEFAULT '{}'"),
             ("run_snapshot_json", "TEXT DEFAULT '{}'"),
         ],
+        "reference_update_statuses": [
+            ("current_import_status", "VARCHAR(32) DEFAULT ''"),
+            ("current_import_started_at", "DATETIME"),
+            ("current_import_finished_at", "DATETIME"),
+            ("last_successful_import_job_id", "INTEGER"),
+            ("active_snapshot_product_count", "INTEGER DEFAULT 0"),
+        ],
         "calculated_prices": [
             ("price_from_competitor", "NUMERIC(18, 4)"),
             ("lowest_competitor_price", "NUMERIC(18, 4)"),
@@ -407,6 +414,10 @@ def _ensure_compatible_column_types() -> None:
             "run_reference_versions_json",
             "run_percentile_config_json",
             "run_snapshot_json",
+        ),
+        "reference_update_statuses": (
+            "current_import_status",
+            "last_successful_import_job_id",
         ),
         "universal_lists": ("code", "name", "status", "type"),
         "calculated_prices": (

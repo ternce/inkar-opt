@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ..config import Settings
 from ..models import CompetitorPriceList, CompetitorPriceListItem, PriceFormat, PriceFormatCompetitorAssignment, RefreshJob
-from .competitor_assignments import upsert_assignment
+from .competitor_assignments import propagate_emit_assignments_to_price_formats, upsert_assignment
 from .competitor_percentiles import recalculate_competitor_percentiles
 from .competitor_persist import _ensure_price_format
 from .manufacturers import resolve_manufacturer
@@ -1624,6 +1624,20 @@ def _recalculate_percentiles_for_emit_rows(
         for row in db.execute(select(CompetitorPriceList).where(CompetitorPriceList.id.in_(ids))).scalars().all()
     } if ids else {}
 
+    propagation = propagate_emit_assignments_to_price_formats(db=db, emit_price_list_ids=ids) if ids else None
+    if propagation is not None:
+        logger.info(
+            "[EMIT_FORMAT_CONTEXT] action=global_assignment_propagation price_list_ids=%s created=%s reused=%s "
+            "reactivated=%s skipped_incompatible=%s affected_price_format_ids=%s",
+            ids,
+            propagation.created_count,
+            propagation.reused_count,
+            propagation.reactivated_count,
+            propagation.skipped_incompatible_count,
+            propagation.affected_price_format_ids,
+        )
+        db.flush()
+
     assignment_rows = list(
         db.execute(
             select(
@@ -1697,6 +1711,7 @@ def _recalculate_percentiles_for_emit_rows(
         "summaries": summaries,
         "warnings": warnings,
         "assigned_price_format_ids": sorted(touched_format_ids),
+        "assignment_propagation": propagation.to_dict() if propagation is not None else {},
     }
 
 
@@ -1813,10 +1828,10 @@ class EmitWorker:
                         result.get("price_list_id"),
                     )
             if aggregate["failed"]:
-                status = "failed" if not aggregate["success"] else "success"
+                status = "error" if not aggregate["success"] else "partial_success"
         except Exception as exc:
             logger.exception("Emit refresh job failed: job_id=%s", job_id)
-            status = "failed"
+            status = "error"
             error = str(exc)
         finally:
             with self.session_factory() as db:
@@ -1830,7 +1845,7 @@ class EmitWorker:
                         if isinstance(row, dict) and int(row.get("price_list_id") or 0) > 0
                     ]
                     percentile_rebuild = {}
-                    if status == "success" and refreshed_price_list_ids:
+                    if status in {"success", "partial_success"} and refreshed_price_list_ids:
                         percentile_rebuild = _recalculate_percentiles_for_emit_rows(
                             db,
                             price_list_ids=refreshed_price_list_ids,
@@ -1867,7 +1882,7 @@ class EmitWorker:
                         job,
                         status=status,
                         message=f"Emit refresh completed: success={aggregate['success']}, failed={aggregate['failed']}."
-                        if status == "success"
+                        if status in {"success", "partial_success"}
                         else "Emit refresh failed.",
                         error=error,
                         metadata=aggregate,

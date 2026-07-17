@@ -6,6 +6,14 @@ import { BarChart3, FileText, ListChecks, Save, Settings, Trash2, PlugZap, Refre
 import { useEffect, useMemo, useState } from 'react';
 import { toast } from 'sonner';
 import { listTypeLabel } from './listTypeLabels';
+import {
+  competitorFreshnessClassName,
+  competitorFreshnessLabel,
+  competitorLastDataReplacement,
+  competitorLastSuccessfulCheck,
+  formatLocalDate,
+  formatLocalDateTime,
+} from '../competitorTimestamps';
 
 type MarkupRow = {
   id: number;
@@ -79,6 +87,11 @@ type AssignmentRow = {
   competitorName: string;
   coefficient: number;
   priceDate: string;
+  updatedAt?: string;
+  sourceUpdatedAt?: string;
+  lastCheckedAt?: string;
+  lastSuccessAt?: string;
+  lastUpdatedAt?: string;
   itemsCount: number;
   active: boolean;
 };
@@ -659,18 +672,20 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
         </div>
         <div className="admin-table-card">
           <table className="admin-table">
-            <thead><tr><th>Источник / конкурент</th><th>Регион</th><th>Дата цен</th><th>Коэффициент</th><th>Готовность</th></tr></thead>
+            <thead><tr><th>Источник / конкурент</th><th>Регион</th><th>Дата цен</th><th>Последняя успешная проверка</th><th>Последняя замена данных</th><th>Коэффициент</th><th>Актуальность</th></tr></thead>
             <tbody>
               {activeAssignments.map((row) => (
                 <tr key={row.id}>
                   <td><div className="font-medium text-gray-900">{row.competitorName || row.sourceName}</div><div className="text-xs text-gray-500">{row.sourceName}</div></td>
                   <td>{row.region || '—'}</td>
-                  <td>{fmtDate(row.priceDate)}</td>
+                  <td>{formatLocalDate(row.priceDate)}</td>
+                  <td>{formatLocalDateTime(competitorLastSuccessfulCheck(row))}</td>
+                  <td>{formatLocalDateTime(competitorLastDataReplacement(row))}</td>
                   <td>{Number(row.coefficient || 1).toLocaleString('ru-RU')}</td>
-                  <td><span className={`status-pill ${row.priceDate ? 'ok' : 'warn'}`}>{row.priceDate ? 'Готово' : 'Требует внимания'}</span></td>
+                  <td><span className={`status-pill ${competitorFreshnessClassName(row)}`}>{competitorFreshnessLabel(row)}</span></td>
                 </tr>
               ))}
-              {!activeAssignments.length ? <tr><td colSpan={5} className="empty-cell">ПЛК не назначены</td></tr> : null}
+              {!activeAssignments.length ? <tr><td colSpan={7} className="empty-cell">ПЛК не назначены</td></tr> : null}
             </tbody>
           </table>
         </div>

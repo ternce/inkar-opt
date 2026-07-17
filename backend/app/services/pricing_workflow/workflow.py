@@ -37,6 +37,19 @@ def _loads(value: str | None, fallback: object) -> object:
 
 
 def _apply_snapshot(target: object, snapshot: dict) -> None:
+    existing_reconciliation = None
+    try:
+        existing_versions = loads_snapshot(getattr(target, "run_reference_versions_json", "") or "{}", {})
+        if isinstance(existing_versions, dict):
+            existing_reconciliation = existing_versions.get("generationReconciliation")
+    except Exception:
+        existing_reconciliation = None
+    if existing_reconciliation and "generationReconciliation" not in snapshot:
+        snapshot = dict(snapshot)
+        run_reference_versions = dict(snapshot.get("runReferenceVersions") or {})
+        run_reference_versions["generationReconciliation"] = existing_reconciliation
+        snapshot["runReferenceVersions"] = run_reference_versions
+        snapshot["generationReconciliation"] = existing_reconciliation
     setattr(target, "generated_by", str(snapshot.get("generatedBy") or ""))
     setattr(target, "run_sources_json", dumps_snapshot(snapshot.get("runSources") or {}))
     setattr(target, "run_rule_json", dumps_snapshot(snapshot.get("runRule") or {}))
@@ -289,7 +302,10 @@ def list_workflow_competitors(*, db: Session, price_format_id: int) -> dict:
             "competitor": row.get("competitorName") or row.get("supplier") or row.get("name") or "Конкурент",
             "name": row.get("sourceName") or row.get("name") or row.get("sourceKey") or "",
             "priceDate": row.get("priceDate") or "",
-            "updatedAt": row.get("updatedAt") or row.get("sourceUpdatedAt") or "",
+            "lastSuccessAt": row.get("lastSuccessAt") or "",
+            "lastCheckedAt": row.get("lastCheckedAt") or "",
+            "updatedAt": row.get("updatedAt") or "",
+            "sourceUpdatedAt": row.get("sourceUpdatedAt") or "",
             "coefficient": float(row.get("coefficient") or 1),
             "priority": 100,
             "enabled": bool(row.get("isSelected")),

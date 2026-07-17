@@ -34,6 +34,12 @@ def status_to_dict(row: ReferenceUpdateStatus) -> dict:
         "status": row.status,
         "freshness": freshness,
         "error": row.error,
+        "currentImportStatus": row.current_import_status or "",
+        "currentImportStartedAt": local_iso(row.current_import_started_at) if row.current_import_started_at else "",
+        "currentImportFinishedAt": local_iso(row.current_import_finished_at) if row.current_import_finished_at else "",
+        "lastSuccessfulSnapshotId": row.last_successful_import_job_id,
+        "lastSuccessfulImportAt": local_iso(row.last_updated_at) if row.last_updated_at else "",
+        "activeSnapshotProductCount": row.active_snapshot_product_count or row.rows_count,
     }
 
 
@@ -57,6 +63,12 @@ def list_reference_statuses(*, db: Session) -> list[dict]:
                         "status": "missing",
                         "freshness": "missing",
                         "error": "",
+                        "currentImportStatus": "",
+                        "currentImportStartedAt": "",
+                        "currentImportFinishedAt": "",
+                        "lastSuccessfulSnapshotId": None,
+                        "lastSuccessfulImportAt": "",
+                        "activeSnapshotProductCount": 0,
                     },
                 )
             )
@@ -89,6 +101,12 @@ def reference_readiness_matrix(*, db: Session) -> dict:
                             "status": "missing",
                             "freshness": "missing",
                             "error": "",
+                            "currentImportStatus": "",
+                            "currentImportStartedAt": "",
+                            "currentImportFinishedAt": "",
+                            "lastSuccessfulSnapshotId": None,
+                            "lastSuccessfulImportAt": "",
+                            "activeSnapshotProductCount": 0,
                         },
                     )
                     for code in READINESS_COLUMNS

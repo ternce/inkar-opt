@@ -31,6 +31,15 @@ import { ContractorsTab } from './components/ContractorsTab';
 import { PricingRulesTab } from './components/PricingRulesTab';
 import { AnalyticsTab } from './components/AnalyticsTab';
 import { UserGuideTab } from './components/UserGuideTab';
+import {
+  competitorFreshnessClassName,
+  competitorFreshnessLabel,
+  competitorLastDataReplacement,
+  competitorLastSuccessfulCheck,
+  competitorPriceDate,
+  formatLocalDate,
+  formatLocalDateTime,
+} from './competitorTimestamps';
 
 interface PriceFormat {
   id: string;
@@ -856,17 +865,18 @@ function HomeDashboard({
         </div>
         <CompactTable
           empty="Нет назначенных ПЛК"
-          columns={['Источник', 'Регион', 'Конкурент', 'Клиент / логин', 'Коэффициент', 'Дата цен', 'Актуальность']}
+          columns={['Источник', 'Регион', 'Конкурент', 'Клиент / логин', 'Коэффициент', 'Дата цен', 'Последняя успешная проверка', 'Последняя замена данных', 'Актуальность']}
           rows={assignedSources.map((row) => {
-            const freshness = priceDateFreshness(row.priceDate);
             return [
               row.sourceName || row.name || '—',
               row.branchName || row.region || '—',
               row.competitorName || row.supplier || '—',
               row.accountLogin || row.accountId || '—',
               row.coefficient ?? '—',
-              row.priceDate || '—',
-              <span key={row.id || row.sourceName} className={`status-pill ${freshnessClassName(freshness)}`}>{freshness}</span>,
+              formatLocalDate(competitorPriceDate(row)),
+              formatLocalDateTime(competitorLastSuccessfulCheck(row)),
+              formatLocalDateTime(competitorLastDataReplacement(row)),
+              <span key={row.id || row.sourceName} className={`status-pill ${competitorFreshnessClassName(row)}`}>{competitorFreshnessLabel(row)}</span>,
             ];
           })}
         />

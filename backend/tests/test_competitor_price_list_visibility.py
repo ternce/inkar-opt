@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from datetime import date, datetime
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -13,6 +14,7 @@ from backend.app.models import (
 from backend.app.services.competitor_assignments import get_assigned_competitor_price_lists
 from backend.app.services.competitor_price_lists import _visible_competitor_price_list_rows
 from backend.app.services.competitor_price_lists import list_competitor_price_lists
+from backend.app.services.competitors.management import list_competitor_sources
 
 
 def _row(row_id: int, source_type: str = "vidman", branch_name: str = "Aktau", competitor_name: str = "Inkar"):
@@ -148,3 +150,40 @@ def test_active_assignments_still_exclude_inactive_global_pool_rows():
     assigned = get_assigned_competitor_price_lists(db=db, price_format_id=pf.id)
 
     assert [item.price_list.id for item in assigned] == [active.id]
+
+
+def test_competitor_price_list_timestamps_keep_distinct_semantics():
+    db = _session()
+    pf = _format(db, branch="Алматы")
+    price_list = _price_list(db, pf, source_key="4:128", branch_name="Инкар (Алматы)", external_price_list_id=128)
+    price_list.price_date = date(2026, 1, 2)
+    price_list.source_updated_at = "external-2026-01-02"
+    price_list.last_checked_at = datetime(2026, 1, 3, 9, 0, 0)
+    price_list.last_success_at = datetime(2026, 1, 3, 9, 1, 0)
+    price_list.updated_at = datetime(2026, 1, 1, 8, 0, 0)
+    _item(db, price_list)
+    db.flush()
+
+    [row] = list_competitor_price_lists(db=db, price_format_code=pf.code)
+
+    assert row["priceDate"] == "2026-01-02"
+    assert row["sourceUpdatedAt"] == "external-2026-01-02"
+    assert row["lastCheckedAt"].startswith("2026-01-03T09:00:00")
+    assert row["lastSuccessAt"].startswith("2026-01-03T09:01:00")
+    assert row["updatedAt"].startswith("2026-01-01T08:00:00")
+
+
+def test_competitor_management_last_updated_at_uses_successful_check_not_replacement():
+    db = _session()
+    pf = _format(db, branch="Алматы")
+    price_list = _price_list(db, pf, source_key="4:128", branch_name="Инкар (Алматы)", external_price_list_id=128)
+    price_list.price_date = date(2026, 1, 2)
+    price_list.last_checked_at = datetime(2026, 1, 3, 9, 0, 0)
+    price_list.last_success_at = datetime(2026, 1, 3, 9, 1, 0)
+    price_list.updated_at = datetime(2026, 1, 1, 8, 0, 0)
+    _item(db, price_list)
+    db.flush()
+
+    [row] = list_competitor_sources(db=db, price_format_code=pf.code)
+
+    assert row["lastUpdatedAt"].startswith("2026-01-03T09:01:00")

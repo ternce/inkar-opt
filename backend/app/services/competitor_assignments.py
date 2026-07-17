@@ -149,6 +149,44 @@ class AssignedCompetitorPriceList:
     assignment: PriceFormatCompetitorAssignment
 
 
+@dataclass
+class EmitAssignmentPropagationResult:
+    created_assignment_ids: list[int]
+    reused_assignment_ids: list[int]
+    reactivated_assignment_ids: list[int]
+    skipped_incompatible_assignment_ids: list[int]
+    affected_price_format_ids: list[int]
+
+    @property
+    def created_count(self) -> int:
+        return len(self.created_assignment_ids)
+
+    @property
+    def reused_count(self) -> int:
+        return len(self.reused_assignment_ids)
+
+    @property
+    def reactivated_count(self) -> int:
+        return len(self.reactivated_assignment_ids)
+
+    @property
+    def skipped_incompatible_count(self) -> int:
+        return len(self.skipped_incompatible_assignment_ids)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "created_assignment_ids": self.created_assignment_ids,
+            "created_count": self.created_count,
+            "reused_assignment_ids": self.reused_assignment_ids,
+            "reused_count": self.reused_count,
+            "reactivated_assignment_ids": self.reactivated_assignment_ids,
+            "reactivated_count": self.reactivated_count,
+            "skipped_incompatible_assignment_ids": self.skipped_incompatible_assignment_ids,
+            "skipped_incompatible_count": self.skipped_incompatible_count,
+            "affected_price_format_ids": self.affected_price_format_ids,
+        }
+
+
 def get_assigned_competitor_price_lists(
     *,
     db: Session,
@@ -238,71 +276,139 @@ def _is_active_emit_price_list(row: CompetitorPriceList) -> bool:
     return status not in INACTIVE_REFRESH_STATUSES
 
 
-def propagate_emit_assignments_to_new_price_format(*, db: Session, price_format_id: int) -> int:
-    price_format_id = int(price_format_id)
-    price_format = db.get(PriceFormat, price_format_id)
-    if price_format is None:
-        return 0
-    existing_ids = {
-        int(row.competitor_price_list_id)
-        for row in db.execute(
-            select(PriceFormatCompetitorAssignment.competitor_price_list_id)
-            .where(PriceFormatCompetitorAssignment.price_format_id == price_format_id)
-        )
-    }
-    emit_rows = list_global_competitor_price_lists_for_format(
-        db=db,
-        price_format=price_format,
-    )
-    emit_rows = [row for row in emit_rows if _is_active_emit_price_list(row)]
-    target_ids = [int(row.id) for row in emit_rows if int(row.id) not in existing_ids]
-    if not target_ids:
-        return 0
+def _all_active_price_formats(db: Session) -> list[PriceFormat]:
+    # PriceFormat has no active/deleted/archive flag in the current model.
+    return db.execute(select(PriceFormat).order_by(PriceFormat.id.asc())).scalars().all()
 
+
+def propagate_emit_assignments_to_price_formats(
+    *,
+    db: Session,
+    emit_price_list_ids: list[int] | None = None,
+    price_format_ids: list[int] | None = None,
+) -> EmitAssignmentPropagationResult:
+    target_price_list_ids = {int(item) for item in (emit_price_list_ids or []) if int(item) > 0}
+    pf_filter_ids = {int(item) for item in (price_format_ids or []) if int(item) > 0}
+
+    price_formats = _all_active_price_formats(db)
+    if pf_filter_ids:
+        price_formats = [pf for pf in price_formats if int(pf.id) in pf_filter_ids]
+    price_format_ids_ordered = [int(pf.id) for pf in price_formats]
+
+    stmt = select(CompetitorPriceList)
+    if target_price_list_ids:
+        stmt = stmt.where(CompetitorPriceList.id.in_(target_price_list_ids))
+    rows = db.execute(stmt.order_by(CompetitorPriceList.id.asc())).scalars().all()
+    emit_rows = [row for row in rows if _is_active_emit_price_list(row)]
+    emit_row_ids = [int(row.id) for row in emit_rows]
     metadata_by_price_list_id: dict[int, PriceFormatCompetitorAssignment] = {}
-    metadata_rows = (
-        db.execute(
-            select(PriceFormatCompetitorAssignment)
-            .where(PriceFormatCompetitorAssignment.competitor_price_list_id.in_(target_ids))
-            .where(PriceFormatCompetitorAssignment.is_active.is_(True))
-            .order_by(PriceFormatCompetitorAssignment.updated_at.desc(), PriceFormatCompetitorAssignment.id.desc())
-        )
-        .scalars()
-        .all()
-    )
-    for assignment in metadata_rows:
-        metadata_by_price_list_id.setdefault(int(assignment.competitor_price_list_id), assignment)
-
-    now = datetime.utcnow()
-    by_id = {int(row.id): row for row in emit_rows}
-    created = 0
-    for price_list_id in target_ids:
-        template = metadata_by_price_list_id.get(price_list_id)
-        price_list = by_id.get(price_list_id)
-        db.add(
-            PriceFormatCompetitorAssignment(
-                price_format_id=price_format_id,
-                competitor_price_list_id=price_list_id,
-                is_active=True,
-                coefficient=float(template.coefficient) if template is not None else 1.0,
-                percentile_mode=(
-                    str(template.percentile_mode or "").strip()
-                    if template is not None and str(template.percentile_mode or "").strip()
-                    else default_percentile_mode_for_source(price_list) if price_list is not None else MULTI_PRICE_PERCENTILE_MODE
-                ),
-                source_mode=str(template.source_mode or "").strip() if template is not None else "",
-                created_at=now,
-                updated_at=now,
+    if emit_row_ids:
+        metadata_rows = (
+            db.execute(
+                select(PriceFormatCompetitorAssignment)
+                .where(PriceFormatCompetitorAssignment.competitor_price_list_id.in_(emit_row_ids))
+                .where(PriceFormatCompetitorAssignment.is_active.is_(True))
+                .order_by(PriceFormatCompetitorAssignment.updated_at.desc(), PriceFormatCompetitorAssignment.id.desc())
             )
+            .scalars()
+            .all()
         )
-        created += 1
+        for existing_assignment in metadata_rows:
+            mode = str(existing_assignment.percentile_mode or "").strip()
+            if mode and mode != MULTI_PRICE_PERCENTILE_MODE:
+                continue
+            metadata_by_price_list_id.setdefault(int(existing_assignment.competitor_price_list_id), existing_assignment)
+
+    created: list[int] = []
+    reused: list[int] = []
+    reactivated: list[int] = []
+    skipped: list[int] = []
+    affected: set[int] = set()
+    now = datetime.utcnow()
+
     logger.info(
-        "[EMIT_ASSIGNMENT_PROPAGATION] price_format_id=%s emit_price_list_ids=%s assignments_created=%s",
-        price_format_id,
-        target_ids,
-        created,
+        "[EMIT_ASSIGNMENT_PROPAGATION] action=start price_format_ids=%s price_list_ids=%s",
+        price_format_ids_ordered,
+        [int(row.id) for row in emit_rows],
     )
-    return created
+
+    for pf in price_formats:
+        for price_list in emit_rows:
+            assignment = get_assignment(
+                db=db,
+                price_format_id=int(pf.id),
+                competitor_price_list_id=int(price_list.id),
+            )
+            if assignment is None:
+                template = metadata_by_price_list_id.get(int(price_list.id))
+                assignment = PriceFormatCompetitorAssignment(
+                    price_format_id=int(pf.id),
+                    competitor_price_list_id=int(price_list.id),
+                    is_active=True,
+                    coefficient=float(template.coefficient) if template is not None else 1.0,
+                    percentile_mode=MULTI_PRICE_PERCENTILE_MODE,
+                    source_mode=str(template.source_mode or "").strip() if template is not None else "",
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(assignment)
+                db.flush()
+                created.append(int(assignment.id))
+                affected.add(int(pf.id))
+                continue
+
+            mode = str(assignment.percentile_mode or "").strip()
+            if mode and mode != MULTI_PRICE_PERCENTILE_MODE:
+                skipped.append(int(assignment.id))
+                logger.warning(
+                    "[EMIT_ASSIGNMENT_PROPAGATION] action=skip reason=incompatible_percentile_mode "
+                    "price_format_id=%s price_list_id=%s assignment_id=%s percentile_mode=%s",
+                    int(pf.id),
+                    int(price_list.id),
+                    int(assignment.id),
+                    mode,
+                )
+                continue
+
+            if not assignment.is_active:
+                assignment.is_active = True
+                assignment.percentile_mode = MULTI_PRICE_PERCENTILE_MODE
+                assignment.updated_at = now
+                reactivated.append(int(assignment.id))
+                affected.add(int(pf.id))
+                continue
+
+            if not mode:
+                assignment.percentile_mode = MULTI_PRICE_PERCENTILE_MODE
+                assignment.updated_at = now
+                affected.add(int(pf.id))
+            reused.append(int(assignment.id))
+            affected.add(int(pf.id))
+
+    result = EmitAssignmentPropagationResult(
+        created_assignment_ids=created,
+        reused_assignment_ids=reused,
+        reactivated_assignment_ids=reactivated,
+        skipped_incompatible_assignment_ids=skipped,
+        affected_price_format_ids=sorted(affected),
+    )
+    logger.info(
+        "[EMIT_ASSIGNMENT_PROPAGATION] action=end price_format_ids=%s price_list_ids=%s created=%s reused=%s "
+        "reactivated=%s skipped_incompatible=%s affected_price_format_ids=%s",
+        price_format_ids_ordered,
+        [int(row.id) for row in emit_rows],
+        result.created_count,
+        result.reused_count,
+        result.reactivated_count,
+        result.skipped_incompatible_count,
+        result.affected_price_format_ids,
+    )
+    return result
+
+
+def propagate_emit_assignments_to_new_price_format(*, db: Session, price_format_id: int) -> int:
+    result = propagate_emit_assignments_to_price_formats(db=db, price_format_ids=[int(price_format_id)])
+    return result.created_count
 
 
 def set_competitor_assignments(
