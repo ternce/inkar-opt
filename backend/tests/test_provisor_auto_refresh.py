@@ -323,6 +323,7 @@ class _FakeEmitConfig:
     enabled = True
     cron = "0 3 * * *"
     timezone = "UTC"
+    filial_ids = [1108, 1111, 1114]
 
 
 class _FakeScheduler:
@@ -364,7 +365,7 @@ def _install_fake_emit_scheduler(monkeypatch, Session):
     scheduler_module = types.ModuleType("apscheduler.schedulers.asyncio")
     scheduler_module.AsyncIOScheduler = _FakeScheduler
     trigger_module = types.ModuleType("apscheduler.triggers.cron")
-    trigger_module.CronTrigger = types.SimpleNamespace(from_crontab=lambda cron: ("cron", cron))
+    trigger_module.CronTrigger = types.SimpleNamespace(from_crontab=lambda cron, timezone=None: ("cron", cron, timezone))
 
     _FakeScheduler.instances = []
     monkeypatch.setitem(sys.modules, "apscheduler.schedulers.asyncio", scheduler_module)
@@ -375,6 +376,37 @@ def _install_fake_emit_scheduler(monkeypatch, Session):
     monkeypatch.setattr(main, "_emit_refresh_scheduler", None)
     monkeypatch.setattr(main, "_emit_refresh_scheduler_token", None)
     monkeypatch.setattr(main, "_emit_refresh_scheduler_renew_task", None)
+    return main
+
+
+def _install_fake_provisor_scheduler(monkeypatch, Session):
+    import backend.app.main as main
+
+    scheduler_module = types.ModuleType("apscheduler.schedulers.asyncio")
+    scheduler_module.AsyncIOScheduler = _FakeScheduler
+    trigger_module = types.ModuleType("apscheduler.triggers.cron")
+    trigger_module.CronTrigger = types.SimpleNamespace(from_crontab=lambda cron, timezone=None: ("cron", cron, timezone))
+
+    _FakeScheduler.instances = []
+    monkeypatch.setitem(sys.modules, "apscheduler.schedulers.asyncio", scheduler_module)
+    monkeypatch.setitem(sys.modules, "apscheduler.triggers.cron", trigger_module)
+    monkeypatch.setattr(main, "SessionLocal", Session)
+    monkeypatch.setattr(
+        main,
+        "settings",
+        types.SimpleNamespace(
+            environment="prod",
+            provisor_auto_refresh_enabled=True,
+            provisor_auto_refresh_mode="selected",
+            provisor_auto_refresh_cron="0 2 * * *",
+            provisor_auto_refresh_timezone="Asia/Qyzylorda",
+            provisor_auto_refresh_max_parallel_accounts=2,
+            provisor_auto_refresh_max_parallel_plk=1,
+        ),
+    )
+    monkeypatch.setattr(main, "_provisor_auto_refresh_scheduler", None)
+    monkeypatch.setattr(main, "_provisor_auto_refresh_scheduler_token", None)
+    monkeypatch.setattr(main, "_provisor_auto_refresh_scheduler_renew_task", None)
     return main
 
 
@@ -390,8 +422,115 @@ def test_emit_scheduler_registers_job_only_when_lease_owned(monkeypatch, tmp_pat
     assert scheduler.timezone == "UTC"
     assert len(scheduler.jobs) == 1
     assert scheduler.jobs[0][1]["id"] == "emit_refresh"
+    assert scheduler.jobs[0][0][0] is main._run_scheduled_emit_refresh
+    assert scheduler.jobs[0][1]["kwargs"] == {"mode": "all"}
+    assert scheduler.jobs[0][1]["trigger"] == ("cron", "0 3 * * *", "UTC")
     assert main._emit_refresh_scheduler is scheduler
     assert main._emit_refresh_scheduler_token is not None
+
+
+def test_provisor_scheduler_registers_async_job_with_timezone(monkeypatch, tmp_path):
+    Session = _session_factory(tmp_path / "provisor-scheduler-start.db")
+    main = _install_fake_provisor_scheduler(monkeypatch, Session)
+
+    main._start_provisor_auto_refresh_scheduler()
+
+    assert len(_FakeScheduler.instances) == 1
+    scheduler = _FakeScheduler.instances[0]
+    assert scheduler.started is True
+    assert scheduler.timezone == "Asia/Qyzylorda"
+    assert len(scheduler.jobs) == 1
+    assert scheduler.jobs[0][0][0] is main._run_scheduled_provisor_refresh
+    assert scheduler.jobs[0][1]["kwargs"] == {"mode": "selected"}
+    assert scheduler.jobs[0][1]["trigger"] == ("cron", "0 2 * * *", "Asia/Qyzylorda")
+    assert main._provisor_auto_refresh_scheduler is scheduler
+    assert main._provisor_auto_refresh_scheduler_token is not None
+
+
+def test_provisor_scheduled_callback_runs_without_thread_event_loop(monkeypatch):
+    import backend.app.main as main
+
+    calls = []
+
+    async def fake_start_provisor_refresh_background(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(main, "_start_provisor_refresh_background", fake_start_provisor_refresh_background)
+    monkeypatch.setattr(
+        main,
+        "settings",
+        types.SimpleNamespace(provisor_auto_refresh_timezone="Asia/Qyzylorda"),
+    )
+
+    def run_in_thread():
+        asyncio.run(main._run_scheduled_provisor_refresh(mode="selected"))
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(run_in_thread).result()
+
+    assert calls == [{"mode": "selected", "requested_by": "scheduler", "run_inline": True}]
+
+
+def test_provisor_scheduled_callback_logs_and_reraises_exception(monkeypatch, caplog):
+    import backend.app.main as main
+
+    async def fake_start_provisor_refresh_background(**_kwargs):
+        raise RuntimeError("provisor boom")
+
+    monkeypatch.setattr(main, "_start_provisor_refresh_background", fake_start_provisor_refresh_background)
+    monkeypatch.setattr(
+        main,
+        "settings",
+        types.SimpleNamespace(provisor_auto_refresh_timezone="Asia/Qyzylorda"),
+    )
+
+    try:
+        asyncio.run(main._run_scheduled_provisor_refresh(mode="selected"))
+    except RuntimeError as exc:
+        assert str(exc) == "provisor boom"
+    else:
+        raise AssertionError("expected scheduled Provisor failure")
+
+    assert "action=job_failed" in caplog.text
+
+
+def test_emit_scheduled_callback_runs_without_thread_event_loop(monkeypatch):
+    import backend.app.main as main
+
+    calls = []
+
+    async def fake_start_emit_refresh_background(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(main, "_start_emit_refresh_background", fake_start_emit_refresh_background)
+    monkeypatch.setattr(main, "_emit_worker_instance", lambda: types.SimpleNamespace(config=_FakeEmitConfig()))
+
+    def run_in_thread():
+        asyncio.run(main._run_scheduled_emit_refresh(mode="all"))
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(run_in_thread).result()
+
+    assert calls == [{"mode": "all", "requested_by": "scheduler", "filial_ids": None, "run_inline": True}]
+
+
+def test_emit_scheduled_callback_logs_and_reraises_exception(monkeypatch, caplog):
+    import backend.app.main as main
+
+    async def fake_start_emit_refresh_background(**_kwargs):
+        raise RuntimeError("emit boom")
+
+    monkeypatch.setattr(main, "_start_emit_refresh_background", fake_start_emit_refresh_background)
+    monkeypatch.setattr(main, "_emit_worker_instance", lambda: types.SimpleNamespace(config=_FakeEmitConfig()))
+
+    try:
+        asyncio.run(main._run_scheduled_emit_refresh(mode="all"))
+    except RuntimeError as exc:
+        assert str(exc) == "emit boom"
+    else:
+        raise AssertionError("expected scheduled Emit failure")
+
+    assert "action=job_failed" in caplog.text
 
 
 def test_emit_scheduler_does_not_register_without_lease(monkeypatch, tmp_path):
@@ -424,7 +563,7 @@ def test_emit_scheduler_releases_lease_when_cron_is_invalid(monkeypatch, tmp_pat
 
     class RaisingCronTrigger:
         @staticmethod
-        def from_crontab(_cron):
+        def from_crontab(_cron, timezone=None):
             raise ValueError("invalid cron")
 
     monkeypatch.setitem(sys.modules, "apscheduler.triggers.cron", types.SimpleNamespace(CronTrigger=RaisingCronTrigger))

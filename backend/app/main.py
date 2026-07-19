@@ -13,6 +13,9 @@ import unicodedata
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from inspect import iscoroutinefunction
+from threading import current_thread
+from zoneinfo import ZoneInfo
 from urllib.parse import quote
 from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -474,12 +477,13 @@ def _start_provisor_auto_refresh_scheduler() -> None:
         logger.exception("[PROVISOR_AUTO_REFRESH] APScheduler is not installed; scheduler not started")
         return
     mode = normalize_refresh_mode(settings.provisor_auto_refresh_mode)
-    trigger = CronTrigger.from_crontab(settings.provisor_auto_refresh_cron)
     scheduler_timezone = settings.provisor_auto_refresh_timezone
+    trigger = CronTrigger.from_crontab(settings.provisor_auto_refresh_cron, timezone=scheduler_timezone)
     scheduler = AsyncIOScheduler(timezone=scheduler_timezone)
     scheduler.add_job(
-        lambda: asyncio.create_task(_start_provisor_refresh_background(mode=mode, requested_by="scheduler")),
+        _run_scheduled_provisor_refresh,
         trigger=trigger,
+        kwargs={"mode": mode},
         id="provisor_auto_refresh",
         name="Provisor PLK auto refresh",
         max_instances=1,
@@ -490,14 +494,21 @@ def _start_provisor_auto_refresh_scheduler() -> None:
     _provisor_auto_refresh_scheduler = scheduler
     _provisor_auto_refresh_scheduler_token = owner_token
     try:
-        _provisor_auto_refresh_scheduler_renew_task = asyncio.create_task(_renew_provisor_scheduler_ownership(owner_token))
+        _provisor_auto_refresh_scheduler_renew_task = _create_task_on_running_loop(_renew_provisor_scheduler_ownership, owner_token)
     except RuntimeError:
         logger.warning("[PROVISOR_AUTO_REFRESH] scheduler ownership renew task not started: no running event loop")
     logger.info(
-        "[PROVISOR_AUTO_REFRESH] scheduler started cron=%s timezone=%s mode=%s max_parallel_accounts=%s max_parallel_plk=%s",
+        "[PROVISOR_AUTO_REFRESH] scheduler started class=%s executor=%s cron=%s timezone=%s mode=%s "
+        "now=%s next_run=%s async_job=%s owner=%s max_parallel_accounts=%s max_parallel_plk=%s",
+        scheduler.__class__.__name__,
+        scheduler._executors.get("default").__class__.__name__ if getattr(scheduler, "_executors", None) else "unknown",
         settings.provisor_auto_refresh_cron,
         scheduler_timezone,
         mode,
+        _scheduler_now_iso(scheduler_timezone),
+        _scheduler_next_run_iso(scheduler, "provisor_auto_refresh"),
+        iscoroutinefunction(_run_scheduled_provisor_refresh),
+        owner_token,
         settings.provisor_auto_refresh_max_parallel_accounts,
         settings.provisor_auto_refresh_max_parallel_plk,
     )
@@ -547,6 +558,100 @@ def _emit_worker_instance() -> EmitWorker:
     return _emit_worker
 
 
+def _scheduler_now_iso(timezone_name: str) -> str:
+    try:
+        return datetime.now(ZoneInfo(str(timezone_name))).isoformat()
+    except Exception:
+        return datetime.now().isoformat()
+
+
+def _scheduler_next_run_iso(scheduler, job_id: str) -> str:
+    try:
+        job = scheduler.get_job(job_id)
+        next_run = getattr(job, "next_run_time", None)
+        return next_run.isoformat() if next_run else ""
+    except Exception:
+        return ""
+
+
+def _scheduler_loop_info() -> tuple[bool, int | None]:
+    try:
+        loop = asyncio.get_running_loop()
+        return loop.is_running(), id(loop)
+    except RuntimeError:
+        return False, None
+
+
+def _create_task_on_running_loop(coro_func, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return loop.create_task(coro_func(*args, **kwargs))
+
+
+async def _run_scheduled_provisor_refresh(*, mode: str) -> None:
+    started_at = time.perf_counter()
+    loop_running, loop_id = _scheduler_loop_info()
+    logger.info(
+        "[PROVISOR_AUTO_REFRESH] action=job_started requested_by=scheduler mode=%s timezone=%s "
+        "thread=%s loop_running=%s loop_id=%s owner=%s actual_start=%s",
+        mode,
+        settings.provisor_auto_refresh_timezone,
+        current_thread().name,
+        loop_running,
+        loop_id,
+        _provisor_auto_refresh_scheduler_token,
+        _scheduler_now_iso(settings.provisor_auto_refresh_timezone),
+    )
+    try:
+        await _start_provisor_refresh_background(mode=mode, requested_by="scheduler", run_inline=True)
+        logger.info(
+            "[PROVISOR_AUTO_REFRESH] action=job_completed requested_by=scheduler mode=%s duration_sec=%s",
+            mode,
+            round(time.perf_counter() - started_at, 3),
+        )
+    except Exception:
+        logger.exception(
+            "[PROVISOR_AUTO_REFRESH] action=job_failed requested_by=scheduler mode=%s duration_sec=%s",
+            mode,
+            round(time.perf_counter() - started_at, 3),
+        )
+        raise
+
+
+async def _run_scheduled_emit_refresh(*, mode: str = "all") -> None:
+    started_at = time.perf_counter()
+    worker = _emit_worker_instance()
+    filial_ids = configured_filial_ids_for_mode(worker.config, mode=mode, filial_ids=None)
+    loop_running, loop_id = _scheduler_loop_info()
+    logger.info(
+        "[EMIT_SCHEDULER] action=job_started requested_by=scheduler mode=%s filial_ids=%s timezone=%s "
+        "thread=%s loop_running=%s loop_id=%s owner=%s actual_start=%s",
+        mode,
+        filial_ids,
+        worker.config.timezone,
+        current_thread().name,
+        loop_running,
+        loop_id,
+        _emit_refresh_scheduler_token,
+        _scheduler_now_iso(worker.config.timezone),
+    )
+    try:
+        await _start_emit_refresh_background(mode=mode, requested_by="scheduler", filial_ids=None, run_inline=True)
+        logger.info(
+            "[EMIT_SCHEDULER] action=job_completed requested_by=scheduler mode=%s filial_ids=%s duration_sec=%s",
+            mode,
+            filial_ids,
+            round(time.perf_counter() - started_at, 3),
+        )
+    except Exception:
+        logger.exception(
+            "[EMIT_SCHEDULER] action=job_failed requested_by=scheduler mode=%s filial_ids=%s duration_sec=%s",
+            mode,
+            filial_ids,
+            round(time.perf_counter() - started_at, 3),
+        )
+        raise
+
+
 def _start_emit_refresh_scheduler() -> None:
     global _emit_refresh_scheduler, _emit_refresh_scheduler_token, _emit_refresh_scheduler_renew_task
     config = EmitConfig.from_settings(settings)
@@ -571,8 +676,9 @@ def _start_emit_refresh_scheduler() -> None:
     try:
         scheduler = AsyncIOScheduler(timezone=config.timezone)
         scheduler.add_job(
-            lambda: asyncio.create_task(_start_emit_refresh_background(mode="all", requested_by="scheduler")),
-            trigger=CronTrigger.from_crontab(config.cron),
+            _run_scheduled_emit_refresh,
+            trigger=CronTrigger.from_crontab(config.cron, timezone=config.timezone),
+            kwargs={"mode": "all"},
             id="emit_refresh",
             name="Emit/Amity International refresh",
             max_instances=1,
@@ -588,11 +694,23 @@ def _start_emit_refresh_scheduler() -> None:
     _emit_refresh_scheduler = scheduler
     _emit_refresh_scheduler_token = owner_token
     try:
-        _emit_refresh_scheduler_renew_task = asyncio.create_task(_renew_emit_scheduler_ownership(owner_token))
+        _emit_refresh_scheduler_renew_task = _create_task_on_running_loop(_renew_emit_scheduler_ownership, owner_token)
     except RuntimeError:
         logger.warning("[EMIT_SCHEDULER] action=renew_task_not_started reason=no_running_event_loop")
     logger.info("[EMIT_SCHEDULER] action=lease_acquired owner=%s", owner_token)
-    logger.info("[EMIT_REFRESH] scheduler started cron=%s timezone=%s", config.cron, config.timezone)
+    logger.info(
+        "[EMIT_REFRESH] scheduler started class=%s executor=%s cron=%s timezone=%s now=%s next_run=%s "
+        "async_job=%s owner=%s filial_ids=%s",
+        scheduler.__class__.__name__,
+        scheduler._executors.get("default").__class__.__name__ if getattr(scheduler, "_executors", None) else "unknown",
+        config.cron,
+        config.timezone,
+        _scheduler_now_iso(config.timezone),
+        _scheduler_next_run_iso(scheduler, "emit_refresh"),
+        iscoroutinefunction(_run_scheduled_emit_refresh),
+        owner_token,
+        config.filial_ids,
+    )
 
 
 async def _renew_emit_scheduler_ownership(owner_token: str) -> None:
@@ -630,11 +748,11 @@ def _shutdown_emit_refresh_scheduler() -> None:
         _emit_refresh_scheduler_token = None
 
 
-async def _start_emit_refresh_background(*, mode: str, requested_by: str, filial_ids: list[int] | None = None) -> None:
+async def _start_emit_refresh_background(*, mode: str, requested_by: str, filial_ids: list[int] | None = None, run_inline: bool = False) -> None:
     worker = _emit_worker_instance()
     target_ids = configured_filial_ids_for_mode(worker.config, mode=mode, filial_ids=filial_ids)
     if not target_ids:
-        logger.warning("[EMIT_REFRESH] skipped: no filial IDs requested")
+        logger.warning("[EMIT_REFRESH] skipped: no filial IDs requested mode=%s requested_by=%s", mode, requested_by)
         return
     with SessionLocal() as db:
         provisor_blocker = active_or_stale_refresh_job(db)
@@ -649,7 +767,19 @@ async def _start_emit_refresh_background(*, mode: str, requested_by: str, filial
         reason = "emit_refresh_active" if blocker is not None else "global_refresh_lock_owned"
         logger.warning("[REFRESH_MUTEX] source=emit action=skip reason=%s active_job_id=%s", reason, getattr(blocker, "id", None))
         return
-    asyncio.create_task(worker.run_job(int(job.id), owner_token=owner_token))
+    logger.info(
+        "[EMIT_REFRESH] action=execution_start job_id=%s requested_by=%s mode=%s filial_ids=%s run_inline=%s",
+        job.id,
+        requested_by,
+        mode,
+        target_ids,
+        run_inline,
+    )
+    coro = worker.run_job(int(job.id), owner_token=owner_token)
+    if run_inline:
+        await coro
+    else:
+        asyncio.create_task(coro)
 
 
 def _fmt_dt(dt: datetime | None) -> str:
@@ -5642,7 +5772,7 @@ def get_emit_refresh_job(job_id: int, db: Session = Depends(get_db)):
     return {"id": job.id, **emit_job_to_dict(job)}
 
 
-async def _start_provisor_refresh_background(*, mode: str, requested_by: str) -> None:
+async def _start_provisor_refresh_background(*, mode: str, requested_by: str, run_inline: bool = False) -> None:
     db = SessionLocal()
     try:
         emit_blocker = active_emit_job(db, config=EmitConfig.from_settings(settings))
@@ -5665,7 +5795,18 @@ async def _start_provisor_refresh_background(*, mode: str, requested_by: str) ->
             logger.warning("[REFRESH_MUTEX] source=provisor action=skip reason=global_refresh_lock_owned active_job_id=%s", getattr(blocker, "id", None))
             return
         assert owner_token is not None
-        asyncio.create_task(_run_provisor_refresh_job(int(job.id), mode=job.mode, requested_by=requested_by, owner_token=owner_token))
+        logger.info(
+            "[PROVISOR_AUTO_REFRESH] action=execution_start job_id=%s requested_by=%s mode=%s run_inline=%s",
+            job.id,
+            requested_by,
+            job.mode,
+            run_inline,
+        )
+        coro = _run_provisor_refresh_job(int(job.id), mode=job.mode, requested_by=requested_by, owner_token=owner_token)
+        if run_inline:
+            await coro
+        else:
+            asyncio.create_task(coro)
     finally:
         db.close()
 

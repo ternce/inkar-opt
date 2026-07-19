@@ -765,7 +765,7 @@ def export_percentile_product_rows(
     export_columns.extend(
         [
             ("competitorCount", "Количество цен конкурентов"),
-            ("status", "Статус"),
+            ("status", "Status"),
         ]
     )
     safe_code = price_format_code.strip() or "format"
