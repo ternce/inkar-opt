@@ -235,6 +235,7 @@ class CompetitorPriceList(Base):
     price_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     coefficient: Mapped[float] = mapped_column(Numeric(18, 6), default=1.0)
+    price_coefficient: Mapped[float] = mapped_column(Numeric(18, 6), default=1.0)
     is_selected: Mapped[bool] = mapped_column(Boolean, default=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
@@ -322,12 +323,64 @@ class CompetitorPriceListItem(Base):
     )
 
 
+class ManualPriceListImport(Base):
+    __tablename__ = "manual_price_list_imports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    competitor_price_list_id: Mapped[int | None] = mapped_column(
+        ForeignKey("competitor_price_lists.id"), nullable=True, index=True
+    )
+    source_key: Mapped[str] = mapped_column(Text, default="", index=True)
+    original_filename: Mapped[str] = mapped_column(Text, default="")
+    file_type: Mapped[str] = mapped_column(String(16), default="")
+    file_checksum: Mapped[str] = mapped_column(String(64), default="", index=True)
+    detected_sheet: Mapped[str] = mapped_column(Text, default="")
+    detected_delimiter: Mapped[str] = mapped_column(String(8), default="")
+    detected_encoding: Mapped[str] = mapped_column(String(64), default="")
+    status: Mapped[str] = mapped_column(String(32), default="preview", index=True)
+    total_rows: Mapped[int] = mapped_column(Integer, default=0)
+    empty_rows: Mapped[int] = mapped_column(Integer, default=0)
+    valid_rows: Mapped[int] = mapped_column(Integer, default=0)
+    invalid_rows: Mapped[int] = mapped_column(Integer, default=0)
+    duplicate_rows: Mapped[int] = mapped_column(Integer, default=0)
+    conflicting_duplicate_skus: Mapped[int] = mapped_column(Integer, default=0)
+    matched_rows: Mapped[int] = mapped_column(Integer, default=0)
+    unmatched_rows: Mapped[int] = mapped_column(Integer, default=0)
+    persisted_rows: Mapped[int] = mapped_column(Integer, default=0)
+    preserved_previous_snapshot: Mapped[bool] = mapped_column(Boolean, default=False)
+    requested_by: Mapped[str] = mapped_column(Text, default="")
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    error_summary: Mapped[str] = mapped_column(Text, default="")
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
+
+    __table_args__ = (
+        Index("ix_manual_pl_import_pl_started", "competitor_price_list_id", "started_at"),
+    )
+
+
+class ManualPriceListImportError(Base):
+    __tablename__ = "manual_price_list_import_errors"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    import_id: Mapped[int] = mapped_column(ForeignKey("manual_price_list_imports.id"), index=True)
+    row_number: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    field: Mapped[str] = mapped_column(Text, default="")
+    raw_value: Mapped[str] = mapped_column(Text, default="")
+    error_code: Mapped[str] = mapped_column(String(64), default="", index=True)
+    message: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+
 class CompetitorPricePercentile(Base):
     __tablename__ = "competitor_price_percentiles"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     price_format_id: Mapped[int] = mapped_column(ForeignKey("price_formats.id"), index=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
+    competitor_price_list_id: Mapped[int | None] = mapped_column(ForeignKey("competitor_price_lists.id"), nullable=True, index=True)
+    source_type: Mapped[str] = mapped_column(String(32), default="", index=True)
+    source_key: Mapped[str] = mapped_column(Text, default="", index=True)
 
     branch_name: Mapped[str] = mapped_column(Text, default="Без филиала", index=True)
     competitor_name: Mapped[str] = mapped_column(Text, default="", index=True)
@@ -344,17 +397,19 @@ class CompetitorPricePercentile(Base):
         UniqueConstraint(
             "price_format_id",
             "product_id",
+            "source_key",
             "branch_name",
             "competitor_name",
             "percentile_scope",
             "percentile",
             name="uq_comp_percentile_scope",
         ),
-        Index("ix_comp_percentile_lookup", "price_format_id", "product_id", "percentile_scope", "percentile"),
+        Index("ix_comp_percentile_lookup", "price_format_id", "product_id", "source_key", "percentile_scope", "percentile"),
         Index("ix_comp_percentile_bulk_generation", "price_format_id", "percentile_scope", "percentile", "product_id"),
         Index(
             "ix_comp_percentile_group_lookup",
             "price_format_id",
+            "source_key",
             "branch_name",
             "competitor_name",
             "percentile_scope",

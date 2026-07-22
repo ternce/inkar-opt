@@ -3,6 +3,7 @@ import { toast } from 'sonner';
 import { ChevronDown, Eye, FileDown, FileUp, Link2, RefreshCw, Search, Trash2, XCircle } from 'lucide-react';
 import { Button } from './ui/button';
 import { Checkbox } from './ui/checkbox';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from './ui/dialog';
 import { Input } from './ui/input';
 import { Popover, PopoverContent, PopoverTrigger } from './ui/popover';
 import { ScrollArea } from './ui/scroll-area';
@@ -48,6 +49,44 @@ type CompetitorSource = {
   name?: string;
 };
 
+type ManualImportReport = {
+  ok?: boolean;
+  status?: string;
+  id?: number;
+  importId?: number;
+  sourceKey?: string;
+  mode?: string;
+  fileType?: string;
+  sheet?: string;
+  delimiter?: string;
+  encoding?: string;
+  totalRows?: number;
+  validRows?: number;
+  invalidRows?: number;
+  duplicateRows?: number;
+  conflictingDuplicateSkus?: number;
+  matchedRows?: number;
+  unmatchedRows?: number;
+  persistedRows?: number;
+  sampleRows?: Array<{ rowNumber: number; sku: string; name: string; price: number }>;
+  errors?: Array<{ rowNumber?: number; field: string; errorCode: string; message: string }>;
+};
+
+type ManualImportHistoryRow = {
+  id: number;
+  status: string;
+  filename: string;
+  startedAt: string;
+  totalRows: number;
+  validRows: number;
+  invalidRows: number;
+  duplicateRows: number;
+  matchedRows: number;
+  unmatchedRows: number;
+  preservedPreviousSnapshot: boolean;
+  errorSummary: string;
+};
+
 type ProvisorAccount = {
   id: number;
   login: string;
@@ -72,6 +111,7 @@ type PriceListItem = {
 
 type PercentileSource = {
   id: string;
+  sourceKey?: string;
   name: string;
   region: string;
   competitor: string;
@@ -99,6 +139,7 @@ type PercentileBrowserRow = {
 
 type PercentileGroup = {
   id: string;
+  sourceKey?: string;
   region: string;
   competitor: string;
   scope?: string;
@@ -130,6 +171,7 @@ type PercentilePayload = {
   groups: PercentileGroup[];
   selectedRegion: string;
   selectedCompetitor: string;
+  selectedSourceKey?: string;
   priceColumns: PercentilePriceColumn[];
 };
 
@@ -338,6 +380,7 @@ function PercentileBrowser({
   groups,
   selectedRegion,
   selectedCompetitor,
+  selectedSourceKey,
   priceColumns,
   percentileNumbers,
   search,
@@ -352,6 +395,7 @@ function PercentileBrowser({
   onDirection,
   onRegion,
   onCompetitor,
+  onSourceKey,
   onPage,
   onExport,
 }: {
@@ -363,6 +407,7 @@ function PercentileBrowser({
   groups: PercentileGroup[];
   selectedRegion: string;
   selectedCompetitor: string;
+  selectedSourceKey?: string;
   priceColumns: PercentilePriceColumn[];
   percentileNumbers: number[];
   search: string;
@@ -377,6 +422,7 @@ function PercentileBrowser({
   onDirection: (value: 'asc' | 'desc') => void;
   onRegion: (value: string) => void;
   onCompetitor: (value: string) => void;
+  onSourceKey: (value: string) => void;
   onPage: (value: number | ((current: number) => number)) => void;
   onExport: (fmt: 'csv' | 'xlsx') => void;
 }) {
@@ -388,7 +434,8 @@ function PercentileBrowser({
     ['Без конкурентов', summary.productsWithoutCompetitors],
     ['Покрытие', `${fmtNumber(summary.coveragePercent)}%`],
   ];
-  const regions = Array.from(new Set(groups.map((group) => group.region).filter(Boolean)));
+  const groupOptions = groups.filter((group) => group.scope !== 'kazakhstan');
+  const selectedGroupId = selectedSourceKey || groupOptions.find((group) => group.region === selectedRegion && group.competitor === selectedCompetitor)?.sourceKey || '__none__';
   const competitors = Array.from(
     new Set(groups.filter((group) => !selectedRegion || group.region === selectedRegion).map((group) => group.competitor).filter(Boolean))
   );
@@ -406,11 +453,11 @@ function PercentileBrowser({
 
       <div className="admin-card p-4">
         <div className="mb-3 grid grid-cols-1 gap-3 md:grid-cols-2">
-          <Select value={selectedRegion || '__none__'} onValueChange={(value) => onRegion(value === '__none__' ? '' : value)}>
+          <Select value={selectedGroupId} onValueChange={(value) => onSourceKey(value === '__none__' ? '' : value)}>
             <SelectTrigger><SelectValue placeholder="Регион" /></SelectTrigger>
             <SelectContent>
-              {regions.length ? regions.map((region) => (
-                <SelectItem key={region} value={region}>{region}</SelectItem>
+              {groupOptions.length ? groupOptions.map((group) => (
+                <SelectItem key={group.id} value={group.sourceKey || group.id}>{group.name || group.region}</SelectItem>
               )) : <SelectItem value="__none__">Нет регионов</SelectItem>}
             </SelectContent>
           </Select>
@@ -539,6 +586,13 @@ export function CompetitorsTab({ formatCode }: Props) {
   const [opened, setOpened] = useState<{ meta: any; items: PriceListItem[] } | null>(null);
   const [activeListId, setActiveListId] = useState<number | null>(null);
   const [excelFile, setExcelFile] = useState<File | null>(null);
+  const [manualName, setManualName] = useState('');
+  const [manualCompetitor, setManualCompetitor] = useState('');
+  const [manualBranch, setManualBranch] = useState('');
+  const [manualTargetId, setManualTargetId] = useState<number | null>(null);
+  const [manualReport, setManualReport] = useState<ManualImportReport | null>(null);
+  const [manualHistory, setManualHistory] = useState<ManualImportHistoryRow[]>([]);
+  const [manualDialogOpen, setManualDialogOpen] = useState(false);
   const [percentiles, setPercentiles] = useState<PercentileSource[]>([]);
   const [percentileRows, setPercentileRows] = useState<PercentileBrowserRow[]>([]);
   const [percentileSummary, setPercentileSummary] = useState<PercentileSummary>({
@@ -555,6 +609,7 @@ export function CompetitorsTab({ formatCode }: Props) {
   const [percentileGroups, setPercentileGroups] = useState<PercentileGroup[]>([]);
   const [percentileRegion, setPercentileRegion] = useState('');
   const [percentileCompetitor, setPercentileCompetitor] = useState('');
+  const [percentileSourceKey, setPercentileSourceKey] = useState('');
   const [percentilePriceColumns, setPercentilePriceColumns] = useState<PercentilePriceColumn[]>([]);
   const [percentileNumbers, setPercentileNumbers] = useState<number[]>([10, 20, 30, 40, 60]);
   const [percentileSearch, setPercentileSearch] = useState('');
@@ -611,6 +666,7 @@ export function CompetitorsTab({ formatCode }: Props) {
       format_code: formatCode,
       region: percentileRegion,
       competitor: percentileCompetitor,
+      source_key: percentileSourceKey,
       q: appliedPercentileSearch,
       percentile_filter: percentileFilter,
       competitor_filter: percentileCompetitorFilter,
@@ -639,6 +695,7 @@ export function CompetitorsTab({ formatCode }: Props) {
     setPercentileNumbers(Array.isArray(data?.percentiles) ? data.percentiles.map(Number) : [10, 20, 30, 40, 60]);
     if (data?.selectedRegion && data.selectedRegion !== percentileRegion) setPercentileRegion(data.selectedRegion);
     if (data?.selectedCompetitor && data.selectedCompetitor !== percentileCompetitor) setPercentileCompetitor(data.selectedCompetitor);
+    if (data?.selectedSourceKey && data.selectedSourceKey !== percentileSourceKey) setPercentileSourceKey(data.selectedSourceKey);
     if (data?.page && data.page !== percentilePage) setPercentilePage(data.page);
   };
 
@@ -701,6 +758,7 @@ export function CompetitorsTab({ formatCode }: Props) {
   useEffect(() => {
     setPercentileRegion('');
     setPercentileCompetitor('');
+    setPercentileSourceKey('');
     setPercentilePage(1);
     setPercentileRows([]);
     setPercentilePriceColumns([]);
@@ -725,7 +783,7 @@ export function CompetitorsTab({ formatCode }: Props) {
       .catch((e: any) => setError(e?.message || 'Не удалось загрузить персентили'))
       .finally(() => setIsLoading(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [formatCode, percentileRegion, percentileCompetitor, appliedPercentileSearch, percentileFilter, percentileCompetitorFilter, percentileSort, percentileDirection, percentilePage]);
+  }, [formatCode, percentileRegion, percentileCompetitor, percentileSourceKey, appliedPercentileSearch, percentileFilter, percentileCompetitorFilter, percentileSort, percentileDirection, percentilePage]);
 
   useEffect(() => {
     mappingRequestRef.current?.abort();
@@ -762,6 +820,7 @@ export function CompetitorsTab({ formatCode }: Props) {
       format_code: formatCode,
       region: percentileRegion,
       competitor: percentileCompetitor,
+      source_key: percentileSourceKey,
       q: appliedPercentileSearch,
       percentile_filter: percentileFilter,
       competitor_filter: percentileCompetitorFilter,
@@ -812,6 +871,40 @@ export function CompetitorsTab({ formatCode }: Props) {
     }
   };
 
+  const manualFormData = () => {
+    if (!excelFile) {
+      setError('Select an XLSX or CSV file');
+      return null;
+    }
+    const fd = new FormData();
+    fd.append('file', excelFile);
+    fd.append('name', manualName);
+    fd.append('competitor', manualCompetitor);
+    fd.append('branch', manualBranch);
+    return fd;
+  };
+
+  const previewManualPriceList = async () => {
+    const fd = manualFormData();
+    if (!fd) return;
+    setIsLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/price-formats/${encodeURIComponent(formatCode)}/competitor-price-lists/manual/preview`, {
+        method: 'POST',
+        body: fd,
+      });
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) throw new Error(data?.detail || text || 'preview failed');
+      setManualReport(data);
+    } catch (e: any) {
+      setError(e?.message || 'preview failed');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   const uploadManualPriceList = async () => {
     if (!excelFile) {
       setError('Выберите Excel-файл');
@@ -820,9 +913,12 @@ export function CompetitorsTab({ formatCode }: Props) {
     setIsLoading(true);
     setError(null);
     try {
-      const fd = new FormData();
-      fd.append('file', excelFile);
-      const res = await fetch(`/api/price-formats/${encodeURIComponent(formatCode)}/competitor-price-lists/upload-excel`, {
+      const fd = manualFormData();
+      if (!fd) return;
+      const url = manualTargetId
+        ? `/api/competitor-price-lists/${manualTargetId}/manual/reimport`
+        : `/api/price-formats/${encodeURIComponent(formatCode)}/competitor-price-lists/manual`;
+      const res = await fetch(url, {
         method: 'POST',
         body: fd,
       });
@@ -830,9 +926,71 @@ export function CompetitorsTab({ formatCode }: Props) {
       const data = parseJsonOrNull(text);
       if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить Excel');
       await Promise.all([loadSources(), loadProvisorDiagnostics()]);
+      setManualReport(data);
+      setManualTargetId(null);
+      setExcelFile(null);
       toast.success('Прайс-лист конкурента загружен');
     } catch (e: any) {
       setError(e?.message || 'Ошибка загрузки Excel');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const startManualReimport = (row: CompetitorSource) => {
+    setManualTargetId(row.id);
+    setManualName(row.sourceName || row.name || '');
+    setManualCompetitor(row.competitorName || '');
+    setManualBranch(row.branchName || '');
+    setManualReport(null);
+    setManualDialogOpen(true);
+  };
+
+  const loadManualHistory = async (row: CompetitorSource) => {
+    setIsLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/competitor-price-lists/${row.id}/manual/imports`);
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) throw new Error(data?.detail || text || 'history failed');
+      setManualHistory(Array.isArray(data?.items) ? data.items : []);
+      setManualDialogOpen(true);
+    } catch (e: any) {
+      setError(e?.message || 'history failed');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const deactivateManualSource = async (row: CompetitorSource) => {
+    setIsLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/competitor-price-lists/${row.id}/manual/deactivate`, { method: 'POST' });
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) throw new Error(data?.detail || text || 'deactivate failed');
+      await loadSources();
+    } catch (e: any) {
+      setError(e?.message || 'deactivate failed');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const deleteManualSource = async (row: CompetitorSource) => {
+    if (!window.confirm('Delete manual PLK? Active assignments must be deactivated first.')) return;
+    setIsLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/competitor-price-lists/${row.id}/manual`, { method: 'DELETE' });
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) throw new Error(data?.detail || text || 'delete failed');
+      await loadSources();
+    } catch (e: any) {
+      setError(e?.message || 'delete failed');
     } finally {
       setIsLoading(false);
     }
@@ -1569,14 +1727,39 @@ export function CompetitorsTab({ formatCode }: Props) {
             ) : null}
 
             <div className="admin-card p-4">
-              <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(240px,420px)_auto]">
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
+                <Input placeholder="PLK name" value={manualName} onChange={(e) => setManualName(e.target.value)} />
+                <Input placeholder="Competitor" value={manualCompetitor} onChange={(e) => setManualCompetitor(e.target.value)} />
+                <Input placeholder="Branch / region" value={manualBranch} onChange={(e) => setManualBranch(e.target.value)} />
                 <Input type="file" accept=".xlsx,.csv" onChange={(e) => setExcelFile(e.target.files?.[0] ?? null)} />
+              </div>
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                {manualTargetId ? <span className="status-pill warn">Reimport #{manualTargetId}</span> : <span className="status-pill ok">New manual PLK</span>}
+                <Button variant="outline" size="sm" onClick={previewManualPriceList} disabled={isLoading}>
+                  Preview
+                </Button>
                 <Button variant="outline" size="sm" onClick={uploadManualPriceList} disabled={isLoading}>
                   <FileUp className="mr-2 h-4 w-4" />
                   Загрузить ручной Excel
                 </Button>
               </div>
             </div>
+
+              {manualTargetId ? (
+                <Button variant="ghost" size="sm" onClick={() => { setManualTargetId(null); setManualReport(null); }} disabled={isLoading}>
+                  Cancel reimport
+                </Button>
+              ) : null}
+              {manualReport ? (
+                <div className="mt-3 grid grid-cols-2 gap-2 text-sm md:grid-cols-6">
+                  <div><span className="text-gray-500">Rows</span><div className="font-semibold tabular-nums">{fmtNumber(manualReport.totalRows)}</div></div>
+                  <div><span className="text-gray-500">Valid</span><div className="font-semibold tabular-nums">{fmtNumber(manualReport.validRows)}</div></div>
+                  <div><span className="text-gray-500">Invalid</span><div className="font-semibold tabular-nums">{fmtNumber(manualReport.invalidRows)}</div></div>
+                  <div><span className="text-gray-500">Duplicates</span><div className="font-semibold tabular-nums">{fmtNumber(manualReport.duplicateRows)}</div></div>
+                  <div><span className="text-gray-500">Matched</span><div className="font-semibold tabular-nums">{fmtNumber(manualReport.matchedRows)}</div></div>
+                  <div><span className="text-gray-500">Status</span><div className="font-semibold">{manualReport.status || manualReport.mode || 'preview'}</div></div>
+                </div>
+              ) : null}
 
             <div className="admin-table-card">
               <div className="thin-scrollbar max-h-[560px] min-h-[360px] overflow-auto">
@@ -1654,6 +1837,22 @@ export function CompetitorsTab({ formatCode }: Props) {
                                 Пересчитать
                               </Button>
                             ) : null}
+                            {row.sourceType === 'manual' ? (
+                              <>
+                                <Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => startManualReimport(row)} disabled={isLoading}>
+                                  Reimport
+                                </Button>
+                                <Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => loadManualHistory(row)} disabled={isLoading}>
+                                  History
+                                </Button>
+                                <Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => deactivateManualSource(row)} disabled={isLoading}>
+                                  Deactivate
+                                </Button>
+                                <Button variant="ghost" size="sm" className="h-7 px-2 text-red-600" onClick={() => deleteManualSource(row)} disabled={isLoading}>
+                                  <Trash2 className="h-4 w-4" />
+                                </Button>
+                              </>
+                            ) : null}
                           </div>
                         </td>
                       </tr>
@@ -1723,6 +1922,7 @@ export function CompetitorsTab({ formatCode }: Props) {
             groups={percentileGroups}
             selectedRegion={percentileRegion}
             selectedCompetitor={percentileCompetitor}
+            selectedSourceKey={percentileSourceKey}
             priceColumns={percentilePriceColumns}
             percentileNumbers={percentileNumbers}
             search={percentileSearch}
@@ -1737,6 +1937,13 @@ export function CompetitorsTab({ formatCode }: Props) {
             onDirection={(value) => { setPercentileDirection(value); setPercentilePage(1); }}
             onRegion={(value) => { setPercentileRegion(value); setPercentileCompetitor(''); setPercentilePage(1); }}
             onCompetitor={(value) => { setPercentileCompetitor(value); setPercentilePage(1); }}
+            onSourceKey={(value) => {
+              const group = percentileGroups.find((item) => (item.sourceKey || item.id) === value);
+              setPercentileSourceKey(value);
+              setPercentileRegion(group?.region || '');
+              setPercentileCompetitor(group?.competitor || '');
+              setPercentilePage(1);
+            }}
             onPage={setPercentilePage}
             onExport={exportPercentiles}
           />
@@ -1944,6 +2151,65 @@ export function CompetitorsTab({ formatCode }: Props) {
           )}
         </TabsContent>
       </Tabs>
+      <Dialog open={manualDialogOpen} onOpenChange={setManualDialogOpen}>
+        <DialogContent className="max-w-4xl">
+          <DialogHeader>
+            <DialogTitle>Manual PLK imports</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            {manualReport?.errors?.length ? (
+              <div>
+                <div className="text-sm font-medium text-gray-900">Recent errors</div>
+                <div className="mt-2 max-h-48 overflow-auto rounded border border-gray-200">
+                  <table className="admin-table">
+                    <tbody>
+                      {manualReport.errors.slice(0, 20).map((row, index) => (
+                        <tr key={`${row.rowNumber}-${row.errorCode}-${index}`}>
+                          <td className="px-3 py-2 text-sm tabular-nums">{row.rowNumber || ''}</td>
+                          <td className="px-3 py-2 text-sm">{row.field}</td>
+                          <td className="px-3 py-2 text-sm">{row.errorCode}</td>
+                          <td className="px-3 py-2 text-sm">{row.message}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ) : null}
+            <div>
+              <div className="text-sm font-medium text-gray-900">History</div>
+              <div className="mt-2 max-h-72 overflow-auto rounded border border-gray-200">
+                <table className="admin-table">
+                  <thead>
+                    <tr>
+                      <th className="px-3 py-2 text-left text-sm">Status</th>
+                      <th className="px-3 py-2 text-left text-sm">File</th>
+                      <th className="px-3 py-2 text-left text-sm">Rows</th>
+                      <th className="px-3 py-2 text-left text-sm">Matched</th>
+                      <th className="px-3 py-2 text-left text-sm">Snapshot</th>
+                      <th className="px-3 py-2 text-left text-sm">Started</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {manualHistory.length ? manualHistory.map((row) => (
+                      <tr key={row.id}>
+                        <td className="px-3 py-2 text-sm">{row.status}</td>
+                        <td className="px-3 py-2 text-sm">{row.filename}</td>
+                        <td className="px-3 py-2 text-sm tabular-nums">{fmtNumber(row.validRows)} / {fmtNumber(row.totalRows)}</td>
+                        <td className="px-3 py-2 text-sm tabular-nums">{fmtNumber(row.matchedRows)}</td>
+                        <td className="px-3 py-2 text-sm">{row.preservedPreviousSnapshot ? 'preserved' : 'replaced'}</td>
+                        <td className="px-3 py-2 text-sm">{formatLocalDateTime(row.startedAt)}</td>
+                      </tr>
+                    )) : (
+                      <tr><td colSpan={6} className="px-3 py-6 text-center text-sm text-gray-500">No import history loaded</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

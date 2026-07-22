@@ -43,6 +43,7 @@ from .competitor_assignments import (
     list_global_competitor_price_lists_for_format,
     set_competitor_assignments,
 )
+from .competitor_coefficients import effective_price_coefficient, validate_price_coefficient
 from .competitor_percentiles import DEFAULT_BRANCH, recalculate_competitor_percentiles_if_needed
 from .manufacturers import resolve_manufacturer
 from .price_sources import UnifiedPriceItem, UnifiedPriceList
@@ -116,6 +117,8 @@ def _source_name(row: CompetitorPriceList) -> str:
 
 
 def _source_key_for_unified(price_list: UnifiedPriceList) -> str:
+    if price_list.source == "provisor":
+        return f"plk:{price_list.price_list_id}"
     return f"{price_list.account_id}:{price_list.price_list_id}"
 
 
@@ -487,7 +490,7 @@ def _replace_legacy_price_rows_for_list(*, db: Session, price_list: CompetitorPr
                 source_name=src,
                 supplier=price_list.supplier or price_list.display_name,
                 price_date=price_list.price_date,
-                coefficient=1.0,
+                coefficient=effective_price_coefficient(price_list),
                 source_price=float(item.distributor_price),
             )
         )
@@ -658,6 +661,21 @@ def upsert_unified_price_list(
         .scalars()
         .first()
     )
+    if row is None and price_list.source == "provisor" and str(price_list.price_list_id or "").strip():
+        row = (
+            db.execute(
+                select(CompetitorPriceList)
+                .where(CompetitorPriceList.source_type == price_list.source)
+                .where(CompetitorPriceList.external_price_list_id == str(price_list.price_list_id).strip())
+                .order_by(
+                    CompetitorPriceList.last_success_at.desc().nullslast(),
+                    CompetitorPriceList.updated_at.desc(),
+                    CompetitorPriceList.id.desc(),
+                )
+            )
+            .scalars()
+            .first()
+        )
     if row is None:
         row = CompetitorPriceList(
             price_format_id=pf.id,
@@ -668,6 +686,7 @@ def upsert_unified_price_list(
         db.add(row)
         db.flush()
 
+    row.source_key = source_key
     branch_name = getattr(price_list, "branch_name", "") or "Без филиала"
     competitor_name = getattr(price_list, "competitor_name", "") or price_list.distributor_name or price_list.price_list_name
     account_login = getattr(price_list, "account_login", "") or price_list.account_id
@@ -692,9 +711,16 @@ def upsert_unified_price_list(
         visible_status = "; visible:on"
     elif getattr(price_list, "enabled", None) is False:
         visible_status = "; visible:off"
+    aliases_json = ""
+    source_aliases = getattr(price_list, "source_aliases", None)
+    if source_aliases:
+        try:
+            aliases_json = "; aliasesJson:" + json.dumps(source_aliases, ensure_ascii=False, default=str)
+        except Exception:
+            aliases_json = ""
     row.region = (
         f"branch:{branch_name}; competitor:{competitor_name}; account:{price_list.account_id}; "
-        f"accountLogin:{account_login}; status:{status}{visible_status}"
+        f"accountLogin:{account_login}; status:{status}{visible_status}{aliases_json}"
     )
     row.price_date = today
     row.updated_at = datetime.utcnow()
@@ -916,9 +942,25 @@ def mark_unified_price_list_checked(
         .scalars()
         .first()
     )
+    if row is None and price_list.source == "provisor" and str(price_list.price_list_id or "").strip():
+        row = (
+            db.execute(
+                select(CompetitorPriceList)
+                .where(CompetitorPriceList.source_type == price_list.source)
+                .where(CompetitorPriceList.external_price_list_id == str(price_list.price_list_id).strip())
+                .order_by(
+                    CompetitorPriceList.last_success_at.desc().nullslast(),
+                    CompetitorPriceList.updated_at.desc(),
+                    CompetitorPriceList.id.desc(),
+                )
+            )
+            .scalars()
+            .first()
+        )
     if row is None:
         return None
 
+    row.source_key = source_key
     checked_at = datetime.utcnow()
     source_updated_at = getattr(price_list, "source_updated_at", "") or ""
     if source_updated_at:
@@ -1020,7 +1062,8 @@ def list_competitor_price_lists(
             "refreshMessage": row.last_refresh_message or "",
             "lastCheckedAt": row.last_checked_at.isoformat() if row.last_checked_at else "",
             "lastSuccessAt": row.last_success_at.isoformat() if row.last_success_at else "",
-            "coefficient": float((assignments.get(int(row.id)).coefficient if assignments.get(int(row.id)) is not None else row.coefficient) or 1.0),
+            "coefficient": effective_price_coefficient(row),
+            "priceCoefficient": effective_price_coefficient(row),
             "isSelected": bool(assignments.get(int(row.id)) is not None and assignments[int(row.id)].is_active),
             "itemsCount": int(counts.get(row.id, 0)),
             "items_count": int(counts.get(row.id, 0)),
@@ -1056,6 +1099,7 @@ def get_competitor_price_list_items(*, db: Session, price_list_id: int) -> dict:
             "region": row.region or "",
             "priceDate": row.price_date.isoformat() if row.price_date else "",
             "sourceUpdatedAt": row.source_updated_at or "",
+            "priceCoefficient": effective_price_coefficient(row),
         },
         "items": [
             {
@@ -1067,6 +1111,13 @@ def get_competitor_price_list_items(*, db: Session, price_list_id: int) -> dict:
                 "distributor_goods_name": x.distributor_goods_name,
                 "distributor_goods_id": x.distributor_goods_id,
                 "distributor_price": float(x.distributor_price) if x.distributor_price is not None else None,
+                "original_competitor_price": float(x.distributor_price) if x.distributor_price is not None else None,
+                "price_coefficient": effective_price_coefficient(row),
+                "adjusted_distributor_price": (
+                    float(x.distributor_price) * effective_price_coefficient(row)
+                    if x.distributor_price is not None
+                    else None
+                ),
                 "stock": float(x.stock) if x.stock is not None else None,
                 "package_count": float(x.package_count) if x.package_count is not None else None,
                 "expiry_date": x.expiry_date or "",
@@ -1111,7 +1162,7 @@ def sync_selected_competitor_configs(*, db: Session, price_format_id: int) -> No
             )
             db.add(cfg)
         cfg.supplier = row.supplier or row.display_name
-        cfg.coefficient = float(item.assignment.coefficient or 1.0)
+        cfg.coefficient = effective_price_coefficient(row)
         cfg.price_date = row.price_date
 
 
@@ -1188,6 +1239,22 @@ def import_manual_price_list_excel(
     content: bytes,
     filename: str,
 ) -> CompetitorPriceList:
+    from .manual_price_list_import import import_manual_price_list
+
+    title = filename.rsplit(".", 1)[0] or "Manual price list"
+    result = import_manual_price_list(
+        db=db,
+        price_format_code=price_format_code,
+        content=content,
+        filename=filename,
+        display_name=title,
+        competitor_name=title,
+    )
+    row = db.get(CompetitorPriceList, int(result["id"]))
+    if row is None:
+        raise ValueError("manual price list import did not return a price list")
+    return row
+
     pf = _ensure_price_format(db, price_format_code)
     if filename.lower().endswith(".csv"):
         text = content.decode("utf-8-sig")
@@ -1311,17 +1378,27 @@ def export_competitor_price_list(*, db: Session, price_list_id: int, fmt: str) -
     if fmt == "csv":
         s = io.StringIO()
         writer = csv.writer(s, lineterminator="\n")
-        writer.writerow([label for _, label in PRICE_LIST_EXPORT_COLUMNS])
+        columns = PRICE_LIST_EXPORT_COLUMNS + [
+            ("original_competitor_price", "Original competitor price"),
+            ("price_coefficient", "Price coefficient"),
+            ("adjusted_distributor_price", "Adjusted competitor price"),
+        ]
+        writer.writerow([label for _, label in columns])
         for row in rows:
-            writer.writerow([row.get(key) if row.get(key) is not None else "" for key, _ in PRICE_LIST_EXPORT_COLUMNS])
+            writer.writerow([row.get(key) if row.get(key) is not None else "" for key, _ in columns])
         return f"{name}.csv", s.getvalue().encode("utf-8-sig"), "text/csv; charset=utf-8"
 
     wb = Workbook()
     ws = wb.active
     ws.title = "price"
-    ws.append([label for _, label in PRICE_LIST_EXPORT_COLUMNS])
+    columns = PRICE_LIST_EXPORT_COLUMNS + [
+        ("original_competitor_price", "Original competitor price"),
+        ("price_coefficient", "Price coefficient"),
+        ("adjusted_distributor_price", "Adjusted competitor price"),
+    ]
+    ws.append([label for _, label in columns])
     for row in rows:
-        ws.append([row.get(key) if row.get(key) is not None else "" for key, _ in PRICE_LIST_EXPORT_COLUMNS])
+        ws.append([row.get(key) if row.get(key) is not None else "" for key, _ in columns])
     bio = io.BytesIO()
     wb.save(bio)
     return f"{name}.xlsx", bio.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"

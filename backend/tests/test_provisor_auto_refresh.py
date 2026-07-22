@@ -765,6 +765,40 @@ def test_selected_mode_uses_assigned_active_provisor_plk():
     assert svc.selected_refresh_targets(db) == {"FMT": {"3": {"128"}}}
 
 
+def test_selected_mode_deduplicates_same_provisor_plk_across_accounts():
+    db = _session()
+    pf = PriceFormat(code="FMT", name="Format")
+    db.add(pf)
+    db.flush()
+    first = CompetitorPriceList(
+        price_format_id=pf.id,
+        source_type="provisor",
+        source_key="plk:128",
+        account_id="3",
+        external_price_list_id="128",
+        display_name="Filial 128",
+    )
+    duplicate = CompetitorPriceList(
+        price_format_id=pf.id,
+        source_type="provisor",
+        source_key="legacy:4:128",
+        account_id="4",
+        external_price_list_id="128",
+        display_name="Filial 128 copy",
+    )
+    db.add_all([first, duplicate])
+    db.flush()
+    db.add_all(
+        [
+            PriceFormatCompetitorAssignment(price_format_id=pf.id, competitor_price_list_id=first.id, is_active=True),
+            PriceFormatCompetitorAssignment(price_format_id=pf.id, competitor_price_list_id=duplicate.id, is_active=True),
+        ]
+    )
+    db.commit()
+
+    assert svc.selected_refresh_targets(db) == {"FMT": {"3": {"128"}}}
+
+
 def test_full_mode_targets_active_accounts_and_excluded_filials_env(monkeypatch):
     db = _session()
     db.add_all(

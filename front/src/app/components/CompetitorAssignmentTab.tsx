@@ -43,6 +43,7 @@ type SourceRow = {
   skuCount?: number;
   status?: string;
   coefficient?: number;
+  priceCoefficient?: number;
   active?: boolean;
   isSelected?: boolean;
   isPercentile?: boolean;
@@ -51,6 +52,7 @@ type SourceRow = {
 
 type AssignmentRow = SourceRow & {
   coefficient: number;
+  priceCoefficient: number;
   active: boolean;
 };
 
@@ -129,7 +131,8 @@ const normalizeSource = (row: any): SourceRow => ({
   itemsCount: Number(row.itemsCount ?? row.skuCount ?? 0),
   skuCount: Number(row.skuCount ?? row.itemsCount ?? 0),
   status: String(row.status || ''),
-  coefficient: Number(row.coefficient ?? 1),
+  coefficient: Number(row.priceCoefficient ?? row.coefficient ?? 1),
+  priceCoefficient: Number(row.priceCoefficient ?? row.coefficient ?? 1),
   active: Boolean(row.active ?? row.isSelected ?? true),
   isSelected: Boolean(row.isSelected),
   isPercentile: row.sourceType === 'percentile' || Boolean(row.isPercentile),
@@ -140,6 +143,7 @@ const percentileToSource = (row: any): SourceRow =>
   normalizeSource({
     id: row.id,
     sourceId: row.id,
+    sourceKey: row.sourceKey || row.id,
     sourceType: 'percentile',
     sourceName: row.name || `${row.region || 'Регион'} - Эмити - Персентиль ${row.percentile}`,
     region: row.region,
@@ -312,7 +316,7 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
           sourceId: source.sourceId,
           sourceType: source.sourceType,
           sourceName: source.sourceName || source.name,
-          coefficient: 1.0,
+          priceCoefficient: Number(source.priceCoefficient ?? source.coefficient ?? 1.0),
           active: true,
         }),
       });
@@ -333,12 +337,17 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
   const saveAssignment = async (assignment: AssignmentRow, patch: Partial<AssignmentRow>) => {
     if (!selectedFormat?.code) return;
     const next = { ...assignment, ...patch };
+    const priceCoefficient = Number(next.priceCoefficient ?? next.coefficient ?? 1);
+    if (!Number.isFinite(priceCoefficient) || priceCoefficient < 0.01 || priceCoefficient > 100) {
+      setError('priceCoefficient must be between 0.01 and 100');
+      return;
+    }
     setAssignments((prev) => prev.map((row) => (row.id === assignment.id ? next : row)));
     try {
       const res = await fetch(`/api/price-formats/${encodeURIComponent(selectedFormat.code)}/competitor-assignments/${encodeURIComponent(assignment.id)}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ coefficient: Number(next.coefficient || 1), active: Boolean(next.active) }),
+        body: JSON.stringify({ priceCoefficient, active: Boolean(next.active) }),
       });
       const text = await res.text();
       const data = parseJsonOrNull(text);
@@ -529,8 +538,13 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
                 <Input
                   key={`${row.id}-coef`}
                   className="numeric-input assignment-coef-input"
-                  defaultValue={String(row.coefficient ?? 1)}
-                  onBlur={(event) => saveAssignment(row, { coefficient: Number(event.target.value || 1) })}
+                  type="number"
+                  min="0.01"
+                  max="100"
+                  step="0.001"
+                  defaultValue={String(row.priceCoefficient ?? row.coefficient ?? 1)}
+                  title="1.000 = no change; 0.975 = discount 2.5%; 1.025 = increase 2.5%"
+                  onBlur={(event) => saveAssignment(row, { priceCoefficient: Number(event.target.value) })}
                 />,
                 formatLocalDate(row.priceDate),
                 formatLocalDateTime(competitorLastSuccessfulCheck(row)),

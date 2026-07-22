@@ -54,6 +54,7 @@ class UnifiedPriceList:
     items_hint: int = 0
     enabled: bool | None = None
     source_updated_at: str = ""
+    source_aliases: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)

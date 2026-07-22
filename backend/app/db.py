@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
+import logging
 import os
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
@@ -63,8 +66,11 @@ def init_db() -> None:
     _ensure_compatible_columns()
     _ensure_compatible_column_types()
     _ensure_nullable_percentile_values()
+    _ensure_percentile_source_identity()
+    _backfill_percentile_source_identity()
     _ensure_compatible_indexes()
     _backfill_competitor_assignments()
+    _backfill_competitor_price_coefficients()
 
 
 def _ensure_compatible_columns() -> None:
@@ -99,6 +105,7 @@ def _ensure_compatible_columns() -> None:
             ("last_success_at", "DATETIME"),
             ("last_refresh_status", "VARCHAR(64) DEFAULT ''"),
             ("last_refresh_message", "TEXT DEFAULT ''"),
+            ("price_coefficient", "NUMERIC(18, 6) DEFAULT 1.0"),
         ],
         "competitor_price_list_items": [
             ("provisor_goods_id", "BIGINT"),
@@ -134,6 +141,9 @@ def _ensure_compatible_columns() -> None:
             ("source_manufacturer", "TEXT DEFAULT ''"),
         ],
         "competitor_price_percentiles": [
+            ("competitor_price_list_id", "INTEGER"),
+            ("source_type", "VARCHAR(32) DEFAULT ''"),
+            ("source_key", "TEXT DEFAULT ''"),
             ("percentile_scope", "VARCHAR(32) DEFAULT 'regional'"),
             ("price_count", "INTEGER DEFAULT 0"),
             ("used_price_count", "INTEGER DEFAULT 0"),
@@ -549,6 +559,251 @@ def _ensure_nullable_percentile_values() -> None:
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_comp_percentile_lookup ON competitor_price_percentiles (price_format_id, product_id, percentile_scope, percentile)"))
 
 
+def _ensure_percentile_source_identity() -> None:
+    inspector = inspect(engine)
+    if not inspector.has_table("competitor_price_percentiles"):
+        return
+
+    columns = {col["name"] for col in inspector.get_columns("competitor_price_percentiles")}
+    required = {"competitor_price_list_id", "source_type", "source_key"}
+    missing = required - columns
+    if missing:
+        return
+
+    unique_constraints = inspector.get_unique_constraints("competitor_price_percentiles")
+    current = next((constraint for constraint in unique_constraints if constraint.get("name") == "uq_comp_percentile_scope"), None)
+    current_columns = tuple((current or {}).get("column_names") or ())
+    desired_columns = (
+        "price_format_id",
+        "product_id",
+        "source_key",
+        "branch_name",
+        "competitor_name",
+        "percentile_scope",
+        "percentile",
+    )
+    if current_columns == desired_columns:
+        return
+
+    with engine.begin() as conn:
+        if engine.dialect.name == "postgresql":
+            conn.execute(text("ALTER TABLE competitor_price_percentiles DROP CONSTRAINT IF EXISTS uq_comp_percentile_scope"))
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE competitor_price_percentiles
+                    ADD CONSTRAINT uq_comp_percentile_scope UNIQUE (
+                        price_format_id,
+                        product_id,
+                        source_key,
+                        branch_name,
+                        competitor_name,
+                        percentile_scope,
+                        percentile
+                    )
+                    """
+                )
+            )
+            return
+
+        if engine.dialect.name != "sqlite":
+            return
+
+        conn.execute(text("ALTER TABLE competitor_price_percentiles RENAME TO competitor_price_percentiles_old"))
+        conn.execute(
+            text(
+                """
+                CREATE TABLE competitor_price_percentiles (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    price_format_id INTEGER NOT NULL,
+                    product_id INTEGER NOT NULL,
+                    competitor_price_list_id INTEGER,
+                    source_type VARCHAR(32) NOT NULL DEFAULT '',
+                    source_key TEXT NOT NULL DEFAULT '',
+                    branch_name TEXT NOT NULL,
+                    competitor_name TEXT NOT NULL,
+                    percentile_scope VARCHAR(32) NOT NULL DEFAULT 'regional',
+                    percentile INTEGER NOT NULL,
+                    value NUMERIC(18, 4),
+                    source_count INTEGER NOT NULL,
+                    price_count INTEGER NOT NULL DEFAULT 0,
+                    used_price_count INTEGER NOT NULL DEFAULT 0,
+                    status VARCHAR(64) NOT NULL DEFAULT '',
+                    updated_at DATETIME NOT NULL,
+                    FOREIGN KEY(price_format_id) REFERENCES price_formats (id),
+                    FOREIGN KEY(product_id) REFERENCES products (id),
+                    FOREIGN KEY(competitor_price_list_id) REFERENCES competitor_price_lists (id),
+                    CONSTRAINT uq_comp_percentile_scope UNIQUE (
+                        price_format_id,
+                        product_id,
+                        source_key,
+                        branch_name,
+                        competitor_name,
+                        percentile_scope,
+                        percentile
+                    )
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT OR IGNORE INTO competitor_price_percentiles (
+                    id,
+                    price_format_id,
+                    product_id,
+                    competitor_price_list_id,
+                    source_type,
+                    source_key,
+                    branch_name,
+                    competitor_name,
+                    percentile_scope,
+                    percentile,
+                    value,
+                    source_count,
+                    price_count,
+                    used_price_count,
+                    status,
+                    updated_at
+                )
+                SELECT
+                    id,
+                    price_format_id,
+                    product_id,
+                    competitor_price_list_id,
+                    COALESCE(source_type, ''),
+                    COALESCE(source_key, ''),
+                    branch_name,
+                    competitor_name,
+                    COALESCE(percentile_scope, 'regional'),
+                    percentile,
+                    value,
+                    source_count,
+                    COALESCE(price_count, 0),
+                    COALESCE(used_price_count, COALESCE(price_count, source_count, 0)),
+                    COALESCE(status, ''),
+                    updated_at
+                FROM competitor_price_percentiles_old
+                """
+            )
+        )
+        conn.execute(text("DROP TABLE competitor_price_percentiles_old"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_competitor_price_percentiles_price_format_id ON competitor_price_percentiles (price_format_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_competitor_price_percentiles_product_id ON competitor_price_percentiles (product_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_competitor_price_percentiles_competitor_price_list_id ON competitor_price_percentiles (competitor_price_list_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_competitor_price_percentiles_source_type ON competitor_price_percentiles (source_type)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_competitor_price_percentiles_source_key ON competitor_price_percentiles (source_key)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_competitor_price_percentiles_branch_name ON competitor_price_percentiles (branch_name)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_competitor_price_percentiles_competitor_name ON competitor_price_percentiles (competitor_name)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_competitor_price_percentiles_percentile_scope ON competitor_price_percentiles (percentile_scope)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_competitor_price_percentiles_percentile ON competitor_price_percentiles (percentile)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_comp_percentile_lookup ON competitor_price_percentiles (price_format_id, product_id, source_key, percentile_scope, percentile)"))
+
+
+def _backfill_percentile_source_identity() -> None:
+    inspector = inspect(engine)
+    if not inspector.has_table("competitor_price_percentiles") or not inspector.has_table("competitor_price_lists"):
+        return
+    columns = {col["name"] for col in inspector.get_columns("competitor_price_percentiles")}
+    required = {"competitor_price_list_id", "source_type", "source_key", "price_format_id", "branch_name", "competitor_name", "percentile_scope"}
+    if required - columns:
+        return
+
+    with engine.begin() as conn:
+        legacy_before = int(
+            conn.execute(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM competitor_price_percentiles
+                    WHERE COALESCE(source_key, '') = ''
+                    """
+                )
+            ).scalar()
+            or 0
+        )
+        regional_result = conn.execute(
+            text(
+                """
+                UPDATE competitor_price_percentiles AS p
+                SET
+                    competitor_price_list_id = (
+                        SELECT MIN(c.id)
+                        FROM competitor_price_lists AS c
+                        WHERE c.price_format_id = p.price_format_id
+                          AND c.branch_name = p.branch_name
+                          AND c.competitor_name = p.competitor_name
+                          AND COALESCE(c.source_key, '') <> ''
+                    ),
+                    source_key = (
+                        SELECT MIN(c.source_key)
+                        FROM competitor_price_lists AS c
+                        WHERE c.price_format_id = p.price_format_id
+                          AND c.branch_name = p.branch_name
+                          AND c.competitor_name = p.competitor_name
+                          AND COALESCE(c.source_key, '') <> ''
+                    ),
+                    source_type = (
+                        SELECT CASE
+                            WHEN MIN(c.source_key) LIKE 'emit:%' THEN 'emit'
+                            ELSE COALESCE(MIN(c.source_type), '')
+                        END
+                        FROM competitor_price_lists AS c
+                        WHERE c.price_format_id = p.price_format_id
+                          AND c.branch_name = p.branch_name
+                          AND c.competitor_name = p.competitor_name
+                          AND COALESCE(c.source_key, '') <> ''
+                    )
+                WHERE COALESCE(p.source_key, '') = ''
+                  AND COALESCE(p.percentile_scope, 'regional') = 'regional'
+                  AND (
+                    SELECT COUNT(*)
+                    FROM competitor_price_lists AS c
+                    WHERE c.price_format_id = p.price_format_id
+                      AND c.branch_name = p.branch_name
+                      AND c.competitor_name = p.competitor_name
+                      AND COALESCE(c.source_key, '') <> ''
+                  ) = 1
+                """
+            )
+        )
+        kazakhstan_result = conn.execute(
+            text(
+                """
+                UPDATE competitor_price_percentiles
+                SET
+                    source_type = 'emit',
+                    source_key = 'emit:kazakhstan:' || COALESCE(competitor_name, '')
+                WHERE COALESCE(source_key, '') = ''
+                  AND COALESCE(percentile_scope, '') = 'kazakhstan'
+                """
+            )
+        )
+        legacy_after = int(
+            conn.execute(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM competitor_price_percentiles
+                    WHERE COALESCE(source_key, '') = ''
+                    """
+                )
+            ).scalar()
+            or 0
+        )
+    if legacy_before or int(regional_result.rowcount or 0) or int(kazakhstan_result.rowcount or 0):
+        logger.info(
+            "[EMIT_PERCENTILE_INVENTORY] stage=schema_backfill legacy_before=%s regional_backfilled=%s "
+            "kazakhstan_backfilled=%s legacy_remaining=%s ambiguous_or_unmatched=%s",
+            legacy_before,
+            int(regional_result.rowcount or 0),
+            int(kazakhstan_result.rowcount or 0),
+            legacy_after,
+            legacy_after,
+        )
+
+
 def _ensure_compatible_indexes() -> None:
     indexes = [
         (
@@ -577,9 +832,14 @@ def _ensure_compatible_indexes() -> None:
             ("price_format_id", "percentile_scope", "percentile", "product_id"),
         ),
         (
+            "ix_comp_percentile_source_lookup",
+            "competitor_price_percentiles",
+            ("price_format_id", "source_key", "percentile_scope", "percentile", "product_id"),
+        ),
+        (
             "ix_comp_percentile_group_lookup",
             "competitor_price_percentiles",
-            ("price_format_id", "branch_name", "competitor_name", "percentile_scope", "percentile", "product_id"),
+            ("price_format_id", "source_key", "branch_name", "competitor_name", "percentile_scope", "percentile", "product_id"),
         ),
         (
             "ix_product_substitute_lookup",
@@ -727,3 +987,71 @@ def _backfill_competitor_assignments() -> None:
                     """
                 )
             )
+
+
+def _backfill_competitor_price_coefficients() -> None:
+    inspector = inspect(engine)
+    if not inspector.has_table("competitor_price_lists"):
+        return
+    columns = {col["name"] for col in inspector.get_columns("competitor_price_lists")}
+    if "price_coefficient" not in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                UPDATE competitor_price_lists
+                SET price_coefficient = COALESCE(NULLIF(coefficient, 0), 1.0)
+                WHERE (price_coefficient IS NULL OR price_coefficient = 1.0)
+                  AND coefficient IS NOT NULL
+                  AND coefficient > 0
+                  AND coefficient != 1.0
+                """
+            )
+        )
+        if inspector.has_table("price_format_competitor_assignments"):
+            if engine.dialect.name == "postgresql":
+                conn.execute(
+                    text(
+                        """
+                        UPDATE competitor_price_lists c
+                        SET price_coefficient = a.coefficient
+                        FROM price_format_competitor_assignments a
+                        WHERE a.competitor_price_list_id = c.id
+                          AND a.is_active = TRUE
+                          AND a.coefficient IS NOT NULL
+                          AND a.coefficient > 0
+                          AND a.coefficient != 1.0
+                          AND (c.price_coefficient IS NULL OR c.price_coefficient = 1.0)
+                        """
+                    )
+                )
+            else:
+                conn.execute(
+                    text(
+                        """
+                        UPDATE competitor_price_lists
+                        SET price_coefficient = (
+                            SELECT a.coefficient
+                            FROM price_format_competitor_assignments a
+                            WHERE a.competitor_price_list_id = competitor_price_lists.id
+                              AND a.is_active = 1
+                              AND a.coefficient IS NOT NULL
+                              AND a.coefficient > 0
+                              AND a.coefficient != 1.0
+                            ORDER BY a.updated_at DESC, a.id DESC
+                            LIMIT 1
+                        )
+                        WHERE (price_coefficient IS NULL OR price_coefficient = 1.0)
+                          AND EXISTS (
+                            SELECT 1
+                            FROM price_format_competitor_assignments a
+                            WHERE a.competitor_price_list_id = competitor_price_lists.id
+                              AND a.is_active = 1
+                              AND a.coefficient IS NOT NULL
+                              AND a.coefficient > 0
+                              AND a.coefficient != 1.0
+                          )
+                        """
+                    )
+                )

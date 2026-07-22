@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import json
 import logging
 import os
 from decimal import Decimal
@@ -97,9 +98,24 @@ def emit_percentile_assignments(*, db: Session, price_format_id: int):
     ]
 
 
-def emit_percentile_group_keys(*, db: Session, price_format_id: int) -> set[tuple[str, str]]:
+def _source_key(price_list: CompetitorPriceList) -> str:
+    return str(price_list.source_key or "").strip()
+
+
+def _percentile_source_type(price_list: CompetitorPriceList) -> str:
+    source_key = _source_key(price_list)
+    if source_key.startswith("emit:"):
+        return "emit"
+    return str(price_list.source_type or "").strip()
+
+
+def _kazakhstan_source_key(competitor: str) -> str:
+    return f"emit:kazakhstan:{competitor}"
+
+
+def emit_percentile_group_keys(*, db: Session, price_format_id: int) -> set[tuple[str, str, str]]:
     return {
-        (_branch_name(item.price_list), _competitor_name(item.price_list))
+        (_branch_name(item.price_list), _competitor_name(item.price_list), _source_key(item.price_list))
         for item in emit_percentile_assignments(db=db, price_format_id=price_format_id)
     }
 
@@ -148,12 +164,30 @@ def recalculate_competitor_percentiles(
 
     regional_group_filters = [
         (
-            (CompetitorPricePercentile.branch_name == _branch_name(item.price_list))
-            & (CompetitorPricePercentile.competitor_name == _competitor_name(item.price_list))
+            (
+                (func.coalesce(CompetitorPricePercentile.source_key, "") == _source_key(item.price_list))
+                | (
+                    (func.coalesce(CompetitorPricePercentile.source_key, "") == "")
+                    & (CompetitorPricePercentile.branch_name == _branch_name(item.price_list))
+                    & (CompetitorPricePercentile.competitor_name == _competitor_name(item.price_list))
+                )
+            )
             & (CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
         )
         for item in selected
     ]
+    rows_before_by_source: dict[str, int] = {}
+    for item in selected:
+        source_key = _source_key(item.price_list)
+        rows_before_by_source[source_key] = int(
+            db.execute(
+                select(func.count(CompetitorPricePercentile.id))
+                .where(CompetitorPricePercentile.price_format_id == price_format_id)
+                .where(CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
+                .where(func.coalesce(CompetitorPricePercentile.source_key, "") == source_key)
+            ).scalar_one()
+            or 0
+        )
     kazakhstan_competitors = sorted({_competitor_name(item.price_list) for item in selected})
     kazakhstan_group_filters = [
         (
@@ -228,14 +262,24 @@ def recalculate_competitor_percentiles(
         if selected_ids
         else []
     )
+    raw_count_by_source: dict[str, int] = defaultdict(int)
+    matched_products_by_source: dict[str, set[int]] = defaultdict(set)
 
-    source_groups: set[tuple[str, str]] = set()
+    source_groups: set[tuple[str, str, str, int, str]] = set()
     for item in selected:
-        source_groups.add((_branch_name(item.price_list), _competitor_name(item.price_list)))
+        source_groups.add(
+            (
+                _branch_name(item.price_list),
+                _competitor_name(item.price_list),
+                _source_key(item.price_list),
+                int(item.price_list.id),
+                _percentile_source_type(item.price_list),
+            )
+        )
 
     # Active assignments are the account set. For duplicate rows inside the
     # same account/SKU, Emit percentile sources keep every valid parsed row.
-    multi_price_groups: dict[tuple[int, str, str, int], list[Decimal]] = defaultdict(list)
+    multi_price_groups: dict[tuple[int, str, str, str, int], list[Decimal]] = defaultdict(list)
     for price_list, item in rows:
         product_id = int(item.product_id or 0)
         if not product_id and item.provisor_goods_id is not None:
@@ -249,26 +293,29 @@ def recalculate_competitor_percentiles(
             continue
         branch = _branch_name(price_list)
         competitor = _competitor_name(price_list)
-        source_groups.add((branch, competitor))
-        key = (product_id, branch, competitor, int(price_list.id))
+        source_key = _source_key(price_list)
+        raw_count_by_source[source_key] += 1
+        matched_products_by_source[source_key].add(product_id)
+        source_groups.add((branch, competitor, source_key, int(price_list.id), _percentile_source_type(price_list)))
+        key = (product_id, branch, competitor, source_key, int(price_list.id))
         multi_price_groups[key].append(price)
 
-    grouped: dict[tuple[int, str, str], list[Decimal]] = defaultdict(list)
-    source_count_by_group: dict[tuple[int, str, str], set[int]] = defaultdict(set)
+    grouped: dict[tuple[int, str, str, str], list[Decimal]] = defaultdict(list)
+    source_count_by_group: dict[tuple[int, str, str, str], set[int]] = defaultdict(set)
     for key, prices in multi_price_groups.items():
-        product_id, branch, competitor, price_list_id = key
-        grouped[(product_id, branch, competitor)].extend(prices)
-        source_count_by_group[(product_id, branch, competitor)].add(price_list_id)
+        product_id, branch, competitor, source_key, price_list_id = key
+        grouped[(product_id, branch, competitor, source_key)].extend(prices)
+        source_count_by_group[(product_id, branch, competitor, source_key)].add(price_list_id)
 
     now = now_kz_naive()
     inserted = 0
     products_with_competitors: set[int] = set()
     regional_percentiles: dict[tuple[int, str, int], list[Decimal]] = defaultdict(list)
 
-    for branch, competitor in sorted(source_groups):
+    for branch, competitor, source_key, price_list_id, source_type in sorted(source_groups):
         for product_id in product_ids:
-            values = grouped.get((product_id, branch, competitor), [])
-            source_count = len(source_count_by_group.get((product_id, branch, competitor), set()))
+            values = grouped.get((product_id, branch, competitor, source_key), [])
+            source_count = len(source_count_by_group.get((product_id, branch, competitor, source_key), set()))
             price_count = len(values)
             status = _status_for_values(values)
             if values:
@@ -300,6 +347,9 @@ def recalculate_competitor_percentiles(
                     CompetitorPricePercentile(
                         price_format_id=price_format_id,
                         product_id=product_id,
+                        competitor_price_list_id=price_list_id,
+                        source_type=source_type,
+                        source_key=source_key,
                         branch_name=branch,
                         competitor_name=competitor,
                         percentile_scope=REGIONAL_SCOPE,
@@ -314,7 +364,7 @@ def recalculate_competitor_percentiles(
                 )
                 inserted += 1
 
-    for competitor in sorted({competitor for _branch, competitor in source_groups}):
+    for competitor in sorted({competitor for _branch, competitor, _source_key, _price_list_id, _source_type in source_groups}):
         for product_id in product_ids:
             for pct in PERCENTILES:
                 values = regional_percentiles.get((product_id, competitor, pct), [])
@@ -323,6 +373,9 @@ def recalculate_competitor_percentiles(
                     CompetitorPricePercentile(
                         price_format_id=price_format_id,
                         product_id=product_id,
+                        competitor_price_list_id=None,
+                        source_type="emit",
+                        source_key=_kazakhstan_source_key(competitor),
                         branch_name=KAZAKHSTAN_REGION,
                         competitor_name=competitor,
                         percentile_scope=KAZAKHSTAN_SCOPE,
@@ -348,6 +401,37 @@ def recalculate_competitor_percentiles(
         "rows_skipped": 0,
         "rows_deleted": deleted_rows,
     }
+    for item in selected:
+        price_list = item.price_list
+        source_key = _source_key(price_list)
+        rows_after = int(
+            db.execute(
+                select(func.count(CompetitorPricePercentile.id))
+                .where(CompetitorPricePercentile.price_format_id == price_format_id)
+                .where(CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
+                .where(CompetitorPricePercentile.source_key == source_key)
+            ).scalar_one()
+            or 0
+        )
+        logger.info(
+            "[EMIT_PERCENTILE_INVENTORY] stage=percentile_rebuild price_format_id=%s inventory=%s",
+            price_format_id,
+            json.dumps(
+                {
+                    "filial_id": price_list.branch_id or price_list.external_price_list_id or "",
+                    "source_key": source_key,
+                    "competitor_price_list_id": int(price_list.id),
+                    "raw_price_rows": int(raw_count_by_source.get(source_key, 0)),
+                    "product_count": len(matched_products_by_source.get(source_key, set())),
+                    "percentile_rows_before": int(rows_before_by_source.get(source_key, 0)),
+                    "percentile_rows_after": rows_after,
+                    "generated_levels": list(PERCENTILES),
+                    "result": "success",
+                    "failure_reason": "",
+                },
+                ensure_ascii=False,
+            ),
+        )
     for item in selected:
         logger.info(
             "[PERCENTILE_MUTATION] action=insert reason=%s price_format_id=%s source_price_list_id=%s "

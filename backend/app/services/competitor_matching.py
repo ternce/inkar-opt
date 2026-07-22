@@ -30,6 +30,7 @@ from ..models import (
 )
 from .competitors.code_mappings import apply_manual_mappings_to_items
 from .competitor_assignments import get_assigned_competitor_price_lists
+from .competitor_coefficients import effective_price_coefficient
 from .competitor_source_config import MULTI_PRICE_PERCENTILE_MODE, default_percentile_mode_for_source, effective_percentile_mode
 from .manufacturers import normalize_manufacturer
 from .sku import normalize_external_sku, normalize_sku, normalize_sku_variants
@@ -4578,7 +4579,7 @@ def rebuild_competitor_prices_for_selected(
     audit_rows: list[dict] = []
     unmatched_audit_rows: list[dict] = []
     manufacturer_alias_rows: list[dict] = []
-    matched_by_source: list[tuple[str, str, object, list[dict]]] = []
+    matched_by_source: list[tuple[str, str, object, float, list[dict]]] = []
     for item in skipped_aggregated:
         price_list = item.price_list
         src = f"{price_list.source_type}:{price_list.source_key}"
@@ -4624,6 +4625,7 @@ def rebuild_competitor_prices_for_selected(
                 src,
                 price_list.supplier or price_list.display_name,
                 price_list.price_date,
+                effective_price_coefficient(price_list),
                 matched_rows,
             )
         )
@@ -4640,17 +4642,19 @@ def rebuild_competitor_prices_for_selected(
 
     insert_started_at = time.perf_counter()
     new_rows: list[CompetitorPrice] = []
-    for src, supplier, price_date, matched_items in matched_by_source:
+    for src, supplier, price_date, price_coefficient, matched_items in matched_by_source:
         for matched in matched_items:
             product_id = int(matched.get("product_id") or 0)
             distributor_price = float(matched.get("price") or 0)
             source_item_id = matched.get("source_item_id")
             reason = str(matched.get("match_type") or "matched")
             _verbose_debug(
-                "[PRICE] product=%s supplier=%s selected_price=%s source_price_list=%s source_item=%s reason=%s",
+                "[PRICE] product=%s supplier=%s original_price=%s price_coefficient=%s adjusted_price=%s source_price_list=%s source_item=%s reason=%s",
                 product_id,
                 supplier,
                 distributor_price,
+                price_coefficient,
+                distributor_price * price_coefficient,
                 src,
                 source_item_id,
                 reason,
@@ -4662,7 +4666,7 @@ def rebuild_competitor_prices_for_selected(
                     source_name=src,
                     supplier=supplier,
                     price_date=price_date,
-                    coefficient=1.0,
+                    coefficient=price_coefficient,
                     source_price=distributor_price,
                     match_type=reason,
                     source_item_id=int(source_item_id) if source_item_id is not None else None,

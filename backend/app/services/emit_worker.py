@@ -1798,6 +1798,7 @@ class EmitWorker:
             token = owner_token or job_owner_token(job)
             metadata = _json_loads(job.metadata_json, {})
             filial_ids = [int(x) for x in (metadata.get("filial_ids") or self.config.filial_ids)]
+            job_mode = str(job.mode or "")
             job.status = "running"
             job.started_at = job.started_at or datetime.utcnow()
             job.heartbeat_at = datetime.utcnow()
@@ -1805,6 +1806,11 @@ class EmitWorker:
             job.message = "Emit refresh started."
             db.commit()
         logger.info("[EMIT_REFRESH] job_id=%s requested_filials=%s", job_id, filial_ids)
+        logger.info(
+            "[EMIT_PERCENTILE_INVENTORY] stage=refresh_start job_id=%s inventory=%s",
+            job_id,
+            _json_dumps(emit_refresh_inventory(config=self.config, mode=job_mode, filial_ids=filial_ids)),
+        )
         status = "success"
         error = ""
         aggregate = {"success": 0, "failed": 0, "filials": []}
@@ -1861,6 +1867,14 @@ class EmitWorker:
                     ]
                     aggregate["duration_sec"] = round(time.perf_counter() - total_started, 3)
                     aggregate["percentile_rebuild_formats"] = sorted((percentile_rebuild.get("summaries") or {}).keys())
+                    aggregate["refresh_inventory"] = emit_refresh_inventory(
+                        config=self.config,
+                        mode=str(job.mode or ""),
+                        filial_ids=filial_ids,
+                        aggregate=aggregate,
+                    )
+                    aggregate["refresh_inventory"]["rebuilt_price_format_ids"] = percentile_rebuild.get("assigned_price_format_ids", [])
+                    aggregate["refresh_inventory"]["rebuilt_formats"] = aggregate["percentile_rebuild_formats"]
                     logger.info(
                         "[EMIT_REFRESH] job_id=%s requested_filials=%s refreshed_filials=%s success_count=%s "
                         "failed_count=%s percentile_rebuild_formats=%s filial_durations=%s total_duration_sec=%s",
@@ -1876,6 +1890,11 @@ class EmitWorker:
                             if isinstance(row, dict) and int(row.get("filial_id") or 0) > 0
                         },
                         aggregate["duration_sec"],
+                    )
+                    logger.info(
+                        "[EMIT_PERCENTILE_INVENTORY] stage=refresh_complete job_id=%s inventory=%s",
+                        job_id,
+                        _json_dumps(aggregate["refresh_inventory"]),
                     )
                     finish_job(
                         db,
@@ -1999,3 +2018,49 @@ def configured_filial_ids_for_mode(config: EmitConfig, *, mode: str, filial_ids:
         return list(config.filial_ids)
     ids = [int(x) for x in (filial_ids or []) if int(x) > 0]
     return list(dict.fromkeys(ids))
+
+
+def emit_refresh_inventory(
+    *,
+    config: EmitConfig,
+    mode: str,
+    filial_ids: list[int],
+    aggregate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    configured = list(dict.fromkeys(int(x) for x in config.filial_ids if int(x) > 0))
+    raw_candidates = [int(x) for x in filial_ids if int(x) > 0]
+    unique_filials = list(dict.fromkeys(raw_candidates))
+    duplicate_filials = len(raw_candidates) - len(unique_filials)
+    source_keys = [f"emit:{filial_id}" for filial_id in unique_filials]
+    selected_mode_excluded = [filial_id for filial_id in configured if filial_id not in set(unique_filials)]
+    filials = list((aggregate or {}).get("filials") or [])
+    started = len(filials)
+    succeeded = [int(row.get("filial_id") or 0) for row in filials if isinstance(row, dict) and row.get("ok")]
+    failed = [int(row.get("filial_id") or 0) for row in filials if isinstance(row, dict) and not row.get("ok")]
+    timed_out = [
+        int(row.get("filial_id") or 0)
+        for row in filials
+        if isinstance(row, dict) and "timeout" in str(row.get("error") or "").casefold()
+    ]
+    skipped = [filial_id for filial_id in unique_filials if filial_id not in {int(row.get("filial_id") or 0) for row in filials if isinstance(row, dict)}]
+    return {
+        "mode": str(mode or ""),
+        "business_rule": "all_configured_emit_filials" if str(mode or "").strip().lower() == "all" else "explicit_requested_emit_filials_only",
+        "raw_candidates": len(raw_candidates),
+        "raw_candidate_filial_ids": raw_candidates,
+        "unique_plks": len(source_keys),
+        "unique_source_keys": source_keys,
+        "duplicates": duplicate_filials,
+        "queued": len(unique_filials),
+        "started": started,
+        "succeeded": len([item for item in succeeded if item > 0]),
+        "succeeded_filial_ids": [item for item in succeeded if item > 0],
+        "failed": len([item for item in failed if item > 0]),
+        "failed_filial_ids": [item for item in failed if item > 0],
+        "timed_out": len([item for item in timed_out if item > 0]),
+        "timed_out_filial_ids": [item for item in timed_out if item > 0],
+        "skipped": len(skipped),
+        "skipped_filial_ids": skipped,
+        "selected_mode_excluded": len(selected_mode_excluded) if str(mode or "").strip().lower() != "all" else 0,
+        "selected_mode_excluded_filial_ids": selected_mode_excluded if str(mode or "").strip().lower() != "all" else [],
+    }

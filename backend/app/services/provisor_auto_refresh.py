@@ -29,6 +29,10 @@ EMIT_SCHEDULER_LOCK_NAME = "emit_auto_refresh_scheduler"
 GLOBAL_REFRESH_LOCK_NAME = "competitor_refresh_global"
 REFRESH_LOCK_LEASE = timedelta(hours=12)
 SCHEDULER_LOCK_LEASE = timedelta(seconds=90)
+REFRESH_MODE_BUSINESS_RULES = {
+    "selected": "Refresh actively assigned unique Provisor PLKs only.",
+    "all": "Refresh every discovered unique Provisor PLK from active Provisor accounts.",
+}
 
 
 def _json_loads(value: str | None, fallback: Any) -> Any:
@@ -55,7 +59,7 @@ def _metadata_with_token(metadata: dict[str, Any] | None, token: str) -> str:
 
 def normalize_mode(mode: str | None) -> str:
     value = str(mode or "selected").strip().lower()
-    if value not in {"selected", "all"}:
+    if value not in REFRESH_MODE_BUSINESS_RULES:
         raise ValueError("PROVISOR_AUTO_REFRESH_MODE must be selected or all")
     return value
 
@@ -509,13 +513,13 @@ def selected_refresh_targets(db: Session) -> dict[str, dict[str, set[str]]]:
         .all()
     )
     targets: dict[str, dict[str, set[str]]] = {}
-    seen_plk: set[tuple[str, str]] = set()
+    seen_plk: set[str] = set()
     for format_code, account_id, filial_id in rows:
         account_s = str(account_id or "").strip()
         filial_s = str(filial_id or "").strip()
-        if not account_s or not filial_s or (account_s, filial_s) in seen_plk:
+        if not account_s or not filial_s or filial_s in seen_plk:
             continue
-        seen_plk.add((account_s, filial_s))
+        seen_plk.add(filial_s)
         targets.setdefault(str(format_code), {}).setdefault(account_s, set()).add(filial_s)
     return targets
 

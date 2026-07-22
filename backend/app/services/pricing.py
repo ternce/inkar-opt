@@ -154,6 +154,7 @@ class CompetitorResolved:
 @dataclass(frozen=True)
 class CompetitorResolvedMany:
     prices: list[tuple[Decimal, str]]  # (computed_price, source_name)
+    details: dict[str, dict[str, Decimal]] | None = None
 
 
 PercentilePriceCache = dict[int, dict[int, list[tuple[Decimal, str]]]]
@@ -625,6 +626,7 @@ def resolve_competitor_prices(
         return CompetitorResolvedMany([])
 
     out: list[tuple[Decimal, str]] = []
+    details: dict[str, dict[str, Decimal]] = {}
     selected_meta = _selected_source_meta(db, price_format_id)
     for cfg in config_rows:
         source_name = cfg.source_name
@@ -656,10 +658,16 @@ def resolve_competitor_prices(
         if source_price is None:
             continue
 
-        out.append((source_price * coefficient, source_name))
+        adjusted = source_price * coefficient
+        out.append((adjusted, source_name))
+        details[str(source_name or "")] = {
+            "original_price": source_price,
+            "price_coefficient": coefficient,
+            "adjusted_price": adjusted,
+        }
 
     out.sort(key=lambda x: x[0])
-    return CompetitorResolvedMany(out)
+    return CompetitorResolvedMany(out, details)
 
 
 def resolve_percentile_prices(
@@ -686,12 +694,17 @@ def resolve_percentile_prices(
     )
     out: list[tuple[Decimal, str]] = []
     for row in rows:
-        if (str(row.branch_name or ""), str(row.competitor_name or "")) not in active_groups:
+        source_key = str(getattr(row, "source_key", "") or "")
+        branch = str(row.branch_name or "")
+        competitor = str(row.competitor_name or "")
+        if (branch, competitor, source_key) not in active_groups and (
+            source_key or not any(active_branch == branch and active_competitor == competitor for active_branch, active_competitor, _active_source_key in active_groups)
+        ):
             continue
         value = _as_decimal(row.value)
         if value is None or value <= 0:
             continue
-        src = f"percentile:{row.competitor_name}:{row.branch_name}:p{row.percentile}"
+        src = f"percentile:{row.source_key}:{row.competitor_name}:{row.branch_name}:p{row.percentile}"
         out.append((value, src))
     out.sort(key=lambda x: x[0])
     return CompetitorResolvedMany(out)
@@ -709,6 +722,7 @@ def load_percentile_price_cache(db: Session, price_format_id: int) -> Percentile
                 CompetitorPricePercentile.value,
                 CompetitorPricePercentile.competitor_name,
                 CompetitorPricePercentile.branch_name,
+                CompetitorPricePercentile.source_key,
             )
             .where(CompetitorPricePercentile.price_format_id == price_format_id)
             .where(CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
@@ -722,13 +736,18 @@ def load_percentile_price_cache(db: Session, price_format_id: int) -> Percentile
         .all()
     )
     cache: PercentilePriceCache = {}
-    for product_id, percentile, value, competitor_name, branch_name in rows:
-        if (str(branch_name or ""), str(competitor_name or "")) not in active_groups:
+    for product_id, percentile, value, competitor_name, branch_name, source_key in rows:
+        source_key = str(source_key or "")
+        branch_name = str(branch_name or "")
+        competitor_name = str(competitor_name or "")
+        if (branch_name, competitor_name, source_key) not in active_groups and (
+            source_key or not any(active_branch == branch_name and active_competitor == competitor_name for active_branch, active_competitor, _active_source_key in active_groups)
+        ):
             continue
         price = _as_decimal(value)
         if price is None or price <= 0:
             continue
-        src = f"percentile:{competitor_name}:{branch_name}:p{percentile}"
+        src = f"percentile:{source_key}:{competitor_name}:{branch_name}:p{percentile}"
         cache.setdefault(int(product_id), {}).setdefault(int(percentile), []).append((price, src))
     return cache
 
@@ -1307,6 +1326,7 @@ def calculate_price_for_product(
     chosen_bend_percent: Decimal = fallback_bend_percent
     price_from_competitor: Decimal | None = None
     rejected_competitors: list[dict] = []
+    competitor_price_details = resolved_many.details or {}
 
     # По формуле: считаем только от минимальной цены конкурента (Ц1).
     # Если Ц1*(1-прогиб) < МДЦ — берём МДЦ.
@@ -1347,6 +1367,9 @@ def calculate_price_for_product(
                     "rank": idx,
                     "source": competitor_source,
                     "price": competitor_price,
+                    "adjusted_price": competitor_price,
+                    "original_price": competitor_price_details.get(competitor_source, {}).get("original_price", competitor_price),
+                    "price_coefficient": competitor_price_details.get(competitor_source, {}).get("price_coefficient", Decimal("1")),
                     "candidate": candidate,
                     "mdc": mdc,
                 }
@@ -1489,6 +1512,13 @@ def calculate_price_for_product(
             for effect in applied_list_effects
         ),
     )
+    chosen_details = (resolved_many.details or {}).get(chosen_source) if chosen_source else None
+    if chosen_details:
+        calculation_log = (
+            f"{calculation_log} Original competitor price: {chosen_details.get('original_price')}; "
+            f"priceCoefficient: {chosen_details.get('price_coefficient')}; "
+            f"adjusted competitor price: {chosen_details.get('adjusted_price')}."
+        )
 
     debug = {
         "cost": cost,
@@ -1524,6 +1554,17 @@ def calculate_price_for_product(
         "competitor_candidate_price": competitor_candidate_price,
         "chosen_competitor_price": chosen_competitor,
         "selected_competitor_price": chosen_competitor,
+        "chosen_competitor_original_price": (
+            competitor_price_details.get(chosen_source, {}).get("original_price")
+            if chosen_source
+            else None
+        ),
+        "chosen_competitor_price_coefficient": (
+            competitor_price_details.get(chosen_source, {}).get("price_coefficient")
+            if chosen_source
+            else None
+        ),
+        "chosen_competitor_adjusted_price": chosen_competitor,
         "chosen_competitor_source": chosen_source,
         "chosen_competitor_rank": chosen_competitor_rank,
         "rejected_competitors": rejected_competitors,

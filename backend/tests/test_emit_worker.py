@@ -11,7 +11,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -34,6 +34,7 @@ from backend.app.services.emit_worker import (
     cleanup_temp,
     deduplicate_emit_items,
     download_emit_filial,
+    emit_refresh_inventory,
     iter_stage_rows,
     is_emit_plk,
     mark_stale_emit_jobs,
@@ -48,7 +49,7 @@ from backend.app.services.competitor_assignments import (
     propagate_emit_assignments_to_new_price_format,
     propagate_emit_assignments_to_price_formats,
 )
-from backend.app.services.competitors.percentiles.read_models import list_percentile_sources
+from backend.app.services.competitors.percentiles.read_models import list_percentile_product_rows, list_percentile_sources
 from backend.app.services import provisor_auto_refresh as refresh_svc
 from backend.app.services.price_sources import UnifiedPriceItem, UnifiedPriceList
 
@@ -819,6 +820,247 @@ def test_emit_global_propagation_assigns_new_region_to_all_existing_formats():
             CompetitorPricePercentile.percentile_scope == "regional",
         ).all()
         assert rows
+
+
+def _seed_emit_region(
+    db,
+    pf,
+    product,
+    *,
+    filial_id: int,
+    source_key: str | None = None,
+    display_name: str | None = None,
+    prices: list[int],
+):
+    name = display_name or f"Emit International {filial_id}"
+    row = CompetitorPriceList(
+        price_format_id=pf.id,
+        source_type="provisor",
+        source_key=source_key or f"emit:{filial_id}",
+        display_name=name,
+        supplier=name,
+        branch_id=str(filial_id),
+        branch_code=str(filial_id),
+        branch_name=name,
+        competitor_name=name,
+        external_price_list_id=str(filial_id),
+        account_login="emit",
+        last_refresh_status="success",
+    )
+    db.add(row)
+    db.flush()
+    db.add(
+        PriceFormatCompetitorAssignment(
+            price_format_id=pf.id,
+            competitor_price_list_id=row.id,
+            is_active=True,
+            percentile_mode="multi_price_per_sku",
+        )
+    )
+    for price in prices:
+        db.add(
+            CompetitorPriceListItem(
+                price_list_id=row.id,
+                product_id=product.id,
+                provisor_goods_id=product.provisor_goods_id,
+                filial_id=filial_id,
+                name=product.name,
+                distributor_goods_name=product.name,
+                distributor_price=price,
+            )
+        )
+    db.flush()
+    return row
+
+
+def test_emit_percentiles_same_label_sources_persist_independently():
+    db = _session()
+    pf = _seed_format(db)
+    product = Product(code="SKU-EMIT", name="Emit product", cost=100, provisor_goods_id=9001)
+    db.add(product)
+    db.flush()
+    first = _seed_emit_region(db, pf, product, filial_id=1108, display_name="Emit Same", prices=[100, 120])
+    second = _seed_emit_region(db, pf, product, filial_id=1111, display_name="Emit Same", prices=[300, 330])
+    db.commit()
+
+    summary = _recalculate_percentiles_for_emit_rows(db, price_list_ids=[first.id, second.id], scope_to_price_list_ids=True)
+
+    assert summary["assigned_price_format_ids"] == [pf.id]
+    rows = (
+        db.execute(
+            select(CompetitorPricePercentile)
+            .where(CompetitorPricePercentile.price_format_id == pf.id)
+            .where(CompetitorPricePercentile.product_id == product.id)
+            .where(CompetitorPricePercentile.percentile_scope == "regional")
+            .where(CompetitorPricePercentile.percentile == 10)
+            .order_by(CompetitorPricePercentile.source_key.asc())
+        )
+        .scalars()
+        .all()
+    )
+    assert [row.source_key for row in rows] == ["emit:1108", "emit:1111"]
+    assert [round(float(row.value), 2) for row in rows] == [102.0, 303.0]
+    assert {row.competitor_price_list_id for row in rows} == {first.id, second.id}
+
+    groups = list_percentile_product_rows(db=db, price_format_code="FMT", page_size=20)["groups"]
+    regional_groups = [group for group in groups if group["scope"] == "regional"]
+    assert sorted(group["sourceKey"] for group in regional_groups) == ["emit:1108", "emit:1111"]
+
+
+def test_emit_scoped_rebuild_does_not_delete_other_region_percentiles():
+    db = _session()
+    pf = _seed_format(db)
+    product = Product(code="SKU-EMIT", name="Emit product", cost=100, provisor_goods_id=9001)
+    db.add(product)
+    db.flush()
+    first = _seed_emit_region(db, pf, product, filial_id=1108, display_name="Emit Same", prices=[100, 120])
+    second = _seed_emit_region(db, pf, product, filial_id=1111, display_name="Emit Same", prices=[300, 330])
+    db.commit()
+
+    _recalculate_percentiles_for_emit_rows(db, price_list_ids=[first.id], scope_to_price_list_ids=True)
+    first_value_before = db.scalar(
+        select(CompetitorPricePercentile.value)
+        .where(CompetitorPricePercentile.price_format_id == pf.id)
+        .where(CompetitorPricePercentile.product_id == product.id)
+        .where(CompetitorPricePercentile.source_key == "emit:1108")
+        .where(CompetitorPricePercentile.percentile_scope == "regional")
+        .where(CompetitorPricePercentile.percentile == 10)
+    )
+
+    _recalculate_percentiles_for_emit_rows(db, price_list_ids=[second.id], scope_to_price_list_ids=True)
+    first_value_after = db.scalar(
+        select(CompetitorPricePercentile.value)
+        .where(CompetitorPricePercentile.price_format_id == pf.id)
+        .where(CompetitorPricePercentile.product_id == product.id)
+        .where(CompetitorPricePercentile.source_key == "emit:1108")
+        .where(CompetitorPricePercentile.percentile_scope == "regional")
+        .where(CompetitorPricePercentile.percentile == 10)
+    )
+
+    assert float(first_value_before) == float(first_value_after)
+    assert db.scalar(
+        select(func.count(CompetitorPricePercentile.id))
+        .where(CompetitorPricePercentile.price_format_id == pf.id)
+        .where(CompetitorPricePercentile.percentile_scope == "regional")
+        .where(CompetitorPricePercentile.source_key.in_(["emit:1108", "emit:1111"]))
+    ) == len([10, 20, 30, 40, 60]) * 2
+
+
+def test_emit_refresh_inventory_explains_duplicate_and_selected_counts():
+    config = EmitConfig(filial_ids=[1108, 1111, 1114, 1149])
+
+    inventory = emit_refresh_inventory(
+        config=config,
+        mode="selected",
+        filial_ids=[1108, 1108, 1111],
+        aggregate={"filials": [{"ok": True, "filial_id": 1108}, {"ok": False, "filial_id": 1111, "error": "download timeout"}]},
+    )
+
+    assert inventory["raw_candidates"] == 3
+    assert inventory["unique_plks"] == 2
+    assert inventory["duplicates"] == 1
+    assert inventory["queued"] == 2
+    assert inventory["started"] == 2
+    assert inventory["succeeded"] == 1
+    assert inventory["failed"] == 1
+    assert inventory["timed_out"] == 1
+    assert inventory["skipped"] == 0
+    assert inventory["selected_mode_excluded"] == 2
+    assert inventory["selected_mode_excluded_filial_ids"] == [1114, 1149]
+
+
+def test_percentile_schema_backfills_only_unambiguous_legacy_source_keys(monkeypatch):
+    import backend.app.db as app_db
+
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE competitor_price_lists (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    price_format_id INTEGER NOT NULL,
+                    source_type VARCHAR(32),
+                    source_key TEXT,
+                    branch_name TEXT,
+                    competitor_name TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE competitor_price_percentiles (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    price_format_id INTEGER NOT NULL,
+                    product_id INTEGER NOT NULL,
+                    branch_name TEXT NOT NULL,
+                    competitor_name TEXT NOT NULL,
+                    percentile_scope VARCHAR(32) NOT NULL DEFAULT 'regional',
+                    percentile INTEGER NOT NULL,
+                    value NUMERIC(18, 4),
+                    source_count INTEGER NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    CONSTRAINT uq_comp_percentile_scope UNIQUE (
+                        price_format_id,
+                        product_id,
+                        branch_name,
+                        competitor_name,
+                        percentile_scope,
+                        percentile
+                    )
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO competitor_price_lists (id, price_format_id, source_type, source_key, branch_name, competitor_name)
+                VALUES
+                    (1, 10, 'provisor', 'emit:1108', 'Emit 1108', 'Emit 1108'),
+                    (2, 10, 'provisor', 'emit:1111', 'Emit Same', 'Emit Same'),
+                    (3, 10, 'provisor', 'emit:1114', 'Emit Same', 'Emit Same')
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO competitor_price_percentiles
+                    (id, price_format_id, product_id, branch_name, competitor_name, percentile_scope, percentile, value, source_count, updated_at)
+                VALUES
+                    (1, 10, 100, 'Emit 1108', 'Emit 1108', 'regional', 10, 100, 1, '2026-01-01'),
+                    (2, 10, 100, 'Emit Same', 'Emit Same', 'regional', 10, 200, 1, '2026-01-01')
+                """
+            )
+        )
+
+    monkeypatch.setattr(app_db, "engine", engine)
+    app_db._ensure_compatible_columns()
+    app_db._ensure_percentile_source_identity()
+    app_db._backfill_percentile_source_identity()
+
+    with engine.connect() as conn:
+        rows = {
+            int(row.id): dict(row._mapping)
+            for row in conn.execute(
+                text(
+                    """
+                    SELECT id, competitor_price_list_id, source_type, source_key
+                    FROM competitor_price_percentiles
+                    ORDER BY id
+                    """
+                )
+            )
+        }
+
+    assert rows[1]["competitor_price_list_id"] == 1
+    assert rows[1]["source_type"] == "emit"
+    assert rows[1]["source_key"] == "emit:1108"
+    assert rows[2]["competitor_price_list_id"] is None
+    assert rows[2]["source_key"] == ""
 
 
 def test_emit_global_propagation_reuses_reactivates_and_skips_incompatible():
