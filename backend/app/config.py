@@ -39,6 +39,8 @@ class Settings(BaseModel):
     emit_min_final_rows: int
     emit_min_row_ratio: float
     emit_refresh_stale_timeout_seconds: int
+    emit_heartbeat_interval_seconds: int
+    emit_max_memory_mb: int
     emit_cron: str
     emit_timezone: str
     vidman_base_url: str
@@ -114,7 +116,12 @@ def get_settings() -> Settings:
         emit_max_concurrent_filials=max(1, int(os.getenv("EMIT_MAX_CONCURRENT_FILIALS", "1"))),
         emit_min_final_rows=max(1, int(os.getenv("EMIT_MIN_FINAL_ROWS", "100"))),
         emit_min_row_ratio=max(0.0, float(os.getenv("EMIT_MIN_ROW_RATIO", "0.5"))),
-        emit_refresh_stale_timeout_seconds=max(1, int(os.getenv("EMIT_REFRESH_STALE_TIMEOUT_SECONDS", "14400"))),
+        emit_refresh_stale_timeout_seconds=max(
+            1,
+            int(os.getenv("EMIT_STALE_JOB_TIMEOUT_SECONDS", os.getenv("EMIT_REFRESH_STALE_TIMEOUT_SECONDS", "14400"))),
+        ),
+        emit_heartbeat_interval_seconds=max(1, int(os.getenv("EMIT_HEARTBEAT_INTERVAL_SECONDS", "30"))),
+        emit_max_memory_mb=max(0, int(os.getenv("EMIT_MAX_MEMORY_MB", "0"))),
         emit_cron=os.getenv("EMIT_CRON", "0 3 * * *"),
         emit_timezone=os.getenv("EMIT_TIMEZONE", os.getenv("TZ", "Asia/Qyzylorda")).strip() or "Asia/Qyzylorda",
         vidman_base_url=os.getenv("VIDMAN_BASE_URL", "https://1.provizor.kz"),

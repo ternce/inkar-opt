@@ -73,6 +73,7 @@ from .models import (
     ProductSubstituteMatch,
     ReferenceUpdateStatus,
     RefreshJob,
+    RefreshLock,
     SourceGoodsMatch,
     UniversalList,
     UniversalListPriceFormat,
@@ -241,6 +242,7 @@ from .services.provisor_auto_refresh import (
     normalize_mode as normalize_refresh_mode,
     new_owner_token as new_refresh_owner_token,
     release_emit_scheduler_lock,
+    release_lock,
     release_scheduler_lock,
     renew_emit_scheduler_lock,
     renew_scheduler_lock,
@@ -259,6 +261,7 @@ from .services.provisor_auto_refresh import (
 from .services.emit_worker import (
     EmitConfig,
     EmitWorker,
+    LOCK_NAME as EMIT_REFRESH_LOCK_NAME,
     active_emit_job,
     configured_filial_ids_for_mode,
     emit_job_to_dict,
@@ -5873,7 +5876,85 @@ def resolve_stale_provisor_auto_refresh(db: Session = Depends(get_db)):
 
 @app.get("/api/emit/refresh/status")
 def get_emit_refresh_status(db: Session = Depends(get_db)):
-    return emit_job_to_dict(latest_emit_job(db, config=_emit_worker_instance().config))
+    config = _emit_worker_instance().config
+    job = latest_emit_job(db, config=config)
+    data = emit_job_to_dict(job, config=config)
+    lock = db.get(RefreshLock, EMIT_REFRESH_LOCK_NAME)
+    global_lock = db.get(RefreshLock, "competitor_refresh_global")
+    data["lock_owner"] = lock.owner_token if lock is not None else None
+    data["global_lock_owner"] = global_lock.owner_token if global_lock is not None else None
+    return data
+
+
+@app.post("/api/emit/refresh/resolve-stale")
+def resolve_stale_emit_refresh(db: Session = Depends(get_db)):
+    config = _emit_worker_instance().config
+    recovered = mark_stale_emit_jobs(db, config=config)
+    items = [emit_job_to_dict(row, config=config) | {"id": row.id} for row in recovered]
+    released = sorted(
+        {
+            str(lock)
+            for item in items
+            for lock in (item.get("locks_released") or [])
+            if str(lock)
+        }
+    )
+    return {
+        "recovered": len(items),
+        "job_ids": [item["id"] for item in items],
+        "released_locks": released,
+        "items": items,
+        "message": "Recovered stale Emit refresh jobs." if items else "No stale Emit refresh jobs found.",
+    }
+
+
+@app.post("/api/emit/refresh/jobs/{job_id}/force-fail")
+def force_fail_emit_refresh_job(job_id: int, payload: dict = Body(default={}), db: Session = Depends(get_db)):
+    confirmation = str(payload.get("confirm") or "").strip()
+    force = bool(payload.get("force"))
+    if confirmation != "force-fail-emit-job":
+        raise HTTPException(status_code=400, detail="confirm must be force-fail-emit-job")
+    config = _emit_worker_instance().config
+    job = db.get(RefreshJob, job_id)
+    if job is None or job.source_type != "emit":
+        raise HTTPException(status_code=404, detail="Emit refresh job not found")
+    now = datetime.utcnow()
+    heartbeat_at = job.heartbeat_at
+    age_seconds = int((now - heartbeat_at).total_seconds()) if heartbeat_at else config.stale_timeout_seconds + 1
+    if job.status in ("pending", "downloading", "parsing", "normalizing", "saving", "running") and age_seconds <= config.stale_timeout_seconds and not force:
+        raise HTTPException(status_code=409, detail="Emit job heartbeat is still healthy; pass force=true to override.")
+    metadata = json.loads(job.metadata_json or "{}") if job.metadata_json else {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    token = str(metadata.get("owner_token") or "")
+    released: list[str] = []
+    if token:
+        if release_lock(db, name=EMIT_REFRESH_LOCK_NAME, owner_token=token):
+            released.append(EMIT_REFRESH_LOCK_NAME)
+        if release_global_refresh_lock(db, owner_token=token):
+            released.append("competitor_refresh_global")
+    metadata.update(
+        {
+            "stale_reason": "manual_force_fail" if force else "manual_stale_resolve",
+            "recovered_at": now.isoformat(),
+            "stale_age_seconds": age_seconds,
+            "locks_released": released,
+        }
+    )
+    finish_refresh_job(
+        db,
+        job,
+        status="interrupted",
+        message="Emit refresh manually marked interrupted.",
+        error="Emit refresh manually marked interrupted.",
+        metadata=metadata,
+        owner_token=token or None,
+        allowed_statuses={"pending", "downloading", "parsing", "normalizing", "saving", "running", "interrupted", "error"},
+        release_refresh=False,
+        release_global=False,
+    )
+    db.refresh(job)
+    return emit_job_to_dict(job, config=config) | {"id": job.id, "released_locks": released}
 
 
 @app.post("/api/emit/refresh/run-now", status_code=202)

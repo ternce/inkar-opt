@@ -8,6 +8,8 @@ import os
 import re
 import shutil
 import sqlite3
+import socket
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -78,6 +80,8 @@ class EmitConfig:
     min_final_rows: int = 100
     min_row_ratio: float = 0.5
     stale_timeout_seconds: int = DEFAULT_STALE_TIMEOUT_SECONDS
+    heartbeat_interval_seconds: int = 30
+    max_memory_mb: int = 0
     cron: str = "0 3 * * *"
     timezone: str = "Asia/Qyzylorda"
     provisor_base_url: str = "https://api.provisor.kz"
@@ -100,6 +104,8 @@ class EmitConfig:
             min_final_rows=settings.emit_min_final_rows,
             min_row_ratio=settings.emit_min_row_ratio,
             stale_timeout_seconds=settings.emit_refresh_stale_timeout_seconds,
+            heartbeat_interval_seconds=settings.emit_heartbeat_interval_seconds,
+            max_memory_mb=settings.emit_max_memory_mb,
             cron=settings.emit_cron,
             timezone=settings.emit_timezone,
             provisor_base_url=settings.provisor_base_url,
@@ -593,6 +599,38 @@ def current_rss_mb() -> float | None:
         return None
 
 
+def _emit_worker_identity() -> dict[str, Any]:
+    return {
+        "worker_owner_id": os.getenv("HOSTNAME") or os.getenv("COMPUTERNAME") or socket.gethostname(),
+        "worker_pid": os.getpid(),
+        "instance_id": os.getenv("RAILWAY_REPLICA_ID") or os.getenv("RENDER_INSTANCE_ID") or os.getenv("HOSTNAME") or "",
+    }
+
+
+def _temp_disk_usage(config: EmitConfig) -> dict[str, Any]:
+    temp_dir = Path(config.temp_dir)
+    total = 0
+    files = 0
+    if temp_dir.exists():
+        for path in temp_dir.rglob("*"):
+            if path.is_file():
+                try:
+                    total += path.stat().st_size
+                    files += 1
+                except OSError:
+                    continue
+    return {"temp_disk_bytes": total, "temp_disk_files": files}
+
+
+def _raise_if_memory_exceeded(config: EmitConfig | None, *, stage: str, stats: EmitStats | None = None) -> None:
+    limit = int(getattr(config, "max_memory_mb", 0) or 0)
+    rss = current_rss_mb()
+    if stats is not None and rss is not None:
+        stats.max_rss_mb = max(float(stats.max_rss_mb or 0.0), rss)
+    if limit > 0 and rss is not None and rss > limit:
+        raise MemoryError(f"Emit worker RSS {rss}MB exceeded EMIT_MAX_MEMORY_MB={limit} during {stage}")
+
+
 def _update_max_rss(stats: EmitStats) -> None:
     rss = current_rss_mb()
     if rss is not None:
@@ -1059,6 +1097,7 @@ async def download_emit_filial(*, config: EmitConfig, filial_id: int, filial_nam
                     if _free_disk_gb(temp_dir) < config.min_free_disk_gb:
                         raise RuntimeError("Free disk fell below EMIT_MIN_FREE_DISK_GB while downloading")
                     fh.write(chunk)
+                    _raise_if_memory_exceeded(config, stage="download")
                     elapsed = max(0.001, time.perf_counter() - started)
                     progress = {
                         "filial_id": filial_id,
@@ -1126,6 +1165,7 @@ def parse_normalize_stage(
                 conn.commit()
                 batch_count = 0
                 _ensure_free_disk(Path(cfg.temp_dir), cfg.min_free_disk_gb)
+                _raise_if_memory_exceeded(cfg, stage="parse_normalize_stage", stats=stats)
                 _update_max_rss(stats)
         conn.commit()
         stats.final_rows_saved = int(conn.execute("SELECT COUNT(*) FROM stage_items").fetchone()[0] or 0)
@@ -1316,6 +1356,7 @@ def replace_emit_price_list_from_staging(
         if batch:
             db.bulk_insert_mappings(CompetitorPriceListItem, batch)
         _ensure_free_disk(Path(config.temp_dir), config.min_free_disk_gb)
+        _raise_if_memory_exceeded(config, stage="db_replace", stats=stats)
     stats.final_rows_saved = final_count
     stats.db_replace_elapsed_sec = round(time.perf_counter() - started, 3)
     db.flush()
@@ -1372,7 +1413,15 @@ def _create_emit_job(
         requested_by=requested_by,
         total_plk=len(filial_ids),
         message="Emit refresh queued.",
-        metadata_json=_json_dumps({"owner_token": owner_token, "filial_ids": filial_ids, "price_format_code": price_format_code or ""}),
+        metadata_json=_json_dumps(
+            {
+                "owner_token": owner_token,
+                "filial_ids": filial_ids,
+                "price_format_code": price_format_code or "",
+                **_emit_worker_identity(),
+                "worker_started_at": now.isoformat(),
+            }
+        ),
     )
     db.add(job)
     db.commit()
@@ -1383,7 +1432,7 @@ def _create_emit_job(
 def _emit_stale_timeout_seconds(config: EmitConfig | None = None) -> int:
     if config is not None:
         return max(1, int(config.stale_timeout_seconds or DEFAULT_STALE_TIMEOUT_SECONDS))
-    raw = os.getenv("EMIT_REFRESH_STALE_TIMEOUT_SECONDS")
+    raw = os.getenv("EMIT_STALE_JOB_TIMEOUT_SECONDS", os.getenv("EMIT_REFRESH_STALE_TIMEOUT_SECONDS", ""))
     if raw is not None:
         try:
             return max(1, int(raw))
@@ -1483,11 +1532,11 @@ def mark_stale_emit_jobs(db: Session, *, config: EmitConfig | None = None, now: 
             .where(RefreshJob.heartbeat_at == old_heartbeat)
             .where(RefreshJob.metadata_json == old_metadata_json)
             .values(
-                status="stale",
                 finished_at=now,
                 heartbeat_at=now,
-                message=f"Emit refresh marked stale: no heartbeat for {age_seconds} seconds.",
-                error_message=f"Emit refresh marked stale: no heartbeat for {age_seconds} seconds.",
+                status="interrupted",
+                message=f"Emit refresh interrupted: no heartbeat for {age_seconds} seconds.",
+                error_message=f"Emit refresh interrupted by stale recovery: no heartbeat for {age_seconds} seconds.",
                 metadata_json=_json_dumps(metadata),
             )
         )
@@ -1508,7 +1557,7 @@ def mark_stale_emit_jobs(db: Session, *, config: EmitConfig | None = None, now: 
         db.execute(
             update(RefreshJob)
             .where(RefreshJob.id == row.id)
-            .where(RefreshJob.status == "stale")
+            .where(RefreshJob.status == "interrupted")
             .values(metadata_json=_json_dumps(metadata))
         )
         db.commit()
@@ -1543,17 +1592,36 @@ def latest_emit_job(db: Session, *, config: EmitConfig | None = None) -> Refresh
     )
 
 
-def emit_job_to_dict(job: RefreshJob | None) -> dict[str, Any]:
+def emit_job_to_dict(job: RefreshJob | None, *, config: EmitConfig | None = None) -> dict[str, Any]:
     base = refresh_job_to_status(job)
     if job is None:
         base["source_type"] = SOURCE_TYPE
+        base["is_stale"] = False
+        base["stale_timeout_seconds"] = _emit_stale_timeout_seconds(config)
         return base
+    now = datetime.utcnow()
+    timeout_seconds = _emit_stale_timeout_seconds(config)
+    heartbeat = job.heartbeat_at
+    stale_age = int((now - heartbeat).total_seconds()) if heartbeat else 0
+    is_stale = bool(job.status in ACTIVE_STATUSES and heartbeat is not None and stale_age > timeout_seconds)
+    base.update(
+        {
+            "is_stale": is_stale,
+            "stale_age_seconds": stale_age if is_stale or job.status == "interrupted" else 0,
+            "stale_timeout_seconds": timeout_seconds,
+            "last_heartbeat": heartbeat.isoformat() if heartbeat else None,
+        }
+    )
     meta = _json_loads(job.metadata_json, {})
     if isinstance(meta, dict):
         base.update(
             {
                 "filial_id": meta.get("filial_id"),
                 "filial_name": meta.get("filial_name"),
+                "current_stage": meta.get("current_stage") or job.status,
+                "current_filial_progress": meta.get("current_filial_progress", {}),
+                "completed_filial_ids": meta.get("completed_filial_ids", meta.get("refreshed_filials", [])),
+                "failed_filial_ids": meta.get("failed_filial_ids", []),
                 "downloaded_bytes": meta.get("downloaded_bytes", 0),
                 "file_size_bytes": meta.get("file_size_bytes", 0),
                 "input_rows": meta.get("input_rows", 0),
@@ -1562,9 +1630,16 @@ def emit_job_to_dict(job: RefreshJob | None) -> dict[str, Any]:
                 "temp_file_path": meta.get("temp_file_path", ""),
                 "stale_reason": meta.get("stale_reason", ""),
                 "recovered_at": meta.get("recovered_at", ""),
-                "stale_age_seconds": meta.get("stale_age_seconds", 0),
+                "stale_age_seconds": meta.get("stale_age_seconds", base.get("stale_age_seconds", 0)),
                 "locks_released": meta.get("locks_released", []),
                 "temp_cleanup": meta.get("temp_cleanup", {}),
+                "worker_owner_id": meta.get("worker_owner_id", ""),
+                "worker_pid": meta.get("worker_pid"),
+                "container_instance_id": meta.get("instance_id", ""),
+                "rss_memory_mb": meta.get("rss_memory_mb"),
+                "temp_disk_bytes": meta.get("temp_disk_bytes", 0),
+                "temp_disk_files": meta.get("temp_disk_files", 0),
+                "restart_interruption_reason": meta.get("stale_reason", "") if job.status == "interrupted" else "",
                 "metadata": {k: v for k, v in meta.items() if k != "owner_token"},
             }
         )
@@ -1578,7 +1653,7 @@ def list_emit_jobs(db: Session, *, limit: int = 50, config: EmitConfig | None = 
         .scalars()
         .all()
     )
-    return [emit_job_to_dict(row) | {"id": row.id} for row in rows]
+    return [emit_job_to_dict(row, config=config) | {"id": row.id} for row in rows]
 
 
 def _recalculate_percentiles_for_emit_rows(
@@ -1738,6 +1813,77 @@ def update_emit_job(db: Session, job: RefreshJob, *, status: str, message: str, 
     db.commit()
 
 
+def _emit_heartbeat_once(
+    *,
+    session_factory: sessionmaker,
+    job_id: int,
+    owner_token: str,
+    config: EmitConfig,
+    message: str,
+) -> bool:
+    try:
+        with session_factory() as db:
+            job = db.get(RefreshJob, job_id)
+            if job is None or job.source_type != SOURCE_TYPE or job.status not in ACTIVE_STATUSES:
+                return False
+            if job_owner_token(job) != owner_token:
+                return False
+            if not renew_global_refresh_lock(db, owner_token=owner_token):
+                logger.error("[EMIT_HEARTBEAT] job_id=%s action=failed lock=competitor_refresh_global", job_id)
+                return False
+            if not renew_lock(db, name=LOCK_NAME, owner_token=owner_token, lease=REFRESH_LOCK_LEASE):
+                logger.error("[EMIT_HEARTBEAT] job_id=%s action=failed lock=%s", job_id, LOCK_NAME)
+                return False
+            metadata = _json_loads(job.metadata_json, {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata.update(
+                {
+                    **_emit_worker_identity(),
+                    "rss_memory_mb": current_rss_mb(),
+                    "heartbeat_interval_seconds": int(config.heartbeat_interval_seconds),
+                    **_temp_disk_usage(config),
+                }
+            )
+            metadata.setdefault("owner_token", owner_token)
+            job.heartbeat_at = datetime.utcnow()
+            if message:
+                job.message = message[:512]
+            job.metadata_json = _json_dumps(metadata)
+            db.commit()
+            logger.debug("[EMIT_HEARTBEAT] job_id=%s action=beat status=%s", job_id, job.status)
+            return True
+    except Exception:
+        logger.exception("[EMIT_HEARTBEAT] job_id=%s action=exception", job_id)
+        return False
+
+
+def _start_emit_heartbeat_thread(
+    *,
+    session_factory: sessionmaker,
+    job_id: int,
+    owner_token: str,
+    config: EmitConfig,
+) -> tuple[threading.Event, threading.Thread]:
+    stop_event = threading.Event()
+
+    def beat() -> None:
+        while not stop_event.wait(max(1, int(config.heartbeat_interval_seconds))):
+            if not _emit_heartbeat_once(
+                session_factory=session_factory,
+                job_id=job_id,
+                owner_token=owner_token,
+                config=config,
+                message="Emit refresh is running.",
+            ):
+                logger.warning("[EMIT_HEARTBEAT] job_id=%s action=stopped reason=beat_failed", job_id)
+                return
+
+    thread = threading.Thread(target=beat, name=f"emit-heartbeat-{job_id}", daemon=True)
+    thread.start()
+    return stop_event, thread
+
+
 class EmitWorker:
     def __init__(self, *, session_factory: sessionmaker, config: EmitConfig):
         self.session_factory = session_factory
@@ -1791,6 +1937,8 @@ class EmitWorker:
 
     async def run_job(self, job_id: int, *, owner_token: str | None = None) -> None:
         total_started = time.perf_counter()
+        heartbeat_stop: threading.Event | None = None
+        heartbeat_thread: threading.Thread | None = None
         with self.session_factory() as db:
             job = db.get(RefreshJob, job_id)
             if job is None:
@@ -1804,7 +1952,18 @@ class EmitWorker:
             job.heartbeat_at = datetime.utcnow()
             job.total_plk = len(filial_ids)
             job.message = "Emit refresh started."
+            if token:
+                metadata.update({**_emit_worker_identity(), "rss_memory_mb": current_rss_mb()})
+                metadata["owner_token"] = token
+                job.metadata_json = _json_dumps(metadata)
             db.commit()
+        if token:
+            heartbeat_stop, heartbeat_thread = _start_emit_heartbeat_thread(
+                session_factory=self.session_factory,
+                job_id=job_id,
+                owner_token=token,
+                config=self.config,
+            )
         logger.info("[EMIT_REFRESH] job_id=%s requested_filials=%s", job_id, filial_ids)
         logger.info(
             "[EMIT_PERCENTILE_INVENTORY] stage=refresh_start job_id=%s inventory=%s",
@@ -1825,6 +1984,47 @@ class EmitWorker:
                         aggregate["success"] += 1
                     else:
                         aggregate["failed"] += 1
+                    with self.session_factory() as progress_db:
+                        progress_job = progress_db.get(RefreshJob, job_id)
+                        if progress_job is not None and progress_job.status in ACTIVE_STATUSES:
+                            progress_job.processed_plk = len(aggregate["filials"])
+                            progress_job.success_count = int(aggregate["success"])
+                            progress_job.failed_count = int(aggregate["failed"])
+                            progress_job.skipped_count = len(
+                                [row for row in aggregate["filials"] if isinstance(row, dict) and row.get("skipped")]
+                            )
+                            progress_meta = _json_loads(progress_job.metadata_json, {})
+                            if not isinstance(progress_meta, dict):
+                                progress_meta = {}
+                            completed = [
+                                int(row.get("filial_id") or 0)
+                                for row in aggregate["filials"]
+                                if isinstance(row, dict) and row.get("ok") and int(row.get("filial_id") or 0) > 0
+                            ]
+                            failed_filials = [
+                                int(row.get("filial_id") or 0)
+                                for row in aggregate["filials"]
+                                if isinstance(row, dict) and not row.get("ok") and int(row.get("filial_id") or 0) > 0
+                            ]
+                            progress_meta.update(
+                                {
+                                    "filials": aggregate["filials"],
+                                    "completed_filial_ids": completed,
+                                    "failed_filial_ids": failed_filials,
+                                    "filial_id": result.get("filial_id"),
+                                    "current_stage": "filial_saved" if result.get("ok") else "filial_failed",
+                                    "rss_memory_mb": current_rss_mb(),
+                                    **_temp_disk_usage(self.config),
+                                }
+                            )
+                            progress_job.metadata_json = _json_dumps(progress_meta)
+                            progress_job.heartbeat_at = datetime.utcnow()
+                            progress_job.message = (
+                                f"Saved Emit filial {result.get('filial_id')}"
+                                if result.get("ok")
+                                else f"Emit filial {result.get('filial_id')} failed"
+                            )
+                            progress_db.commit()
                     logger.info(
                         "[EMIT_REFRESH] job_id=%s filial_id=%s ok=%s duration_sec=%s price_list_id=%s",
                         job_id,
@@ -1912,6 +2112,10 @@ class EmitWorker:
                     if token:
                         release_lock(db, name=LOCK_NAME, owner_token=token)
                         release_global_refresh_lock(db, owner_token=token)
+            if heartbeat_stop is not None:
+                heartbeat_stop.set()
+            if heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=5)
 
     async def refresh_filial(self, *, job_id: int, filial_id: int, owner_token: str | None = None) -> dict[str, Any]:
         filial_started = time.perf_counter()

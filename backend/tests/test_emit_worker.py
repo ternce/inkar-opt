@@ -43,6 +43,7 @@ from backend.app.services.emit_worker import (
     parse_normalize_stage,
     replace_emit_price_list_from_staging,
     stage_row_count,
+    _emit_heartbeat_once,
     _recalculate_percentiles_for_emit_rows,
 )
 from backend.app.services.competitor_assignments import (
@@ -1435,6 +1436,9 @@ def test_emit_run_job_mixed_filials_finishes_partial_success(monkeypatch):
     with Session() as db:
         saved = db.get(RefreshJob, int(job.id))
         assert saved.status == "partial_success"
+        assert saved.processed_plk == 2
+        assert saved.success_count == 1
+        assert saved.failed_count == 1
         metadata = json.loads(saved.metadata_json)
         assert metadata["success"] == 1
         assert metadata["failed"] == 1
@@ -1457,6 +1461,9 @@ def test_emit_run_job_no_success_finishes_error(monkeypatch):
     with Session() as db:
         saved = db.get(RefreshJob, int(job.id))
         assert saved.status == "error"
+        assert saved.processed_plk == 1
+        assert saved.success_count == 0
+        assert saved.failed_count == 1
         metadata = json.loads(saved.metadata_json)
         assert metadata["success"] == 0
         assert metadata["failed"] == 1
@@ -1512,7 +1519,7 @@ def test_stale_emit_job_marked_and_locks_released(tmp_path):
         db.refresh(job)
 
         assert [row.id for row in recovered] == [job.id]
-        assert job.status == "stale"
+        assert job.status == "interrupted"
         assert job.finished_at is not None
         metadata = json.loads(job.metadata_json)
         assert set(metadata["locks_released"]) == {"emit_refresh", "competitor_refresh_global"}
@@ -1575,6 +1582,49 @@ def test_emit_start_succeeds_after_stale_recovery(tmp_path):
     assert job is not None
     assert blocker is None
     assert owner_token
+
+
+def test_emit_heartbeat_uses_separate_session_and_renews_locks(tmp_path):
+    Session = _session_factory_static()
+    old_heartbeat = datetime.utcnow() - timedelta(seconds=30)
+    token = refresh_svc.new_owner_token()
+    with Session() as db:
+        assert refresh_svc.try_acquire_global_refresh_lock(db, owner_token=token, source="emit", requested_by="test")
+        assert refresh_svc.try_acquire_lock(
+            db,
+            name="emit_refresh",
+            lock_type="refresh",
+            owner_token=token,
+            lease=refresh_svc.REFRESH_LOCK_LEASE,
+        )
+        job = RefreshJob(
+            source_type="emit",
+            mode="selected",
+            status="running",
+            started_at=old_heartbeat,
+            heartbeat_at=old_heartbeat,
+            metadata_json=json.dumps({"owner_token": token}),
+        )
+        db.add(job)
+        db.commit()
+        job_id = int(job.id)
+
+    ok = _emit_heartbeat_once(
+        session_factory=Session,
+        job_id=job_id,
+        owner_token=token,
+        config=EmitConfig(temp_dir=str(tmp_path), heartbeat_interval_seconds=1),
+        message="beat",
+    )
+
+    assert ok is True
+    with Session() as db:
+        saved = db.get(RefreshJob, job_id)
+        metadata = json.loads(saved.metadata_json)
+        assert saved.heartbeat_at > old_heartbeat
+        assert saved.message == "beat"
+        assert metadata["owner_token"] == token
+        assert metadata["worker_pid"]
 
 
 def test_stale_recovery_race_recheck_keeps_fresh_job(monkeypatch, tmp_path):
@@ -1670,7 +1720,7 @@ def test_stale_recovery_cleanup_failure_does_not_block(monkeypatch, tmp_path):
         db.refresh(job)
         metadata = json.loads(job.metadata_json)
 
-        assert job.status == "stale"
+        assert job.status == "interrupted"
         assert "competitor_refresh_global" in metadata["locks_released"]
         assert metadata["temp_cleanup"]["files_failed"] == [str(temp_file)]
 
@@ -1714,6 +1764,85 @@ def test_status_endpoint(monkeypatch):
         assert response.json()["source_type"] == "emit"
         assert response.json()["status"] == "pending"
         assert job is not None
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+def test_resolve_stale_endpoint_recovers_emit_job(monkeypatch, tmp_path):
+    import backend.app.main as main
+
+    Session = _session_factory_static()
+    stale_time = datetime.utcnow() - timedelta(seconds=120)
+    token = refresh_svc.new_owner_token()
+    with Session() as db:
+        assert refresh_svc.try_acquire_global_refresh_lock(db, owner_token=token, source="emit", requested_by="test")
+        assert refresh_svc.try_acquire_lock(
+            db,
+            name="emit_refresh",
+            lock_type="refresh",
+            owner_token=token,
+            lease=refresh_svc.REFRESH_LOCK_LEASE,
+        )
+        db.add(
+            RefreshJob(
+                source_type="emit",
+                mode="selected",
+                status="running",
+                started_at=stale_time,
+                heartbeat_at=stale_time,
+                metadata_json=json.dumps({"owner_token": token}),
+            )
+        )
+        db.commit()
+
+    worker = EmitWorker(session_factory=Session, config=EmitConfig(temp_dir=str(tmp_path), stale_timeout_seconds=60))
+    monkeypatch.setattr(main, "SessionLocal", Session)
+    monkeypatch.setattr(main, "_emit_worker", worker)
+    main.app.dependency_overrides[main.get_db] = lambda: Session()
+    try:
+        client = TestClient(main.app)
+        response = client.post("/api/emit/refresh/resolve-stale")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["recovered"] == 1
+        assert set(payload["released_locks"]) == {"competitor_refresh_global", "emit_refresh"}
+
+        second = client.post("/api/emit/refresh/resolve-stale")
+        assert second.status_code == 200
+        assert second.json()["recovered"] == 0
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+def test_status_endpoint_flags_stale_running_job(monkeypatch, tmp_path):
+    import backend.app.main as main
+
+    Session = _session_factory_static()
+    stale_time = datetime.utcnow() - timedelta(seconds=120)
+    with Session() as db:
+        db.add(
+            RefreshJob(
+                source_type="emit",
+                mode="selected",
+                status="running",
+                started_at=stale_time,
+                heartbeat_at=stale_time,
+                metadata_json=json.dumps({"owner_token": refresh_svc.new_owner_token()}),
+            )
+        )
+        db.commit()
+
+    worker = EmitWorker(session_factory=Session, config=EmitConfig(temp_dir=str(tmp_path), stale_timeout_seconds=60))
+    monkeypatch.setattr(main, "SessionLocal", Session)
+    monkeypatch.setattr(main, "_emit_worker", worker)
+    main.app.dependency_overrides[main.get_db] = lambda: Session()
+    try:
+        client = TestClient(main.app)
+        response = client.get("/api/emit/refresh/status")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "interrupted"
+        assert payload["stale_reason"] == "stale_timeout"
     finally:
         main.app.dependency_overrides.clear()
 
