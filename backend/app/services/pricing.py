@@ -36,6 +36,7 @@ from ..timezone import local_iso
 from .competitor_matching import rebuild_competitor_prices_for_selected
 from .competitor_percentiles import emit_percentile_group_keys, recalculate_competitor_percentiles_if_needed
 from .competitor_percentiles import REGIONAL_SCOPE
+from .competitors.percentiles.sources import PERCENTILE_SOURCE_COMPETITOR, is_emit_source_key, percentile_source_id
 from .competitor_assignments import get_assigned_competitor_price_lists, propagate_emit_assignments_to_new_price_format
 from .references.types import canonical_branch_id
 from .regions import allowed_provisor_source_names_for_city_id, city_id_from_branch
@@ -678,14 +679,14 @@ def resolve_percentile_prices(
     percentile_number: int,
 ) -> CompetitorResolvedMany:
     active_groups = emit_percentile_group_keys(db=db, price_format_id=price_format_id)
-    if not active_groups:
+    assigned_source_ids = _assigned_percentile_source_ids(db=db, price_format_id=price_format_id)
+    if not active_groups and not assigned_source_ids:
         return CompetitorResolvedMany([])
     rows = (
         db.execute(
             select(CompetitorPricePercentile)
             .where(CompetitorPricePercentile.price_format_id == price_format_id)
             .where(CompetitorPricePercentile.product_id == product_id)
-            .where(CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
             .where(CompetitorPricePercentile.percentile == percentile_number)
             .where(CompetitorPricePercentile.value.is_not(None))
         )
@@ -697,22 +698,57 @@ def resolve_percentile_prices(
         source_key = str(getattr(row, "source_key", "") or "")
         branch = str(row.branch_name or "")
         competitor = str(row.competitor_name or "")
-        if (branch, competitor, source_key) not in active_groups and (
-            source_key or not any(active_branch == branch and active_competitor == competitor for active_branch, active_competitor, _active_source_key in active_groups)
-        ):
-            continue
+        is_active_emit_row = (branch, competitor, source_key) in active_groups or (
+            not source_key
+            and any(active_branch == branch and active_competitor == competitor for active_branch, active_competitor, _active_source_key in active_groups)
+        )
+        if is_emit_source_key(source_key) or is_active_emit_row:
+            if row.percentile_scope != REGIONAL_SCOPE:
+                continue
+            if (branch, competitor, source_key) not in active_groups and (
+                source_key or not any(active_branch == branch and active_competitor == competitor for active_branch, active_competitor, _active_source_key in active_groups)
+            ):
+                continue
+            src = f"percentile:{row.source_key}:{row.competitor_name}:{row.branch_name}:p{row.percentile}"
+        else:
+            source_id = percentile_source_id(
+                percentile_source=PERCENTILE_SOURCE_COMPETITOR,
+                price_format_id=price_format_id,
+                scope="global",
+                source_key=source_key,
+                region="",
+                competitor=competitor,
+                percentile=row.percentile,
+            )
+            if source_id not in assigned_source_ids:
+                continue
+            src = f"percentile:{source_id}"
         value = _as_decimal(row.value)
         if value is None or value <= 0:
             continue
-        src = f"percentile:{row.source_key}:{row.competitor_name}:{row.branch_name}:p{row.percentile}"
         out.append((value, src))
     out.sort(key=lambda x: x[0])
     return CompetitorResolvedMany(out)
 
 
+def _assigned_percentile_source_ids(*, db: Session, price_format_id: int) -> set[str]:
+    rows = (
+        db.execute(
+            select(CompetitorPrice.source_name)
+            .where(CompetitorPrice.price_format_id == price_format_id)
+            .where(CompetitorPrice.product_id.is_(None))
+            .where(CompetitorPrice.source_name.like("percentile:%"))
+        )
+        .scalars()
+        .all()
+    )
+    return {str(row or "").removeprefix("percentile:").strip() for row in rows if str(row or "").strip()}
+
+
 def load_percentile_price_cache(db: Session, price_format_id: int) -> PercentilePriceCache:
     active_groups = emit_percentile_group_keys(db=db, price_format_id=price_format_id)
-    if not active_groups:
+    assigned_source_ids = _assigned_percentile_source_ids(db=db, price_format_id=price_format_id)
+    if not active_groups and not assigned_source_ids:
         return {}
     rows = (
         db.execute(
@@ -723,9 +759,9 @@ def load_percentile_price_cache(db: Session, price_format_id: int) -> Percentile
                 CompetitorPricePercentile.competitor_name,
                 CompetitorPricePercentile.branch_name,
                 CompetitorPricePercentile.source_key,
+                CompetitorPricePercentile.percentile_scope,
             )
             .where(CompetitorPricePercentile.price_format_id == price_format_id)
-            .where(CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
             .where(CompetitorPricePercentile.value.is_not(None))
             .order_by(
                 CompetitorPricePercentile.product_id.asc(),
@@ -736,18 +772,38 @@ def load_percentile_price_cache(db: Session, price_format_id: int) -> Percentile
         .all()
     )
     cache: PercentilePriceCache = {}
-    for product_id, percentile, value, competitor_name, branch_name, source_key in rows:
+    for product_id, percentile, value, competitor_name, branch_name, source_key, percentile_scope in rows:
         source_key = str(source_key or "")
         branch_name = str(branch_name or "")
         competitor_name = str(competitor_name or "")
-        if (branch_name, competitor_name, source_key) not in active_groups and (
-            source_key or not any(active_branch == branch_name and active_competitor == competitor_name for active_branch, active_competitor, _active_source_key in active_groups)
-        ):
-            continue
+        is_active_emit_row = (branch_name, competitor_name, source_key) in active_groups or (
+            not source_key
+            and any(active_branch == branch_name and active_competitor == competitor_name for active_branch, active_competitor, _active_source_key in active_groups)
+        )
+        if is_emit_source_key(source_key) or is_active_emit_row:
+            if percentile_scope != REGIONAL_SCOPE:
+                continue
+            if (branch_name, competitor_name, source_key) not in active_groups and (
+                source_key or not any(active_branch == branch_name and active_competitor == competitor_name for active_branch, active_competitor, _active_source_key in active_groups)
+            ):
+                continue
+            src = f"percentile:{source_key}:{competitor_name}:{branch_name}:p{percentile}"
+        else:
+            source_id = percentile_source_id(
+                percentile_source=PERCENTILE_SOURCE_COMPETITOR,
+                price_format_id=price_format_id,
+                scope="global",
+                source_key=source_key,
+                region="",
+                competitor=competitor_name,
+                percentile=percentile,
+            )
+            if source_id not in assigned_source_ids:
+                continue
+            src = f"percentile:{source_id}"
         price = _as_decimal(value)
         if price is None or price <= 0:
             continue
-        src = f"percentile:{source_key}:{competitor_name}:{branch_name}:p{percentile}"
         cache.setdefault(int(product_id), {}).setdefault(int(percentile), []).append((price, src))
     return cache
 

@@ -4413,9 +4413,10 @@ def get_provisor_diagnostics(
 @app.get("/api/competitors/percentiles")
 def get_competitor_percentile_sources(
     format_code: str | None = Query(None),
+    percentile_source: str = Query("emit"),
     db: Session = Depends(get_db),
 ):
-    return list_percentile_sources(db=db, price_format_code=format_code)
+    return list_percentile_sources(db=db, price_format_code=format_code, percentile_source=percentile_source)
 
 
 @app.get("/api/competitors/percentile-rows")
@@ -4424,6 +4425,7 @@ def get_competitor_percentile_rows(
     region: str = Query(""),
     competitor: str = Query(""),
     source_key: str = Query(""),
+    percentile_source: str = Query("emit"),
     q: str = Query(""),
     percentile_filter: str = Query("all"),
     competitor_filter: str = Query("all"),
@@ -4439,6 +4441,7 @@ def get_competitor_percentile_rows(
         region=region,
         competitor=competitor,
         source_key=source_key,
+        percentile_source=percentile_source,
         q=q,
         percentile_filter=percentile_filter,
         competitor_filter=competitor_filter,
@@ -4455,6 +4458,7 @@ def get_competitor_percentile_trace(
     region: str = Query(...),
     competitor: str = Query(...),
     source_key: str = Query(""),
+    percentile_source: str = Query("emit"),
     sku: str = Query(...),
     db: Session = Depends(get_db),
 ):
@@ -4464,6 +4468,7 @@ def get_competitor_percentile_trace(
         region=region,
         competitor=competitor,
         source_key=source_key,
+        percentile_source=percentile_source,
         sku=sku,
     )
 
@@ -4474,6 +4479,7 @@ def get_competitor_percentile_coverage_audit(
     region: str = Query(...),
     competitor: str = Query(...),
     source_key: str = Query(""),
+    percentile_source: str = Query("emit"),
     db: Session = Depends(get_db),
 ):
     return percentile_coverage_audit(
@@ -4482,6 +4488,7 @@ def get_competitor_percentile_coverage_audit(
         region=region,
         competitor=competitor,
         source_key=source_key,
+        percentile_source=percentile_source,
     )
 
 
@@ -4492,6 +4499,7 @@ def export_competitor_percentile_rows_endpoint(
     region: str = Query(""),
     competitor: str = Query(""),
     source_key: str = Query(""),
+    percentile_source: str = Query("emit"),
     q: str = Query(""),
     percentile_filter: str = Query("all"),
     competitor_filter: str = Query("all"),
@@ -4508,6 +4516,7 @@ def export_competitor_percentile_rows_endpoint(
         region=region,
         competitor=competitor,
         source_key=source_key,
+        percentile_source=percentile_source,
         q=q,
         percentile_filter=percentile_filter,
         competitor_filter=competitor_filter,
@@ -4621,11 +4630,12 @@ def get_competitor_assignments(format_code: str, db: Session = Depends(get_db), 
         .all()
     )
     cfg_by_source_name = {cfg.source_name: cfg for cfg in percentile_cfgs}
-    for source in list_percentile_sources(db=db, price_format_code=format_code):
-        source_id = str(source.get("id") or "")
-        cfg = cfg_by_source_name.get(_assignment_percentile_source_name(source_id))
-        if cfg is not None:
-            rows.append(_assignment_row_from_percentile(source, cfg))
+    for percentile_source in ("emit", "competitor"):
+        for source in list_percentile_sources(db=db, price_format_code=format_code, percentile_source=percentile_source):
+            source_id = str(source.get("id") or "")
+            cfg = cfg_by_source_name.get(_assignment_percentile_source_name(source_id))
+            if cfg is not None:
+                rows.append(_assignment_row_from_percentile(source, cfg))
     return rows
 
 

@@ -204,17 +204,27 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
     setIsLoading(true);
     setError(null);
     try {
-      const [sourcesRes, percentileRes, assignmentRows] = await Promise.all([
+      const [sourcesRes, emitPercentileRes, competitorPercentileRes, assignmentRows] = await Promise.all([
         fetch(`/api/competitors/price-lists?format_code=${encodeURIComponent(selectedFormat.code)}`),
-        fetch(`/api/competitors/percentiles?format_code=${encodeURIComponent(selectedFormat.code)}`),
+        fetch(`/api/competitors/percentiles?format_code=${encodeURIComponent(selectedFormat.code)}&percentile_source=emit`),
+        fetch(`/api/competitors/percentiles?format_code=${encodeURIComponent(selectedFormat.code)}&percentile_source=competitor`),
         loadAssignments(selectedFormat.code),
       ]);
       const sourcesText = await sourcesRes.text();
-      const percentileText = await percentileRes.text();
+      const emitPercentileText = await emitPercentileRes.text();
+      const competitorPercentileText = await competitorPercentileRes.text();
       const sourcesData = parseJsonOrNull(sourcesText);
-      const percentileData = parseJsonOrNull(percentileText);
+      const emitPercentileData = parseJsonOrNull(emitPercentileText);
+      const competitorPercentileData = parseJsonOrNull(competitorPercentileText);
+      const percentileRes = emitPercentileRes;
+      const percentileText = emitPercentileText;
+      const percentileData = [
+        ...(Array.isArray(emitPercentileData) ? emitPercentileData : []),
+        ...(Array.isArray(competitorPercentileData) ? competitorPercentileData : []),
+      ];
       if (!sourcesRes.ok) throw new Error(sourcesData?.detail || sourcesText || 'Не удалось загрузить источники цен');
       if (!percentileRes.ok) throw new Error(percentileData?.detail || percentileText || 'Не удалось загрузить источники персентилей');
+      if (!competitorPercentileRes.ok) throw new Error(competitorPercentileData?.detail || competitorPercentileText || 'percentile sources request failed');
       const rows = [
         ...(Array.isArray(sourcesData) ? sourcesData.map(normalizeSource) : []),
         ...(Array.isArray(percentileData) ? percentileData.map(percentileToSource) : []),

@@ -29,16 +29,31 @@ from ...competitor_percentiles import (
     percentile_inc_linear,
 )
 from ...competitor_source_config import MULTI_PRICE_PERCENTILE_MODE, effective_percentile_mode
+from .sources import (
+    PERCENTILE_SOURCE_COMPETITOR,
+    PERCENTILE_SOURCE_DEFAULT,
+    PERCENTILE_SOURCE_EMIT,
+    get_percentile_provider,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def list_percentile_sources(*, db: Session, price_format_code: str | None = None) -> list[dict]:
+def list_percentile_sources(
+    *,
+    db: Session,
+    price_format_code: str | None = None,
+    percentile_source: str = PERCENTILE_SOURCE_DEFAULT,
+) -> list[dict]:
     """Group stored percentile rows into source-like UI records.
 
     The percentile engine is already partially present in
     competitor_price_percentiles. Stage 1 only exposes it as a management view.
     """
+
+    provider = get_percentile_provider(percentile_source)
+    if provider.key == PERCENTILE_SOURCE_COMPETITOR:
+        return _list_competitor_percentile_sources(db=db, price_format_code=price_format_code)
 
     allowed_groups_by_format: dict[int, set[tuple[str, str, str]]] = {}
     stmt = (
@@ -55,6 +70,7 @@ def list_percentile_sources(*, db: Session, price_format_code: str | None = None
             func.sum(CompetitorPricePercentile.source_count).label("source_count"),
             func.max(CompetitorPricePercentile.updated_at).label("generated_at"),
         )
+        .where(provider.row_filter())
         .group_by(
             CompetitorPricePercentile.price_format_id,
             CompetitorPricePercentile.source_type,
@@ -94,7 +110,15 @@ def list_percentile_sources(*, db: Session, price_format_code: str | None = None
         generated_at = row.generated_at.isoformat() if row.generated_at else ""
         out.append(
             {
-                "id": f"{row.price_format_id}:{row.percentile_scope}:{row.source_key}:{row.branch_name}:{row.competitor_name}:p{row.percentile}",
+                "id": provider.source_id(
+                    price_format_id=row.price_format_id,
+                    scope=row.percentile_scope,
+                    source_key=row.source_key,
+                    region=row.branch_name,
+                    competitor=row.competitor_name,
+                    percentile=row.percentile,
+                ),
+                "percentileSource": PERCENTILE_SOURCE_EMIT,
                 "priceFormatId": row.price_format_id,
                 "competitorPriceListId": row.competitor_price_list_id,
                 "sourceKey": row.source_key or "",
@@ -104,6 +128,69 @@ def list_percentile_sources(*, db: Session, price_format_code: str | None = None
                 "scope": row.percentile_scope or REGIONAL_SCOPE,
                 "percentile": int(row.percentile),
                 "name": f"{row.branch_name or 'Без филиала'} — {row.competitor_name or 'Конкурент'} — P{int(row.percentile)}",
+                "skuCount": int(row.sku_count or 0),
+                "sourceCount": int(row.source_count or 0),
+                "generatedAt": generated_at,
+                "sourceType": "percentile",
+            }
+        )
+    return out
+
+
+def _list_competitor_percentile_sources(*, db: Session, price_format_code: str | None = None) -> list[dict]:
+    provider = get_percentile_provider(PERCENTILE_SOURCE_COMPETITOR)
+    stmt = (
+        select(
+            CompetitorPricePercentile.price_format_id,
+            CompetitorPricePercentile.source_key,
+            func.min(CompetitorPricePercentile.source_type).label("source_type"),
+            func.min(CompetitorPricePercentile.competitor_price_list_id).label("competitor_price_list_id"),
+            CompetitorPricePercentile.competitor_name,
+            CompetitorPricePercentile.percentile,
+            func.count(func.distinct(CompetitorPricePercentile.product_id)).label("sku_count"),
+            func.sum(CompetitorPricePercentile.source_count).label("source_count"),
+            func.max(CompetitorPricePercentile.updated_at).label("generated_at"),
+        )
+        .where(provider.row_filter())
+        .group_by(
+            CompetitorPricePercentile.price_format_id,
+            CompetitorPricePercentile.source_key,
+            CompetitorPricePercentile.competitor_name,
+            CompetitorPricePercentile.percentile,
+        )
+    )
+    if price_format_code:
+        pf = db.execute(select(PriceFormat).where(PriceFormat.code == price_format_code.strip())).scalars().first()
+        if pf is None:
+            return []
+        stmt = stmt.where(CompetitorPricePercentile.price_format_id == pf.id)
+    rows = db.execute(stmt.order_by(CompetitorPricePercentile.competitor_name.asc())).all()
+    out: list[dict] = []
+    for row in rows:
+        competitor = str(row.competitor_name or "").strip()
+        if not competitor:
+            continue
+        generated_at = row.generated_at.isoformat() if row.generated_at else ""
+        out.append(
+            {
+                "id": provider.source_id(
+                    price_format_id=row.price_format_id,
+                    scope="global",
+                    source_key=row.source_key,
+                    region="",
+                    competitor=competitor,
+                    percentile=row.percentile,
+                ),
+                "percentileSource": PERCENTILE_SOURCE_COMPETITOR,
+                "priceFormatId": row.price_format_id,
+                "competitorPriceListId": row.competitor_price_list_id,
+                "sourceKey": row.source_key or "",
+                "percentileSourceType": row.source_type or "",
+                "region": "",
+                "competitor": competitor,
+                "scope": "global",
+                "percentile": int(row.percentile),
+                "name": f"{competitor or 'Конкурент'} — P{int(row.percentile)}",
                 "skuCount": int(row.sku_count or 0),
                 "sourceCount": int(row.source_count or 0),
                 "generatedAt": generated_at,
@@ -200,10 +287,18 @@ def _group_key(region: object, competitor: object, source_key: object = "") -> t
     return str(region or "").strip(), str(competitor or "").strip(), str(source_key or "").strip()
 
 
-def list_percentile_groups(*, db: Session, price_format_code: str) -> list[dict]:
+def list_percentile_groups(
+    *,
+    db: Session,
+    price_format_code: str,
+    percentile_source: str = PERCENTILE_SOURCE_DEFAULT,
+) -> list[dict]:
     pf = _get_price_format(db, price_format_code)
     if pf is None:
         return []
+    provider = get_percentile_provider(percentile_source)
+    if provider.key == PERCENTILE_SOURCE_COMPETITOR:
+        return _list_competitor_percentile_groups(db=db, pf=pf)
     allowed_groups = emit_percentile_group_keys(db=db, price_format_id=int(pf.id))
     if not allowed_groups:
         return []
@@ -219,6 +314,7 @@ def list_percentile_groups(*, db: Session, price_format_code: str) -> list[dict]
                 func.max(CompetitorPricePercentile.updated_at).label("generated_at"),
             )
             .where(CompetitorPricePercentile.price_format_id == pf.id)
+            .where(provider.row_filter())
             .group_by(
                 CompetitorPricePercentile.branch_name,
                 CompetitorPricePercentile.competitor_name,
@@ -257,11 +353,83 @@ def list_percentile_groups(*, db: Session, price_format_code: str) -> list[dict]
     return groups
 
 
-def _selected_group(db: Session, pf: PriceFormat, region: str = "", competitor: str = "", source_key: str = "") -> tuple[str, str, str]:
+def _list_competitor_percentile_groups(*, db: Session, pf: PriceFormat) -> list[dict]:
+    provider = get_percentile_provider(PERCENTILE_SOURCE_COMPETITOR)
+    rows = (
+        db.execute(
+            select(
+                CompetitorPricePercentile.competitor_name,
+                CompetitorPricePercentile.source_key,
+                func.count(func.distinct(CompetitorPricePercentile.product_id)).label("sku_count"),
+                func.sum(CompetitorPricePercentile.source_count).label("source_count"),
+                func.max(CompetitorPricePercentile.updated_at).label("generated_at"),
+            )
+            .where(CompetitorPricePercentile.price_format_id == pf.id)
+            .where(provider.row_filter())
+            .group_by(
+                CompetitorPricePercentile.competitor_name,
+                CompetitorPricePercentile.source_key,
+            )
+            .order_by(CompetitorPricePercentile.competitor_name.asc())
+        )
+        .all()
+    )
+    groups: list[dict] = []
+    for row in rows:
+        competitor = str(row.competitor_name or "").strip()
+        if not competitor:
+            continue
+        source_key = str(row.source_key or "").strip()
+        groups.append(
+            {
+                "id": f"{PERCENTILE_SOURCE_COMPETITOR}::{source_key}::{competitor}",
+                "sourceKey": source_key,
+                "region": "",
+                "competitor": competitor,
+                "scope": "global",
+                "name": competitor,
+                "skuCount": int(row.sku_count or 0),
+                "sourceCount": int(row.source_count or 0),
+                "generatedAt": row.generated_at.isoformat() if row.generated_at else "",
+            }
+        )
+    return groups
+
+
+def _selected_group(
+    db: Session,
+    pf: PriceFormat,
+    region: str = "",
+    competitor: str = "",
+    source_key: str = "",
+    percentile_source: str = PERCENTILE_SOURCE_DEFAULT,
+) -> tuple[str, str, str]:
     requested_region = region.strip()
     requested_competitor = competitor.strip()
     requested_source_key = source_key.strip()
-    groups = list_percentile_groups(db=db, price_format_code=str(pf.code or ""))
+    groups = list_percentile_groups(
+        db=db,
+        price_format_code=str(pf.code or ""),
+        percentile_source=percentile_source,
+    )
+    if get_percentile_provider(percentile_source).key == PERCENTILE_SOURCE_COMPETITOR:
+        if requested_competitor:
+            match = next(
+                (
+                    group
+                    for group in groups
+                    if str(group.get("competitor") or "") == requested_competitor
+                    and (not requested_source_key or str(group.get("sourceKey") or "") == requested_source_key)
+                ),
+                None,
+            )
+            if match is not None:
+                return "", str(match.get("competitor") or ""), str(match.get("sourceKey") or "")
+            return "", requested_competitor, requested_source_key
+        if groups:
+            first = groups[0]
+            return "", str(first.get("competitor") or ""), str(first.get("sourceKey") or "")
+        return "", requested_competitor, requested_source_key
     if requested_source_key:
         for group in groups:
             if str(group.get("sourceKey") or "") == requested_source_key:
@@ -352,7 +520,33 @@ def _prices_by_product_for_columns(db: Session, product_ids: list[int], columns:
     }
 
 
-def _available_percentiles_for_group(*, db: Session, pf: PriceFormat, region: str, competitor: str, source_key: str) -> list[int]:
+def _available_percentiles_for_group(
+    *,
+    db: Session,
+    pf: PriceFormat,
+    region: str,
+    competitor: str,
+    source_key: str,
+    percentile_source: str = PERCENTILE_SOURCE_DEFAULT,
+) -> list[int]:
+    provider = get_percentile_provider(percentile_source)
+    if provider.key == PERCENTILE_SOURCE_COMPETITOR:
+        stmt = (
+            select(CompetitorPricePercentile.percentile)
+            .where(CompetitorPricePercentile.price_format_id == pf.id)
+            .where(provider.row_filter())
+            .where(CompetitorPricePercentile.competitor_name == competitor)
+        )
+        requested_source_key = str(source_key or "").strip()
+        if requested_source_key:
+            stmt = stmt.where(CompetitorPricePercentile.source_key == requested_source_key)
+        levels = [
+            int(value)
+            for value in db.execute(
+                stmt.group_by(CompetitorPricePercentile.percentile).order_by(CompetitorPricePercentile.percentile.asc())
+            ).scalars()
+        ]
+        return levels or list(PERCENTILES)
     scope = KAZAKHSTAN_SCOPE if region == KAZAKHSTAN_REGION else REGIONAL_SCOPE
     stmt = (
         select(CompetitorPricePercentile.percentile)
@@ -373,7 +567,16 @@ def _available_percentiles_for_group(*, db: Session, pf: PriceFormat, region: st
     return levels or list(PERCENTILES)
 
 
-def _build_percentile_browser_rows(*, db: Session, pf: PriceFormat, region: str, competitor: str, source_key: str = "", percentile_numbers: list[int] | None = None) -> tuple[list[dict], list[dict]]:
+def _build_percentile_browser_rows(
+    *,
+    db: Session,
+    pf: PriceFormat,
+    region: str,
+    competitor: str,
+    source_key: str = "",
+    percentile_numbers: list[int] | None = None,
+    percentile_source: str = PERCENTILE_SOURCE_DEFAULT,
+) -> tuple[list[dict], list[dict]]:
     product_rows = (
         db.execute(
             select(Product, ProductExtra)
@@ -383,17 +586,19 @@ def _build_percentile_browser_rows(*, db: Session, pf: PriceFormat, region: str,
         .all()
     )
     product_ids = [int(product.id) for product, _extra in product_rows]
+    provider = get_percentile_provider(percentile_source)
     percentile_stmt = (
         select(CompetitorPricePercentile)
         .where(CompetitorPricePercentile.price_format_id == pf.id)
-        .where(CompetitorPricePercentile.branch_name == region)
+        .where(provider.row_filter())
         .where(CompetitorPricePercentile.competitor_name == competitor)
-        .where(
+        .where(CompetitorPricePercentile.product_id.in_(product_ids))
+    )
+    if provider.regional:
+        percentile_stmt = percentile_stmt.where(CompetitorPricePercentile.branch_name == region).where(
             CompetitorPricePercentile.percentile_scope
             == (KAZAKHSTAN_SCOPE if region == KAZAKHSTAN_REGION else REGIONAL_SCOPE)
         )
-        .where(CompetitorPricePercentile.product_id.in_(product_ids))
-    )
     if str(source_key or "").strip():
         percentile_stmt = percentile_stmt.where(CompetitorPricePercentile.source_key == str(source_key or "").strip())
     percentile_rows = (
@@ -405,7 +610,7 @@ def _build_percentile_browser_rows(*, db: Session, pf: PriceFormat, region: str,
     )
     percentiles_by_product: dict[int, dict[int, float | None]] = defaultdict(dict)
     percentile_values_by_product: dict[int, dict[int, list[Decimal]]] = defaultdict(lambda: defaultdict(list))
-    aggregate_stored_percentiles = not str(source_key or "").strip()
+    aggregate_stored_percentiles = not str(source_key or "").strip() or provider.key == PERCENTILE_SOURCE_COMPETITOR
     competitor_count_by_product: dict[int, int] = defaultdict(int)
     used_price_count_by_product: dict[int, int] = defaultdict(int)
     status_by_product: dict[int, str] = {}
@@ -433,7 +638,11 @@ def _build_percentile_browser_rows(*, db: Session, pf: PriceFormat, region: str,
                 percentiles_by_product[product_id][percentile] = float(value) if value is not None else None
 
     ratings = _ratings_by_product(db, product_ids, str(pf.branch or ""))
-    price_columns = _price_columns_for_group(db, pf, region=region, competitor=competitor, source_key=source_key)
+    price_columns = (
+        _price_columns_for_group(db, pf, region=region, competitor=competitor, source_key=source_key)
+        if provider.regional
+        else []
+    )
     prices_by_product = _prices_by_product_for_columns(db, product_ids, price_columns)
     out: list[dict] = []
     for product, extra in product_rows:
@@ -481,6 +690,7 @@ def percentile_trace(
     competitor: str,
     sku: str,
     source_key: str = "",
+    percentile_source: str = PERCENTILE_SOURCE_DEFAULT,
 ) -> dict:
     pf = _get_price_format(db, price_format_code)
     if pf is None:
@@ -625,6 +835,7 @@ def percentile_coverage_audit(
     region: str,
     competitor: str,
     source_key: str = "",
+    percentile_source: str = PERCENTILE_SOURCE_DEFAULT,
 ) -> dict:
     pf = _get_price_format(db, price_format_code)
     if pf is None:
@@ -760,13 +971,29 @@ def list_percentile_product_rows(
     direction: str = "asc",
     page: int = 1,
     page_size: int = 100,
+    percentile_source: str = PERCENTILE_SOURCE_DEFAULT,
 ) -> dict:
     pf = _get_price_format(db, price_format_code)
+    provider = get_percentile_provider(percentile_source)
     if pf is None:
-        return {"items": [], "summary": _summary_for_percentile_rows([]), "total": 0, "page": page, "pageSize": page_size, "pageCount": 0, "groups": [], "priceColumns": [], "percentiles": list(PERCENTILES)}
-    selected_region, selected_competitor, selected_source_key = _selected_group(db, pf, region=region, competitor=competitor, source_key=source_key)
-    groups = list_percentile_groups(db=db, price_format_code=price_format_code)
-    available_percentiles = _available_percentiles_for_group(db=db, pf=pf, region=selected_region, competitor=selected_competitor, source_key=selected_source_key)
+        return {"items": [], "summary": _summary_for_percentile_rows([]), "total": 0, "page": page, "pageSize": page_size, "pageCount": 0, "groups": [], "priceColumns": [], "percentiles": list(PERCENTILES), "percentileSource": provider.key}
+    selected_region, selected_competitor, selected_source_key = _selected_group(
+        db,
+        pf,
+        region=region if provider.regional else "",
+        competitor=competitor,
+        source_key=source_key,
+        percentile_source=provider.key,
+    )
+    groups = list_percentile_groups(db=db, price_format_code=price_format_code, percentile_source=provider.key)
+    available_percentiles = _available_percentiles_for_group(
+        db=db,
+        pf=pf,
+        region=selected_region,
+        competitor=selected_competitor,
+        source_key=selected_source_key,
+        percentile_source=provider.key,
+    )
     all_rows, price_columns = _build_percentile_browser_rows(
         db=db,
         pf=pf,
@@ -774,6 +1001,7 @@ def list_percentile_product_rows(
         competitor=selected_competitor,
         source_key=selected_source_key,
         percentile_numbers=available_percentiles,
+        percentile_source=provider.key,
     )
     summary = _summary_for_percentile_rows(all_rows)
     filtered = _apply_percentile_filters(
@@ -807,6 +1035,10 @@ def list_percentile_product_rows(
         "selectedRegion": selected_region,
         "selectedCompetitor": selected_competitor,
         "selectedSourceKey": selected_source_key,
+        "percentileSource": provider.key,
+        "percentileSourceLabel": provider.label,
+        "requiresCompetitor": provider.requires_competitor,
+        "regional": provider.regional,
         "priceColumns": price_columns,
     }
 
@@ -824,6 +1056,7 @@ def export_percentile_product_rows(
     competitor_filter: str = "all",
     sort: str = "sku",
     direction: str = "asc",
+    percentile_source: str = PERCENTILE_SOURCE_DEFAULT,
 ) -> tuple[str, bytes, str]:
     payload = list_percentile_product_rows(
         db=db,
@@ -836,6 +1069,7 @@ def export_percentile_product_rows(
         competitor_filter=competitor_filter,
         sort=sort,
         direction=direction,
+        percentile_source=percentile_source,
         page=1,
         page_size=10**9,
     )
