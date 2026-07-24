@@ -1584,6 +1584,99 @@ def test_emit_start_succeeds_after_stale_recovery(tmp_path):
     assert owner_token
 
 
+def _seed_emit_job(db, *, status: str, owner_token: str | None = None, heartbeat_at: datetime | None = None) -> RefreshJob:
+    job = RefreshJob(
+        source_type="emit",
+        mode="selected",
+        status=status,
+        started_at=heartbeat_at or datetime.utcnow(),
+        heartbeat_at=heartbeat_at or datetime.utcnow(),
+        metadata_json=json.dumps({"owner_token": owner_token} if owner_token else {}),
+    )
+    db.add(job)
+    db.commit()
+    return job
+
+
+def test_interrupted_emit_job_does_not_block_new_refresh_after_restart():
+    Session = _session_factory_static()
+    stale_token = refresh_svc.new_owner_token()
+    with Session() as db:
+        assert refresh_svc.try_acquire_global_refresh_lock(db, owner_token=stale_token, source="emit", requested_by="test")
+        assert refresh_svc.try_acquire_lock(
+            db,
+            name="emit_refresh",
+            lock_type="refresh",
+            owner_token=stale_token,
+            lease=refresh_svc.REFRESH_LOCK_LEASE,
+        )
+        _seed_emit_job(db, status="interrupted", owner_token=stale_token)
+
+    worker = EmitWorker(session_factory=Session, config=EmitConfig(temp_dir="unused"))
+    job, blocker, owner_token = worker.create_job(mode="selected", filial_ids=[1106])
+
+    assert job is not None
+    assert blocker is None
+    assert owner_token
+
+
+def test_stale_emit_job_does_not_block_new_refresh():
+    Session = _session_factory_static()
+    with Session() as db:
+        _seed_emit_job(db, status="stale")
+
+    worker = EmitWorker(session_factory=Session, config=EmitConfig(temp_dir="unused"))
+    job, blocker, owner_token = worker.create_job(mode="selected", filial_ids=[1106])
+
+    assert job is not None
+    assert blocker is None
+    assert owner_token
+
+
+def test_success_emit_job_does_not_block_new_refresh():
+    Session = _session_factory_static()
+    with Session() as db:
+        _seed_emit_job(db, status="success")
+
+    worker = EmitWorker(session_factory=Session, config=EmitConfig(temp_dir="unused"))
+    job, blocker, owner_token = worker.create_job(mode="selected", filial_ids=[1106])
+
+    assert job is not None
+    assert blocker is None
+    assert owner_token
+
+
+def test_running_emit_job_rejects_new_refresh():
+    Session = _session_factory_static()
+    with Session() as db:
+        running = _seed_emit_job(db, status="running")
+        running_id = int(running.id)
+
+    worker = EmitWorker(session_factory=Session, config=EmitConfig(temp_dir="unused", stale_timeout_seconds=60))
+    job, blocker, owner_token = worker.create_job(mode="selected", filial_ids=[1106])
+
+    assert job is None
+    assert blocker is not None
+    assert int(blocker.id) == running_id
+    assert blocker.status == "running"
+    assert owner_token is None
+
+
+def test_backend_restart_after_interrupted_emit_job_allows_refresh():
+    Session = _session_factory_static()
+    stale_token = refresh_svc.new_owner_token()
+    with Session() as db:
+        assert refresh_svc.try_acquire_global_refresh_lock(db, owner_token=stale_token, source="emit", requested_by="manual")
+        _seed_emit_job(db, status="interrupted", owner_token=stale_token)
+
+    restarted_worker = EmitWorker(session_factory=Session, config=EmitConfig(temp_dir="unused"))
+    job, blocker, owner_token = restarted_worker.create_job(mode="selected", filial_ids=[1106])
+
+    assert job is not None
+    assert blocker is None
+    assert owner_token
+
+
 def test_emit_heartbeat_uses_separate_session_and_renews_locks(tmp_path):
     Session = _session_factory_static()
     old_heartbeat = datetime.utcnow() - timedelta(seconds=30)

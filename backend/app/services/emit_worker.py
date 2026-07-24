@@ -24,13 +24,14 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..config import Settings
-from ..models import CompetitorPriceList, CompetitorPriceListItem, PriceFormat, PriceFormatCompetitorAssignment, RefreshJob
+from ..models import CompetitorPriceList, CompetitorPriceListItem, PriceFormat, PriceFormatCompetitorAssignment, RefreshJob, RefreshLock
 from .competitor_assignments import propagate_emit_assignments_to_price_formats, upsert_assignment
 from .competitor_percentiles import recalculate_competitor_percentiles
 from .competitor_persist import _ensure_price_format
 from .manufacturers import resolve_manufacturer
 from .provisor import get_access_token
 from .provisor_auto_refresh import (
+    GLOBAL_REFRESH_LOCK_NAME,
     REFRESH_LOCK_LEASE,
     finish_job,
     job_owner_token,
@@ -50,6 +51,7 @@ SOURCE_TYPE = "emit"
 COMPAT_SOURCE_TYPE = "provisor"
 LOCK_NAME = "emit_refresh"
 ACTIVE_STATUSES = ("pending", "downloading", "parsing", "normalizing", "saving", "running")
+TERMINAL_STATUSES = ("success", "error", "interrupted", "stale", "skipped", "cancelled", "failed")
 DEFAULT_STALE_TIMEOUT_SECONDS = 14_400
 EMIT_NAME_MARKERS = (
     "emit",
@@ -1569,6 +1571,7 @@ def mark_stale_emit_jobs(db: Session, *, config: EmitConfig | None = None, now: 
 
 def active_emit_job(db: Session, *, config: EmitConfig | None = None) -> RefreshJob | None:
     mark_stale_emit_jobs(db, config=config)
+    release_orphaned_emit_locks(db)
     return (
         db.execute(
             select(RefreshJob)
@@ -1579,6 +1582,53 @@ def active_emit_job(db: Session, *, config: EmitConfig | None = None) -> Refresh
         .scalars()
         .first()
     )
+
+
+def release_orphaned_emit_locks(db: Session) -> list[str]:
+    active = (
+        db.execute(
+            select(RefreshJob.id)
+            .where(RefreshJob.source_type == SOURCE_TYPE)
+            .where(RefreshJob.status.in_(ACTIVE_STATUSES))
+            .limit(1)
+        )
+        .scalars()
+        .first()
+    )
+    if active is not None:
+        return []
+
+    latest = (
+        db.execute(
+            select(RefreshJob)
+            .where(RefreshJob.source_type == SOURCE_TYPE)
+            .order_by(RefreshJob.id.desc())
+            .limit(1)
+        )
+        .scalars()
+        .first()
+    )
+    latest_meta = _json_loads(latest.metadata_json, {}) if latest is not None else {}
+    latest_token = str(latest_meta.get("owner_token") or "") if isinstance(latest_meta, dict) else ""
+    latest_is_terminal = bool(latest is not None and latest.status in TERMINAL_STATUSES)
+    released: list[str] = []
+
+    for lock_name in (LOCK_NAME, GLOBAL_REFRESH_LOCK_NAME):
+        lock = db.get(RefreshLock, lock_name)
+        if lock is None:
+            continue
+        token_matches_terminal_job = latest_is_terminal and latest_token and lock.owner_token == latest_token
+        if token_matches_terminal_job:
+            db.delete(lock)
+            db.commit()
+            released.append(lock_name)
+            logger.warning(
+                "[EMIT_LOCK_RECOVERY] action=released_orphaned_lock lock=%s latest_job_id=%s latest_status=%s",
+                lock_name,
+                getattr(latest, "id", None),
+                getattr(latest, "status", ""),
+            )
+    return released
 
 
 def latest_emit_job(db: Session, *, config: EmitConfig | None = None) -> RefreshJob | None:
@@ -1909,7 +1959,9 @@ class EmitWorker:
                 source=SOURCE_TYPE,
                 requested_by=requested_by,
             ):
-                return None, latest_emit_job(db), None
+                release_orphaned_emit_locks(db)
+                blocker = active_emit_job(db, config=self.config)
+                return None, blocker, None
             if not try_acquire_lock(
                 db,
                 name=LOCK_NAME,
@@ -1919,7 +1971,9 @@ class EmitWorker:
                 metadata={"requested_by": requested_by},
             ):
                 release_global_refresh_lock(db, owner_token=owner_token)
-                return None, latest_emit_job(db), None
+                release_orphaned_emit_locks(db)
+                blocker = active_emit_job(db, config=self.config)
+                return None, blocker, None
             try:
                 job = _create_emit_job(
                     db,
