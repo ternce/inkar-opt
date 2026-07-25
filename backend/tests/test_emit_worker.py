@@ -1571,6 +1571,110 @@ def test_emit_run_job_no_success_finishes_error(monkeypatch):
         assert metadata["failed"] == 1
 
 
+def test_emit_run_job_success_finishes_success(monkeypatch):
+    Session = _session_factory_static()
+    worker = EmitWorker(session_factory=Session, config=EmitConfig(temp_dir="unused"))
+    job, _blocker, token = worker.create_job(mode="selected", filial_ids=[1106])
+    assert job is not None
+
+    async def fake_refresh_filial(*, job_id, filial_id, owner_token=None):
+        return {"ok": True, "filial_id": filial_id, "price_list_id": 0, "duration_sec": 0.1}
+
+    monkeypatch.setattr(worker, "refresh_filial", fake_refresh_filial)
+
+    asyncio.run(worker.run_job(int(job.id), owner_token=token))
+
+    with Session() as db:
+        saved = db.get(RefreshJob, int(job.id))
+        assert saved.status == "success"
+        metadata = json.loads(saved.metadata_json)
+        assert metadata["success"] == 1
+        assert metadata["failed"] == 0
+
+
+def test_emit_percentile_failure_finalizes_job_error(monkeypatch):
+    import backend.app.services.emit_worker as emit_worker
+
+    Session = _session_factory_static()
+    worker = EmitWorker(session_factory=Session, config=EmitConfig(temp_dir="unused"))
+    job, _blocker, token = worker.create_job(mode="selected", filial_ids=[1106])
+    assert job is not None
+
+    async def fake_refresh_filial(*, job_id, filial_id, owner_token=None):
+        return {"ok": True, "filial_id": filial_id, "price_list_id": 123, "duration_sec": 0.1}
+
+    def fail_percentiles(*_args, **_kwargs):
+        raise RuntimeError("percentile boom")
+
+    monkeypatch.setattr(worker, "refresh_filial", fake_refresh_filial)
+    monkeypatch.setattr(emit_worker, "_recalculate_percentiles_for_emit_rows", fail_percentiles)
+
+    asyncio.run(worker.run_job(int(job.id), owner_token=token))
+
+    with Session() as db:
+        saved = db.get(RefreshJob, int(job.id))
+        assert saved.status == "error"
+        assert saved.error_message == "percentile boom"
+        metadata = json.loads(saved.metadata_json)
+        assert metadata["percentile_rebuild"]["status"] == "failed"
+        assert metadata["percentile_rebuild"]["error"] == "percentile boom"
+
+
+def test_emit_percentile_failure_rolls_back_and_persists_error_status(monkeypatch):
+    import backend.app.services.emit_worker as emit_worker
+
+    Session = _session_factory_static()
+    worker = EmitWorker(session_factory=Session, config=EmitConfig(temp_dir="unused"))
+    job, _blocker, token = worker.create_job(mode="selected", filial_ids=[1106])
+    assert job is not None
+
+    async def fake_refresh_filial(*, job_id, filial_id, owner_token=None):
+        return {"ok": True, "filial_id": filial_id, "price_list_id": 123, "duration_sec": 0.1}
+
+    def fail_after_flush(db, **_kwargs):
+        db.add(PriceFormat(code="ROLLBACK_MARKER", name="Rollback marker"))
+        db.flush()
+        raise RuntimeError("commit failed after percentile writes")
+
+    monkeypatch.setattr(worker, "refresh_filial", fake_refresh_filial)
+    monkeypatch.setattr(emit_worker, "_recalculate_percentiles_for_emit_rows", fail_after_flush)
+
+    asyncio.run(worker.run_job(int(job.id), owner_token=token))
+
+    with Session() as db:
+        saved = db.get(RefreshJob, int(job.id))
+        assert saved.status == "error"
+        assert saved.error_message == "commit failed after percentile writes"
+        assert db.scalar(select(func.count(PriceFormat.id)).where(PriceFormat.code == "ROLLBACK_MARKER")) == 0
+
+
+def test_scheduled_emit_refresh_uses_worker_finalization(monkeypatch):
+    import backend.app.main as main
+    import backend.app.services.emit_worker as emit_worker
+
+    Session = _session_factory_static()
+    worker = EmitWorker(session_factory=Session, config=EmitConfig(temp_dir="unused", filial_ids=[1106]))
+
+    async def fake_refresh_filial(*, job_id, filial_id, owner_token=None):
+        return {"ok": True, "filial_id": filial_id, "price_list_id": 123, "duration_sec": 0.1}
+
+    def fail_percentiles(*_args, **_kwargs):
+        raise RuntimeError("scheduled percentile boom")
+
+    monkeypatch.setattr(main, "SessionLocal", Session)
+    monkeypatch.setattr(main, "_emit_worker", worker)
+    monkeypatch.setattr(worker, "refresh_filial", fake_refresh_filial)
+    monkeypatch.setattr(emit_worker, "_recalculate_percentiles_for_emit_rows", fail_percentiles)
+
+    asyncio.run(main._start_emit_refresh_background(mode="all", requested_by="scheduler", run_inline=True))
+
+    with Session() as db:
+        saved = db.execute(select(RefreshJob).where(RefreshJob.source_type == "emit")).scalar_one()
+        assert saved.requested_by == "scheduler"
+        assert saved.status == "error"
+        assert saved.error_message == "scheduled percentile boom"
+
+
 def test_recent_emit_job_not_marked_stale():
     Session = _session_factory_static()
     with Session() as db:

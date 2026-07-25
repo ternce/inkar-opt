@@ -1895,6 +1895,7 @@ def _recalculate_percentiles_for_emit_rows(
     price_format_code: str | None = None,
     scope_to_price_list_ids: bool = False,
 ) -> dict[str, Any]:
+    rebuild_started = time.perf_counter()
     ids = [int(item) for item in price_list_ids if int(item) > 0]
     requested_format = str(price_format_code or "").strip()
     requested_pf: PriceFormat | None = None
@@ -1999,11 +2000,13 @@ def _recalculate_percentiles_for_emit_rows(
         pf = db.get(PriceFormat, price_format_id)
         if pf is None:
             continue
+        format_started = time.perf_counter()
         summary = recalculate_competitor_percentiles(
             db=db,
             price_format_id=price_format_id,
             source_price_list_ids=ids if scope_to_price_list_ids else None,
         )
+        summary["percentile_total_elapsed"] = round(time.perf_counter() - format_started, 3)
         summaries[str(pf.code or price_format_id)] = {"price_format_id": price_format_id, **summary}
         logger.info(
             "[EMIT_PERCENTILE_REBUILD] requested_format_code=%s format_code=%s price_format_id=%s rows_created=%s products_with_competitors=%s",
@@ -2013,12 +2016,16 @@ def _recalculate_percentiles_for_emit_rows(
             summary.get("rows_created"),
             summary.get("products_with_competitors"),
         )
+    commit_started = time.perf_counter()
     db.commit()
+    commit_elapsed = round(time.perf_counter() - commit_started, 3)
     return {
         "summaries": summaries,
         "warnings": warnings,
         "assigned_price_format_ids": sorted(touched_format_ids),
         "assignment_propagation": propagation.to_dict() if propagation is not None else {},
+        "percentile_commit_elapsed": commit_elapsed,
+        "percentile_total_elapsed": round(time.perf_counter() - rebuild_started, 3),
     }
 
 
@@ -2201,6 +2208,7 @@ class EmitWorker:
                 config=self.config,
             )
         logger.info("[EMIT_REFRESH] job_id=%s requested_filials=%s", job_id, filial_ids)
+        logger.info("[EMIT_STAGE] event=emit_job_started job_id=%s filial_ids=%s", job_id, filial_ids)
         logger.info(
             "[EMIT_PERCENTILE_INVENTORY] stage=refresh_start job_id=%s inventory=%s",
             job_id,
@@ -2271,6 +2279,10 @@ class EmitWorker:
                     )
             if aggregate["failed"]:
                 status = "error" if not aggregate["success"] else "partial_success"
+        except asyncio.CancelledError as exc:
+            logger.warning("[EMIT_STAGE] event=emit_job_interrupted job_id=%s reason=cancelled", job_id)
+            status = "interrupted"
+            error = "Emit refresh task was cancelled."
         except Exception as exc:
             logger.exception("Emit refresh job failed: job_id=%s", job_id)
             status = "error"
@@ -2288,66 +2300,116 @@ class EmitWorker:
                     ]
                     percentile_rebuild = {}
                     if status in {"success", "partial_success"} and refreshed_price_list_ids:
-                        percentile_rebuild = _recalculate_percentiles_for_emit_rows(
-                            db,
-                            price_list_ids=refreshed_price_list_ids,
-                            price_format_code=price_format_code,
-                            scope_to_price_list_ids=not bool(price_format_code),
+                        percentile_started = time.perf_counter()
+                        logger.info(
+                            "[EMIT_STAGE] event=emit_percentile_rebuild_started job_id=%s price_list_ids=%s price_format_code=%s",
+                            job_id,
+                            refreshed_price_list_ids,
+                            price_format_code or "",
                         )
+                        try:
+                            update_emit_job(
+                                db,
+                                job,
+                                status="running",
+                                message="emit_percentile_rebuild_started",
+                                metadata={
+                                    "current_stage": "emit_percentile_rebuild_started",
+                                    "percentile_price_list_ids": refreshed_price_list_ids,
+                                },
+                            )
+                            percentile_rebuild = _recalculate_percentiles_for_emit_rows(
+                                db,
+                                price_list_ids=refreshed_price_list_ids,
+                                price_format_code=price_format_code,
+                                scope_to_price_list_ids=not bool(price_format_code),
+                            )
+                            percentile_rebuild["percentile_total_elapsed"] = round(time.perf_counter() - percentile_started, 3)
+                            logger.info(
+                                "[EMIT_STAGE] event=emit_percentile_rebuild_completed job_id=%s price_list_ids=%s elapsed_sec=%s summary=%s",
+                                job_id,
+                                refreshed_price_list_ids,
+                                percentile_rebuild["percentile_total_elapsed"],
+                                _json_dumps(percentile_rebuild),
+                            )
+                        except Exception as exc:
+                            db.rollback()
+                            status = "error"
+                            error = str(exc)
+                            percentile_rebuild = {
+                                "status": "failed",
+                                "error": error,
+                                "percentile_total_elapsed": round(time.perf_counter() - percentile_started, 3),
+                            }
+                            logger.exception(
+                                "[EMIT_STAGE] event=emit_percentile_rebuild_failed job_id=%s price_list_ids=%s elapsed_sec=%s",
+                                job_id,
+                                refreshed_price_list_ids,
+                                percentile_rebuild["percentile_total_elapsed"],
+                            )
+                            job = db.get(RefreshJob, job_id)
                         aggregate["percentile_rebuild"] = percentile_rebuild
-                    aggregate["requested_filials"] = filial_ids
-                    aggregate["refreshed_filials"] = [
-                        int(row.get("filial_id") or 0)
-                        for row in aggregate.get("filials", [])
-                        if isinstance(row, dict) and row.get("ok") and int(row.get("filial_id") or 0) > 0
-                    ]
-                    aggregate["duration_sec"] = round(time.perf_counter() - total_started, 3)
-                    aggregate["percentile_rebuild_formats"] = sorted((percentile_rebuild.get("summaries") or {}).keys())
-                    aggregate["refresh_inventory"] = emit_refresh_inventory(
-                        config=self.config,
-                        mode=str(job.mode or ""),
-                        filial_ids=filial_ids,
-                        aggregate=aggregate,
-                    )
-                    aggregate["refresh_inventory"]["rebuilt_price_format_ids"] = percentile_rebuild.get("assigned_price_format_ids", [])
-                    aggregate["refresh_inventory"]["rebuilt_formats"] = aggregate["percentile_rebuild_formats"]
-                    logger.info(
-                        "[EMIT_REFRESH] job_id=%s requested_filials=%s refreshed_filials=%s success_count=%s "
-                        "failed_count=%s percentile_rebuild_formats=%s filial_durations=%s total_duration_sec=%s",
-                        job_id,
-                        aggregate["requested_filials"],
-                        aggregate["refreshed_filials"],
-                        aggregate["success"],
-                        aggregate["failed"],
-                        aggregate["percentile_rebuild_formats"],
-                        {
-                            int(row.get("filial_id") or 0): row.get("duration_sec")
+                    if job is not None:
+                        aggregate["requested_filials"] = filial_ids
+                        aggregate["refreshed_filials"] = [
+                            int(row.get("filial_id") or 0)
                             for row in aggregate.get("filials", [])
-                            if isinstance(row, dict) and int(row.get("filial_id") or 0) > 0
-                        },
-                        aggregate["duration_sec"],
-                    )
-                    logger.info(
-                        "[EMIT_PERCENTILE_INVENTORY] stage=refresh_complete job_id=%s inventory=%s",
-                        job_id,
-                        _json_dumps(aggregate["refresh_inventory"]),
-                    )
-                    finish_job(
-                        db,
-                        job,
-                        status=status,
-                        message=f"Emit refresh completed: success={aggregate['success']}, failed={aggregate['failed']}."
-                        if status in {"success", "partial_success"}
-                        else "Emit refresh failed.",
-                        error=error,
-                        metadata=aggregate,
-                        owner_token=token,
-                        allowed_statuses=set(ACTIVE_STATUSES),
-                        release_refresh=False,
-                    )
-                    if token:
-                        release_lock(db, name=LOCK_NAME, owner_token=token)
-                        release_global_refresh_lock(db, owner_token=token)
+                            if isinstance(row, dict) and row.get("ok") and int(row.get("filial_id") or 0) > 0
+                        ]
+                        aggregate["duration_sec"] = round(time.perf_counter() - total_started, 3)
+                        aggregate["percentile_rebuild_formats"] = sorted((percentile_rebuild.get("summaries") or {}).keys())
+                        aggregate["refresh_inventory"] = emit_refresh_inventory(
+                            config=self.config,
+                            mode=str(job.mode or ""),
+                            filial_ids=filial_ids,
+                            aggregate=aggregate,
+                        )
+                        aggregate["refresh_inventory"]["rebuilt_price_format_ids"] = percentile_rebuild.get("assigned_price_format_ids", [])
+                        aggregate["refresh_inventory"]["rebuilt_formats"] = aggregate["percentile_rebuild_formats"]
+                        logger.info(
+                            "[EMIT_REFRESH] job_id=%s requested_filials=%s refreshed_filials=%s success_count=%s "
+                            "failed_count=%s percentile_rebuild_formats=%s filial_durations=%s total_duration_sec=%s",
+                            job_id,
+                            aggregate["requested_filials"],
+                            aggregate["refreshed_filials"],
+                            aggregate["success"],
+                            aggregate["failed"],
+                            aggregate["percentile_rebuild_formats"],
+                            {
+                                int(row.get("filial_id") or 0): row.get("duration_sec")
+                                for row in aggregate.get("filials", [])
+                                if isinstance(row, dict) and int(row.get("filial_id") or 0) > 0
+                            },
+                            aggregate["duration_sec"],
+                        )
+                        logger.info(
+                            "[EMIT_PERCENTILE_INVENTORY] stage=refresh_complete job_id=%s inventory=%s",
+                            job_id,
+                            _json_dumps(aggregate["refresh_inventory"]),
+                        )
+                        logger.info(
+                            "[EMIT_STAGE] event=%s job_id=%s status=%s duration_sec=%s",
+                            "emit_job_completed" if status in {"success", "partial_success"} else "emit_job_failed",
+                            job_id,
+                            status,
+                            aggregate["duration_sec"],
+                        )
+                        finish_job(
+                            db,
+                            job,
+                            status=status,
+                            message=f"Emit refresh completed: success={aggregate['success']}, failed={aggregate['failed']}."
+                            if status in {"success", "partial_success"}
+                            else "Emit refresh failed.",
+                            error=error,
+                            metadata=aggregate,
+                            owner_token=token,
+                            allowed_statuses=set(ACTIVE_STATUSES),
+                            release_refresh=False,
+                        )
+                        if token:
+                            release_lock(db, name=LOCK_NAME, owner_token=token)
+                            release_global_refresh_lock(db, owner_token=token)
             if heartbeat_stop is not None:
                 heartbeat_stop.set()
             if heartbeat_thread is not None:
@@ -2372,21 +2434,42 @@ class EmitWorker:
                         update_emit_job(progress_db, progress_job, status="downloading", message=f"Downloading Emit filial {filial_id}", metadata=progress)
 
             download_started = time.perf_counter()
+            logger.info("[EMIT_STAGE] event=emit_download_started job_id=%s filial_id=%s", job_id, filial_id)
             temp_path = await download_emit_filial(config=self.config, filial_id=filial_id, filial_name=filial_name, job_callback=_download_progress)
             download_elapsed = round(time.perf_counter() - download_started, 3)
+            logger.info(
+                "[EMIT_STAGE] event=emit_download_completed job_id=%s filial_id=%s elapsed_sec=%s bytes=%s",
+                job_id,
+                filial_id,
+                download_elapsed,
+                temp_path.stat().st_size,
+            )
             staging_dir = Path(self.config.temp_dir)
             staging_path = staging_dir / f"emit_stage_{job_id}_{filial_id}_{uuid.uuid4().hex}.sqlite"
             with self.session_factory() as db:
                 job = db.get(RefreshJob, job_id)
                 if job is not None:
                     update_emit_job(db, job, status="parsing", message=f"Parsing Emit filial {filial_id}", metadata={"temp_file_path": str(temp_path), "file_size_bytes": temp_path.stat().st_size})
+            parse_started = time.perf_counter()
+            logger.info("[EMIT_STAGE] event=emit_parse_started job_id=%s filial_id=%s stage_db_path=%s", job_id, filial_id, staging_path)
             stats = parse_normalize_stage(source_path=temp_path, stage_db_path=staging_path, filial_id=filial_id, filial_name=filial_name, config=self.config)
+            logger.info(
+                "[EMIT_STAGE] event=emit_parse_completed job_id=%s filial_id=%s elapsed_sec=%s input_rows=%s final_rows=%s duplicates_removed=%s",
+                job_id,
+                filial_id,
+                round(time.perf_counter() - parse_started, 3),
+                stats.input_rows,
+                stats.final_rows_saved,
+                stats.duplicate_rows_removed,
+            )
             stats.downloaded_bytes = temp_path.stat().st_size
             stats.download_elapsed_sec = download_elapsed
             with self.session_factory() as db:
                 job = db.get(RefreshJob, job_id)
                 if job is not None:
                     update_emit_job(db, job, status="saving", message=f"Saving Emit filial {filial_id}", metadata=stats.to_dict())
+                db_replace_started = time.perf_counter()
+                logger.info("[EMIT_STAGE] event=emit_db_replace_started job_id=%s filial_id=%s", job_id, filial_id)
                 price_list = replace_emit_price_list_from_staging(
                     db=db,
                     config=self.config,
@@ -2397,6 +2480,14 @@ class EmitWorker:
                     price_format_code=str((job.metadata_json and _json_loads(job.metadata_json, {}).get("price_format_code")) or ""),
                 )
                 price_list_id = int(price_list.id)
+                logger.info(
+                    "[EMIT_STAGE] event=emit_db_replace_completed job_id=%s filial_id=%s price_list_id=%s elapsed_sec=%s final_rows=%s",
+                    job_id,
+                    filial_id,
+                    price_list_id,
+                    round(time.perf_counter() - db_replace_started, 3),
+                    stats.final_rows_saved,
+                )
                 job = db.get(RefreshJob, job_id)
                 if job is not None:
                     job.processed_plk = int(job.processed_plk or 0) + 1
