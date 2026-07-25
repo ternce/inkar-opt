@@ -14,7 +14,11 @@ from ..models import (
     PriceFormat,
     PriceFormatCompetitorAssignment,
 )
-from .competitor_source_config import MULTI_PRICE_PERCENTILE_MODE, default_percentile_mode_for_source
+from .competitor_source_config import (
+    MULTI_PRICE_PERCENTILE_MODE,
+    default_percentile_mode_for_source,
+    ensure_canonical_source_key,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -252,6 +256,8 @@ def upsert_assignment(
     now = datetime.utcnow()
     if row is None:
         price_list = db.get(CompetitorPriceList, competitor_price_list_id)
+        if price_list is not None:
+            ensure_canonical_source_key(price_list)
         row = PriceFormatCompetitorAssignment(
             price_format_id=price_format_id,
             competitor_price_list_id=competitor_price_list_id,
@@ -263,6 +269,9 @@ def upsert_assignment(
         )
         db.add(row)
     else:
+        price_list = db.get(CompetitorPriceList, competitor_price_list_id)
+        if price_list is not None:
+            ensure_canonical_source_key(price_list)
         row.coefficient = coefficient
         row.is_active = is_active
         row.updated_at = now
@@ -448,4 +457,5 @@ def set_competitor_assignments(
         if not (assignment.percentile_mode or "").strip():
             price_list = db.get(CompetitorPriceList, source_id)
             if price_list is not None:
+                ensure_canonical_source_key(price_list)
                 assignment.percentile_mode = default_percentile_mode_for_source(price_list)

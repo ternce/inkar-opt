@@ -186,7 +186,11 @@ from .services.competitor_matching import (
     provisor_item_variants,
     rebuild_competitor_prices_for_selected,
 )
-from .services.competitor_percentiles import recalculate_competitor_percentiles_if_needed
+from .services.competitor_percentiles import (
+    recalculate_competitor_percentiles_if_needed,
+    recalculate_percentiles_for_price_lists,
+)
+from .services.competitor_source_config import canonical_competitor_source_key, ensure_canonical_source_key
 from .services.sku import normalize_external_sku, normalize_sku, normalize_sku_variants
 from .services.competitors.management import list_competitor_sources
 from .services.competitors.mappings.read_models import (
@@ -4539,15 +4543,19 @@ def _selected_competitor_rows(db: Session, pf: PriceFormat) -> list[CompetitorPr
 
 
 def _assignment_row_from_price_list(row: CompetitorPriceList, items_count: int = 0, assignment: object | None = None) -> dict:
+    canonical_source_key = canonical_competitor_source_key(row)
     last_checked_at = row.last_checked_at.isoformat() if row.last_checked_at else ""
     last_success_at = row.last_success_at.isoformat() if row.last_success_at else ""
     updated_at = row.updated_at.isoformat() if row.updated_at else ""
     source_updated_at = row.source_updated_at or ""
     return {
         "id": str(row.id),
+        "rowType": "physical_plk",
+        "assignmentKind": "physical",
         "sourceId": row.id,
         "sourceType": row.source_type,
-        "sourceKey": row.source_key,
+        "sourceKey": canonical_source_key or row.source_key,
+        "canonicalSourceKey": canonical_source_key,
         "sourceName": row.display_name or row.supplier or f"{row.source_type}:{row.source_key}",
         "region": row.branch_name or row.region or "",
         "branchName": row.branch_name or "",
@@ -4573,6 +4581,8 @@ def _assignment_row_from_percentile(source: dict, cfg: CompetitorPrice | None = 
     generated_at = source.get("generatedAt") or ""
     return {
         "id": _assignment_percentile_source_name(source_id),
+        "rowType": "percentile_config",
+        "assignmentKind": "percentile_config",
         "sourceId": source_id,
         "sourceType": "percentile",
         "sourceKey": source_id,
@@ -4596,13 +4606,20 @@ def _assignment_row_from_percentile(source: dict, cfg: CompetitorPrice | None = 
 
 
 @app.get("/api/price-formats/{format_code}/competitor-assignments")
-def get_competitor_assignments(format_code: str, db: Session = Depends(get_db), current_user: AppUser = Depends(get_current_user)):
+def get_competitor_assignments(
+    format_code: str,
+    include_summary: bool = Query(False, alias="include_summary"),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
     pf = db.execute(select(PriceFormat).where(PriceFormat.code == format_code)).scalars().first()
     if pf is None:
         raise HTTPException(status_code=404, detail="price format not found")
     _ensure_price_format_access(pf, current_user)
 
     selected = get_assigned_competitor_price_lists(db=db, price_format_id=int(pf.id))
+    for item in selected:
+        ensure_canonical_source_key(item.price_list)
     counts = (
         dict(
             db.execute(
@@ -4636,6 +4653,14 @@ def get_competitor_assignments(format_code: str, db: Session = Depends(get_db), 
             cfg = cfg_by_source_name.get(_assignment_percentile_source_name(source_id))
             if cfg is not None:
                 rows.append(_assignment_row_from_percentile(source, cfg))
+    summary = {
+        "activePhysicalPlkCount": sum(1 for row in rows if row.get("assignmentKind") == "physical" and row.get("active") is not False),
+        "inactivePhysicalPlkCount": sum(1 for row in rows if row.get("assignmentKind") == "physical" and row.get("active") is False),
+        "percentileSourceCount": sum(1 for row in rows if row.get("assignmentKind") == "percentile_config"),
+        "totalRowsCount": len(rows),
+    }
+    if include_summary:
+        return {"items": rows, "summary": summary}
     return rows
 
 
@@ -4686,6 +4711,7 @@ def post_competitor_assignment(format_code: str, payload: dict = Body(...), db: 
     row = db.get(CompetitorPriceList, source_id_int)
     if row is None:
         raise HTTPException(status_code=404, detail="source not found")
+    ensure_canonical_source_key(row)
     if "priceCoefficient" in payload or "coefficient" in payload:
         try:
             row.price_coefficient = validate_price_coefficient(payload.get("priceCoefficient", payload.get("coefficient", 1.0)))
@@ -4741,6 +4767,7 @@ def patch_competitor_assignment(format_code: str, assignment_id: str, payload: d
     assignment = get_assignment(db=db, price_format_id=int(pf.id), competitor_price_list_id=source_id_int)
     if row is None or assignment is None:
         raise HTTPException(status_code=404, detail="assignment not found")
+    ensure_canonical_source_key(row)
     if "priceCoefficient" in payload or "coefficient" in payload:
         try:
             row.price_coefficient = validate_price_coefficient(payload.get("priceCoefficient", payload.get("coefficient", 1.0)))
@@ -6126,6 +6153,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
     logger.info("[REFRESH] JOB START format_code=%s source=%s", format_code, refresh_source)
     print(f"[REFRESH] JOB START format_code={format_code} source={refresh_source}", flush=True)
     refreshed: list[dict] = []
+    refreshed_price_list_ids: list[int] = []
     errors: list[str] = []
     account_statuses: list[dict] = []
     progress = {
@@ -7358,6 +7386,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                     saved_source_type = str(saved.source_type or "")
                     saved_source_key = str(saved.source_key or "")
                     saved_display_name = str(saved.display_name or price_list_name)
+                    refreshed_price_list_ids.append(int(saved.id))
                     if account_source_type == "vidman":
                         logger.info(
                             "[VW_PRICE_LIST_SAVED] account_id=%s price_id=%s price_name=%s old_date=%s new_date=%s items_count=%s",
@@ -7535,6 +7564,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
         )
 
     rebuild_summary = {}
+    percentile_rebuild_summary = {}
     if pf_for_refresh is not None and run_rebuild_after_refresh:
         if job is not None:
             update_job(db, job, status="running", progress=90, message="Пересобираем цены выбранных конкурентов", log_level="info")
@@ -7549,6 +7579,54 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
             '[REFRESH_NO_MATCHING] format_code=%s message="Refresh completed without matching/rebuild"',
             format_code,
         )
+        if refreshed_price_list_ids:
+            percentile_started_at = time.perf_counter()
+            if job is not None:
+                update_job(
+                    db,
+                    job,
+                    status="running",
+                    progress=90,
+                    message="percentile_rebuild_started",
+                    log_level="info",
+                    log_meta={"priceListIds": sorted(set(refreshed_price_list_ids))},
+                )
+            try:
+                percentile_rebuild_summary = recalculate_percentiles_for_price_lists(
+                    db=db,
+                    competitor_price_list_ids=refreshed_price_list_ids,
+                )
+                db.commit()
+                if job is not None:
+                    update_job(
+                        db,
+                        job,
+                        status="running",
+                        progress=95,
+                        message="percentile_rebuild_completed",
+                        log_level="info",
+                        log_meta=percentile_rebuild_summary,
+                    )
+                _timing(operation, "scoped_percentile_rebuild", percentile_started_at)
+            except Exception as e:
+                db.rollback()
+                percentile_rebuild_summary = {
+                    "status": "failed",
+                    "error": str(e),
+                    "priceListIds": sorted(set(refreshed_price_list_ids)),
+                    "percentileElapsedSec": round(time.perf_counter() - percentile_started_at, 3),
+                }
+                if job is not None:
+                    update_job(
+                        db,
+                        job,
+                        status="running",
+                        progress=95,
+                        message="percentile_rebuild_failed",
+                        log_level="warning",
+                        log_meta=percentile_rebuild_summary,
+                    )
+                logger.exception("[PERCENTILE_REBUILD_FAILED] source_price_list_ids=%s", sorted(set(refreshed_price_list_ids)))
 
     _timing(operation, "finish", refresh_started_at)
     _timing(operation, "total_ms", refresh_started_at)
@@ -7595,6 +7673,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
         "progress": progress,
         "inventory": inventory,
         "rebuild": rebuild_summary,
+        "percentileRebuild": percentile_rebuild_summary,
         "items": list_competitor_price_lists(db=db, price_format_code=format_code),
     }
 

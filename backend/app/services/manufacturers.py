@@ -684,6 +684,21 @@ def _alias_patterns() -> tuple[tuple[re.Pattern[str], str], ...]:
     return tuple((re.compile(rf"\b{re.escape(alias)}\b"), canonical) for alias, canonical in _SORTED_ALIASES if len(alias) > 2)
 
 
+@lru_cache(maxsize=8192)
+def _normalize_manufacturer_cleaned(text: str) -> str:
+    if text.lower() in _NO_VALUE:
+        return ""
+
+    if text in _ALIASES:
+        return _ALIASES[text]
+
+    for pattern, canonical in _alias_patterns():
+        if pattern.search(text):
+            return canonical
+
+    return text
+
+
 _HARD_CONFLICTS = {
     frozenset(("LEK", "SANDOZ")),
     frozenset(("BAYER", "SANDOZ")),
@@ -714,17 +729,7 @@ def _clean(value: object) -> str:
 
 def normalize_manufacturer(value: object) -> str:
     text = _clean(value)
-    if text.lower() in _NO_VALUE:
-        return ""
-
-    if text in _ALIASES:
-        return _ALIASES[text]
-
-    for pattern, canonical in _alias_patterns():
-        if pattern.search(text):
-            return canonical
-
-    return text
+    return _normalize_manufacturer_cleaned(text)
 
 
 def manufacturer_similarity(a: object, b: object) -> float:

@@ -45,6 +45,7 @@ from .competitor_assignments import (
 )
 from .competitor_coefficients import effective_price_coefficient, validate_price_coefficient
 from .competitor_percentiles import DEFAULT_BRANCH, recalculate_competitor_percentiles_if_needed
+from .competitor_source_config import ensure_canonical_source_key
 from .manufacturers import resolve_manufacturer
 from .price_sources import UnifiedPriceItem, UnifiedPriceList
 from .sku import normalize_external_sku, normalize_sku, normalize_sku_variants
@@ -699,6 +700,7 @@ def upsert_unified_price_list(
     row.account_id = price_list.account_id
     row.account_login = account_login
     row.external_price_list_id = price_list.price_list_id
+    ensure_canonical_source_key(row)
     row.sync_batch_id = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
     row.source_updated_at = getattr(price_list, "source_updated_at", "") or ""
     row.last_checked_at = datetime.utcnow()

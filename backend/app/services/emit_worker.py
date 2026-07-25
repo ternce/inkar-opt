@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import io
 import json
 import logging
 import os
@@ -65,6 +66,22 @@ EMIT_NAME_MARKERS = (
 MIN_FINAL_ROWS = 1
 DEFAULT_TRACE_SKU = "163571"
 _emit_stale_recovery_before_mark_hook = None
+_NORMALIZE_TEXT_NON_WORD_RE = re.compile(r"[^\w%/.,+-]+", flags=re.UNICODE)
+_NORMALIZE_TEXT_SPACES_RE = re.compile(r"\s+")
+_NORMALIZE_SKU_RE = re.compile(r"[^a-z\u0430-\u044f0-9_-]+", flags=re.IGNORECASE)
+_BARCODE_RE = re.compile(r"\D+")
+_PRICE_NOISE_RE = re.compile(r"(?<!\w)\d+(?:[,.]\d+)?\s*(?:тг|тенге|kzt|₸)(?!\w)", flags=re.IGNORECASE)
+_PRICE_TAIL_RE = re.compile(r"\bцена\b.*$", flags=re.IGNORECASE)
+_PACK_PATTERNS = tuple(
+    re.compile(pattern, flags=re.IGNORECASE)
+    for pattern in (
+        r"(?:\u2116|n)\s*\d+\b",
+        r"\b\d+\s*(?:\u0442\u0430\u0431|\u0442\u0430\u0431\u043b|\u043a\u0430\u043f\u0441|\u043a\u0430\u043f|\u0430\u043c\u043f|\u0444\u043b|\u043f\u0430\u043a|\u0441\u0430\u0448\u0435|\u0448\u0442)\b",
+        r"\b\d+(?:[,.]\d+)?\s*(?:\u043c\u043b|\u043b|\u0433|\u043c\u0433|\u043c\u043a\u0433|\u043a\u0433)\b",
+        r"\b\d+(?:[,.]\d+)?\s*(?:\u043c\u0433|\u043c\u043a\u0433|\u0433)\s*/\s*(?:\u043c\u043b|\u0433)\b",
+        r"\b\d+(?:[,.]\d+)?\s*%\s*\d*(?:[,.]\d+)?\s*(?:\u0433|\u043c\u043b)?\b",
+    )
+)
 
 
 @dataclass
@@ -138,6 +155,18 @@ class EmitStats:
     download_elapsed_sec: float = 0.0
     parse_dedupe_elapsed_sec: float = 0.0
     db_replace_elapsed_sec: float = 0.0
+    decode_elapsed: float = 0.0
+    normalize_elapsed: float = 0.0
+    manufacturer_elapsed: float = 0.0
+    stage_upsert_elapsed: float = 0.0
+    stage_commit_elapsed: float = 0.0
+    stage_audit_elapsed: float = 0.0
+    delete_elapsed: float = 0.0
+    stage_read_elapsed: float = 0.0
+    mapping_build_elapsed: float = 0.0
+    bulk_insert_elapsed: float = 0.0
+    flush_elapsed: float = 0.0
+    commit_elapsed: float = 0.0
     cleanup_elapsed_sec: float = 0.0
     trace: dict[str, Any] = field(default_factory=dict)
 
@@ -163,6 +192,18 @@ class EmitStats:
             "download_elapsed_sec": self.download_elapsed_sec,
             "parse_dedupe_elapsed_sec": self.parse_dedupe_elapsed_sec,
             "db_replace_elapsed_sec": self.db_replace_elapsed_sec,
+            "decode_elapsed": self.decode_elapsed,
+            "normalize_elapsed": self.normalize_elapsed,
+            "manufacturer_elapsed": self.manufacturer_elapsed,
+            "stage_upsert_elapsed": self.stage_upsert_elapsed,
+            "stage_commit_elapsed": self.stage_commit_elapsed,
+            "stage_audit_elapsed": self.stage_audit_elapsed,
+            "delete_elapsed": self.delete_elapsed,
+            "stage_read_elapsed": self.stage_read_elapsed,
+            "mapping_build_elapsed": self.mapping_build_elapsed,
+            "bulk_insert_elapsed": self.bulk_insert_elapsed,
+            "flush_elapsed": self.flush_elapsed,
+            "commit_elapsed": self.commit_elapsed,
             "cleanup_elapsed_sec": self.cleanup_elapsed_sec,
             "trace": self.trace,
         }
@@ -286,6 +327,10 @@ def _increment_skip(stats: EmitStats, reason: str) -> None:
         stats.zero_price_rows_skipped += 1
 
 
+def _add_elapsed(stats: EmitStats, field: str, started_at: float) -> None:
+    setattr(stats, field, round(float(getattr(stats, field, 0.0) or 0.0) + (time.perf_counter() - started_at), 6))
+
+
 def _emit_price(row: dict[str, Any], goods: dict[str, Any]) -> tuple[Decimal | None, str]:
     if row.get("goodsPrice") not in (None, ""):
         price = _as_decimal(row.get("goodsPrice"))
@@ -313,13 +358,12 @@ def _first(row: dict[str, Any], *keys: str) -> Any:
 
 def normalize_text_key(value: object) -> str:
     text = str(value or "").casefold().replace("ё", "е")
-    text = re.sub(r"[^\w%/.,+-]+", " ", text, flags=re.UNICODE)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    text = _NORMALIZE_TEXT_NON_WORD_RE.sub(" ", text)
+    return _NORMALIZE_TEXT_SPACES_RE.sub(" ", text).strip()
 
 
 def normalize_barcode(value: object) -> str:
-    digits = re.sub(r"\D+", "", str(value or ""))
+    digits = _BARCODE_RE.sub("", str(value or ""))
     return digits if 6 <= len(digits) <= 18 else ""
 
 
@@ -329,7 +373,7 @@ def normalize_sku_key(value: object) -> str:
     if barcode:
         return f"barcode:{barcode}"
     key = normalize_text_key(text)
-    key = re.sub(r"[^a-zа-я0-9_-]+", "", key, flags=re.IGNORECASE)
+    key = _NORMALIZE_SKU_RE.sub("", key)
     return f"sku:{key}" if key else ""
 
 
@@ -367,6 +411,10 @@ def extract_producer_key(row: dict[str, Any], goods: dict[str, Any] | None = Non
     return normalize_text_key(producer)
 
 
+def _producer_key_from_resolved(producer: object) -> str:
+    return normalize_text_key(producer)
+
+
 def extract_pack_signature(row: dict[str, Any], goods: dict[str, Any] | None = None, name: str = "") -> str:
     goods = goods or _nested_dict(row.get("goods"))
     explicit_parts: list[str] = []
@@ -390,28 +438,21 @@ def extract_pack_signature(row: dict[str, Any], goods: dict[str, Any] | None = N
         return "|".join(explicit_parts[:4])
 
     text = normalize_text_key(name or _row_lookup(row, goods, "fullName", "name", "distributorGoodsName"))
-    patterns = [
-        r"(?:\u2116|n)\s*\d+\b",
-        r"\b\d+\s*(?:\u0442\u0430\u0431|\u0442\u0430\u0431\u043b|\u043a\u0430\u043f\u0441|\u043a\u0430\u043f|\u0430\u043c\u043f|\u0444\u043b|\u043f\u0430\u043a|\u0441\u0430\u0448\u0435|\u0448\u0442)\b",
-        r"\b\d+(?:[,.]\d+)?\s*(?:\u043c\u043b|\u043b|\u0433|\u043c\u0433|\u043c\u043a\u0433|\u043a\u0433)\b",
-        r"\b\d+(?:[,.]\d+)?\s*(?:\u043c\u0433|\u043c\u043a\u0433|\u0433)\s*/\s*(?:\u043c\u043b|\u0433)\b",
-        r"\b\d+(?:[,.]\d+)?\s*%\s*\d*(?:[,.]\d+)?\s*(?:\u0433|\u043c\u043b)?\b",
-    ]
     matches: list[str] = []
-    for pattern in patterns:
-        matches.extend(re.findall(pattern, text, flags=re.IGNORECASE))
-    cleaned = [re.sub(r"\s+", "", match.casefold()) for match in matches if str(match).strip()]
+    for pattern in _PACK_PATTERNS:
+        matches.extend(pattern.findall(text))
+    cleaned = [_NORMALIZE_TEXT_SPACES_RE.sub("", match.casefold()) for match in matches if str(match).strip()]
     return "|".join(list(dict.fromkeys(cleaned))[:6])
 
 
 def normalize_name_without_price_noise(value: object) -> str:
-    text = normalize_text_key(value)
-    text = re.sub(r"\b\d+(?:[,.]\d+)?\s*(?:тг|тенге|kzt|₸)\b", " ", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bцена\b.*$", " ", text, flags=re.IGNORECASE)
-    return re.sub(r"\s+", " ", text).strip()
+    text = str(value or "").casefold().replace("ё", "е")
+    text = _PRICE_NOISE_RE.sub(" ", text)
+    text = _PRICE_TAIL_RE.sub(" ", text)
+    return normalize_text_key(text)
 
 
-def normalize_emit_item(row: dict[str, Any], *, filial_id: int, filial_name: str) -> dict[str, Any] | None:
+def normalize_emit_item(row: dict[str, Any], *, filial_id: int, filial_name: str, stats: EmitStats | None = None) -> dict[str, Any] | None:
     goods = _nested_dict(row.get("goods"))
     goods_id = _as_int(_first(row, "goodsId", "goods_id", "provisor_goods_id") or goods.get("id") or goods.get("goodsId"))
     price, _reason = _emit_price(row, goods)
@@ -427,11 +468,14 @@ def normalize_emit_item(row: dict[str, Any], *, filial_id: int, filial_name: str
     if not name:
         return None
     producer_raw = row.get("distributorProducer") or _first(row, "manufacturer", "producer") or goods.get("producer")
+    manufacturer_started = time.perf_counter()
     producer = resolve_manufacturer(producer_raw, name, default="")
+    if stats is not None:
+        _add_elapsed(stats, "manufacturer_elapsed", manufacturer_started)
     distributor_goods_id = str(_first(row, "distributorGoodsId", "distributor_goods_id", "sku", "code") or "").strip()
     variant_key = extract_variant_key(row, goods)
     pack_signature = extract_pack_signature(row, goods, name=name)
-    producer_key = extract_producer_key(row, goods, name=name)
+    producer_key = _producer_key_from_resolved(producer)
     normalized_name_key = normalize_name_without_price_noise(name)
     source_timestamp = str(_first(row, "insertedDate", "updatedAt", "updated_at", "source_updated_at", "timestamp") or "").strip()
     stock = _as_decimal(_first(row, "stored", "stock", "quantity"))
@@ -533,7 +577,6 @@ def _stage_storage_key(item: dict[str, Any]) -> tuple[str, ...]:
         str(item.get("distributor_price") or ""),
         str(item.get("stock") or ""),
         str(item.get("source_timestamp") or ""),
-        str(item.get("_stage_sequence") or ""),
         str(item.get("raw_json") or ""),
     )
 
@@ -714,82 +757,33 @@ def _stage_values(item: dict[str, Any]) -> tuple[Any, ...]:
 
 
 def _stage_upsert(conn: sqlite3.Connection, item: dict[str, Any], stats: EmitStats) -> None:
-    if "_stage_sequence" not in item:
-        sequence = int(getattr(stats, "_stage_sequence", 0) or 0) + 1
-        setattr(stats, "_stage_sequence", sequence)
-        item["_stage_sequence"] = sequence
-    dedupe_key = json.dumps(_stage_storage_key(item), ensure_ascii=False)
-    existing = conn.execute("SELECT quality_json FROM stage_items WHERE dedupe_key = ?", (dedupe_key,)).fetchone()
-    if existing is None:
-        conn.execute(
-            """
-            INSERT INTO stage_items (
-                dedupe_key, key_type, quality_json, provisor_id, provisor_goods_id, goods_id_text,
-                variant_key, pack_signature, producer_key, rows_seen, names_sample_json,
-                producers_sample_json, price_min, price_max, filial_id, name, reg_number,
-                distributor_goods_name, distributor_goods_id, distributor_price, stock, package_count,
-                expiry_date, raw_name, raw_manufacturer, raw_json
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            _stage_values(item),
-        )
-        return
-    stats.duplicate_rows_removed += 1
-    existing_audit = conn.execute(
-        "SELECT names_sample_json, producers_sample_json, price_min, price_max, rows_seen FROM stage_items WHERE dedupe_key = ?",
-        (dedupe_key,),
-    ).fetchone()
-    price = float(item.get("distributor_price") or 0)
-    conn.execute(
+    returned = conn.execute(
         """
-        UPDATE stage_items
-        SET rows_seen = rows_seen + 1,
-            names_sample_json = ?,
-            producers_sample_json = ?,
-            price_min = CASE WHEN price_min IS NULL OR ? < price_min THEN ? ELSE price_min END,
-            price_max = CASE WHEN price_max IS NULL OR ? > price_max THEN ? ELSE price_max END
-        WHERE dedupe_key = ?
-        """,
-        (
-            _json_sample_add(existing_audit[0] if existing_audit else "[]", item.get("name")),
-            _json_sample_add(existing_audit[1] if existing_audit else "[]", item.get("raw_manufacturer")),
-            price,
-            price,
-            price,
-            price,
-            dedupe_key,
-        ),
-    )
-    if _candidate_quality(item) > _quality_tuple(existing[0]):
-        conn.execute(
-            """
-            UPDATE stage_items
-            SET key_type = ?, quality_json = ?, provisor_id = ?, provisor_goods_id = ?, goods_id_text = ?,
-                variant_key = ?, pack_signature = ?, producer_key = ?, rows_seen = rows_seen,
-                names_sample_json = names_sample_json, producers_sample_json = producers_sample_json,
-                price_min = price_min, price_max = price_max, filial_id = ?, name = ?,
-                reg_number = ?, distributor_goods_name = ?, distributor_goods_id = ?, distributor_price = ?,
-                stock = ?, package_count = ?, expiry_date = ?, raw_name = ?, raw_manufacturer = ?, raw_json = ?
-            WHERE dedupe_key = ?
-            """,
-            (
-                *_stage_values(item)[1:9],
-                item.get("filial_id"),
-                item.get("name") or "",
-                item.get("reg_number") or "",
-                item.get("distributor_goods_name") or item.get("name") or "",
-                item.get("distributor_goods_id") or "",
-                item.get("distributor_price"),
-                item.get("stock"),
-                item.get("package_count"),
-                item.get("expiry_date") or "",
-                item.get("raw_name") or item.get("name") or "",
-                item.get("raw_manufacturer") or "",
-                item.get("raw_json") or "{}",
-                dedupe_key,
-            ),
+        INSERT INTO stage_items (
+            dedupe_key, key_type, quality_json, provisor_id, provisor_goods_id, goods_id_text,
+            variant_key, pack_signature, producer_key, rows_seen, names_sample_json,
+            producers_sample_json, price_min, price_max, filial_id, name, reg_number,
+            distributor_goods_name, distributor_goods_id, distributor_price, stock, package_count,
+            expiry_date, raw_name, raw_manufacturer, raw_json
         )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(dedupe_key) DO UPDATE SET
+            rows_seen = stage_items.rows_seen + 1,
+            price_min = CASE
+                WHEN stage_items.price_min IS NULL OR excluded.price_min < stage_items.price_min THEN excluded.price_min
+                ELSE stage_items.price_min
+            END,
+            price_max = CASE
+                WHEN stage_items.price_max IS NULL OR excluded.price_max > stage_items.price_max THEN excluded.price_max
+                ELSE stage_items.price_max
+            END
+        RETURNING rows_seen
+        """,
+        _stage_values(item),
+    )
+    rows_seen = int((returned.fetchone() or [1])[0] or 1)
+    if rows_seen > 1:
+        stats.duplicate_rows_removed += 1
 
 
 def stage_row_count(stage_db_path: Path) -> int:
@@ -800,23 +794,24 @@ def stage_row_count(stage_db_path: Path) -> int:
 def iter_stage_rows(stage_db_path: Path, *, batch_size: int) -> Iterable[list[dict[str, Any]]]:
     with sqlite3.connect(str(stage_db_path)) as conn:
         conn.row_factory = sqlite3.Row
-        offset = 0
+        last_rowid = 0
         while True:
             rows = conn.execute(
                 """
-                SELECT provisor_id, provisor_goods_id, filial_id, name, reg_number,
+                SELECT rowid, provisor_id, provisor_goods_id, filial_id, name, reg_number,
                        distributor_goods_name, distributor_goods_id, distributor_price,
                        stock, package_count, expiry_date, raw_name, raw_manufacturer, raw_json
                 FROM stage_items
+                WHERE rowid > ?
                 ORDER BY rowid
-                LIMIT ? OFFSET ?
+                LIMIT ?
                 """,
-                (batch_size, offset),
+                (last_rowid, batch_size),
             ).fetchall()
             if not rows:
                 break
-            yield [dict(row) for row in rows]
-            offset += len(rows)
+            last_rowid = int(rows[-1]["rowid"])
+            yield [{key: row[key] for key in row.keys() if key != "rowid"} for row in rows]
 
 
 def collect_stage_audit(conn: sqlite3.Connection, *, limit: int = 20) -> tuple[dict[str, int], list[dict[str, Any]]]:
@@ -1145,31 +1140,50 @@ def parse_normalize_stage(
     trace_goods_id = _trace_goods_id()
     trace_raw_prices: list[float] = []
     try:
-        for row in iter_source_rows(source_path):
-            stats.input_rows += 1
+        source_iter = iter(iter_source_rows(source_path))
+        while True:
+            decode_started = time.perf_counter()
             try:
-                item = normalize_emit_item(row, filial_id=filial_id, filial_name=filial_name)
+                row = next(source_iter)
+            except StopIteration:
+                _add_elapsed(stats, "decode_elapsed", decode_started)
+                break
+            _add_elapsed(stats, "decode_elapsed", decode_started)
+            stats.input_rows += 1
+            normalize_started = time.perf_counter()
+            try:
+                item = normalize_emit_item(row, filial_id=filial_id, filial_name=filial_name, stats=stats)
             except Exception:
+                _add_elapsed(stats, "normalize_elapsed", normalize_started)
                 _increment_skip(stats, "normalization_error")
                 logger.exception("[EMIT_NORMALIZE_ERROR] filial_id=%s row_index=%s", filial_id, stats.input_rows)
                 continue
             if item is None:
                 _increment_skip(stats, emit_skip_reason(row))
+                _add_elapsed(stats, "normalize_elapsed", normalize_started)
                 continue
+            _add_elapsed(stats, "normalize_elapsed", normalize_started)
             if trace_goods_id is not None and item.get("provisor_goods_id") == trace_goods_id:
                 trace_raw_prices.append(float(item.get("distributor_price") or 0))
             stats.normalized_rows += 1
             if not item.get("provisor_goods_id"):
                 stats.rows_without_goodsId += 1
+            stage_upsert_started = time.perf_counter()
             _stage_upsert(conn, item, stats)
+            _add_elapsed(stats, "stage_upsert_elapsed", stage_upsert_started)
             batch_count += 1
             if batch_count >= cfg.batch_insert_size:
+                stage_commit_started = time.perf_counter()
                 conn.commit()
+                _add_elapsed(stats, "stage_commit_elapsed", stage_commit_started)
                 batch_count = 0
                 _ensure_free_disk(Path(cfg.temp_dir), cfg.min_free_disk_gb)
                 _raise_if_memory_exceeded(cfg, stage="parse_normalize_stage", stats=stats)
                 _update_max_rss(stats)
+        stage_commit_started = time.perf_counter()
         conn.commit()
+        _add_elapsed(stats, "stage_commit_elapsed", stage_commit_started)
+        stage_audit_started = time.perf_counter()
         stats.final_rows_saved = int(conn.execute("SELECT COUNT(*) FROM stage_items").fetchone()[0] or 0)
         stats.key_type_counts, stats.suspicious_groups = collect_stage_audit(conn)
         if trace_goods_id is not None:
@@ -1188,9 +1202,12 @@ def parse_normalize_stage(
                 "items_saved_count": len(stage_prices),
                 "item_prices_in_stage": stage_prices,
             }
+        _add_elapsed(stats, "stage_audit_elapsed", stage_audit_started)
     finally:
         conn.close()
+    stage_audit_started = time.perf_counter()
     stats.stage_db_size_mb = _stage_total_size_mb(stage_path)
+    _add_elapsed(stats, "stage_audit_elapsed", stage_audit_started)
     stats.parse_dedupe_elapsed_sec = round(time.perf_counter() - started, 3)
     _update_max_rss(stats)
     if stats.final_rows_saved < cfg.min_final_rows:
@@ -1264,6 +1281,170 @@ def _empty_match_structure_fields() -> dict[str, Any]:
     }
 
 
+_ITEM_INSERT_COLUMNS = (
+    "price_list_id",
+    "product_id",
+    "provisor_id",
+    "provisor_goods_id",
+    "filial_id",
+    "name",
+    "reg_number",
+    "distributor_goods_name",
+    "distributor_goods_id",
+    "distributor_price",
+    "stock",
+    "package_count",
+    "expiry_date",
+    "match_key",
+    "match_type",
+    "match_score",
+    "matched_sku",
+    "raw_name",
+    "raw_manufacturer",
+    "normalized_name",
+    "normalized_manufacturer",
+    "parsed_base_name",
+    "parsed_form",
+    "parsed_forms_json",
+    "parsed_dosage",
+    "parsed_dosage_volume",
+    "parsed_quantity",
+    "parsed_volume",
+    "parsed_weight",
+    "parsed_percent_strength",
+    "parsed_concentration",
+    "parsed_iu_dosage",
+    "parsed_strength_signature",
+    "parsed_dimensions_json",
+    "parsed_critical_tokens_json",
+    "raw_json",
+)
+
+
+def _mapping_from_stage_item(item: dict[str, Any], *, price_list_id: int, filial_id: int, empty_fields: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **empty_fields,
+        "price_list_id": price_list_id,
+        "product_id": None,
+        "provisor_id": item.get("provisor_id"),
+        "provisor_goods_id": item.get("provisor_goods_id"),
+        "filial_id": item.get("filial_id") or filial_id,
+        "name": item.get("name") or "",
+        "reg_number": item.get("reg_number") or "",
+        "distributor_goods_name": item.get("distributor_goods_name") or item.get("name") or "",
+        "distributor_goods_id": item.get("distributor_goods_id") or "",
+        "distributor_price": item.get("distributor_price"),
+        "stock": item.get("stock"),
+        "package_count": item.get("package_count"),
+        "expiry_date": item.get("expiry_date") or "",
+        "raw_name": item.get("raw_name") or item.get("name") or "",
+        "raw_manufacturer": item.get("raw_manufacturer") or "",
+        "raw_json": item.get("raw_json") or "{}",
+    }
+
+
+def _copy_value(value: object, null_token: str) -> object:
+    return null_token if value is None else value
+
+
+def _bulk_insert_items_from_stage(
+    *,
+    db: Session,
+    staging_path: Path,
+    stats: EmitStats,
+    price_list_id: int,
+    filial_id: int,
+    batch_size: int,
+    temp_dir: Path,
+    min_free_disk_gb: float,
+    config: EmitConfig,
+) -> None:
+    empty_fields = _empty_match_structure_fields()
+    stage_iter = iter_stage_rows(staging_path, batch_size=batch_size)
+    while True:
+        stage_read_started = time.perf_counter()
+        try:
+            rows = next(stage_iter)
+        except StopIteration:
+            _add_elapsed(stats, "stage_read_elapsed", stage_read_started)
+            break
+        _add_elapsed(stats, "stage_read_elapsed", stage_read_started)
+        mapping_build_started = time.perf_counter()
+        batch = [
+            _mapping_from_stage_item(item, price_list_id=price_list_id, filial_id=filial_id, empty_fields=empty_fields)
+            for item in rows
+        ]
+        _add_elapsed(stats, "mapping_build_elapsed", mapping_build_started)
+        if batch:
+            bulk_insert_started = time.perf_counter()
+            db.bulk_insert_mappings(CompetitorPriceListItem, batch)
+            _add_elapsed(stats, "bulk_insert_elapsed", bulk_insert_started)
+        _ensure_free_disk(temp_dir, min_free_disk_gb)
+        _raise_if_memory_exceeded(config, stage="db_replace", stats=stats)
+
+
+def _copy_items_from_stage_postgresql(
+    *,
+    db: Session,
+    staging_path: Path,
+    stats: EmitStats,
+    price_list_id: int,
+    filial_id: int,
+    batch_size: int,
+    temp_dir: Path,
+    min_free_disk_gb: float,
+    config: EmitConfig,
+) -> bool:
+    if (db.get_bind().dialect.name or "").lower() != "postgresql":
+        return False
+    connection = db.connection()
+    raw_connection = getattr(connection.connection, "driver_connection", connection.connection)
+    cursor = raw_connection.cursor()
+    if not hasattr(cursor, "copy_expert"):
+        cursor.close()
+        return False
+    temp_table = f"tmp_emit_items_{uuid.uuid4().hex}"
+    null_token = f"__APTEKA_COPY_NULL_{uuid.uuid4().hex}__"
+    columns_sql = ", ".join(_ITEM_INSERT_COLUMNS)
+    try:
+        cursor.execute(f"CREATE TEMP TABLE {temp_table} (LIKE competitor_price_list_items INCLUDING DEFAULTS) ON COMMIT DROP")
+        empty_fields = _empty_match_structure_fields()
+        stage_iter = iter_stage_rows(staging_path, batch_size=batch_size)
+        while True:
+            stage_read_started = time.perf_counter()
+            try:
+                rows = next(stage_iter)
+            except StopIteration:
+                _add_elapsed(stats, "stage_read_elapsed", stage_read_started)
+                break
+            _add_elapsed(stats, "stage_read_elapsed", stage_read_started)
+            mapping_build_started = time.perf_counter()
+            buffer = io.StringIO()
+            writer = csv.writer(buffer, lineterminator="\n")
+            for item in rows:
+                mapping = _mapping_from_stage_item(item, price_list_id=price_list_id, filial_id=filial_id, empty_fields=empty_fields)
+                writer.writerow([_copy_value(mapping.get(column), null_token) for column in _ITEM_INSERT_COLUMNS])
+            buffer.seek(0)
+            _add_elapsed(stats, "mapping_build_elapsed", mapping_build_started)
+            if buffer.tell() or rows:
+                bulk_insert_started = time.perf_counter()
+                cursor.copy_expert(
+                    f"COPY {temp_table} ({columns_sql}) FROM STDIN WITH CSV NULL '{null_token}'",
+                    buffer,
+                )
+                _add_elapsed(stats, "bulk_insert_elapsed", bulk_insert_started)
+            _ensure_free_disk(temp_dir, min_free_disk_gb)
+            _raise_if_memory_exceeded(config, stage="db_replace", stats=stats)
+        bulk_insert_started = time.perf_counter()
+        cursor.execute(
+            f"INSERT INTO competitor_price_list_items ({columns_sql}) SELECT {columns_sql} FROM {temp_table}"
+        )
+        _add_elapsed(stats, "bulk_insert_elapsed", bulk_insert_started)
+        return True
+    finally:
+        cursor.close()
+
+
 def replace_emit_price_list_from_staging(
     *,
     db: Session,
@@ -1330,38 +1511,37 @@ def replace_emit_price_list_from_staging(
     row.price_date = date.today()
     row.updated_at = now
 
+    delete_started = time.perf_counter()
     db.execute(delete(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == row.id))
-    empty_fields = _empty_match_structure_fields()
-    for rows in iter_stage_rows(staging_path, batch_size=config.batch_insert_size):
-        batch: list[dict[str, Any]] = []
-        for item in rows:
-            mapping = {
-                **empty_fields,
-                "price_list_id": row.id,
-                "product_id": None,
-                "provisor_id": item.get("provisor_id"),
-                "provisor_goods_id": item.get("provisor_goods_id"),
-                "filial_id": item.get("filial_id") or filial_id,
-                "name": item.get("name") or "",
-                "reg_number": item.get("reg_number") or "",
-                "distributor_goods_name": item.get("distributor_goods_name") or item.get("name") or "",
-                "distributor_goods_id": item.get("distributor_goods_id") or "",
-                "distributor_price": item.get("distributor_price"),
-                "stock": item.get("stock"),
-                "package_count": item.get("package_count"),
-                "expiry_date": item.get("expiry_date") or "",
-                "raw_name": item.get("raw_name") or item.get("name") or "",
-                "raw_manufacturer": item.get("raw_manufacturer") or "",
-                "raw_json": item.get("raw_json") or "{}",
-            }
-            batch.append(mapping)
-        if batch:
-            db.bulk_insert_mappings(CompetitorPriceListItem, batch)
-        _ensure_free_disk(Path(config.temp_dir), config.min_free_disk_gb)
-        _raise_if_memory_exceeded(config, stage="db_replace", stats=stats)
+    _add_elapsed(stats, "delete_elapsed", delete_started)
+    used_copy = _copy_items_from_stage_postgresql(
+        db=db,
+        staging_path=staging_path,
+        stats=stats,
+        price_list_id=int(row.id),
+        filial_id=filial_id,
+        batch_size=config.batch_insert_size,
+        temp_dir=Path(config.temp_dir),
+        min_free_disk_gb=config.min_free_disk_gb,
+        config=config,
+    )
+    if not used_copy:
+        _bulk_insert_items_from_stage(
+            db=db,
+            staging_path=staging_path,
+            stats=stats,
+            price_list_id=int(row.id),
+            filial_id=filial_id,
+            batch_size=config.batch_insert_size,
+            temp_dir=Path(config.temp_dir),
+            min_free_disk_gb=config.min_free_disk_gb,
+            config=config,
+        )
     stats.final_rows_saved = final_count
     stats.db_replace_elapsed_sec = round(time.perf_counter() - started, 3)
+    flush_started = time.perf_counter()
     db.flush()
+    _add_elapsed(stats, "flush_elapsed", flush_started)
     trace_goods_id = _trace_goods_id()
     if trace_goods_id is not None:
         db_prices = [
@@ -1385,7 +1565,9 @@ def replace_emit_price_list_from_staging(
         )
         stats.trace = trace
         logger.info("[EMIT_TRACE] stage=db_replace filial_id=%s price_list_id=%s trace=%s", filial_id, row.id, trace)
+    commit_started = time.perf_counter()
     db.commit()
+    _add_elapsed(stats, "commit_elapsed", commit_started)
     logger.info(
         "[EMIT_DB_REPLACE_SUMMARY] filial_id=%s previous_rows=%s final_rows_saved=%s elapsed_sec=%s",
         filial_id,

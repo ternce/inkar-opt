@@ -47,6 +47,8 @@ type SourceRow = {
   active?: boolean;
   isSelected?: boolean;
   isPercentile?: boolean;
+  rowType?: 'physical_plk' | 'percentile_config' | string;
+  assignmentKind?: 'physical' | 'percentile_config' | string;
   percentile?: number;
 };
 
@@ -59,6 +61,8 @@ type AssignmentRow = SourceRow & {
 type FormatSummary = {
   pricingRule: string;
   assignmentsCount: number;
+  percentileSourceCount?: number;
+  totalRowsCount?: number;
   lastGeneratedAt: string;
 };
 
@@ -76,6 +80,16 @@ const parseJsonOrNull = (text: string) => {
   } catch {
     return null;
   }
+};
+
+const assignmentItems = (data: any) => (Array.isArray(data) ? data : Array.isArray(data?.items) ? data.items : []);
+const activePhysicalAssignmentCount = (data: any) => {
+  const summaryCount = Number(data?.summary?.activePhysicalPlkCount);
+  if (Number.isFinite(summaryCount)) return summaryCount;
+  return assignmentItems(data).filter((row: any) => {
+    const kind = String(row.assignmentKind || (row.sourceType === 'percentile' || row.isPercentile ? 'percentile_config' : 'physical'));
+    return kind === 'physical' && row.active !== false;
+  }).length;
 };
 
 const branchKey = (value: any) => String(value || '').trim().toLocaleLowerCase('ru-RU');
@@ -135,6 +149,8 @@ const normalizeSource = (row: any): SourceRow => ({
   priceCoefficient: Number(row.priceCoefficient ?? row.coefficient ?? 1),
   active: Boolean(row.active ?? row.isSelected ?? true),
   isSelected: Boolean(row.isSelected),
+  rowType: String(row.rowType || (row.sourceType === 'percentile' || row.isPercentile ? 'percentile_config' : 'physical_plk')),
+  assignmentKind: String(row.assignmentKind || (row.sourceType === 'percentile' || row.isPercentile ? 'percentile_config' : 'physical')),
   isPercentile: row.sourceType === 'percentile' || Boolean(row.isPercentile),
   percentile: row.percentile != null ? Number(row.percentile) : undefined,
 });
@@ -194,7 +210,7 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
     const text = await res.text();
     const data = parseJsonOrNull(text);
     if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить назначенные ПЛК');
-    const rows = (Array.isArray(data) ? data : []).map(normalizeSource) as AssignmentRow[];
+    const rows = assignmentItems(data).map(normalizeSource) as AssignmentRow[];
     if (code === selectedFormatCode || code === selectedFormat?.code) setAssignments(rows);
     return rows;
   };
@@ -253,14 +269,16 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
             const [settingsRes, latestRes, assignmentsRes] = await Promise.all([
               fetch(`/api/price-formats/${encodeURIComponent(format.code)}/settings`),
               fetch(`/api/price-lists/latest?format_code=${encodeURIComponent(format.code)}`),
-              fetch(`/api/price-formats/${encodeURIComponent(format.code)}/competitor-assignments`),
+              fetch(`/api/price-formats/${encodeURIComponent(format.code)}/competitor-assignments?include_summary=1`),
             ]);
             const settings = parseJsonOrNull(await settingsRes.text());
             const latest = parseJsonOrNull(await latestRes.text());
             const assigned = parseJsonOrNull(await assignmentsRes.text());
             next[format.code] = {
               pricingRule: settings?.pricingRule || '—',
-              assignmentsCount: Array.isArray(assigned) ? assigned.length : 0,
+              assignmentsCount: activePhysicalAssignmentCount(assigned),
+              percentileSourceCount: Number(assigned?.summary?.percentileSourceCount || 0),
+              totalRowsCount: Number(assigned?.summary?.totalRowsCount || assignmentItems(assigned).length),
               lastGeneratedAt: latest?.date || '',
             };
           } catch {

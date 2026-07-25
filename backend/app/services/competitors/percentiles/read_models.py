@@ -28,7 +28,11 @@ from ...competitor_percentiles import (
     emit_percentile_group_keys,
     percentile_inc_linear,
 )
-from ...competitor_source_config import MULTI_PRICE_PERCENTILE_MODE, effective_percentile_mode
+from ...competitor_source_config import (
+    MULTI_PRICE_PERCENTILE_MODE,
+    canonical_competitor_source_key,
+    effective_percentile_mode,
+)
 from .sources import (
     PERCENTILE_SOURCE_COMPETITOR,
     PERCENTILE_SOURCE_DEFAULT,
@@ -139,6 +143,7 @@ def list_percentile_sources(
 
 def _list_competitor_percentile_sources(*, db: Session, price_format_code: str | None = None) -> list[dict]:
     provider = get_percentile_provider(PERCENTILE_SOURCE_COMPETITOR)
+    allowed_by_format: dict[int, set[tuple[str, str]]] = {}
     stmt = (
         select(
             CompetitorPricePercentile.price_format_id,
@@ -164,27 +169,37 @@ def _list_competitor_percentile_sources(*, db: Session, price_format_code: str |
         if pf is None:
             return []
         stmt = stmt.where(CompetitorPricePercentile.price_format_id == pf.id)
+        allowed_by_format[int(pf.id)] = _competitor_percentile_group_keys(db=db, price_format_id=int(pf.id))
     rows = db.execute(stmt.order_by(CompetitorPricePercentile.competitor_name.asc())).all()
     out: list[dict] = []
     for row in rows:
         competitor = str(row.competitor_name or "").strip()
         if not competitor:
             continue
+        price_format_id = int(row.price_format_id)
+        if price_format_id not in allowed_by_format:
+            allowed_by_format[price_format_id] = _competitor_percentile_group_keys(
+                db=db,
+                price_format_id=price_format_id,
+            )
+        source_key = str(row.source_key or "").strip()
+        if (competitor, source_key) not in allowed_by_format[price_format_id]:
+            continue
         generated_at = row.generated_at.isoformat() if row.generated_at else ""
         out.append(
             {
                 "id": provider.source_id(
-                    price_format_id=row.price_format_id,
+                    price_format_id=price_format_id,
                     scope="global",
-                    source_key=row.source_key,
+                    source_key=source_key,
                     region="",
                     competitor=competitor,
                     percentile=row.percentile,
                 ),
                 "percentileSource": PERCENTILE_SOURCE_COMPETITOR,
-                "priceFormatId": row.price_format_id,
+                "priceFormatId": price_format_id,
                 "competitorPriceListId": row.competitor_price_list_id,
-                "sourceKey": row.source_key or "",
+                "sourceKey": source_key,
                 "percentileSourceType": row.source_type or "",
                 "region": "",
                 "competitor": competitor,
@@ -249,12 +264,38 @@ def _assigned_rows_for_group(
     ).all()
     requested_source_key = str(source_key or "").strip()
     if requested_source_key:
-        rows = [(row, assignment) for row, assignment in rows if str(row.source_key or "").strip() == requested_source_key]
+        rows = [(row, assignment) for row, assignment in rows if canonical_competitor_source_key(row) == requested_source_key]
     return [
         (row, assignment)
         for row, assignment in rows
         if effective_percentile_mode(row, assignment.percentile_mode) == MULTI_PRICE_PERCENTILE_MODE
+        and canonical_competitor_source_key(row)
     ]
+
+
+def _competitor_percentile_group_keys(*, db: Session, price_format_id: int) -> set[tuple[str, str]]:
+    rows = (
+        db.execute(
+            select(CompetitorPriceList, PriceFormatCompetitorAssignment)
+            .join(
+                PriceFormatCompetitorAssignment,
+                PriceFormatCompetitorAssignment.competitor_price_list_id == CompetitorPriceList.id,
+            )
+            .where(PriceFormatCompetitorAssignment.price_format_id == price_format_id)
+            .where(PriceFormatCompetitorAssignment.is_active.is_(True))
+            .order_by(CompetitorPriceList.id.asc())
+        )
+        .all()
+    )
+    return {
+        (competitor, source_key)
+        for row, assignment in rows
+        for competitor in (str(row.competitor_name or "").strip(),)
+        for source_key in (canonical_competitor_source_key(row),)
+        if competitor
+        and source_key
+        and effective_percentile_mode(row, assignment.percentile_mode) == MULTI_PRICE_PERCENTILE_MODE
+    }
 
 
 def _ratings_by_product(db: Session, product_ids: list[int], branch_id: str) -> dict[int, dict[str, int | None]]:
@@ -355,6 +396,9 @@ def list_percentile_groups(
 
 def _list_competitor_percentile_groups(*, db: Session, pf: PriceFormat) -> list[dict]:
     provider = get_percentile_provider(PERCENTILE_SOURCE_COMPETITOR)
+    allowed_groups = _competitor_percentile_group_keys(db=db, price_format_id=int(pf.id))
+    if not allowed_groups:
+        return []
     rows = (
         db.execute(
             select(
@@ -380,6 +424,8 @@ def _list_competitor_percentile_groups(*, db: Session, pf: PriceFormat) -> list[
         if not competitor:
             continue
         source_key = str(row.source_key or "").strip()
+        if (competitor, source_key) not in allowed_groups:
+            continue
         groups.append(
             {
                 "id": f"{PERCENTILE_SOURCE_COMPETITOR}::{source_key}::{competitor}",
@@ -425,11 +471,11 @@ def _selected_group(
             )
             if match is not None:
                 return "", str(match.get("competitor") or ""), str(match.get("sourceKey") or "")
-            return "", requested_competitor, requested_source_key
+            return "", "", ""
         if groups:
             first = groups[0]
             return "", str(first.get("competitor") or ""), str(first.get("sourceKey") or "")
-        return "", requested_competitor, requested_source_key
+        return "", "", ""
     if requested_source_key:
         for group in groups:
             if str(group.get("sourceKey") or "") == requested_source_key:

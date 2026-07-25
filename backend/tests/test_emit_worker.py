@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import inspect
+import io
 import json
 import os
 import sqlite3
@@ -43,7 +45,11 @@ from backend.app.services.emit_worker import (
     parse_normalize_stage,
     replace_emit_price_list_from_staging,
     stage_row_count,
+    normalize_name_without_price_noise,
+    _copy_value,
     _emit_heartbeat_once,
+    _PRICE_NOISE_RE,
+    _PRICE_TAIL_RE,
     _recalculate_percentiles_for_emit_rows,
 )
 from backend.app.services.competitor_assignments import (
@@ -243,6 +249,43 @@ def test_parse_normalize_stage_does_not_accumulate_normalized_list():
     assert "deduplicate_emit_items(" not in source
 
 
+def test_price_noise_regex_uses_valid_cyrillic_and_tenge_sign():
+    assert "тг" in _PRICE_NOISE_RE.pattern
+    assert "тенге" in _PRICE_NOISE_RE.pattern
+    assert "₸" in _PRICE_NOISE_RE.pattern
+    assert "цена" in _PRICE_TAIL_RE.pattern
+    assert "С‚Рі" not in _PRICE_NOISE_RE.pattern
+    assert "С†РµРЅР°" not in _PRICE_TAIL_RE.pattern
+
+
+def test_normalize_name_without_price_noise_removes_price_tail():
+    assert normalize_name_without_price_noise("Аспирин 1000 тг цена старая") == "аспирин"
+    assert normalize_name_without_price_noise("Аспирин 1000 тенге") == "аспирин"
+    assert normalize_name_without_price_noise("Аспирин 1000 ₸") == "аспирин"
+
+
+def test_copy_csv_serialization_preserves_special_strings_and_null_marker():
+    null_token = "__APTEKA_COPY_NULL_test__"
+    values = [
+        _copy_value(None, null_token),
+        _copy_value("\\N", null_token),
+        _copy_value("name, with comma", null_token),
+        _copy_value('name "quoted"', null_token),
+        _copy_value("name\nwith newline", null_token),
+    ]
+    buffer = io.StringIO()
+    csv.writer(buffer, lineterminator="\n").writerow(values)
+    parsed = next(csv.reader(io.StringIO(buffer.getvalue())))
+
+    assert parsed == [
+        null_token,
+        "\\N",
+        "name, with comma",
+        'name "quoted"',
+        "name\nwith newline",
+    ]
+
+
 def test_deduplicate_prefers_goods_id_positive_price_and_full_name():
     from backend.app.services.emit_worker import EmitStats
 
@@ -262,6 +305,8 @@ def test_deduplicate_prefers_goods_id_positive_price_and_full_name():
 
 def test_sqlite_staging_keeps_multiple_positive_prices_for_same_goods_id(tmp_path):
     from backend.app.services.emit_worker import _stage_upsert
+
+    assert sqlite3.sqlite_version_info >= (3, 35, 0)
 
     stage = tmp_path / "stage.sqlite"
     stats = EmitStats()
@@ -286,6 +331,63 @@ def test_sqlite_staging_keeps_multiple_positive_prices_for_same_goods_id(tmp_pat
     assert stats.duplicate_rows_removed == 0
     assert [row["name"] for row in rows] == ["Short", "Long full name"]
     assert [row["distributor_price"] for row in rows] == [20, 9]
+
+
+def test_sqlite_staging_removes_only_exact_duplicate_observations(tmp_path):
+    from backend.app.services.emit_worker import _stage_upsert
+
+    duplicate = {
+        "provisor_id": 1,
+        "provisor_goods_id": 10,
+        "name": "A",
+        "raw_name": "A",
+        "raw_manufacturer": "P",
+        "producer_key": "p",
+        "variant_key": "sku:a",
+        "distributor_goods_id": "A",
+        "distributor_price": 8688.26,
+        "stock": 3,
+        "source_timestamp": "2026-07-25T00:00:00",
+        "raw_json": '{"id":1,"goodsId":10,"goodsPrice":8688.26}',
+    }
+    different_price = dict(duplicate, provisor_id=2, distributor_price=8989.73, raw_json='{"id":2,"goodsId":10,"goodsPrice":8989.73}')
+    stage = tmp_path / "stage.sqlite"
+    stats = EmitStats()
+    conn = open_stage_db(stage)
+    try:
+        _stage_upsert(conn, dict(duplicate), stats)
+        _stage_upsert(conn, dict(duplicate), stats)
+        _stage_upsert(conn, different_price, stats)
+        conn.commit()
+    finally:
+        conn.close()
+
+    rows = [row for batch in iter_stage_rows(stage, batch_size=10) for row in batch]
+    assert stats.duplicate_rows_removed == 1
+    assert [row["distributor_price"] for row in rows] == [8688.26, 8989.73]
+
+
+def test_emit_stats_exposes_split_timing_fields(tmp_path):
+    stats, rows = _parse_rows_to_stage(
+        tmp_path,
+        [
+            {"id": 1, "goodsId": 10, "distributorGoodsId": "SKU-A", "distributorGoodsName": "A", "goodsPrice": 12},
+            {"id": 2, "goodsId": 10, "distributorGoodsId": "SKU-A", "distributorGoodsName": "A", "goodsPrice": 8},
+        ],
+    )
+    payload = stats.to_dict()
+
+    assert len(rows) == 2
+    for key in (
+        "decode_elapsed",
+        "normalize_elapsed",
+        "manufacturer_elapsed",
+        "stage_upsert_elapsed",
+        "stage_commit_elapsed",
+        "stage_audit_elapsed",
+    ):
+        assert key in payload
+        assert payload[key] >= 0
 
 
 def _parse_rows_to_stage(tmp_path, rows):
