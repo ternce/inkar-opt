@@ -286,6 +286,133 @@ def test_copy_csv_serialization_preserves_special_strings_and_null_marker():
     ]
 
 
+def test_postgresql_copy_path_supports_psycopg3_cursor_copy(monkeypatch, tmp_path):
+    import backend.app.services.emit_worker as emit_worker
+
+    writes = []
+    executed = []
+
+    class FakeCopy:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def write(self, data):
+            writes.append(data)
+
+    class FakeCursor:
+        def execute(self, sql):
+            executed.append(sql)
+
+        def copy(self, sql):
+            executed.append(sql)
+            return FakeCopy()
+
+        def close(self):
+            pass
+
+    class FakeDriverConnection:
+        def cursor(self):
+            return FakeCursor()
+
+    class FakeConnectionProxy:
+        driver_connection = FakeDriverConnection()
+
+    class FakeConnection:
+        connection = FakeConnectionProxy()
+
+    class FakeDialect:
+        name = "postgresql"
+
+    class FakeBind:
+        dialect = FakeDialect()
+
+    class FakeDb:
+        def get_bind(self):
+            return FakeBind()
+
+        def connection(self):
+            return FakeConnection()
+
+    stage = tmp_path / "stage.sqlite"
+    conn = emit_worker.open_stage_db(stage)
+    try:
+        emit_worker._stage_insert_many(
+            conn,
+            [
+                {
+                    "provisor_id": 1,
+                    "provisor_goods_id": 10,
+                    "filial_id": 1106,
+                    "name": "A",
+                    "distributor_goods_name": "A",
+                    "distributor_goods_id": "SKU",
+                    "distributor_price": 12.5,
+                    "raw_name": "A",
+                    "raw_manufacturer": "P",
+                    "raw_json": '{"id":1}',
+                }
+            ],
+            EmitStats(),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    used, backend, reason = emit_worker._copy_items_from_stage_postgresql(
+        db=FakeDb(),
+        staging_path=stage,
+        stats=EmitStats(),
+        price_list_id=5,
+        filial_id=1106,
+        batch_size=100,
+        temp_dir=tmp_path,
+        min_free_disk_gb=0,
+        config=EmitConfig(temp_dir=str(tmp_path), min_free_disk_gb=0),
+    )
+
+    assert used is True
+    assert backend == "psycopg3_copy"
+    assert reason == ""
+    assert any(str(sql).startswith("COPY tmp_emit_items_") for sql in executed)
+    assert writes and "SKU" in writes[0]
+    emit_worker._delete_stage_files(stage)
+    assert not stage.exists()
+
+
+def test_copy_path_reports_sqlalchemy_fallback_for_non_postgresql(tmp_path):
+    class FakeDialect:
+        name = "sqlite"
+
+    class FakeBind:
+        dialect = FakeDialect()
+
+    class FakeDb:
+        def get_bind(self):
+            return FakeBind()
+
+    used, backend, reason = __import__(
+        "backend.app.services.emit_worker",
+        fromlist=["_copy_items_from_stage_postgresql"],
+    )._copy_items_from_stage_postgresql(
+        db=FakeDb(),
+        staging_path=tmp_path / "stage.sqlite",
+        stats=EmitStats(),
+        price_list_id=5,
+        filial_id=1106,
+        batch_size=100,
+        temp_dir=tmp_path,
+        min_free_disk_gb=0,
+        config=EmitConfig(temp_dir=str(tmp_path), min_free_disk_gb=0),
+    )
+
+    assert used is False
+    assert backend == "sqlalchemy_fallback"
+    assert reason == "database_dialect_is_not_postgresql"
+
+
 def test_deduplicate_prefers_goods_id_positive_price_and_full_name():
     from backend.app.services.emit_worker import EmitStats
 
@@ -388,6 +515,87 @@ def test_emit_stats_exposes_split_timing_fields(tmp_path):
     ):
         assert key in payload
         assert payload[key] >= 0
+
+
+def _stage_full_rows(stage_path):
+    with sqlite3.connect(stage_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT dedupe_key, key_type, quality_json, provisor_id, provisor_goods_id,
+                   goods_id_text, variant_key, pack_signature, producer_key, rows_seen,
+                   names_sample_json, producers_sample_json, price_min, price_max, filial_id,
+                   name, reg_number, distributor_goods_name, distributor_goods_id,
+                   distributor_price, stock, package_count, expiry_date, raw_name,
+                   raw_manufacturer, raw_json
+            FROM stage_items
+            ORDER BY rowid
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def test_batched_parse_matches_single_row_batch_serialization_and_dedupe(tmp_path):
+    rows = [
+        {"id": 1, "goodsId": 10, "distributorGoodsId": "SKU-A", "distributorGoodsName": "A", "distributorProducer": "P", "goodsPrice": "12.00", "stored": "3", "box": "1"},
+        {"id": 1, "goodsId": 10, "distributorGoodsId": "SKU-A", "distributorGoodsName": "A", "distributorProducer": "P", "goodsPrice": "12.00", "stored": "3", "box": "1"},
+        {"id": 2, "goodsId": 10, "distributorGoodsId": "SKU-A", "distributorGoodsName": "A", "distributorProducer": "P", "goodsPrice": "8,50", "stored": "4", "box": "1"},
+        {"id": 3, "goodsId": 11, "barcode": "4870000000011", "distributorGoodsName": "B в„–10", "distributorProducer": "", "goodsPrice": 9},
+        {"id": 4, "distributorGoodsName": "No goods", "distributorProducer": "Maker", "goodsPrice": 5},
+        {"id": 5, "goodsId": 12, "distributorGoodsName": "Zero", "goodsPrice": 0},
+    ]
+    source = tmp_path / "emit.ndjson"
+    source.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows), encoding="utf-8")
+    stage_single = tmp_path / "single.sqlite"
+    stage_batch = tmp_path / "batch.sqlite"
+
+    single = parse_normalize_stage(
+        source_path=source,
+        stage_db_path=stage_single,
+        filial_id=1106,
+        filial_name="Emit",
+        config=EmitConfig(temp_dir=str(tmp_path), min_free_disk_gb=0, min_final_rows=1, batch_insert_size=1),
+    )
+    batched = parse_normalize_stage(
+        source_path=source,
+        stage_db_path=stage_batch,
+        filial_id=1106,
+        filial_name="Emit",
+        config=EmitConfig(temp_dir=str(tmp_path), min_free_disk_gb=0, min_final_rows=1, batch_insert_size=50),
+    )
+
+    assert single.input_rows == batched.input_rows == len(rows)
+    assert single.final_rows_saved == batched.final_rows_saved == 4
+    assert single.duplicate_rows_removed == batched.duplicate_rows_removed == 1
+    assert single.zero_price_rows_skipped == batched.zero_price_rows_skipped == 1
+    assert single.skip_reasons == batched.skip_reasons
+    assert _stage_full_rows(stage_single) == _stage_full_rows(stage_batch)
+
+
+def test_emit_numeric_parsing_equivalence_cases():
+    from backend.app.services.emit_worker import _as_decimal, _emit_price
+
+    cases = [
+        (100, Decimal("100")),
+        (100.25, Decimal("100.25")),
+        ("100.25", Decimal("100.25")),
+        ("100,25", Decimal("100.25")),
+        (" 1 000,50 ", Decimal("1000.50")),
+        ("0", Decimal("0")),
+        ("-1.5", Decimal("-1.5")),
+        ("100.2500", Decimal("100.2500")),
+        ("999999999999999999.99", Decimal("999999999999999999.99")),
+        ("bad", None),
+        ("", None),
+        (None, None),
+    ]
+    for raw, expected in cases:
+        assert _as_decimal(raw) == expected
+
+    assert _emit_price({"goodsPrice": "10,50"}, {}) == (Decimal("10.50"), "")
+    assert _emit_price({"goodsPrice": 0, "goodsPriceWithUserDiscount": 9}, {}) == (None, "invalid_price")
+    assert _emit_price({"goodsPriceWithUserDiscount": "8.00"}, {}) == (Decimal("8.00"), "")
+    assert _emit_price({"goodsPrice": "-1"}, {}) == (None, "invalid_price")
 
 
 def _parse_rows_to_stage(tmp_path, rows):

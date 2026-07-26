@@ -708,8 +708,9 @@ _HARD_CONFLICTS = {
 }
 
 
-def _clean(value: object) -> str:
-    text = str(value or "").strip().upper().replace("Ё", "Е")
+@lru_cache(maxsize=32768)
+def _clean_text(text: str) -> str:
+    text = text.strip().upper().replace("Ё", "Е")
     text = text.replace("\u00a0", " ")
     text = re.sub(r"^[\s\-–—]+", "", text)
 
@@ -725,6 +726,10 @@ def _clean(value: object) -> str:
 
     text = _LEGAL_SUFFIX_RE.sub(" ", text)
     return _SPACES_RE.sub(" ", text).strip()
+
+
+def _clean(value: object) -> str:
+    return _clean_text(str(value or ""))
 
 
 def normalize_manufacturer(value: object) -> str:
@@ -761,8 +766,8 @@ def manufacturer_decision(product_manufacturer: object, candidate_manufacturer: 
     return "penalty"
 
 
-def extract_manufacturer(name: object) -> str:
-    text = _clean(name)
+@lru_cache(maxsize=32768)
+def _extract_manufacturer_cleaned(text: str) -> str:
     if not text:
         return ""
 
@@ -782,6 +787,10 @@ def extract_manufacturer(name: object) -> str:
             return canonical
 
     return ""
+
+
+def extract_manufacturer(name: object) -> str:
+    return _extract_manufacturer_cleaned(_clean(name))
 
 
 def resolve_manufacturer(raw: object, name: object = "", *, default: str = UNKNOWN_MANUFACTURER) -> str:

@@ -13,11 +13,14 @@ import socket
 import threading
 import time
 import uuid
+from collections import Counter
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 import httpx
 from openpyxl import load_workbook
@@ -29,7 +32,7 @@ from ..models import CompetitorPriceList, CompetitorPriceListItem, PriceFormat, 
 from .competitor_assignments import propagate_emit_assignments_to_price_formats, upsert_assignment
 from .competitor_percentiles import recalculate_competitor_percentiles
 from .competitor_persist import _ensure_price_format
-from .manufacturers import resolve_manufacturer
+from .manufacturers import _clean_text, _extract_manufacturer_cleaned, _normalize_manufacturer_cleaned, resolve_manufacturer
 from .provisor import get_access_token
 from .provisor_auto_refresh import (
     GLOBAL_REFRESH_LOCK_NAME,
@@ -138,7 +141,9 @@ class EmitStats:
     input_rows: int = 0
     normalized_rows: int = 0
     duplicate_rows_removed: int = 0
+    positive_price_rows: int = 0
     zero_price_rows_skipped: int = 0
+    negative_price_rows_skipped: int = 0
     skip_reasons: dict[str, int] = field(default_factory=dict)
     rows_without_goodsId: int = 0
     final_rows_saved: int = 0
@@ -149,8 +154,13 @@ class EmitStats:
     temp_file_path: str = ""
     staging_file_path: str = ""
     stage_db_path: str = ""
+    stage_db_size_bytes: int = 0
     stage_db_size_mb: float = 0.0
+    stage_db_size_gb: float = 0.0
     source_file_size_gb: float = 0.0
+    download_size_bytes: int = 0
+    download_size_mb: float = 0.0
+    download_size_gb: float = 0.0
     max_rss_mb: float | None = None
     download_elapsed_sec: float = 0.0
     parse_dedupe_elapsed_sec: float = 0.0
@@ -161,13 +171,27 @@ class EmitStats:
     stage_upsert_elapsed: float = 0.0
     stage_commit_elapsed: float = 0.0
     stage_audit_elapsed: float = 0.0
+    previous_count_elapsed: float = 0.0
+    temp_table_create_elapsed: float = 0.0
     delete_elapsed: float = 0.0
     stage_read_elapsed: float = 0.0
+    row_transform_elapsed: float = 0.0
     mapping_build_elapsed: float = 0.0
     bulk_insert_elapsed: float = 0.0
+    copy_serialize_elapsed: float = 0.0
+    copy_transfer_elapsed: float = 0.0
+    temp_insert_elapsed: float = 0.0
+    final_insert_elapsed: float = 0.0
+    validation_elapsed: float = 0.0
     flush_elapsed: float = 0.0
     commit_elapsed: float = 0.0
     cleanup_elapsed_sec: float = 0.0
+    copy_backend: str = ""
+    copy_fallback_reason: str = ""
+    manufacturer_cache_hits: int = 0
+    manufacturer_cache_misses: int = 0
+    normalization_cache_hits: int = 0
+    normalization_cache_misses: int = 0
     trace: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -175,7 +199,9 @@ class EmitStats:
             "input_rows": self.input_rows,
             "normalized_rows": self.normalized_rows,
             "duplicate_rows_removed": self.duplicate_rows_removed,
+            "positive_price_rows": self.positive_price_rows,
             "zero_price_rows_skipped": self.zero_price_rows_skipped,
+            "negative_price_rows_skipped": self.negative_price_rows_skipped,
             "skip_reasons": self.skip_reasons,
             "rows_without_goodsId": self.rows_without_goodsId,
             "final_rows_saved": self.final_rows_saved,
@@ -186,25 +212,50 @@ class EmitStats:
             "temp_file_path": self.temp_file_path,
             "staging_file_path": self.staging_file_path,
             "stage_db_path": self.stage_db_path,
+            "stage_db_size_bytes": self.stage_db_size_bytes,
             "stage_db_size_mb": self.stage_db_size_mb,
+            "stage_db_size_gb": self.stage_db_size_gb,
             "source_file_size_gb": self.source_file_size_gb,
+            "download_size_bytes": self.download_size_bytes,
+            "download_size_mb": self.download_size_mb,
+            "download_size_gb": self.download_size_gb,
             "max_rss_mb": self.max_rss_mb,
             "download_elapsed_sec": self.download_elapsed_sec,
             "parse_dedupe_elapsed_sec": self.parse_dedupe_elapsed_sec,
             "db_replace_elapsed_sec": self.db_replace_elapsed_sec,
             "decode_elapsed": self.decode_elapsed,
+            "decode_elapsed_sec": self.decode_elapsed,
             "normalize_elapsed": self.normalize_elapsed,
+            "normalize_elapsed_sec": self.normalize_elapsed,
             "manufacturer_elapsed": self.manufacturer_elapsed,
+            "manufacturer_normalization_elapsed_sec": self.manufacturer_elapsed,
             "stage_upsert_elapsed": self.stage_upsert_elapsed,
+            "stage_upsert_elapsed_sec": self.stage_upsert_elapsed,
             "stage_commit_elapsed": self.stage_commit_elapsed,
+            "stage_commit_elapsed_sec": self.stage_commit_elapsed,
             "stage_audit_elapsed": self.stage_audit_elapsed,
+            "stage_audit_elapsed_sec": self.stage_audit_elapsed,
+            "previous_count_elapsed": self.previous_count_elapsed,
+            "temp_table_create_elapsed": self.temp_table_create_elapsed,
             "delete_elapsed": self.delete_elapsed,
             "stage_read_elapsed": self.stage_read_elapsed,
+            "row_transform_elapsed": self.row_transform_elapsed,
             "mapping_build_elapsed": self.mapping_build_elapsed,
             "bulk_insert_elapsed": self.bulk_insert_elapsed,
+            "copy_serialize_elapsed": self.copy_serialize_elapsed,
+            "copy_transfer_elapsed": self.copy_transfer_elapsed,
+            "temp_insert_elapsed": self.temp_insert_elapsed,
+            "final_insert_elapsed": self.final_insert_elapsed,
+            "validation_elapsed": self.validation_elapsed,
             "flush_elapsed": self.flush_elapsed,
             "commit_elapsed": self.commit_elapsed,
             "cleanup_elapsed_sec": self.cleanup_elapsed_sec,
+            "copy_backend": self.copy_backend,
+            "copy_fallback_reason": self.copy_fallback_reason,
+            "manufacturer_cache_hits": self.manufacturer_cache_hits,
+            "manufacturer_cache_misses": self.manufacturer_cache_misses,
+            "normalization_cache_hits": self.normalization_cache_hits,
+            "normalization_cache_misses": self.normalization_cache_misses,
             "trace": self.trace,
         }
 
@@ -273,6 +324,14 @@ def _stage_total_size_mb(path: Path) -> float:
         if item.exists():
             total += item.stat().st_size
     return round(total / (1024 * 1024), 3)
+
+
+def _stage_total_size_bytes(path: Path) -> int:
+    total = 0
+    for item in _stage_sidecar_paths(path):
+        if item.exists():
+            total += item.stat().st_size
+    return total
 
 
 def _delete_stage_files(path: Path | None) -> None:
@@ -345,6 +404,119 @@ def _emit_price(row: dict[str, Any], goods: dict[str, Any]) -> tuple[Decimal | N
     )
 
 
+def _row_has_negative_price_candidate(row: dict[str, Any]) -> bool:
+    goods = _nested_dict(row.get("goods"))
+    for value in (
+        row.get("goodsPrice"),
+        row.get("goodsPriceWithUserDiscount"),
+        goods.get("price"),
+        row.get("price"),
+        row.get("distributor_price"),
+    ):
+        price = _as_decimal(value)
+        if price is not None and price < 0:
+            return True
+    return False
+
+
+def _cache_info_snapshot() -> dict[str, tuple[int, int]]:
+    manufacturer_infos = (
+        _clean_text.cache_info(),
+        _normalize_manufacturer_cleaned.cache_info(),
+        _extract_manufacturer_cleaned.cache_info(),
+    )
+    normalization_infos = (
+        _normalize_text_key_cached.cache_info(),
+        _normalize_barcode_cached.cache_info(),
+        _normalize_sku_key_cached.cache_info(),
+        _normalize_name_without_price_noise_cached.cache_info(),
+    )
+    return {
+        "manufacturer": (
+            sum(info.hits for info in manufacturer_infos),
+            sum(info.misses for info in manufacturer_infos),
+        ),
+        "normalization": (
+            sum(info.hits for info in normalization_infos),
+            sum(info.misses for info in normalization_infos),
+        ),
+    }
+
+
+def _apply_cache_info_delta(stats: EmitStats, before: dict[str, tuple[int, int]], after: dict[str, tuple[int, int]]) -> None:
+    before_mfr_hits, before_mfr_misses = before["manufacturer"]
+    after_mfr_hits, after_mfr_misses = after["manufacturer"]
+    before_norm_hits, before_norm_misses = before["normalization"]
+    after_norm_hits, after_norm_misses = after["normalization"]
+    stats.manufacturer_cache_hits = max(0, after_mfr_hits - before_mfr_hits)
+    stats.manufacturer_cache_misses = max(0, after_mfr_misses - before_mfr_misses)
+    stats.normalization_cache_hits = max(0, after_norm_hits - before_norm_hits)
+    stats.normalization_cache_misses = max(0, after_norm_misses - before_norm_misses)
+
+
+def _emit_performance_summary(stats: EmitStats) -> str:
+    return (
+        "\n======================================================\n"
+        "Emit Performance Summary\n"
+        "======================================================\n\n"
+        "Download\n"
+        "--------\n"
+        f"download_elapsed_sec: {stats.download_elapsed_sec}\n"
+        f"download_size_bytes: {stats.download_size_bytes or stats.downloaded_bytes}\n"
+        f"download_size_mb: {stats.download_size_mb}\n"
+        f"download_size_gb: {stats.download_size_gb}\n\n"
+        "Parsing\n"
+        "-------\n"
+        f"decode_elapsed_sec: {stats.decode_elapsed}\n"
+        f"normalize_elapsed_sec: {stats.normalize_elapsed}\n"
+        f"manufacturer_normalization_elapsed_sec: {stats.manufacturer_elapsed}\n\n"
+        "SQLite staging\n"
+        "--------------\n"
+        f"stage_upsert_elapsed_sec: {stats.stage_upsert_elapsed}\n"
+        f"stage_commit_elapsed_sec: {stats.stage_commit_elapsed}\n"
+        f"stage_audit_elapsed_sec: {stats.stage_audit_elapsed}\n\n"
+        "Parser statistics\n"
+        "-----------------\n"
+        f"input_rows: {stats.input_rows}\n"
+        f"normalized_rows: {stats.normalized_rows}\n"
+        f"positive_price_rows: {stats.positive_price_rows}\n"
+        f"duplicate_rows_removed: {stats.duplicate_rows_removed}\n"
+        f"zero_price_rows_skipped: {stats.zero_price_rows_skipped}\n"
+        f"negative_price_rows_skipped: {stats.negative_price_rows_skipped}\n\n"
+        "Cache\n"
+        "-----\n"
+        f"manufacturer_cache_hits: {stats.manufacturer_cache_hits}\n"
+        f"manufacturer_cache_misses: {stats.manufacturer_cache_misses}\n"
+        f"normalization_cache_hits: {stats.normalization_cache_hits}\n"
+        f"normalization_cache_misses: {stats.normalization_cache_misses}\n\n"
+        "Storage\n"
+        "-------\n"
+        f"stage_db_size_bytes: {stats.stage_db_size_bytes}\n"
+        f"stage_db_size_mb: {stats.stage_db_size_mb}\n"
+        f"stage_db_size_gb: {stats.stage_db_size_gb}\n\n"
+        "Memory\n"
+        "------\n"
+        f"max_rss_mb: {stats.max_rss_mb}\n\n"
+        "DB Replace\n"
+        "----------\n"
+        f"previous_count_elapsed: {stats.previous_count_elapsed}\n"
+        f"temp_table_create_elapsed: {stats.temp_table_create_elapsed}\n"
+        f"delete_elapsed: {stats.delete_elapsed}\n"
+        f"stage_read_elapsed: {stats.stage_read_elapsed}\n"
+        f"row_transform_elapsed: {stats.row_transform_elapsed}\n"
+        f"copy_serialize_elapsed: {stats.copy_serialize_elapsed}\n"
+        f"copy_transfer_elapsed: {stats.copy_transfer_elapsed}\n"
+        f"temp_insert_elapsed: {stats.temp_insert_elapsed}\n"
+        f"final_insert_elapsed: {stats.final_insert_elapsed}\n"
+        f"validation_elapsed: {stats.validation_elapsed}\n"
+        f"commit_elapsed: {stats.commit_elapsed}\n"
+        f"replace_elapsed_sec: {stats.db_replace_elapsed_sec}\n"
+        f"copy_backend: {stats.copy_backend}\n"
+        f"copy_fallback_reason: {stats.copy_fallback_reason}\n\n"
+        "======================================================"
+    )
+
+
 def _nested_dict(value: object) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
@@ -356,25 +528,40 @@ def _first(row: dict[str, Any], *keys: str) -> Any:
     return None
 
 
-def normalize_text_key(value: object) -> str:
-    text = str(value or "").casefold().replace("ё", "е")
+@lru_cache(maxsize=65536)
+def _normalize_text_key_cached(text: str) -> str:
+    text = text.casefold().replace("ё", "е")
     text = _NORMALIZE_TEXT_NON_WORD_RE.sub(" ", text)
     return _NORMALIZE_TEXT_SPACES_RE.sub(" ", text).strip()
 
 
-def normalize_barcode(value: object) -> str:
-    digits = _BARCODE_RE.sub("", str(value or ""))
+def normalize_text_key(value: object) -> str:
+    return _normalize_text_key_cached(str(value or ""))
+
+
+@lru_cache(maxsize=65536)
+def _normalize_barcode_cached(text: str) -> str:
+    digits = _BARCODE_RE.sub("", text)
     return digits if 6 <= len(digits) <= 18 else ""
 
 
-def normalize_sku_key(value: object) -> str:
-    text = str(value or "").strip()
+def normalize_barcode(value: object) -> str:
+    return _normalize_barcode_cached(str(value or ""))
+
+
+@lru_cache(maxsize=65536)
+def _normalize_sku_key_cached(text: str) -> str:
+    text = text.strip()
     barcode = normalize_barcode(text)
     if barcode:
         return f"barcode:{barcode}"
     key = normalize_text_key(text)
     key = _NORMALIZE_SKU_RE.sub("", key)
     return f"sku:{key}" if key else ""
+
+
+def normalize_sku_key(value: object) -> str:
+    return _normalize_sku_key_cached(str(value or ""))
 
 
 def _row_lookup(row: dict[str, Any], goods: dict[str, Any], *keys: str) -> Any:
@@ -445,11 +632,16 @@ def extract_pack_signature(row: dict[str, Any], goods: dict[str, Any] | None = N
     return "|".join(list(dict.fromkeys(cleaned))[:6])
 
 
-def normalize_name_without_price_noise(value: object) -> str:
-    text = str(value or "").casefold().replace("ё", "е")
+@lru_cache(maxsize=65536)
+def _normalize_name_without_price_noise_cached(text: str) -> str:
+    text = text.casefold().replace("ё", "е")
     text = _PRICE_NOISE_RE.sub(" ", text)
     text = _PRICE_TAIL_RE.sub(" ", text)
     return normalize_text_key(text)
+
+
+def normalize_name_without_price_noise(value: object) -> str:
+    return _normalize_name_without_price_noise_cached(str(value or ""))
 
 
 def normalize_emit_item(row: dict[str, Any], *, filial_id: int, filial_name: str, stats: EmitStats | None = None) -> dict[str, Any] | None:
@@ -685,8 +877,13 @@ def _update_max_rss(stats: EmitStats) -> None:
 def open_stage_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA page_size=32768")
+    conn.execute("PRAGMA journal_mode=OFF")
+    conn.execute("PRAGMA synchronous=OFF")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA locking_mode=EXCLUSIVE")
+    conn.execute("PRAGMA cache_size=-262144")
+    conn.execute("PRAGMA mmap_size=268435456")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS stage_items (
@@ -757,9 +954,10 @@ def _stage_values(item: dict[str, Any]) -> tuple[Any, ...]:
 
 
 def _stage_upsert(conn: sqlite3.Connection, item: dict[str, Any], stats: EmitStats) -> None:
-    returned = conn.execute(
+    values = _stage_values(item)
+    cursor = conn.execute(
         """
-        INSERT INTO stage_items (
+        INSERT OR IGNORE INTO stage_items (
             dedupe_key, key_type, quality_json, provisor_id, provisor_goods_id, goods_id_text,
             variant_key, pack_signature, producer_key, rows_seen, names_sample_json,
             producers_sample_json, price_min, price_max, filial_id, name, reg_number,
@@ -767,51 +965,135 @@ def _stage_upsert(conn: sqlite3.Connection, item: dict[str, Any], stats: EmitSta
             expiry_date, raw_name, raw_manufacturer, raw_json
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(dedupe_key) DO UPDATE SET
-            rows_seen = stage_items.rows_seen + 1,
-            price_min = CASE
-                WHEN stage_items.price_min IS NULL OR excluded.price_min < stage_items.price_min THEN excluded.price_min
-                ELSE stage_items.price_min
-            END,
-            price_max = CASE
-                WHEN stage_items.price_max IS NULL OR excluded.price_max > stage_items.price_max THEN excluded.price_max
-                ELSE stage_items.price_max
-            END
-        RETURNING rows_seen
         """,
-        _stage_values(item),
+        values,
     )
-    rows_seen = int((returned.fetchone() or [1])[0] or 1)
-    if rows_seen > 1:
-        stats.duplicate_rows_removed += 1
+    if cursor.rowcount:
+        return
+    conn.execute(
+        "UPDATE stage_items SET rows_seen = rows_seen + 1 WHERE dedupe_key = ?",
+        (values[0],),
+    )
+    stats.duplicate_rows_removed += 1
+
+
+def _chunks(values: list[str], size: int) -> Iterable[list[str]]:
+    for index in range(0, len(values), size):
+        yield values[index : index + size]
+
+
+def _stage_existing_keys(conn: sqlite3.Connection, keys: list[str]) -> set[str]:
+    existing: set[str] = set()
+    if not keys:
+        return existing
+    for chunk in _chunks(keys, 900):
+        placeholders = ",".join("?" for _ in chunk)
+        existing.update(
+            str(row[0])
+            for row in conn.execute(
+                f"SELECT dedupe_key FROM stage_items WHERE dedupe_key IN ({placeholders})",
+                chunk,
+            ).fetchall()
+        )
+    return existing
+
+
+_STAGE_INSERT_SQL = """
+    INSERT OR IGNORE INTO stage_items (
+        dedupe_key, key_type, quality_json, provisor_id, provisor_goods_id, goods_id_text,
+        variant_key, pack_signature, producer_key, rows_seen, names_sample_json,
+        producers_sample_json, price_min, price_max, filial_id, name, reg_number,
+        distributor_goods_name, distributor_goods_id, distributor_price, stock, package_count,
+        expiry_date, raw_name, raw_manufacturer, raw_json
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+
+def _stage_insert_many(conn: sqlite3.Connection, items: list[dict[str, Any]], stats: EmitStats) -> None:
+    if not items:
+        return
+    values = [_stage_values(item) for item in items]
+    key_counts = Counter(str(row[0]) for row in values)
+    existing = _stage_existing_keys(conn, list(key_counts.keys()))
+    conn.executemany(_STAGE_INSERT_SQL, values)
+    duplicate_updates = [
+        (count if key in existing else count - 1, key)
+        for key, count in key_counts.items()
+        if (count if key in existing else count - 1) > 0
+    ]
+    if duplicate_updates:
+        conn.executemany(
+            "UPDATE stage_items SET rows_seen = rows_seen + ? WHERE dedupe_key = ?",
+            duplicate_updates,
+        )
+        stats.duplicate_rows_removed += sum(int(count) for count, _key in duplicate_updates)
 
 
 def stage_row_count(stage_db_path: Path) -> int:
-    with sqlite3.connect(str(stage_db_path)) as conn:
+    with closing(sqlite3.connect(str(stage_db_path))) as conn:
         return int(conn.execute("SELECT COUNT(*) FROM stage_items").fetchone()[0] or 0)
 
 
 def iter_stage_rows(stage_db_path: Path, *, batch_size: int) -> Iterable[list[dict[str, Any]]]:
-    with sqlite3.connect(str(stage_db_path)) as conn:
+    with closing(sqlite3.connect(str(stage_db_path))) as conn:
         conn.row_factory = sqlite3.Row
         last_rowid = 0
         while True:
-            rows = conn.execute(
-                """
-                SELECT rowid, provisor_id, provisor_goods_id, filial_id, name, reg_number,
-                       distributor_goods_name, distributor_goods_id, distributor_price,
-                       stock, package_count, expiry_date, raw_name, raw_manufacturer, raw_json
-                FROM stage_items
-                WHERE rowid > ?
-                ORDER BY rowid
-                LIMIT ?
-                """,
-                (last_rowid, batch_size),
-            ).fetchall()
+            rows = _fetch_stage_row_batch(conn, last_rowid=last_rowid, batch_size=batch_size)
             if not rows:
                 break
             last_rowid = int(rows[-1]["rowid"])
             yield [{key: row[key] for key in row.keys() if key != "rowid"} for row in rows]
+
+
+def _fetch_stage_row_batch(sqlite_conn: sqlite3.Connection, *, last_rowid: int, batch_size: int) -> list[sqlite3.Row]:
+    cursor = sqlite_conn.execute(
+        """
+        SELECT rowid, provisor_id, provisor_goods_id, filial_id, name, reg_number,
+               distributor_goods_name, distributor_goods_id, distributor_price,
+               stock, package_count, expiry_date, raw_name, raw_manufacturer, raw_json
+        FROM stage_items
+        WHERE rowid > ?
+        ORDER BY rowid
+        LIMIT ?
+        """,
+        (last_rowid, batch_size),
+    )
+    try:
+        return cursor.fetchall()
+    finally:
+        cursor.close()
+
+
+def iter_stage_copy_rows(stage_db_path: Path, *, batch_size: int) -> Iterable[list[tuple[Any, ...]]]:
+    with closing(sqlite3.connect(str(stage_db_path))) as conn:
+        last_rowid = 0
+        while True:
+            rows = _fetch_stage_copy_batch(conn, last_rowid=last_rowid, batch_size=batch_size)
+            if not rows:
+                break
+            last_rowid = int(rows[-1][0])
+            yield [tuple(row[1:]) for row in rows]
+
+
+def _fetch_stage_copy_batch(sqlite_conn: sqlite3.Connection, *, last_rowid: int, batch_size: int) -> list[tuple[Any, ...]]:
+    cursor = sqlite_conn.execute(
+        """
+        SELECT rowid, provisor_id, provisor_goods_id, filial_id, name, reg_number,
+               distributor_goods_name, distributor_goods_id, distributor_price,
+               stock, package_count, expiry_date, raw_name, raw_manufacturer, raw_json
+        FROM stage_items
+        WHERE rowid > ?
+        ORDER BY rowid
+        LIMIT ?
+        """,
+        (last_rowid, batch_size),
+    )
+    try:
+        return cursor.fetchall()
+    finally:
+        cursor.close()
 
 
 def collect_stage_audit(conn: sqlite3.Connection, *, limit: int = 20) -> tuple[dict[str, int], list[dict[str, Any]]]:
@@ -1050,6 +1332,16 @@ def iter_source_rows(path: Path) -> Iterable[dict[str, Any]]:
         yield from iter_json_rows(path)
 
 
+def _next_row_batch(source_iter: Iterator[dict[str, Any]], batch_size: int) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for _ in range(batch_size):
+        try:
+            rows.append(next(source_iter))
+        except StopIteration:
+            break
+    return rows
+
+
 async def download_emit_filial(*, config: EmitConfig, filial_id: int, filial_name: str, job_callback=None) -> Path:
     temp_dir = Path(config.temp_dir)
     _ensure_free_disk(temp_dir, config.min_free_disk_gb)
@@ -1139,39 +1431,44 @@ def parse_normalize_stage(
     batch_count = 0
     trace_goods_id = _trace_goods_id()
     trace_raw_prices: list[float] = []
+    cache_info_before = _cache_info_snapshot()
     try:
         source_iter = iter(iter_source_rows(source_path))
         while True:
             decode_started = time.perf_counter()
-            try:
-                row = next(source_iter)
-            except StopIteration:
-                _add_elapsed(stats, "decode_elapsed", decode_started)
-                break
+            rows = _next_row_batch(source_iter, max(1, int(cfg.batch_insert_size or 1)))
             _add_elapsed(stats, "decode_elapsed", decode_started)
-            stats.input_rows += 1
+            if not rows:
+                break
+            stats.input_rows += len(rows)
             normalize_started = time.perf_counter()
-            try:
-                item = normalize_emit_item(row, filial_id=filial_id, filial_name=filial_name, stats=stats)
-            except Exception:
-                _add_elapsed(stats, "normalize_elapsed", normalize_started)
-                _increment_skip(stats, "normalization_error")
-                logger.exception("[EMIT_NORMALIZE_ERROR] filial_id=%s row_index=%s", filial_id, stats.input_rows)
-                continue
-            if item is None:
-                _increment_skip(stats, emit_skip_reason(row))
-                _add_elapsed(stats, "normalize_elapsed", normalize_started)
-                continue
+            items: list[dict[str, Any]] = []
+            row_index = stats.input_rows - len(rows)
+            for row in rows:
+                row_index += 1
+                try:
+                    item = normalize_emit_item(row, filial_id=filial_id, filial_name=filial_name, stats=stats)
+                except Exception:
+                    _increment_skip(stats, "normalization_error")
+                    logger.exception("[EMIT_NORMALIZE_ERROR] filial_id=%s row_index=%s", filial_id, row_index)
+                    continue
+                if item is None:
+                    if _row_has_negative_price_candidate(row):
+                        stats.negative_price_rows_skipped += 1
+                    _increment_skip(stats, emit_skip_reason(row))
+                    continue
+                if trace_goods_id is not None and item.get("provisor_goods_id") == trace_goods_id:
+                    trace_raw_prices.append(float(item.get("distributor_price") or 0))
+                stats.positive_price_rows += 1
+                stats.normalized_rows += 1
+                if not item.get("provisor_goods_id"):
+                    stats.rows_without_goodsId += 1
+                items += [item]
             _add_elapsed(stats, "normalize_elapsed", normalize_started)
-            if trace_goods_id is not None and item.get("provisor_goods_id") == trace_goods_id:
-                trace_raw_prices.append(float(item.get("distributor_price") or 0))
-            stats.normalized_rows += 1
-            if not item.get("provisor_goods_id"):
-                stats.rows_without_goodsId += 1
             stage_upsert_started = time.perf_counter()
-            _stage_upsert(conn, item, stats)
+            _stage_insert_many(conn, items, stats)
             _add_elapsed(stats, "stage_upsert_elapsed", stage_upsert_started)
-            batch_count += 1
+            batch_count += len(items)
             if batch_count >= cfg.batch_insert_size:
                 stage_commit_started = time.perf_counter()
                 conn.commit()
@@ -1206,10 +1503,13 @@ def parse_normalize_stage(
     finally:
         conn.close()
     stage_audit_started = time.perf_counter()
-    stats.stage_db_size_mb = _stage_total_size_mb(stage_path)
+    stats.stage_db_size_bytes = _stage_total_size_bytes(stage_path)
+    stats.stage_db_size_mb = round(stats.stage_db_size_bytes / (1024 * 1024), 3)
+    stats.stage_db_size_gb = round(stats.stage_db_size_bytes / (1024 ** 3), 4)
     _add_elapsed(stats, "stage_audit_elapsed", stage_audit_started)
     stats.parse_dedupe_elapsed_sec = round(time.perf_counter() - started, 3)
     _update_max_rss(stats)
+    _apply_cache_info_delta(stats, cache_info_before, _cache_info_snapshot())
     if stats.final_rows_saved < cfg.min_final_rows:
         raise RuntimeError(
             f"Emit parse produced suspiciously low row count: {stats.final_rows_saved} < EMIT_MIN_FINAL_ROWS={cfg.min_final_rows}"
@@ -1228,6 +1528,32 @@ def parse_normalize_stage(
         stats.source_file_size_gb,
         stats.max_rss_mb,
         stats.parse_dedupe_elapsed_sec,
+    )
+    logger.info(
+        "[EMIT_PARSE_PERFORMANCE] filial_id=%s metrics=%s",
+        filial_id,
+        {
+            "decode_elapsed_sec": stats.decode_elapsed,
+            "normalize_elapsed_sec": stats.normalize_elapsed,
+            "manufacturer_normalization_elapsed_sec": stats.manufacturer_elapsed,
+            "stage_upsert_elapsed_sec": stats.stage_upsert_elapsed,
+            "stage_commit_elapsed_sec": stats.stage_commit_elapsed,
+            "stage_audit_elapsed_sec": stats.stage_audit_elapsed,
+            "input_rows": stats.input_rows,
+            "normalized_rows": stats.normalized_rows,
+            "positive_price_rows": stats.positive_price_rows,
+            "duplicate_rows_removed": stats.duplicate_rows_removed,
+            "zero_price_rows_skipped": stats.zero_price_rows_skipped,
+            "negative_price_rows_skipped": stats.negative_price_rows_skipped,
+            "manufacturer_cache_hits": stats.manufacturer_cache_hits,
+            "manufacturer_cache_misses": stats.manufacturer_cache_misses,
+            "normalization_cache_hits": stats.normalization_cache_hits,
+            "normalization_cache_misses": stats.normalization_cache_misses,
+            "stage_db_size_bytes": stats.stage_db_size_bytes,
+            "stage_db_size_mb": stats.stage_db_size_mb,
+            "stage_db_size_gb": stats.stage_db_size_gb,
+            "max_rss_mb": stats.max_rss_mb,
+        },
     )
     if stats.suspicious_groups:
         logger.warning("[EMIT_DEDUPE_SUSPICIOUS_GROUPS] filial_id=%s top=%s", filial_id, stats.suspicious_groups[:20])
@@ -1343,6 +1669,63 @@ def _mapping_from_stage_item(item: dict[str, Any], *, price_list_id: int, filial
     }
 
 
+def _copy_row_from_stage_tuple(row: tuple[Any, ...], *, price_list_id: int, filial_id: int) -> tuple[Any, ...]:
+    (
+        provisor_id,
+        provisor_goods_id,
+        row_filial_id,
+        name,
+        reg_number,
+        distributor_goods_name,
+        distributor_goods_id,
+        distributor_price,
+        stock,
+        package_count,
+        expiry_date,
+        raw_name,
+        raw_manufacturer,
+        raw_json,
+    ) = row
+    return (
+        price_list_id,
+        None,
+        provisor_id,
+        provisor_goods_id,
+        row_filial_id or filial_id,
+        name or "",
+        reg_number or "",
+        distributor_goods_name or name or "",
+        distributor_goods_id or "",
+        distributor_price,
+        stock,
+        package_count,
+        expiry_date or "",
+        "",
+        "unmatched",
+        None,
+        "",
+        raw_name or name or "",
+        raw_manufacturer or "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        "",
+        "",
+        "",
+        raw_json or "{}",
+    )
+
+
 def _copy_value(value: object, null_token: str) -> object:
     return null_token if value is None else value
 
@@ -1360,27 +1743,29 @@ def _bulk_insert_items_from_stage(
     config: EmitConfig,
 ) -> None:
     empty_fields = _empty_match_structure_fields()
-    stage_iter = iter_stage_rows(staging_path, batch_size=batch_size)
-    while True:
-        stage_read_started = time.perf_counter()
-        try:
-            rows = next(stage_iter)
-        except StopIteration:
+    with closing(sqlite3.connect(str(staging_path))) as stage_conn:
+        stage_conn.row_factory = sqlite3.Row
+        last_rowid = 0
+        while True:
+            stage_read_started = time.perf_counter()
+            raw_rows = _fetch_stage_row_batch(stage_conn, last_rowid=last_rowid, batch_size=batch_size)
             _add_elapsed(stats, "stage_read_elapsed", stage_read_started)
-            break
-        _add_elapsed(stats, "stage_read_elapsed", stage_read_started)
-        mapping_build_started = time.perf_counter()
-        batch = [
-            _mapping_from_stage_item(item, price_list_id=price_list_id, filial_id=filial_id, empty_fields=empty_fields)
-            for item in rows
-        ]
-        _add_elapsed(stats, "mapping_build_elapsed", mapping_build_started)
-        if batch:
-            bulk_insert_started = time.perf_counter()
-            db.bulk_insert_mappings(CompetitorPriceListItem, batch)
-            _add_elapsed(stats, "bulk_insert_elapsed", bulk_insert_started)
-        _ensure_free_disk(temp_dir, min_free_disk_gb)
-        _raise_if_memory_exceeded(config, stage="db_replace", stats=stats)
+            if not raw_rows:
+                break
+            last_rowid = int(raw_rows[-1]["rowid"])
+            rows = [{key: row[key] for key in row.keys() if key != "rowid"} for row in raw_rows]
+            mapping_build_started = time.perf_counter()
+            batch = [
+                _mapping_from_stage_item(item, price_list_id=price_list_id, filial_id=filial_id, empty_fields=empty_fields)
+                for item in rows
+            ]
+            _add_elapsed(stats, "mapping_build_elapsed", mapping_build_started)
+            if batch:
+                bulk_insert_started = time.perf_counter()
+                db.bulk_insert_mappings(CompetitorPriceListItem, batch)
+                _add_elapsed(stats, "bulk_insert_elapsed", bulk_insert_started)
+            _ensure_free_disk(temp_dir, min_free_disk_gb)
+            _raise_if_memory_exceeded(config, stage="db_replace", stats=stats)
 
 
 def _copy_items_from_stage_postgresql(
@@ -1394,53 +1779,92 @@ def _copy_items_from_stage_postgresql(
     temp_dir: Path,
     min_free_disk_gb: float,
     config: EmitConfig,
-) -> bool:
+) -> tuple[bool, str, str]:
     if (db.get_bind().dialect.name or "").lower() != "postgresql":
-        return False
+        return False, "sqlalchemy_fallback", "database_dialect_is_not_postgresql"
     connection = db.connection()
     raw_connection = getattr(connection.connection, "driver_connection", connection.connection)
     cursor = raw_connection.cursor()
-    if not hasattr(cursor, "copy_expert"):
+    supports_copy_expert = hasattr(cursor, "copy_expert")
+    supports_copy_context = hasattr(cursor, "copy")
+    if not supports_copy_expert and not supports_copy_context:
         cursor.close()
-        return False
+        return False, "sqlalchemy_fallback", "cursor_has_no_copy_api"
     temp_table = f"tmp_emit_items_{uuid.uuid4().hex}"
     null_token = f"__APTEKA_COPY_NULL_{uuid.uuid4().hex}__"
     columns_sql = ", ".join(_ITEM_INSERT_COLUMNS)
+    copy_sql = f"COPY {temp_table} ({columns_sql}) FROM STDIN WITH CSV NULL '{null_token}'"
+    copy_backend = "psycopg2_copy_expert" if supports_copy_expert else "psycopg3_copy"
     try:
+        temp_create_started = time.perf_counter()
         cursor.execute(f"CREATE TEMP TABLE {temp_table} (LIKE competitor_price_list_items INCLUDING DEFAULTS) ON COMMIT DROP")
-        empty_fields = _empty_match_structure_fields()
-        stage_iter = iter_stage_rows(staging_path, batch_size=batch_size)
-        while True:
-            stage_read_started = time.perf_counter()
-            try:
-                rows = next(stage_iter)
-            except StopIteration:
-                _add_elapsed(stats, "stage_read_elapsed", stage_read_started)
-                break
-            _add_elapsed(stats, "stage_read_elapsed", stage_read_started)
-            mapping_build_started = time.perf_counter()
-            buffer = io.StringIO()
-            writer = csv.writer(buffer, lineterminator="\n")
-            for item in rows:
-                mapping = _mapping_from_stage_item(item, price_list_id=price_list_id, filial_id=filial_id, empty_fields=empty_fields)
-                writer.writerow([_copy_value(mapping.get(column), null_token) for column in _ITEM_INSERT_COLUMNS])
-            buffer.seek(0)
-            _add_elapsed(stats, "mapping_build_elapsed", mapping_build_started)
-            if buffer.tell() or rows:
-                bulk_insert_started = time.perf_counter()
-                cursor.copy_expert(
-                    f"COPY {temp_table} ({columns_sql}) FROM STDIN WITH CSV NULL '{null_token}'",
-                    buffer,
-                )
-                _add_elapsed(stats, "bulk_insert_elapsed", bulk_insert_started)
-            _ensure_free_disk(temp_dir, min_free_disk_gb)
-            _raise_if_memory_exceeded(config, stage="db_replace", stats=stats)
-        bulk_insert_started = time.perf_counter()
+        _add_elapsed(stats, "temp_table_create_elapsed", temp_create_started)
+        with closing(sqlite3.connect(str(staging_path))) as stage_conn:
+            last_rowid = 0
+            if supports_copy_context and not supports_copy_expert:
+                copy_started = time.perf_counter()
+                with cursor.copy(copy_sql) as copy:
+                    _add_elapsed(stats, "copy_transfer_elapsed", copy_started)
+                    while True:
+                        stage_read_started = time.perf_counter()
+                        rows = _fetch_stage_copy_batch(stage_conn, last_rowid=last_rowid, batch_size=batch_size)
+                        _add_elapsed(stats, "stage_read_elapsed", stage_read_started)
+                        if not rows:
+                            break
+                        last_rowid = int(rows[-1][0])
+                        rows = [tuple(row[1:]) for row in rows]
+                        transform_started = time.perf_counter()
+                        copy_rows = [_copy_row_from_stage_tuple(row, price_list_id=price_list_id, filial_id=filial_id) for row in rows]
+                        _add_elapsed(stats, "row_transform_elapsed", transform_started)
+                        serialize_started = time.perf_counter()
+                        buffer = io.StringIO()
+                        writer = csv.writer(buffer, lineterminator="\n")
+                        for copy_row in copy_rows:
+                            writer.writerow(_copy_value(value, null_token) for value in copy_row)
+                        _add_elapsed(stats, "copy_serialize_elapsed", serialize_started)
+                        _add_elapsed(stats, "mapping_build_elapsed", serialize_started)
+                        if buffer.tell() or rows:
+                            transfer_started = time.perf_counter()
+                            copy.write(buffer.getvalue())
+                            _add_elapsed(stats, "copy_transfer_elapsed", transfer_started)
+                            _add_elapsed(stats, "bulk_insert_elapsed", transfer_started)
+                        _ensure_free_disk(temp_dir, min_free_disk_gb)
+                        _raise_if_memory_exceeded(config, stage="db_replace", stats=stats)
+            else:
+                while True:
+                    stage_read_started = time.perf_counter()
+                    rows = _fetch_stage_copy_batch(stage_conn, last_rowid=last_rowid, batch_size=batch_size)
+                    _add_elapsed(stats, "stage_read_elapsed", stage_read_started)
+                    if not rows:
+                        break
+                    last_rowid = int(rows[-1][0])
+                    rows = [tuple(row[1:]) for row in rows]
+                    transform_started = time.perf_counter()
+                    copy_rows = [_copy_row_from_stage_tuple(row, price_list_id=price_list_id, filial_id=filial_id) for row in rows]
+                    _add_elapsed(stats, "row_transform_elapsed", transform_started)
+                    serialize_started = time.perf_counter()
+                    buffer = io.StringIO()
+                    writer = csv.writer(buffer, lineterminator="\n")
+                    for copy_row in copy_rows:
+                        writer.writerow(_copy_value(value, null_token) for value in copy_row)
+                    buffer.seek(0)
+                    _add_elapsed(stats, "copy_serialize_elapsed", serialize_started)
+                    _add_elapsed(stats, "mapping_build_elapsed", serialize_started)
+                    if buffer.tell() or rows:
+                        copy_started = time.perf_counter()
+                        cursor.copy_expert(copy_sql, buffer)
+                        _add_elapsed(stats, "copy_transfer_elapsed", copy_started)
+                        _add_elapsed(stats, "bulk_insert_elapsed", copy_started)
+                    _ensure_free_disk(temp_dir, min_free_disk_gb)
+                    _raise_if_memory_exceeded(config, stage="db_replace", stats=stats)
+        final_insert_started = time.perf_counter()
         cursor.execute(
             f"INSERT INTO competitor_price_list_items ({columns_sql}) SELECT {columns_sql} FROM {temp_table}"
         )
-        _add_elapsed(stats, "bulk_insert_elapsed", bulk_insert_started)
-        return True
+        _add_elapsed(stats, "final_insert_elapsed", final_insert_started)
+        _add_elapsed(stats, "temp_insert_elapsed", final_insert_started)
+        _add_elapsed(stats, "bulk_insert_elapsed", final_insert_started)
+        return True, copy_backend, ""
     finally:
         cursor.close()
 
@@ -1456,7 +1880,9 @@ def replace_emit_price_list_from_staging(
     price_format_code: str | None = None,
 ) -> CompetitorPriceList:
     started = time.perf_counter()
+    validation_started = time.perf_counter()
     final_count = _row_count_in_staging(staging_path)
+    _add_elapsed(stats, "validation_elapsed", validation_started)
     if final_count < config.min_final_rows:
         raise RuntimeError(f"Emit staging produced suspiciously low row count: {final_count} < {config.min_final_rows}")
     pf = _price_format_for_code(db, price_format_code)
@@ -1482,10 +1908,13 @@ def replace_emit_price_list_from_staging(
         )
         db.add(row)
         db.flush()
+    previous_count_started = time.perf_counter()
     previous_count = int(
         db.scalar(select(func.count(CompetitorPriceListItem.id)).where(CompetitorPriceListItem.price_list_id == row.id))
         or 0
     )
+    _add_elapsed(stats, "previous_count_elapsed", previous_count_started)
+    _add_elapsed(stats, "validation_elapsed", previous_count_started)
     if previous_count > 0 and final_count < int(previous_count * config.min_row_ratio):
         raise RuntimeError(
             f"Emit staging row count dropped below ratio: new={final_count}, previous={previous_count}, ratio={config.min_row_ratio}"
@@ -1514,7 +1943,7 @@ def replace_emit_price_list_from_staging(
     delete_started = time.perf_counter()
     db.execute(delete(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == row.id))
     _add_elapsed(stats, "delete_elapsed", delete_started)
-    used_copy = _copy_items_from_stage_postgresql(
+    used_copy, copy_backend, copy_fallback_reason = _copy_items_from_stage_postgresql(
         db=db,
         staging_path=staging_path,
         stats=stats,
@@ -1525,7 +1954,16 @@ def replace_emit_price_list_from_staging(
         min_free_disk_gb=config.min_free_disk_gb,
         config=config,
     )
+    stats.copy_backend = copy_backend
+    stats.copy_fallback_reason = copy_fallback_reason
     if not used_copy:
+        logger.warning(
+            "[EMIT_DB_REPLACE_COPY] filial_id=%s price_list_id=%s copy_backend=%s copy_fallback_reason=%s",
+            filial_id,
+            row.id,
+            copy_backend,
+            copy_fallback_reason,
+        )
         _bulk_insert_items_from_stage(
             db=db,
             staging_path=staging_path,
@@ -1569,11 +2007,27 @@ def replace_emit_price_list_from_staging(
     db.commit()
     _add_elapsed(stats, "commit_elapsed", commit_started)
     logger.info(
-        "[EMIT_DB_REPLACE_SUMMARY] filial_id=%s previous_rows=%s final_rows_saved=%s elapsed_sec=%s",
+        "[EMIT_DB_REPLACE_SUMMARY] filial_id=%s previous_rows=%s final_rows_saved=%s elapsed_sec=%s "
+        "copy_backend=%s copy_fallback_reason=%s timings=%s",
         filial_id,
         previous_count,
         stats.final_rows_saved,
         stats.db_replace_elapsed_sec,
+        stats.copy_backend,
+        stats.copy_fallback_reason,
+        {
+            "validation_elapsed": stats.validation_elapsed,
+            "previous_count_elapsed": stats.previous_count_elapsed,
+            "delete_elapsed": stats.delete_elapsed,
+            "temp_table_create_elapsed": stats.temp_table_create_elapsed,
+            "stage_read_elapsed": stats.stage_read_elapsed,
+            "row_transform_elapsed": stats.row_transform_elapsed,
+            "copy_serialize_elapsed": stats.copy_serialize_elapsed,
+            "copy_transfer_elapsed": stats.copy_transfer_elapsed,
+            "final_insert_elapsed": stats.final_insert_elapsed,
+            "flush_elapsed": stats.flush_elapsed,
+            "commit_elapsed": stats.commit_elapsed,
+        },
     )
     return row
 
@@ -2437,19 +2891,22 @@ class EmitWorker:
             logger.info("[EMIT_STAGE] event=emit_download_started job_id=%s filial_id=%s", job_id, filial_id)
             temp_path = await download_emit_filial(config=self.config, filial_id=filial_id, filial_name=filial_name, job_callback=_download_progress)
             download_elapsed = round(time.perf_counter() - download_started, 3)
+            download_size_bytes = temp_path.stat().st_size
             logger.info(
-                "[EMIT_STAGE] event=emit_download_completed job_id=%s filial_id=%s elapsed_sec=%s bytes=%s",
+                "[EMIT_STAGE] event=emit_download_completed job_id=%s filial_id=%s download_elapsed_sec=%s download_size_bytes=%s download_size_mb=%s download_size_gb=%s",
                 job_id,
                 filial_id,
                 download_elapsed,
-                temp_path.stat().st_size,
+                download_size_bytes,
+                round(download_size_bytes / (1024 * 1024), 3),
+                round(download_size_bytes / (1024 ** 3), 4),
             )
             staging_dir = Path(self.config.temp_dir)
             staging_path = staging_dir / f"emit_stage_{job_id}_{filial_id}_{uuid.uuid4().hex}.sqlite"
             with self.session_factory() as db:
                 job = db.get(RefreshJob, job_id)
                 if job is not None:
-                    update_emit_job(db, job, status="parsing", message=f"Parsing Emit filial {filial_id}", metadata={"temp_file_path": str(temp_path), "file_size_bytes": temp_path.stat().st_size})
+                    update_emit_job(db, job, status="parsing", message=f"Parsing Emit filial {filial_id}", metadata={"temp_file_path": str(temp_path), "file_size_bytes": download_size_bytes})
             parse_started = time.perf_counter()
             logger.info("[EMIT_STAGE] event=emit_parse_started job_id=%s filial_id=%s stage_db_path=%s", job_id, filial_id, staging_path)
             stats = parse_normalize_stage(source_path=temp_path, stage_db_path=staging_path, filial_id=filial_id, filial_name=filial_name, config=self.config)
@@ -2462,7 +2919,10 @@ class EmitWorker:
                 stats.final_rows_saved,
                 stats.duplicate_rows_removed,
             )
-            stats.downloaded_bytes = temp_path.stat().st_size
+            stats.downloaded_bytes = download_size_bytes
+            stats.download_size_bytes = stats.downloaded_bytes
+            stats.download_size_mb = round(stats.download_size_bytes / (1024 * 1024), 3)
+            stats.download_size_gb = round(stats.download_size_bytes / (1024 ** 3), 4)
             stats.download_elapsed_sec = download_elapsed
             with self.session_factory() as db:
                 job = db.get(RefreshJob, job_id)
@@ -2488,6 +2948,7 @@ class EmitWorker:
                     round(time.perf_counter() - db_replace_started, 3),
                     stats.final_rows_saved,
                 )
+                logger.info("%s", _emit_performance_summary(stats))
                 job = db.get(RefreshJob, job_id)
                 if job is not None:
                     job.processed_plk = int(job.processed_plk or 0) + 1
