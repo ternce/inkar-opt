@@ -124,20 +124,33 @@ async def get_access_token(
     async with _lock:
         cached = _tokens_by_key.get(cache_key)
         if cached and cached.access and not _is_expired(cached.access_exp_unix):
+            logger.info("[PROVISOR_AUTH_TIMING] login=%s cache_hit=true auth_elapsed_sec=0.0", login_s)
             return cached.access
 
         timeout = httpx.Timeout(connect=10.0, read=timeout_seconds, write=30.0, pool=30.0)
         async with httpx.AsyncClient(base_url=base_url, timeout=timeout) as client:
             if cached and cached.access and cached.refresh:
                 try:
+                    auth_started_at = time.perf_counter()
                     updated = await _update_tokens(client=client, access=cached.access, refresh=cached.refresh)
                     _tokens_by_key[cache_key] = updated
+                    logger.info(
+                        "[PROVISOR_AUTH_TIMING] login=%s cache_hit=false token_refresh=true auth_elapsed_sec=%s",
+                        login_s,
+                        round(time.perf_counter() - auth_started_at, 3),
+                    )
                     return updated.access
                 except Exception:
                     _tokens_by_key.pop(cache_key, None)
 
+            auth_started_at = time.perf_counter()
             created = await _create_tokens(client=client, login=login_s, password=password_s)
             _tokens_by_key[cache_key] = created
+            logger.info(
+                "[PROVISOR_AUTH_TIMING] login=%s cache_hit=false token_refresh=false auth_elapsed_sec=%s",
+                login_s,
+                round(time.perf_counter() - auth_started_at, 3),
+            )
             return created.access
 
 
@@ -165,25 +178,42 @@ async def get_filials_by_context(
                 headers=headers,
             )
 
+        request_started_at = time.perf_counter()
         resp = await _call(token)
+        request_elapsed_sec = round(time.perf_counter() - request_started_at, 3)
         if resp.status_code in (401, 403):
             cache_key = (base_url.rstrip("/"), (login or "").strip())
             async with _lock:
                 _tokens_by_key.pop(cache_key, None)
             token2 = await get_access_token(base_url=base_url, login=login, password=password, timeout_seconds=timeout_seconds)
+            request_started_at = time.perf_counter()
             resp = await _call(token2)
+            request_elapsed_sec += round(time.perf_counter() - request_started_at, 3)
 
         if resp.status_code >= 400:
             raise ProvisorAuthError(f"Distributor/GetFilialsByContext failed: HTTP {resp.status_code}: {resp.text}")
 
         try:
+            decode_started_at = time.perf_counter()
             data = resp.json()
+            decode_elapsed_sec = round(time.perf_counter() - decode_started_at, 3)
         except Exception:
             raise ProvisorAuthError(f"Distributor/GetFilialsByContext returned invalid JSON: {resp.text}")
         if not isinstance(data, list):
             raise ProvisorAuthError("Distributor/GetFilialsByContext returned non-list JSON")
+        rows = [x for x in data if isinstance(x, dict)]
         logger.info("Provisor filials loaded: %s", len(data))
-        return [x for x in data if isinstance(x, dict)]
+        logger.info(
+            "[PROVISOR_FILIAL_LIST_TIMING] login=%s http_status=%s filials_raw=%s filials_valid=%s response_size_mb=%s filial_list_request_elapsed_sec=%s filial_list_parse_elapsed_sec=%s",
+            (login or "").strip(),
+            resp.status_code,
+            len(data),
+            len(rows),
+            round(len(resp.content) / (1024 * 1024), 3),
+            request_elapsed_sec,
+            decode_elapsed_sec,
+        )
+        return rows
 
 
 async def get_prices_by_filial_id(
