@@ -179,6 +179,50 @@ def recalculate_competitor_percentiles(
     )
 
 
+def fanout_emit_percentiles_from_price_format(
+    *,
+    db: Session,
+    source_price_format_id: int,
+    target_price_format_id: int,
+    source_price_list_ids: list[int],
+) -> dict[str, Any]:
+    """Copy already-calculated Emit percentile rows to another assigned format.
+
+    This preserves the existing compatibility storage shape: readers still use
+    price_format_id-specific rows, while Emit's expensive raw-price aggregation
+    can run once per source refresh.
+    """
+    started_at = time.perf_counter()
+    selected_sources = _selected_source_rows(
+        db=db,
+        price_format_id=target_price_format_id,
+        source_price_list_ids=source_price_list_ids,
+    )
+    if not selected_sources:
+        return _skip_summary(target_price_format_id) | {
+            "engine": "fanout",
+            "source_price_format_id": source_price_format_id,
+            "compatibility_rows_created": 0,
+        }
+
+    dialect = (db.get_bind().dialect.name or "").lower()
+    if dialect == "postgresql":
+        return _fanout_emit_percentiles_postgresql(
+            db=db,
+            source_price_format_id=source_price_format_id,
+            target_price_format_id=target_price_format_id,
+            selected_sources=selected_sources,
+            started_at=started_at,
+        )
+    return _fanout_emit_percentiles_python(
+        db=db,
+        source_price_format_id=source_price_format_id,
+        target_price_format_id=target_price_format_id,
+        selected_sources=selected_sources,
+        started_at=started_at,
+    )
+
+
 def _selected_source_rows(
     *,
     db: Session,
@@ -235,6 +279,309 @@ def _skip_summary(price_format_id: int) -> dict[str, Any]:
         "rows_skipped": 1,
         "rows_deleted": 0,
         "message": "No eligible percentile source assigned; percentile rebuild skipped.",
+    }
+
+
+def _source_scope_filter(selected_sources: list[dict[str, Any]]):
+    regional_filters = [
+        (
+            (
+                (func.coalesce(CompetitorPricePercentile.source_key, "") == str(source["source_key"] or ""))
+                | (
+                    (func.coalesce(CompetitorPricePercentile.source_key, "") == "")
+                    & (CompetitorPricePercentile.branch_name == str(source["branch_name"] or ""))
+                    & (CompetitorPricePercentile.competitor_name == str(source["competitor_name"] or ""))
+                )
+            )
+            & (CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
+        )
+        for source in selected_sources
+    ]
+    kazakhstan_filters = [
+        (
+            (CompetitorPricePercentile.branch_name == KAZAKHSTAN_REGION)
+            & (CompetitorPricePercentile.competitor_name == competitor)
+            & (CompetitorPricePercentile.percentile_scope == KAZAKHSTAN_SCOPE)
+        )
+        for competitor in sorted({str(source["competitor_name"] or "") for source in selected_sources})
+    ]
+    return or_(*(regional_filters + kazakhstan_filters))
+
+
+def _fanout_emit_percentiles_python(
+    *,
+    db: Session,
+    source_price_format_id: int,
+    target_price_format_id: int,
+    selected_sources: list[dict[str, Any]],
+    started_at: float,
+) -> dict[str, Any]:
+    scoped_filter = _source_scope_filter(selected_sources)
+    existing_rows = int(
+        db.execute(
+            select(func.count(CompetitorPricePercentile.id))
+            .where(CompetitorPricePercentile.price_format_id == target_price_format_id)
+            .where(scoped_filter)
+        ).scalar_one()
+        or 0
+    )
+    deleted_rows = int(
+        db.execute(
+            delete(CompetitorPricePercentile)
+            .where(CompetitorPricePercentile.price_format_id == target_price_format_id)
+            .where(scoped_filter)
+        ).rowcount
+        or 0
+    )
+    source_rows = (
+        db.execute(
+            select(CompetitorPricePercentile)
+            .where(CompetitorPricePercentile.price_format_id == source_price_format_id)
+            .where(scoped_filter)
+            .order_by(
+                CompetitorPricePercentile.product_id,
+                CompetitorPricePercentile.source_key,
+                CompetitorPricePercentile.branch_name,
+                CompetitorPricePercentile.competitor_name,
+                CompetitorPricePercentile.percentile_scope,
+                CompetitorPricePercentile.percentile,
+            )
+        )
+        .scalars()
+        .all()
+    )
+    mappings = [
+        {
+            "price_format_id": target_price_format_id,
+            "product_id": row.product_id,
+            "competitor_price_list_id": row.competitor_price_list_id,
+            "source_type": row.source_type,
+            "source_key": row.source_key,
+            "branch_name": row.branch_name,
+            "competitor_name": row.competitor_name,
+            "percentile_scope": row.percentile_scope,
+            "percentile": row.percentile,
+            "value": row.value,
+            "source_count": row.source_count,
+            "price_count": row.price_count,
+            "used_price_count": row.used_price_count,
+            "status": row.status,
+            "updated_at": row.updated_at,
+        }
+        for row in source_rows
+    ]
+    if mappings:
+        db.bulk_insert_mappings(CompetitorPricePercentile, mappings)
+
+    products_processed = int(
+        db.execute(select(func.count(Product.id))).scalar_one()
+        or 0
+    )
+    products_with_competitors = {
+        int(row.product_id)
+        for row in source_rows
+        if row.percentile_scope == REGIONAL_SCOPE and row.value is not None
+    }
+    inserted = len(mappings)
+    summary = {
+        "products_processed": products_processed,
+        "products_with_competitors": len(products_with_competitors),
+        "products_without_competitors": max(0, products_processed - len(products_with_competitors)),
+        "rows_created": inserted,
+        "rows_updated": 0,
+        "rows_skipped": 0,
+        "rows_deleted": deleted_rows,
+        "execution_time_seconds": round(time.perf_counter() - started_at, 3),
+        "engine": "fanout_python",
+        "source_price_format_id": source_price_format_id,
+        "rows_before": existing_rows,
+        "compatibility_rows_created": inserted,
+    }
+    return summary
+
+
+def _fanout_emit_percentiles_postgresql(
+    *,
+    db: Session,
+    source_price_format_id: int,
+    target_price_format_id: int,
+    selected_sources: list[dict[str, Any]],
+    started_at: float,
+) -> dict[str, Any]:
+    db.execute(text("DROP TABLE IF EXISTS tmp_emit_percentile_fanout_sources"))
+    db.execute(
+        text(
+            """
+            CREATE TEMP TABLE tmp_emit_percentile_fanout_sources (
+                price_list_id BIGINT PRIMARY KEY,
+                branch_name TEXT NOT NULL,
+                competitor_name TEXT NOT NULL,
+                source_key TEXT NOT NULL
+            ) ON COMMIT DROP
+            """
+        )
+    )
+    db.execute(
+        text(
+            """
+            INSERT INTO tmp_emit_percentile_fanout_sources (
+                price_list_id,
+                branch_name,
+                competitor_name,
+                source_key
+            )
+            VALUES (
+                :price_list_id,
+                :branch_name,
+                :competitor_name,
+                :source_key
+            )
+            """
+        ),
+        [
+            {
+                "price_list_id": source["price_list_id"],
+                "branch_name": source["branch_name"],
+                "competitor_name": source["competitor_name"],
+                "source_key": source["source_key"],
+            }
+            for source in selected_sources
+        ],
+    )
+    scope_sql = """
+        (
+          cpp.percentile_scope = :regional_scope
+          AND EXISTS (
+            SELECT 1
+            FROM tmp_emit_percentile_fanout_sources s
+            WHERE (
+                cpp.source_key = s.source_key
+                OR (
+                    coalesce(cpp.source_key, '') = ''
+                    AND cpp.branch_name = s.branch_name
+                    AND cpp.competitor_name = s.competitor_name
+                )
+            )
+          )
+        )
+        OR (
+          cpp.percentile_scope = :kazakhstan_scope
+          AND cpp.branch_name = :kazakhstan_region
+          AND EXISTS (
+            SELECT 1
+            FROM tmp_emit_percentile_fanout_sources s
+            WHERE cpp.competitor_name = s.competitor_name
+          )
+        )
+    """
+    params = {
+        "source_price_format_id": source_price_format_id,
+        "target_price_format_id": target_price_format_id,
+        "regional_scope": REGIONAL_SCOPE,
+        "kazakhstan_scope": KAZAKHSTAN_SCOPE,
+        "kazakhstan_region": KAZAKHSTAN_REGION,
+    }
+    existing_rows = int(
+        db.execute(
+            text(
+                f"""
+                SELECT count(cpp.id)
+                FROM competitor_price_percentiles cpp
+                WHERE cpp.price_format_id = :target_price_format_id
+                  AND ({scope_sql})
+                """
+            ),
+            params,
+        ).scalar()
+        or 0
+    )
+    deleted_rows = int(
+        db.execute(
+            text(
+                f"""
+                DELETE FROM competitor_price_percentiles cpp
+                WHERE cpp.price_format_id = :target_price_format_id
+                  AND ({scope_sql})
+                """
+            ),
+            params,
+        ).rowcount
+        or 0
+    )
+    insert_result = db.execute(
+        text(
+            f"""
+            INSERT INTO competitor_price_percentiles (
+                price_format_id,
+                product_id,
+                competitor_price_list_id,
+                source_type,
+                source_key,
+                branch_name,
+                competitor_name,
+                percentile_scope,
+                percentile,
+                value,
+                source_count,
+                price_count,
+                used_price_count,
+                status,
+                updated_at
+            )
+            SELECT
+                :target_price_format_id AS price_format_id,
+                cpp.product_id,
+                cpp.competitor_price_list_id,
+                cpp.source_type,
+                cpp.source_key,
+                cpp.branch_name,
+                cpp.competitor_name,
+                cpp.percentile_scope,
+                cpp.percentile,
+                cpp.value,
+                cpp.source_count,
+                cpp.price_count,
+                cpp.used_price_count,
+                cpp.status,
+                cpp.updated_at
+            FROM competitor_price_percentiles cpp
+            WHERE cpp.price_format_id = :source_price_format_id
+              AND ({scope_sql})
+            """
+        ),
+        params,
+    )
+    inserted = int(insert_result.rowcount or 0)
+    stats = db.execute(
+        text(
+            f"""
+            SELECT
+                (SELECT count(*) FROM products) AS products_processed,
+                count(DISTINCT cpp.product_id) FILTER (
+                    WHERE cpp.percentile_scope = :regional_scope AND cpp.value IS NOT NULL
+                ) AS products_with_competitors
+            FROM competitor_price_percentiles cpp
+            WHERE cpp.price_format_id = :source_price_format_id
+              AND ({scope_sql})
+            """
+        ),
+        params,
+    ).mappings().one()
+    products_processed = int(stats["products_processed"] or 0)
+    products_with_competitors = int(stats["products_with_competitors"] or 0)
+    return {
+        "products_processed": products_processed,
+        "products_with_competitors": products_with_competitors,
+        "products_without_competitors": max(0, products_processed - products_with_competitors),
+        "rows_created": inserted,
+        "rows_updated": 0,
+        "rows_skipped": 0,
+        "rows_deleted": deleted_rows,
+        "execution_time_seconds": round(time.perf_counter() - started_at, 3),
+        "engine": "fanout_postgresql",
+        "source_price_format_id": source_price_format_id,
+        "rows_before": existing_rows,
+        "compatibility_rows_created": inserted,
     }
 
 
@@ -832,6 +1179,7 @@ def _recalculate_competitor_percentiles_postgresql(
         "products_processed": products_processed,
         "products_with_competitors": products_with_competitors_count,
         "products_without_competitors": max(0, products_processed - products_with_competitors_count),
+        "raw_price_rows": int(stats["raw_price_rows"] or 0),
         "rows_created": inserted,
         "rows_updated": 0,
         "rows_skipped": 0,
@@ -1161,6 +1509,7 @@ def _recalculate_competitor_percentiles_python(
         "products_processed": products_processed,
         "products_with_competitors": products_with_competitors_count,
         "products_without_competitors": max(0, products_processed - products_with_competitors_count),
+        "raw_price_rows": sum(int(value) for value in raw_count_by_source.values()),
         "rows_created": inserted,
         "rows_updated": 0,
         "rows_skipped": 0,

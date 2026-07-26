@@ -219,6 +219,9 @@ def test_one_provisor_plk_failure_does_not_cancel_remaining(monkeypatch):
     assert sorted(adapter.fetched_item_ids) == ["100", "104", "105"]
     assert result["progress"]["success_with_items"] == 2
     assert result["progress"]["errors"] == 1
+    assert result["provisorAudit"]["success_nonzero"] == 2
+    assert result["provisorAudit"]["failed"] == 1
+    assert result["provisorAudit"]["invariant_ok"] is True
     saved = sorted(db.execute(select(CompetitorPriceList.external_price_list_id)).scalars().all())
     assert saved == ["100", "105"]
 
@@ -245,6 +248,8 @@ def test_duplicate_provisor_plk_external_id_refreshed_once_with_aliases(monkeypa
     assert result["inventory"]["raw_plk_candidates"] == 2
     assert result["inventory"]["unique_plk"] == 1
     assert result["inventory"]["duplicates"] == 1
+    assert result["provisorAudit"]["skipped"] == 1
+    assert result["provisorAudit"]["failure_skip_reasons"]["duplicate_external_plk_id"] == 1
     rows = db.execute(select(CompetitorPriceList)).scalars().all()
     assert len(rows) == 1
     assert rows[0].source_key == "plk:128"
@@ -491,6 +496,8 @@ def test_provisor_timeout_does_not_wipe_existing_items(monkeypatch):
 
     assert result["progress"]["timeout"] == 1
     assert result["progress"]["skipped_timeout"] == 1
+    assert result["provisorAudit"]["timed_out"] == 1
+    assert result["provisorAudit"]["failure_skip_reasons"]["timeout_0.01s"] == 1
     assert db.execute(select(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == existing.id)).scalar_one().name == "Old Item"
 
 
@@ -534,6 +541,8 @@ def test_provisor_zero_response_does_not_wipe_existing_items(monkeypatch):
     row = db.execute(select(CompetitorPriceList).where(CompetitorPriceList.source_key == "plk:1397")).scalar_one()
     items = db.execute(select(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == row.id)).scalars().all()
     assert result["progress"]["success_zero_items"] == 1
+    assert result["provisorAudit"]["success_zero"] == 1
+    assert result["provisorAudit"]["failure_skip_reasons"]["empty_response_preserved_previous_rows"] == 1
     assert row.last_refresh_status == "success_zero_items"
     assert [item.name for item in items] == ["Old Item"]
 

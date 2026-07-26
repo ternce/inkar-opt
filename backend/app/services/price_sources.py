@@ -124,8 +124,17 @@ class ProvisorPriceService:
             force_refresh=True,
         )
         configured_ids = set(self._configured_filial_ids(account))
+        raw_count = len(filials)
         if configured_ids and bool(account.config.get("limitToConfiguredFilialIds")):
             filials = [row for row in filials if int(row.get("id") or 0) in configured_ids]
+        logger.info(
+            "[PROVISOR_FILIAL_SELECTION] account_id=%s filials_returned=%s filials_selected=%s skipped_by_configuration=%s limit_to_configured=%s",
+            account.id,
+            raw_count,
+            len(filials),
+            max(0, raw_count - len(filials)),
+            bool(account.config.get("limitToConfiguredFilialIds")),
+        )
         return filials
 
     def _configured_filial_ids(self, account: PriceSourceAccountCredentials) -> list[int]:
@@ -226,6 +235,11 @@ class ProvisorPriceService:
 
         out: list[UnifiedPriceItem] = []
         manufacturer_cache: dict[tuple[object, str], str] = {}
+        valid_rows = 0
+        positive_price_rows = 0
+        zero_price_rows = 0
+        invalid_price_rows = 0
+        missing_required_identifier_rows = 0
         source = self.source
         account_id = str(account.id)
         price_list_id = str(filial_id)
@@ -235,10 +249,19 @@ class ProvisorPriceService:
         for item in raw_items:
             if not isinstance(item, dict):
                 continue
+            valid_rows += 1
             goods = item.get("goods") if isinstance(item.get("goods"), dict) else {}
             price = as_decimal(item.get("goodsPriceWithUserDiscount"))
             if price is None or price <= 0:
                 price = as_decimal(item.get("goodsPrice"))
+            if price is not None and price > 0:
+                positive_price_rows += 1
+            elif price == 0:
+                zero_price_rows += 1
+            else:
+                invalid_price_rows += 1
+            if not str(item.get("distributorGoodsId") or "").strip() and not str(item.get("goodsId") or "").strip():
+                missing_required_identifier_rows += 1
             stock = as_decimal(item.get("stored"))
             box = as_decimal(item.get("box"))
             pack = as_decimal(item.get("pack"))
@@ -277,9 +300,15 @@ class ProvisorPriceService:
             )
         normalize_elapsed_ms = round((time.perf_counter() - normalize_started_at) * 1000, 2)
         logger.info(
-            "[PROVISOR_PLK_NORMALIZATION_TIMING] account_id=%s filial_id=%s rows=%s fetch_elapsed_ms=%s normalization_elapsed_ms=%s manufacturer_cache_size=%s",
+            "[PROVISOR_PLK_NORMALIZATION_TIMING] account_id=%s filial_id=%s raw_rows=%s valid_rows=%s positive_price_rows=%s zero_price_rows=%s invalid_price_rows=%s rows_missing_required_identifier=%s normalized_rows=%s fetch_elapsed_ms=%s normalization_elapsed_ms=%s manufacturer_cache_size=%s",
             account.id,
             filial_id,
+            len(raw_items),
+            valid_rows,
+            positive_price_rows,
+            zero_price_rows,
+            invalid_price_rows,
+            missing_required_identifier_rows,
             len(out),
             fetch_elapsed_ms,
             normalize_elapsed_ms,

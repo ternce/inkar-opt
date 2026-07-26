@@ -52,6 +52,7 @@ from backend.app.services.emit_worker import (
     _PRICE_TAIL_RE,
     _recalculate_percentiles_for_emit_rows,
 )
+from backend.app.services import emit_worker as emit_worker_module
 from backend.app.services.competitor_assignments import (
     propagate_emit_assignments_to_new_price_format,
     propagate_emit_assignments_to_price_formats,
@@ -302,6 +303,9 @@ def test_postgresql_copy_path_supports_psycopg3_cursor_copy(monkeypatch, tmp_pat
         def write(self, data):
             writes.append(data)
 
+        def write_row(self, row):
+            writes.append(row)
+
     class FakeCursor:
         def execute(self, sql):
             executed.append(sql)
@@ -361,7 +365,7 @@ def test_postgresql_copy_path_supports_psycopg3_cursor_copy(monkeypatch, tmp_pat
     finally:
         conn.close()
 
-    used, backend, reason = emit_worker._copy_items_from_stage_postgresql(
+    used, backend, reason, temp_table, copied_rows = emit_worker._copy_items_from_stage_postgresql(
         db=FakeDb(),
         staging_path=stage,
         stats=EmitStats(),
@@ -376,6 +380,8 @@ def test_postgresql_copy_path_supports_psycopg3_cursor_copy(monkeypatch, tmp_pat
     assert used is True
     assert backend == "psycopg3_copy"
     assert reason == ""
+    assert temp_table.startswith("tmp_emit_items_")
+    assert copied_rows == 1
     assert any(str(sql).startswith("COPY tmp_emit_items_") for sql in executed)
     assert writes and "SKU" in writes[0]
     emit_worker._delete_stage_files(stage)
@@ -393,7 +399,7 @@ def test_copy_path_reports_sqlalchemy_fallback_for_non_postgresql(tmp_path):
         def get_bind(self):
             return FakeBind()
 
-    used, backend, reason = __import__(
+    used, backend, reason, temp_table, copied_rows = __import__(
         "backend.app.services.emit_worker",
         fromlist=["_copy_items_from_stage_postgresql"],
     )._copy_items_from_stage_postgresql(
@@ -411,6 +417,8 @@ def test_copy_path_reports_sqlalchemy_fallback_for_non_postgresql(tmp_path):
     assert used is False
     assert backend == "sqlalchemy_fallback"
     assert reason == "database_dialect_is_not_postgresql"
+    assert temp_table == ""
+    assert copied_rows == 0
 
 
 def test_deduplicate_prefers_goods_id_positive_price_and_full_name():
@@ -570,6 +578,161 @@ def test_batched_parse_matches_single_row_batch_serialization_and_dedupe(tmp_pat
     assert single.zero_price_rows_skipped == batched.zero_price_rows_skipped == 1
     assert single.skip_reasons == batched.skip_reasons
     assert _stage_full_rows(stage_single) == _stage_full_rows(stage_batch)
+
+
+def _parse_rows_with_batch(tmp_path, rows, *, batch_size, stage_name="stage.sqlite"):
+    source = tmp_path / f"{stage_name}.ndjson"
+    stage = tmp_path / stage_name
+    source.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows), encoding="utf-8")
+    stats = parse_normalize_stage(
+        source_path=source,
+        stage_db_path=stage,
+        filial_id=1106,
+        filial_name="Emit",
+        config=EmitConfig(temp_dir=str(tmp_path), min_free_disk_gb=0, min_final_rows=1, batch_insert_size=batch_size),
+    )
+    return stats, stage, _stage_full_rows(stage)
+
+
+def _assert_parse_equivalent(reference_stats, reference_rows, optimized_stats, optimized_rows):
+    assert reference_rows == optimized_rows
+    for attr in (
+        "input_rows",
+        "final_rows_saved",
+        "duplicate_rows_removed",
+        "zero_price_rows_skipped",
+        "negative_price_rows_skipped",
+        "rows_without_goodsId",
+        "key_type_counts",
+        "skip_reasons",
+    ):
+        assert getattr(optimized_stats, attr) == getattr(reference_stats, attr)
+
+
+def test_emit_fast_path_zero_duplicates_matches_single_row_reference(tmp_path):
+    rows = [
+        {"id": i, "goodsId": i, "distributorGoodsId": f"SKU-{i}", "distributorGoodsName": f"Item {i}", "goodsPrice": i + 10}
+        for i in range(1, 8)
+    ]
+    reference_stats, _reference_stage, reference_rows = _parse_rows_with_batch(tmp_path, rows, batch_size=1, stage_name="reference.sqlite")
+    optimized_stats, _optimized_stage, optimized_rows = _parse_rows_with_batch(tmp_path, rows, batch_size=20, stage_name="optimized.sqlite")
+
+    _assert_parse_equivalent(reference_stats, reference_rows, optimized_stats, optimized_rows)
+    assert optimized_stats.fast_insert_batches == 1
+    assert optimized_stats.fallback_dedupe_batches == 0
+    assert optimized_stats.audit_mode == "parse_time"
+
+
+def test_emit_duplicate_inside_one_batch_uses_fallback_and_matches_reference(tmp_path):
+    rows = [
+        {"id": 1, "goodsId": 10, "distributorGoodsId": "SKU-A", "distributorGoodsName": "A", "goodsPrice": 12, "stored": 3},
+        {"id": 1, "goodsId": 10, "distributorGoodsId": "SKU-A", "distributorGoodsName": "A", "goodsPrice": 12, "stored": 3},
+        {"id": 2, "goodsId": 11, "distributorGoodsId": "SKU-B", "distributorGoodsName": "B", "goodsPrice": 8},
+    ]
+    reference_stats, _reference_stage, reference_rows = _parse_rows_with_batch(tmp_path, rows, batch_size=1, stage_name="reference.sqlite")
+    optimized_stats, _optimized_stage, optimized_rows = _parse_rows_with_batch(tmp_path, rows, batch_size=50, stage_name="optimized.sqlite")
+
+    _assert_parse_equivalent(reference_stats, reference_rows, optimized_stats, optimized_rows)
+    assert optimized_stats.duplicate_rows_removed == 1
+    assert optimized_stats.fallback_dedupe_batches == 1
+    assert optimized_stats.verified_duplicates == 1
+    assert optimized_stats.audit_mode == "sqlite_fallback"
+
+
+def test_emit_duplicate_across_batches_uses_fallback_and_matches_reference(tmp_path):
+    rows = [
+        {"id": 1, "goodsId": 10, "distributorGoodsId": "SKU-A", "distributorGoodsName": "A", "goodsPrice": 12},
+        {"id": 2, "goodsId": 11, "distributorGoodsId": "SKU-B", "distributorGoodsName": "B", "goodsPrice": 8},
+        {"id": 1, "goodsId": 10, "distributorGoodsId": "SKU-A", "distributorGoodsName": "A", "goodsPrice": 12},
+        {"id": 3, "goodsId": 12, "distributorGoodsId": "SKU-C", "distributorGoodsName": "C", "goodsPrice": 9},
+        {"id": 4, "goodsId": 13, "distributorGoodsId": "SKU-D", "distributorGoodsName": "D", "goodsPrice": 10},
+    ]
+    reference_stats, _reference_stage, reference_rows = _parse_rows_with_batch(tmp_path, rows, batch_size=1, stage_name="reference.sqlite")
+    optimized_stats, _optimized_stage, optimized_rows = _parse_rows_with_batch(tmp_path, rows, batch_size=2, stage_name="optimized.sqlite")
+
+    _assert_parse_equivalent(reference_stats, reference_rows, optimized_stats, optimized_rows)
+    assert optimized_stats.duplicate_rows_removed == 1
+    assert optimized_stats.fast_insert_batches == 2
+    assert optimized_stats.fallback_dedupe_batches == 1
+    assert optimized_stats.fast_path_disabled_after_duplicate is False
+    assert optimized_stats.audit_mode == "sqlite_fallback"
+
+
+def test_emit_late_duplicate_after_many_unique_batches_matches_reference(tmp_path):
+    first = {"id": 1, "goodsId": 10, "distributorGoodsId": "SKU-A", "distributorGoodsName": "A", "goodsPrice": 12}
+    rows = [first] + [
+        {"id": i, "goodsId": 100 + i, "distributorGoodsId": f"SKU-{i}", "distributorGoodsName": f"Item {i}", "goodsPrice": i + 1}
+        for i in range(2, 30)
+    ] + [dict(first)]
+    reference_stats, _reference_stage, reference_rows = _parse_rows_with_batch(tmp_path, rows, batch_size=1, stage_name="reference.sqlite")
+    optimized_stats, _optimized_stage, optimized_rows = _parse_rows_with_batch(tmp_path, rows, batch_size=5, stage_name="optimized.sqlite")
+
+    _assert_parse_equivalent(reference_stats, reference_rows, optimized_stats, optimized_rows)
+    assert optimized_stats.duplicate_rows_removed == 1
+    assert optimized_stats.fallback_dedupe_batches == 1
+
+
+def test_emit_many_legitimate_prices_for_same_goods_id_are_preserved(tmp_path):
+    rows = [
+        {"id": i, "goodsId": 10, "distributorGoodsId": f"SKU-{i}", "distributorGoodsName": f"A {i}", "goodsPrice": i + 1}
+        for i in range(15)
+    ]
+    stats, stage, staged_rows = _parse_rows_with_batch(tmp_path, rows, batch_size=50)
+
+    assert stats.final_rows_saved == 15
+    assert stats.duplicate_rows_removed == 0
+    assert [row["distributor_price"] for row in staged_rows] == [float(i + 1) for i in range(15)]
+    with sqlite3.connect(stage) as conn:
+        conn.row_factory = sqlite3.Row
+        key_counts, suspicious = emit_worker_module.collect_stage_audit(conn)
+    assert stats.key_type_counts == key_counts
+    assert stats.suspicious_groups == suspicious
+
+
+def test_emit_same_identity_different_price_stock_or_timestamp_are_distinct(tmp_path):
+    rows = [
+        {"id": 1, "goodsId": 10, "distributorGoodsId": "SKU-A", "distributorGoodsName": "A", "goodsPrice": 12, "stored": 3, "updatedAt": "t1"},
+        {"id": 1, "goodsId": 10, "distributorGoodsId": "SKU-A", "distributorGoodsName": "A", "goodsPrice": 13, "stored": 3, "updatedAt": "t1"},
+        {"id": 1, "goodsId": 10, "distributorGoodsId": "SKU-A", "distributorGoodsName": "A", "goodsPrice": 12, "stored": 4, "updatedAt": "t1"},
+        {"id": 1, "goodsId": 10, "distributorGoodsId": "SKU-A", "distributorGoodsName": "A", "goodsPrice": 12, "stored": 3, "updatedAt": "t2"},
+    ]
+    stats, _stage, staged_rows = _parse_rows_with_batch(tmp_path, rows, batch_size=50)
+
+    assert stats.final_rows_saved == 4
+    assert stats.duplicate_rows_removed == 0
+    assert [row["distributor_price"] for row in staged_rows] == [12, 13, 12, 12]
+    assert [row["stock"] for row in staged_rows] == [3, 3, 4, 3]
+
+
+def test_emit_forced_compact_hash_collision_keeps_distinct_full_keys(monkeypatch, tmp_path):
+    rows = [
+        {"id": 1, "goodsId": 10, "distributorGoodsId": "SKU-A", "distributorGoodsName": "A", "goodsPrice": 12},
+        {"id": 2, "goodsId": 11, "distributorGoodsId": "SKU-B", "distributorGoodsName": "B", "goodsPrice": 8},
+    ]
+    reference_stats, _reference_stage, reference_rows = _parse_rows_with_batch(tmp_path, rows, batch_size=1, stage_name="reference.sqlite")
+    monkeypatch.setattr(emit_worker_module, "_stage_compact_key", lambda _key: b"samekey1")
+    optimized_stats, _optimized_stage, optimized_rows = _parse_rows_with_batch(tmp_path, rows, batch_size=50, stage_name="optimized.sqlite")
+
+    _assert_parse_equivalent(reference_stats, reference_rows, optimized_stats, optimized_rows)
+    assert optimized_stats.duplicate_rows_removed == 0
+    assert optimized_stats.fallback_dedupe_batches == 1
+    assert optimized_stats.hash_collision_candidates == 2
+    assert optimized_stats.audit_mode == "sqlite_fallback"
+
+
+def test_emit_parse_time_audit_equals_collect_stage_audit_for_fast_path(tmp_path):
+    rows = [
+        {"id": i, "goodsId": 10, "distributorGoodsId": f"SKU-{i}", "distributorGoodsName": f"A {i}", "goodsPrice": i + 1}
+        for i in range(12)
+    ]
+    stats, stage, _staged_rows = _parse_rows_with_batch(tmp_path, rows, batch_size=50)
+
+    assert stats.audit_mode == "parse_time"
+    with sqlite3.connect(stage) as conn:
+        conn.row_factory = sqlite3.Row
+        key_counts, suspicious = emit_worker_module.collect_stage_audit(conn)
+    assert stats.key_type_counts == key_counts
+    assert stats.suspicious_groups == suspicious
 
 
 def test_emit_numeric_parsing_equivalence_cases():
@@ -859,6 +1022,118 @@ def test_successful_parse_creates_selectable_competitor_price_list(tmp_path):
     assert db.scalar(select(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == row.id).with_only_columns(CompetitorPriceListItem.id).limit(1)) is not None
 
 
+def test_emit_db_replace_preserves_stage_values_and_other_price_lists(tmp_path):
+    db = _session()
+    pf = _seed_format(db)
+    other = CompetitorPriceList(
+        price_format_id=pf.id,
+        source_type="provisor",
+        source_key="emit:1107",
+        display_name="Other Emit",
+    )
+    db.add(other)
+    db.flush()
+    db.add(CompetitorPriceListItem(price_list_id=other.id, name="Other", distributor_price=99, stock=7))
+    db.commit()
+
+    source = tmp_path / "emit.ndjson"
+    stage = tmp_path / "stage.sqlite"
+    rows = [
+        {"id": 1, "goodsId": 10, "filialId": 1106, "distributorGoodsName": "A", "distributorGoodsId": "SKU-A", "goodsPrice": 12.34, "stored": 5, "box": 2},
+        {"id": 2, "goodsId": 10, "filialId": 1106, "distributorGoodsName": "A", "distributorGoodsId": "SKU-A", "goodsPrice": 13.45, "stored": 6, "box": 3},
+    ]
+    source.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows), encoding="utf-8")
+    stats = parse_normalize_stage(
+        source_path=source,
+        stage_db_path=stage,
+        filial_id=1106,
+        filial_name="Emit International Almaty",
+        config=EmitConfig(temp_dir=str(tmp_path), min_free_disk_gb=0, min_final_rows=1),
+    )
+
+    price_list = replace_emit_price_list_from_staging(
+        db=db,
+        config=EmitConfig(temp_dir=str(tmp_path), min_free_disk_gb=0, batch_insert_size=1, min_final_rows=1),
+        filial_id=1106,
+        filial_name="Emit International Almaty",
+        staging_path=stage,
+        stats=stats,
+    )
+
+    saved = db.execute(
+        select(CompetitorPriceListItem)
+        .where(CompetitorPriceListItem.price_list_id == price_list.id)
+        .order_by(CompetitorPriceListItem.id.asc())
+    ).scalars().all()
+    assert len(saved) == 2
+    assert [float(item.distributor_price) for item in saved] == [12.34, 13.45]
+    assert [float(item.stock) for item in saved] == [5.0, 6.0]
+    assert [float(item.package_count) for item in saved] == [2.0, 3.0]
+    assert all(item.provisor_goods_id == 10 for item in saved)
+    assert db.scalar(
+        select(func.count(CompetitorPriceListItem.id)).where(CompetitorPriceListItem.price_list_id == other.id)
+    ) == 1
+    assert stats.final_rows_saved == 2
+    assert stats.final_inserted_row_count == 2
+    assert stats.final_production_row_count == 2
+    assert stats.deleted_old_row_count == 0
+    assert stats.replacement_strategy == "sqlalchemy_delete_then_bulk_insert"
+    for key in ("validation_pre_copy_elapsed", "old_rows_delete_elapsed", "final_inserted_row_count", "replacement_strategy", "db_replace_batch_size"):
+        assert key in stats.to_dict()
+
+
+def test_emit_db_replace_copy_failure_keeps_previous_rows(monkeypatch, tmp_path):
+    db = _session()
+    pf = _seed_format(db)
+    old = CompetitorPriceList(
+        price_format_id=pf.id,
+        source_type="provisor",
+        source_key="emit:1106",
+        display_name="Old Emit",
+    )
+    db.add(old)
+    db.flush()
+    db.add(CompetitorPriceListItem(price_list_id=old.id, name="Old", distributor_price=10))
+    db.commit()
+
+    source = tmp_path / "emit.ndjson"
+    stage = tmp_path / "stage.sqlite"
+    source.write_text(
+        json.dumps({"id": 1, "goodsId": 10, "distributorGoodsName": "New", "goodsPrice": 12}) + "\n",
+        encoding="utf-8",
+    )
+    stats = parse_normalize_stage(
+        source_path=source,
+        stage_db_path=stage,
+        filial_id=1106,
+        filial_name="Emit",
+        config=EmitConfig(temp_dir=str(tmp_path), min_free_disk_gb=0, min_final_rows=1),
+    )
+
+    def fail_copy(**_kwargs):
+        raise RuntimeError("copy failed before delete")
+
+    monkeypatch.setattr(emit_worker_module, "_copy_items_from_stage_postgresql", fail_copy)
+    try:
+        replace_emit_price_list_from_staging(
+            db=db,
+            config=EmitConfig(temp_dir=str(tmp_path), min_free_disk_gb=0, min_final_rows=1),
+            filial_id=1106,
+            filial_name="Emit",
+            staging_path=stage,
+            stats=stats,
+        )
+    except RuntimeError as exc:
+        assert "copy failed before delete" in str(exc)
+        db.rollback()
+    else:
+        raise AssertionError("Expected copy failure")
+
+    saved = db.execute(select(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == old.id)).scalar_one()
+    assert saved.name == "Old"
+    assert float(saved.distributor_price) == 10
+
+
 def test_emit_percentile_rebuild_uses_assigned_price_format_not_first_format(tmp_path):
     db = _session()
     first_pf = PriceFormat(code="FIRST", name="FIRST", branch="Other")
@@ -1131,6 +1406,106 @@ def test_emit_global_propagation_assigns_new_region_to_all_existing_formats():
             CompetitorPricePercentile.percentile_scope == "regional",
         ).all()
         assert rows
+
+
+def test_emit_percentile_rebuild_calculates_once_and_fans_out_to_assigned_formats():
+    db = _session()
+    formats = [PriceFormat(code=f"PF{idx}", name=f"Format {idx}") for idx in range(1, 5)]
+    product = Product(code="SKU-EMIT", name="Emit product", cost=100, provisor_goods_id=9001)
+    db.add_all([*formats, product])
+    db.flush()
+    emit_row = CompetitorPriceList(
+        price_format_id=formats[0].id,
+        source_type="provisor",
+        source_key="emit:1106",
+        display_name="Emit International 1106",
+        supplier="Emit International 1106",
+        branch_id="1106",
+        branch_code="1106",
+        branch_name="Emit International 1106",
+        competitor_name="Emit International 1106",
+        external_price_list_id="1106",
+        account_login="emit",
+        last_refresh_status="success",
+    )
+    db.add(emit_row)
+    db.flush()
+    db.add_all(
+        [
+            PriceFormatCompetitorAssignment(
+                price_format_id=pf.id,
+                competitor_price_list_id=emit_row.id,
+                is_active=True,
+                percentile_mode="multi_price_per_sku",
+            )
+            for pf in formats
+        ]
+    )
+    for price in [100, 120, 200]:
+        db.add(
+            CompetitorPriceListItem(
+                price_list_id=emit_row.id,
+                product_id=product.id,
+                provisor_goods_id=product.provisor_goods_id,
+                filial_id=1106,
+                name=product.name,
+                distributor_goods_name=product.name,
+                distributor_price=price,
+            )
+        )
+    db.commit()
+
+    summary = _recalculate_percentiles_for_emit_rows(
+        db,
+        price_list_ids=[emit_row.id],
+        scope_to_price_list_ids=True,
+    )
+
+    assert summary["assigned_price_format_ids"] == [pf.id for pf in formats]
+    assert summary["percentile_rebuild_scope"] == "emit_source_shared"
+    assert summary["expensive_calculation_count"] == 1
+    assert summary["shared_result_reuse_count"] == 3
+    assert summary["skipped_duplicate_rebuilds"] == 3
+    assert summary["raw_price_rows_scanned"] == 3
+    assert summary["matched_product_count"] == 1
+    assert summary["compatibility_rows_created"] == 30
+    assert summary["percentile_rows_persisted"] == 40
+
+    by_format = {}
+    for pf in formats:
+        rows = (
+            db.execute(
+                select(CompetitorPricePercentile)
+                .where(CompetitorPricePercentile.price_format_id == pf.id)
+                .where(CompetitorPricePercentile.product_id == product.id)
+                .order_by(
+                    CompetitorPricePercentile.percentile_scope,
+                    CompetitorPricePercentile.percentile,
+                )
+            )
+            .scalars()
+            .all()
+        )
+        by_format[pf.code] = [
+            (
+                row.percentile_scope,
+                row.source_key,
+                row.percentile,
+                float(row.value) if row.value is not None else None,
+                row.price_count,
+                row.used_price_count,
+            )
+            for row in rows
+        ]
+
+    assert set(by_format) == {"PF1", "PF2", "PF3", "PF4"}
+    assert by_format["PF1"] == by_format["PF2"] == by_format["PF3"] == by_format["PF4"]
+    regional = [row for row in by_format["PF1"] if row[0] == "regional"]
+    assert [row[2] for row in regional] == [10, 20, 30, 40, 60]
+    assert round(regional[0][3], 3) == 104.0
+    assert round(regional[-1][3], 3) == 136.0
+    assert {row[4] for row in regional} == {3}
+    assert {row[5] for row in regional} == {3}
 
 
 def _seed_emit_region(

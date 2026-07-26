@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import io
 import json
 import logging
@@ -10,6 +11,7 @@ import re
 import shutil
 import sqlite3
 import socket
+import sys
 import threading
 import time
 import uuid
@@ -30,7 +32,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from ..config import Settings
 from ..models import CompetitorPriceList, CompetitorPriceListItem, PriceFormat, PriceFormatCompetitorAssignment, RefreshJob, RefreshLock
 from .competitor_assignments import propagate_emit_assignments_to_price_formats, upsert_assignment
-from .competitor_percentiles import recalculate_competitor_percentiles
+from .competitor_percentiles import fanout_emit_percentiles_from_price_format, recalculate_competitor_percentiles
+from .competitor_source_config import canonical_competitor_source_key
 from .competitor_persist import _ensure_price_format
 from .manufacturers import _clean_text, _extract_manufacturer_cleaned, _normalize_manufacturer_cleaned, resolve_manufacturer
 from .provisor import get_access_token
@@ -162,6 +165,18 @@ class EmitStats:
     download_size_mb: float = 0.0
     download_size_gb: float = 0.0
     max_rss_mb: float | None = None
+    rss_before_parse_mb: float | None = None
+    rss_after_parse_mb: float | None = None
+    fast_insert_batches: int = 0
+    fallback_dedupe_batches: int = 0
+    duplicate_candidates: int = 0
+    verified_duplicates: int = 0
+    hash_collision_candidates: int = 0
+    fast_path_disabled_after_duplicate: bool = False
+    audit_mode: str = ""
+    seen_key_count: int = 0
+    seen_key_memory_estimate_mb: float = 0.0
+    max_batch_size: int = 0
     download_elapsed_sec: float = 0.0
     parse_dedupe_elapsed_sec: float = 0.0
     db_replace_elapsed_sec: float = 0.0
@@ -183,6 +198,23 @@ class EmitStats:
     temp_insert_elapsed: float = 0.0
     final_insert_elapsed: float = 0.0
     validation_elapsed: float = 0.0
+    validation_pre_copy_elapsed: float = 0.0
+    validation_post_copy_elapsed: float = 0.0
+    sqlite_select_open_elapsed: float = 0.0
+    sqlite_fetch_elapsed: float = 0.0
+    copy_prepare_elapsed: float = 0.0
+    copy_write_elapsed: float = 0.0
+    temp_row_count_elapsed: float = 0.0
+    old_rows_delete_elapsed: float = 0.0
+    final_validation_elapsed: float = 0.0
+    index_or_constraint_elapsed: float = 0.0
+    copy_row_count: int = 0
+    final_inserted_row_count: int = 0
+    deleted_old_row_count: int = 0
+    final_production_row_count: int = 0
+    replacement_strategy: str = ""
+    copy_mode: str = ""
+    db_replace_batch_size: int = 0
     flush_elapsed: float = 0.0
     commit_elapsed: float = 0.0
     cleanup_elapsed_sec: float = 0.0
@@ -220,6 +252,18 @@ class EmitStats:
             "download_size_mb": self.download_size_mb,
             "download_size_gb": self.download_size_gb,
             "max_rss_mb": self.max_rss_mb,
+            "rss_before_parse_mb": self.rss_before_parse_mb,
+            "rss_after_parse_mb": self.rss_after_parse_mb,
+            "fast_insert_batches": self.fast_insert_batches,
+            "fallback_dedupe_batches": self.fallback_dedupe_batches,
+            "duplicate_candidates": self.duplicate_candidates,
+            "verified_duplicates": self.verified_duplicates,
+            "hash_collision_candidates": self.hash_collision_candidates,
+            "fast_path_disabled_after_duplicate": self.fast_path_disabled_after_duplicate,
+            "audit_mode": self.audit_mode,
+            "seen_key_count": self.seen_key_count,
+            "seen_key_memory_estimate_mb": self.seen_key_memory_estimate_mb,
+            "max_batch_size": self.max_batch_size,
             "download_elapsed_sec": self.download_elapsed_sec,
             "parse_dedupe_elapsed_sec": self.parse_dedupe_elapsed_sec,
             "db_replace_elapsed_sec": self.db_replace_elapsed_sec,
@@ -247,6 +291,23 @@ class EmitStats:
             "temp_insert_elapsed": self.temp_insert_elapsed,
             "final_insert_elapsed": self.final_insert_elapsed,
             "validation_elapsed": self.validation_elapsed,
+            "validation_pre_copy_elapsed": self.validation_pre_copy_elapsed,
+            "validation_post_copy_elapsed": self.validation_post_copy_elapsed,
+            "sqlite_select_open_elapsed": self.sqlite_select_open_elapsed,
+            "sqlite_fetch_elapsed": self.sqlite_fetch_elapsed,
+            "copy_prepare_elapsed": self.copy_prepare_elapsed,
+            "copy_write_elapsed": self.copy_write_elapsed,
+            "temp_row_count_elapsed": self.temp_row_count_elapsed,
+            "old_rows_delete_elapsed": self.old_rows_delete_elapsed,
+            "final_validation_elapsed": self.final_validation_elapsed,
+            "index_or_constraint_elapsed": self.index_or_constraint_elapsed,
+            "copy_row_count": self.copy_row_count,
+            "final_inserted_row_count": self.final_inserted_row_count,
+            "deleted_old_row_count": self.deleted_old_row_count,
+            "final_production_row_count": self.final_production_row_count,
+            "replacement_strategy": self.replacement_strategy,
+            "copy_mode": self.copy_mode,
+            "db_replace_batch_size": self.db_replace_batch_size,
             "flush_elapsed": self.flush_elapsed,
             "commit_elapsed": self.commit_elapsed,
             "cleanup_elapsed_sec": self.cleanup_elapsed_sec,
@@ -475,6 +536,18 @@ def _emit_performance_summary(stats: EmitStats) -> str:
         f"stage_upsert_elapsed_sec: {stats.stage_upsert_elapsed}\n"
         f"stage_commit_elapsed_sec: {stats.stage_commit_elapsed}\n"
         f"stage_audit_elapsed_sec: {stats.stage_audit_elapsed}\n\n"
+        "SQLite staging path\n"
+        "-------------------\n"
+        f"fast_insert_batches: {stats.fast_insert_batches}\n"
+        f"fallback_dedupe_batches: {stats.fallback_dedupe_batches}\n"
+        f"duplicate_candidates: {stats.duplicate_candidates}\n"
+        f"verified_duplicates: {stats.verified_duplicates}\n"
+        f"hash_collision_candidates: {stats.hash_collision_candidates}\n"
+        f"fast_path_disabled_after_duplicate: {stats.fast_path_disabled_after_duplicate}\n"
+        f"audit_mode: {stats.audit_mode}\n"
+        f"seen_key_count: {stats.seen_key_count}\n"
+        f"seen_key_memory_estimate_mb: {stats.seen_key_memory_estimate_mb}\n"
+        f"max_batch_size: {stats.max_batch_size}\n\n"
         "Parser statistics\n"
         "-----------------\n"
         f"input_rows: {stats.input_rows}\n"
@@ -491,6 +564,8 @@ def _emit_performance_summary(stats: EmitStats) -> str:
         f"normalization_cache_misses: {stats.normalization_cache_misses}\n\n"
         "Storage\n"
         "-------\n"
+        f"rss_before_parse_mb: {stats.rss_before_parse_mb}\n"
+        f"rss_after_parse_mb: {stats.rss_after_parse_mb}\n"
         f"stage_db_size_bytes: {stats.stage_db_size_bytes}\n"
         f"stage_db_size_mb: {stats.stage_db_size_mb}\n"
         f"stage_db_size_gb: {stats.stage_db_size_gb}\n\n"
@@ -509,6 +584,22 @@ def _emit_performance_summary(stats: EmitStats) -> str:
         f"temp_insert_elapsed: {stats.temp_insert_elapsed}\n"
         f"final_insert_elapsed: {stats.final_insert_elapsed}\n"
         f"validation_elapsed: {stats.validation_elapsed}\n"
+        f"validation_pre_copy_elapsed: {stats.validation_pre_copy_elapsed}\n"
+        f"validation_post_copy_elapsed: {stats.validation_post_copy_elapsed}\n"
+        f"sqlite_select_open_elapsed: {stats.sqlite_select_open_elapsed}\n"
+        f"sqlite_fetch_elapsed: {stats.sqlite_fetch_elapsed}\n"
+        f"copy_prepare_elapsed: {stats.copy_prepare_elapsed}\n"
+        f"copy_write_elapsed: {stats.copy_write_elapsed}\n"
+        f"temp_row_count_elapsed: {stats.temp_row_count_elapsed}\n"
+        f"old_rows_delete_elapsed: {stats.old_rows_delete_elapsed}\n"
+        f"final_validation_elapsed: {stats.final_validation_elapsed}\n"
+        f"copy_row_count: {stats.copy_row_count}\n"
+        f"final_inserted_row_count: {stats.final_inserted_row_count}\n"
+        f"deleted_old_row_count: {stats.deleted_old_row_count}\n"
+        f"final_production_row_count: {stats.final_production_row_count}\n"
+        f"replacement_strategy: {stats.replacement_strategy}\n"
+        f"copy_mode: {stats.copy_mode}\n"
+        f"db_replace_batch_size: {stats.db_replace_batch_size}\n"
         f"commit_elapsed: {stats.commit_elapsed}\n"
         f"replace_elapsed_sec: {stats.db_replace_elapsed_sec}\n"
         f"copy_backend: {stats.copy_backend}\n"
@@ -977,6 +1068,96 @@ def _stage_upsert(conn: sqlite3.Connection, item: dict[str, Any], stats: EmitSta
     stats.duplicate_rows_removed += 1
 
 
+@dataclass
+class _AuditGroup:
+    count: int = 0
+    variants: list[str] = field(default_factory=list)
+    variant_seen: set[str] = field(default_factory=set)
+    price_min: float | None = None
+    price_max: float | None = None
+    names_sample: list[str] = field(default_factory=list)
+    producers_sample: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _StageAuditAccumulator:
+    key_type_counts: Counter[str] = field(default_factory=Counter)
+    goods_groups: dict[str, _AuditGroup] = field(default_factory=dict)
+    fallback_rows: list[dict[str, Any]] = field(default_factory=list)
+    limit: int = 20
+
+    def add(self, item: dict[str, Any]) -> None:
+        key_type = _dedupe_key(item)[0]
+        self.key_type_counts[str(key_type or "")] += 1
+        goods_id = str(item.get("provisor_goods_id") or "")
+        if goods_id:
+            group = self.goods_groups.get(goods_id)
+            if group is None:
+                group = _AuditGroup()
+                self.goods_groups[goods_id] = group
+            name = str(item.get("name") or "").strip()
+            producer = str(item.get("raw_manufacturer") or "").strip()
+            if name and len(group.names_sample) < 5 and name not in group.names_sample:
+                group.names_sample.append(name)
+            if producer and len(group.producers_sample) < 5 and producer not in group.producers_sample:
+                group.producers_sample.append(producer)
+            if key_type == "goodsId+variant":
+                group.count += 1
+                variant = str(item.get("variant_key") or "")
+                if variant and len(group.variants) < 10 and variant not in group.variant_seen:
+                    group.variant_seen.add(variant)
+                    group.variants.append(variant)
+                price = item.get("distributor_price")
+                if price is not None:
+                    price_float = float(price)
+                    group.price_min = price_float if group.price_min is None else min(group.price_min, price_float)
+                    group.price_max = price_float if group.price_max is None else max(group.price_max, price_float)
+        elif (
+            key_type == "fallback"
+            and not str(item.get("variant_key") or "").strip()
+            and not str(item.get("pack_signature") or "").strip()
+            and len(self.fallback_rows) < self.limit
+        ):
+            self.fallback_rows.append(
+                {
+                    "reason": "fallback_without_barcode_or_pack",
+                    "goodsId": "",
+                    "variants_count": 1,
+                    "rows_seen": 1,
+                    "dedupe_key": list(_stage_storage_key(item)),
+                    "names_sample": [item.get("name") or ""] if item.get("name") else [],
+                    "producers_sample": [item.get("raw_manufacturer") or ""] if item.get("raw_manufacturer") else [],
+                    "prices_min": item.get("distributor_price"),
+                    "prices_max": item.get("distributor_price"),
+                }
+            )
+
+    def result(self, *, limit: int = 20) -> tuple[dict[str, int], list[dict[str, Any]]]:
+        suspicious: list[dict[str, Any]] = []
+        groups = sorted(
+            ((goods_id, group) for goods_id, group in self.goods_groups.items() if group.count >= 10),
+            key=lambda row: row[1].count,
+            reverse=True,
+        )
+        for goods_id, group in groups[:limit]:
+            suspicious.append(
+                {
+                    "reason": "same_goodsId_many_variants",
+                    "goodsId": goods_id,
+                    "variants_count": int(group.count or 0),
+                    "variants_sample": group.variants[:10],
+                    "names_sample": group.names_sample[:10],
+                    "producers_sample": group.producers_sample[:10],
+                    "prices_min": group.price_min,
+                    "prices_max": group.price_max,
+                }
+            )
+        remaining = max(0, limit - len(suspicious))
+        if remaining:
+            suspicious.extend(self.fallback_rows[:remaining])
+        return dict(self.key_type_counts), suspicious[:limit]
+
+
 def _chunks(values: list[str], size: int) -> Iterable[list[str]]:
     for index in range(0, len(values), size):
         yield values[index : index + size]
@@ -1009,11 +1190,22 @@ _STAGE_INSERT_SQL = """
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
+_STAGE_INSERT_STRICT_SQL = _STAGE_INSERT_SQL.replace("INSERT OR IGNORE INTO", "INSERT INTO", 1)
 
-def _stage_insert_many(conn: sqlite3.Connection, items: list[dict[str, Any]], stats: EmitStats) -> None:
-    if not items:
-        return
-    values = [_stage_values(item) for item in items]
+
+def _stage_compact_key(canonical_key: str) -> bytes:
+    return hashlib.blake2b(canonical_key.encode("utf-8"), digest_size=8).digest()
+
+
+def _estimate_seen_key_memory_mb(seen_keys: set[bytes]) -> float:
+    if not seen_keys:
+        return 0.0
+    sample = next(iter(seen_keys))
+    total = sys.getsizeof(seen_keys) + (len(seen_keys) * sys.getsizeof(sample))
+    return round(total / (1024 * 1024), 3)
+
+
+def _stage_insert_many_dedupe(conn: sqlite3.Connection, values: list[tuple[Any, ...]], stats: EmitStats) -> None:
     key_counts = Counter(str(row[0]) for row in values)
     existing = _stage_existing_keys(conn, list(key_counts.keys()))
     conn.executemany(_STAGE_INSERT_SQL, values)
@@ -1028,6 +1220,42 @@ def _stage_insert_many(conn: sqlite3.Connection, items: list[dict[str, Any]], st
             duplicate_updates,
         )
         stats.duplicate_rows_removed += sum(int(count) for count, _key in duplicate_updates)
+
+
+def _stage_insert_many(
+    conn: sqlite3.Connection,
+    items: list[dict[str, Any]],
+    stats: EmitStats,
+    seen_compact_keys: set[bytes] | None = None,
+) -> bool:
+    if not items:
+        return True
+    values = [_stage_values(item) for item in items]
+    if seen_compact_keys is None:
+        _stage_insert_many_dedupe(conn, values, stats)
+        return False
+
+    canonical_keys = [str(row[0]) for row in values]
+    compact_keys = [_stage_compact_key(key) for key in canonical_keys]
+    compact_counts = Counter(compact_keys)
+    candidate_compacts = {key for key, count in compact_counts.items() if count > 1 or key in seen_compact_keys}
+    if not candidate_compacts:
+        conn.executemany(_STAGE_INSERT_STRICT_SQL, values)
+        seen_compact_keys.update(compact_keys)
+        stats.fast_insert_batches += 1
+        return True
+
+    stats.duplicate_candidates += sum(1 for key in compact_keys if key in candidate_compacts)
+    candidate_full_keys = [key for key, compact in zip(canonical_keys, compact_keys) if compact in candidate_compacts]
+    existing = _stage_existing_keys(conn, list(dict.fromkeys(candidate_full_keys)))
+    batch_counts = Counter(candidate_full_keys)
+    verified = sum((count if key in existing else count - 1) for key, count in batch_counts.items())
+    stats.verified_duplicates += verified
+    stats.hash_collision_candidates += max(0, len(candidate_full_keys) - verified)
+    _stage_insert_many_dedupe(conn, values, stats)
+    seen_compact_keys.update(compact_keys)
+    stats.fallback_dedupe_batches += 1
+    return False
 
 
 def stage_row_count(stage_db_path: Path) -> int:
@@ -1428,10 +1656,16 @@ def parse_normalize_stage(
     )
     _ensure_free_disk(Path(cfg.temp_dir), cfg.min_free_disk_gb)
     conn = open_stage_db(stage_path)
+    stats.rss_before_parse_mb = current_rss_mb()
+    if stats.rss_before_parse_mb is not None:
+        stats.max_rss_mb = max(float(stats.max_rss_mb or 0.0), stats.rss_before_parse_mb)
     batch_count = 0
     trace_goods_id = _trace_goods_id()
     trace_raw_prices: list[float] = []
     cache_info_before = _cache_info_snapshot()
+    audit_accumulator = _StageAuditAccumulator()
+    fast_audit_valid = True
+    seen_stage_compact_keys: set[bytes] = set()
     try:
         source_iter = iter(iter_source_rows(source_path))
         while True:
@@ -1440,6 +1674,7 @@ def parse_normalize_stage(
             _add_elapsed(stats, "decode_elapsed", decode_started)
             if not rows:
                 break
+            stats.max_batch_size = max(stats.max_batch_size, len(rows))
             stats.input_rows += len(rows)
             normalize_started = time.perf_counter()
             items: list[dict[str, Any]] = []
@@ -1463,11 +1698,17 @@ def parse_normalize_stage(
                 stats.normalized_rows += 1
                 if not item.get("provisor_goods_id"):
                     stats.rows_without_goodsId += 1
+                if fast_audit_valid:
+                    audit_accumulator.add(item)
                 items += [item]
             _add_elapsed(stats, "normalize_elapsed", normalize_started)
             stage_upsert_started = time.perf_counter()
-            _stage_insert_many(conn, items, stats)
+            fast_insert_used = _stage_insert_many(conn, items, stats, seen_stage_compact_keys)
+            if not fast_insert_used:
+                fast_audit_valid = False
             _add_elapsed(stats, "stage_upsert_elapsed", stage_upsert_started)
+            stats.seen_key_count = len(seen_stage_compact_keys)
+            stats.seen_key_memory_estimate_mb = _estimate_seen_key_memory_mb(seen_stage_compact_keys)
             batch_count += len(items)
             if batch_count >= cfg.batch_insert_size:
                 stage_commit_started = time.perf_counter()
@@ -1481,8 +1722,14 @@ def parse_normalize_stage(
         conn.commit()
         _add_elapsed(stats, "stage_commit_elapsed", stage_commit_started)
         stage_audit_started = time.perf_counter()
-        stats.final_rows_saved = int(conn.execute("SELECT COUNT(*) FROM stage_items").fetchone()[0] or 0)
-        stats.key_type_counts, stats.suspicious_groups = collect_stage_audit(conn)
+        if fast_audit_valid and stats.duplicate_rows_removed == 0:
+            stats.final_rows_saved = stats.positive_price_rows
+            stats.key_type_counts, stats.suspicious_groups = audit_accumulator.result()
+            stats.audit_mode = "parse_time"
+        else:
+            stats.final_rows_saved = int(conn.execute("SELECT COUNT(*) FROM stage_items").fetchone()[0] or 0)
+            stats.key_type_counts, stats.suspicious_groups = collect_stage_audit(conn)
+            stats.audit_mode = "sqlite_fallback"
         if trace_goods_id is not None:
             stage_prices = [
                 float(row[0])
@@ -1508,6 +1755,9 @@ def parse_normalize_stage(
     stats.stage_db_size_gb = round(stats.stage_db_size_bytes / (1024 ** 3), 4)
     _add_elapsed(stats, "stage_audit_elapsed", stage_audit_started)
     stats.parse_dedupe_elapsed_sec = round(time.perf_counter() - started, 3)
+    stats.rss_after_parse_mb = current_rss_mb()
+    if stats.rss_after_parse_mb is not None:
+        stats.max_rss_mb = max(float(stats.max_rss_mb or 0.0), stats.rss_after_parse_mb)
     _update_max_rss(stats)
     _apply_cache_info_delta(stats, cache_info_before, _cache_info_snapshot())
     if stats.final_rows_saved < cfg.min_final_rows:
@@ -1553,6 +1803,18 @@ def parse_normalize_stage(
             "stage_db_size_mb": stats.stage_db_size_mb,
             "stage_db_size_gb": stats.stage_db_size_gb,
             "max_rss_mb": stats.max_rss_mb,
+            "rss_before_parse_mb": stats.rss_before_parse_mb,
+            "rss_after_parse_mb": stats.rss_after_parse_mb,
+            "fast_insert_batches": stats.fast_insert_batches,
+            "fallback_dedupe_batches": stats.fallback_dedupe_batches,
+            "duplicate_candidates": stats.duplicate_candidates,
+            "verified_duplicates": stats.verified_duplicates,
+            "hash_collision_candidates": stats.hash_collision_candidates,
+            "fast_path_disabled_after_duplicate": stats.fast_path_disabled_after_duplicate,
+            "audit_mode": stats.audit_mode,
+            "seen_key_count": stats.seen_key_count,
+            "seen_key_memory_estimate_mb": stats.seen_key_memory_estimate_mb,
+            "max_batch_size": stats.max_batch_size,
         },
     )
     if stats.suspicious_groups:
@@ -1730,6 +1992,44 @@ def _copy_value(value: object, null_token: str) -> object:
     return null_token if value is None else value
 
 
+def _validate_postgresql_temp_emit_rows(
+    cursor: Any,
+    *,
+    temp_table: str,
+    expected_rows: int,
+    copied_rows: int,
+    price_list_id: int,
+    stats: EmitStats,
+) -> None:
+    validation_started = time.perf_counter()
+    if copied_rows != expected_rows:
+        raise RuntimeError(f"Emit COPY row count mismatch: copied={copied_rows}, expected={expected_rows}")
+    cursor.execute(
+        f"""
+        SELECT
+            COUNT(*)::bigint AS row_count,
+            COUNT(*) FILTER (WHERE price_list_id IS NULL OR price_list_id <> %s)::bigint AS bad_price_list,
+            COUNT(*) FILTER (WHERE distributor_price IS NULL OR distributor_price <= 0)::bigint AS bad_price,
+            COUNT(*) FILTER (WHERE COALESCE(name, '') = '')::bigint AS missing_name
+        FROM {temp_table}
+        """,
+        (price_list_id,),
+    )
+    row_count, bad_price_list, bad_price, missing_name = cursor.fetchone()
+    stats.temp_row_count_elapsed += round(time.perf_counter() - validation_started, 6)
+    if int(row_count or 0) != expected_rows:
+        raise RuntimeError(f"Emit temp row count mismatch: temp={row_count}, expected={expected_rows}")
+    if int(bad_price_list or 0) or int(bad_price or 0) or int(missing_name or 0):
+        raise RuntimeError(
+            "Emit temp validation failed: "
+            f"bad_price_list={int(bad_price_list or 0)}, "
+            f"bad_price={int(bad_price or 0)}, "
+            f"missing_name={int(missing_name or 0)}"
+        )
+    _add_elapsed(stats, "validation_post_copy_elapsed", validation_started)
+    _add_elapsed(stats, "validation_elapsed", validation_started)
+
+
 def _bulk_insert_items_from_stage(
     *,
     db: Session,
@@ -1779,9 +2079,9 @@ def _copy_items_from_stage_postgresql(
     temp_dir: Path,
     min_free_disk_gb: float,
     config: EmitConfig,
-) -> tuple[bool, str, str]:
+) -> tuple[bool, str, str, str, int]:
     if (db.get_bind().dialect.name or "").lower() != "postgresql":
-        return False, "sqlalchemy_fallback", "database_dialect_is_not_postgresql"
+        return False, "sqlalchemy_fallback", "database_dialect_is_not_postgresql", "", 0
     connection = db.connection()
     raw_connection = getattr(connection.connection, "driver_connection", connection.connection)
     cursor = raw_connection.cursor()
@@ -1789,45 +2089,51 @@ def _copy_items_from_stage_postgresql(
     supports_copy_context = hasattr(cursor, "copy")
     if not supports_copy_expert and not supports_copy_context:
         cursor.close()
-        return False, "sqlalchemy_fallback", "cursor_has_no_copy_api"
+        return False, "sqlalchemy_fallback", "cursor_has_no_copy_api", "", 0
     temp_table = f"tmp_emit_items_{uuid.uuid4().hex}"
     null_token = f"__APTEKA_COPY_NULL_{uuid.uuid4().hex}__"
     columns_sql = ", ".join(_ITEM_INSERT_COLUMNS)
-    copy_sql = f"COPY {temp_table} ({columns_sql}) FROM STDIN WITH CSV NULL '{null_token}'"
+    copy_sql = f"COPY {temp_table} ({columns_sql}) FROM STDIN"
+    copy_csv_sql = f"COPY {temp_table} ({columns_sql}) FROM STDIN WITH CSV NULL '{null_token}'"
     copy_backend = "psycopg2_copy_expert" if supports_copy_expert else "psycopg3_copy"
+    copied_rows = 0
     try:
         temp_create_started = time.perf_counter()
         cursor.execute(f"CREATE TEMP TABLE {temp_table} (LIKE competitor_price_list_items INCLUDING DEFAULTS) ON COMMIT DROP")
         _add_elapsed(stats, "temp_table_create_elapsed", temp_create_started)
+        _add_elapsed(stats, "copy_prepare_elapsed", temp_create_started)
+        sqlite_open_started = time.perf_counter()
         with closing(sqlite3.connect(str(staging_path))) as stage_conn:
+            _add_elapsed(stats, "sqlite_select_open_elapsed", sqlite_open_started)
             last_rowid = 0
             if supports_copy_context and not supports_copy_expert:
                 copy_started = time.perf_counter()
                 with cursor.copy(copy_sql) as copy:
                     _add_elapsed(stats, "copy_transfer_elapsed", copy_started)
+                    _add_elapsed(stats, "copy_prepare_elapsed", copy_started)
                     while True:
                         stage_read_started = time.perf_counter()
                         rows = _fetch_stage_copy_batch(stage_conn, last_rowid=last_rowid, batch_size=batch_size)
                         _add_elapsed(stats, "stage_read_elapsed", stage_read_started)
+                        _add_elapsed(stats, "sqlite_fetch_elapsed", stage_read_started)
                         if not rows:
                             break
                         last_rowid = int(rows[-1][0])
                         rows = [tuple(row[1:]) for row in rows]
                         transform_started = time.perf_counter()
-                        copy_rows = [_copy_row_from_stage_tuple(row, price_list_id=price_list_id, filial_id=filial_id) for row in rows]
+                        copy_rows = [
+                            _copy_row_from_stage_tuple(row, price_list_id=price_list_id, filial_id=filial_id)
+                            for row in rows
+                        ]
                         _add_elapsed(stats, "row_transform_elapsed", transform_started)
-                        serialize_started = time.perf_counter()
-                        buffer = io.StringIO()
-                        writer = csv.writer(buffer, lineterminator="\n")
-                        for copy_row in copy_rows:
-                            writer.writerow(_copy_value(value, null_token) for value in copy_row)
-                        _add_elapsed(stats, "copy_serialize_elapsed", serialize_started)
-                        _add_elapsed(stats, "mapping_build_elapsed", serialize_started)
-                        if buffer.tell() or rows:
+                        if copy_rows:
                             transfer_started = time.perf_counter()
-                            copy.write(buffer.getvalue())
+                            for copy_row in copy_rows:
+                                copy.write_row(copy_row)
                             _add_elapsed(stats, "copy_transfer_elapsed", transfer_started)
+                            _add_elapsed(stats, "copy_write_elapsed", transfer_started)
                             _add_elapsed(stats, "bulk_insert_elapsed", transfer_started)
+                        copied_rows += len(copy_rows)
                         _ensure_free_disk(temp_dir, min_free_disk_gb)
                         _raise_if_memory_exceeded(config, stage="db_replace", stats=stats)
             else:
@@ -1835,6 +2141,7 @@ def _copy_items_from_stage_postgresql(
                     stage_read_started = time.perf_counter()
                     rows = _fetch_stage_copy_batch(stage_conn, last_rowid=last_rowid, batch_size=batch_size)
                     _add_elapsed(stats, "stage_read_elapsed", stage_read_started)
+                    _add_elapsed(stats, "sqlite_fetch_elapsed", stage_read_started)
                     if not rows:
                         break
                     last_rowid = int(rows[-1][0])
@@ -1852,19 +2159,15 @@ def _copy_items_from_stage_postgresql(
                     _add_elapsed(stats, "mapping_build_elapsed", serialize_started)
                     if buffer.tell() or rows:
                         copy_started = time.perf_counter()
-                        cursor.copy_expert(copy_sql, buffer)
+                        cursor.copy_expert(copy_csv_sql, buffer)
                         _add_elapsed(stats, "copy_transfer_elapsed", copy_started)
+                        _add_elapsed(stats, "copy_write_elapsed", copy_started)
                         _add_elapsed(stats, "bulk_insert_elapsed", copy_started)
+                    copied_rows += len(copy_rows)
                     _ensure_free_disk(temp_dir, min_free_disk_gb)
                     _raise_if_memory_exceeded(config, stage="db_replace", stats=stats)
-        final_insert_started = time.perf_counter()
-        cursor.execute(
-            f"INSERT INTO competitor_price_list_items ({columns_sql}) SELECT {columns_sql} FROM {temp_table}"
-        )
-        _add_elapsed(stats, "final_insert_elapsed", final_insert_started)
-        _add_elapsed(stats, "temp_insert_elapsed", final_insert_started)
-        _add_elapsed(stats, "bulk_insert_elapsed", final_insert_started)
-        return True, copy_backend, ""
+        stats.copy_row_count = copied_rows
+        return True, copy_backend, "", temp_table, copied_rows
     finally:
         cursor.close()
 
@@ -1880,9 +2183,14 @@ def replace_emit_price_list_from_staging(
     price_format_code: str | None = None,
 ) -> CompetitorPriceList:
     started = time.perf_counter()
+    stats.replacement_strategy = "postgresql_temp_table_prepare_then_delete_insert"
+    stats.db_replace_batch_size = int(config.batch_insert_size or 0)
     validation_started = time.perf_counter()
-    final_count = _row_count_in_staging(staging_path)
+    final_count = int(stats.final_rows_saved or 0)
+    if final_count <= 0:
+        final_count = _row_count_in_staging(staging_path)
     _add_elapsed(stats, "validation_elapsed", validation_started)
+    _add_elapsed(stats, "validation_pre_copy_elapsed", validation_started)
     if final_count < config.min_final_rows:
         raise RuntimeError(f"Emit staging produced suspiciously low row count: {final_count} < {config.min_final_rows}")
     pf = _price_format_for_code(db, price_format_code)
@@ -1908,17 +2216,6 @@ def replace_emit_price_list_from_staging(
         )
         db.add(row)
         db.flush()
-    previous_count_started = time.perf_counter()
-    previous_count = int(
-        db.scalar(select(func.count(CompetitorPriceListItem.id)).where(CompetitorPriceListItem.price_list_id == row.id))
-        or 0
-    )
-    _add_elapsed(stats, "previous_count_elapsed", previous_count_started)
-    _add_elapsed(stats, "validation_elapsed", previous_count_started)
-    if previous_count > 0 and final_count < int(previous_count * config.min_row_ratio):
-        raise RuntimeError(
-            f"Emit staging row count dropped below ratio: new={final_count}, previous={previous_count}, ratio={config.min_row_ratio}"
-        )
     display_name = filial_name or f"Emit International {filial_id}"
     row.price_format_id = pf.id
     row.display_name = display_name
@@ -1940,10 +2237,7 @@ def replace_emit_price_list_from_staging(
     row.price_date = date.today()
     row.updated_at = now
 
-    delete_started = time.perf_counter()
-    db.execute(delete(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == row.id))
-    _add_elapsed(stats, "delete_elapsed", delete_started)
-    used_copy, copy_backend, copy_fallback_reason = _copy_items_from_stage_postgresql(
+    used_copy, copy_backend, copy_fallback_reason, temp_table, copied_rows = _copy_items_from_stage_postgresql(
         db=db,
         staging_path=staging_path,
         stats=stats,
@@ -1957,6 +2251,7 @@ def replace_emit_price_list_from_staging(
     stats.copy_backend = copy_backend
     stats.copy_fallback_reason = copy_fallback_reason
     if not used_copy:
+        stats.replacement_strategy = "sqlalchemy_delete_then_bulk_insert"
         logger.warning(
             "[EMIT_DB_REPLACE_COPY] filial_id=%s price_list_id=%s copy_backend=%s copy_fallback_reason=%s",
             filial_id,
@@ -1964,6 +2259,16 @@ def replace_emit_price_list_from_staging(
             copy_backend,
             copy_fallback_reason,
         )
+        delete_started = time.perf_counter()
+        delete_result = db.execute(delete(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == row.id))
+        previous_count = int(delete_result.rowcount or 0)
+        stats.deleted_old_row_count = previous_count
+        _add_elapsed(stats, "delete_elapsed", delete_started)
+        _add_elapsed(stats, "old_rows_delete_elapsed", delete_started)
+        if previous_count > 0 and final_count < int(previous_count * config.min_row_ratio):
+            raise RuntimeError(
+                f"Emit staging row count dropped below ratio: new={final_count}, previous={previous_count}, ratio={config.min_row_ratio}"
+            )
         _bulk_insert_items_from_stage(
             db=db,
             staging_path=staging_path,
@@ -1975,6 +2280,49 @@ def replace_emit_price_list_from_staging(
             min_free_disk_gb=config.min_free_disk_gb,
             config=config,
         )
+        stats.final_inserted_row_count = final_count
+        stats.final_production_row_count = final_count
+    else:
+        stats.copy_mode = copy_backend
+        raw_connection = getattr(db.connection().connection, "driver_connection", db.connection().connection)
+        cursor = raw_connection.cursor()
+        columns_sql = ", ".join(_ITEM_INSERT_COLUMNS)
+        try:
+            _validate_postgresql_temp_emit_rows(
+                cursor,
+                temp_table=temp_table,
+                expected_rows=final_count,
+                copied_rows=copied_rows,
+                price_list_id=int(row.id),
+                stats=stats,
+            )
+            delete_started = time.perf_counter()
+            cursor.execute("DELETE FROM competitor_price_list_items WHERE price_list_id = %s", (int(row.id),))
+            previous_count = int(cursor.rowcount or 0)
+            stats.deleted_old_row_count = previous_count
+            _add_elapsed(stats, "delete_elapsed", delete_started)
+            _add_elapsed(stats, "old_rows_delete_elapsed", delete_started)
+            if previous_count > 0 and final_count < int(previous_count * config.min_row_ratio):
+                raise RuntimeError(
+                    f"Emit staging row count dropped below ratio: new={final_count}, previous={previous_count}, ratio={config.min_row_ratio}"
+                )
+            final_insert_started = time.perf_counter()
+            cursor.execute(
+                f"INSERT INTO competitor_price_list_items ({columns_sql}) SELECT {columns_sql} FROM {temp_table}"
+            )
+            inserted_rows = int(cursor.rowcount or 0)
+            stats.final_inserted_row_count = inserted_rows
+            stats.final_production_row_count = inserted_rows
+            _add_elapsed(stats, "final_insert_elapsed", final_insert_started)
+            _add_elapsed(stats, "temp_insert_elapsed", final_insert_started)
+            _add_elapsed(stats, "bulk_insert_elapsed", final_insert_started)
+            final_validation_started = time.perf_counter()
+            if inserted_rows != final_count:
+                raise RuntimeError(f"Emit final insert row count mismatch: inserted={inserted_rows}, expected={final_count}")
+            _add_elapsed(stats, "final_validation_elapsed", final_validation_started)
+            _add_elapsed(stats, "validation_elapsed", final_validation_started)
+        finally:
+            cursor.close()
     stats.final_rows_saved = final_count
     stats.db_replace_elapsed_sec = round(time.perf_counter() - started, 3)
     flush_started = time.perf_counter()
@@ -2025,6 +2373,22 @@ def replace_emit_price_list_from_staging(
             "copy_serialize_elapsed": stats.copy_serialize_elapsed,
             "copy_transfer_elapsed": stats.copy_transfer_elapsed,
             "final_insert_elapsed": stats.final_insert_elapsed,
+            "validation_pre_copy_elapsed": stats.validation_pre_copy_elapsed,
+            "validation_post_copy_elapsed": stats.validation_post_copy_elapsed,
+            "sqlite_select_open_elapsed": stats.sqlite_select_open_elapsed,
+            "sqlite_fetch_elapsed": stats.sqlite_fetch_elapsed,
+            "copy_prepare_elapsed": stats.copy_prepare_elapsed,
+            "copy_write_elapsed": stats.copy_write_elapsed,
+            "temp_row_count_elapsed": stats.temp_row_count_elapsed,
+            "old_rows_delete_elapsed": stats.old_rows_delete_elapsed,
+            "final_validation_elapsed": stats.final_validation_elapsed,
+            "copy_row_count": stats.copy_row_count,
+            "final_inserted_row_count": stats.final_inserted_row_count,
+            "deleted_old_row_count": stats.deleted_old_row_count,
+            "final_production_row_count": stats.final_production_row_count,
+            "replacement_strategy": stats.replacement_strategy,
+            "copy_mode": stats.copy_mode,
+            "db_replace_batch_size": stats.db_replace_batch_size,
             "flush_elapsed": stats.flush_elapsed,
             "commit_elapsed": stats.commit_elapsed,
         },
@@ -2411,10 +2775,14 @@ def _recalculate_percentiles_for_emit_rows(
         )
     ) if ids else []
     assigned_by_price_list: dict[int, list[int]] = {}
+    price_lists_by_format: dict[int, list[int]] = {}
     for row in assignment_rows:
         if row.price_format_id is None:
             continue
-        assigned_by_price_list.setdefault(int(row.competitor_price_list_id), []).append(int(row.price_format_id))
+        competitor_price_list_id = int(row.competitor_price_list_id)
+        price_format_id = int(row.price_format_id)
+        assigned_by_price_list.setdefault(competitor_price_list_id, []).append(price_format_id)
+        price_lists_by_format.setdefault(price_format_id, []).append(competitor_price_list_id)
 
     for price_list_id in ids:
         assigned_ids = sorted(set(assigned_by_price_list.get(price_list_id, [])))
@@ -2450,7 +2818,88 @@ def _recalculate_percentiles_for_emit_rows(
         for format_id in format_ids
     }
     summaries: dict[str, Any] = {}
-    for price_format_id in sorted(touched_format_ids):
+    touched_format_id_list = sorted(touched_format_ids)
+    scoped_ids = sorted(set(ids))
+    can_share_emit_calculation = (
+        scope_to_price_list_ids
+        and bool(scoped_ids)
+        and bool(touched_format_id_list)
+        and all(sorted(set(price_lists_by_format.get(format_id, []))) == scoped_ids for format_id in touched_format_id_list)
+    )
+    expensive_calculation_count = 0
+    shared_result_reuse_count = 0
+    compatibility_rows_created = 0
+    skipped_duplicate_rebuilds = 0
+    calculation_elapsed = 0.0
+    persistence_elapsed = 0.0
+
+    if can_share_emit_calculation and len(touched_format_id_list) > 1:
+        canonical_price_format_id = touched_format_id_list[0]
+        pf = db.get(PriceFormat, canonical_price_format_id)
+        if pf is not None:
+            format_started = time.perf_counter()
+            summary = recalculate_competitor_percentiles(
+                db=db,
+                price_format_id=canonical_price_format_id,
+                source_price_list_ids=scoped_ids,
+            )
+            elapsed = round(time.perf_counter() - format_started, 3)
+            expensive_calculation_count = 1
+            calculation_elapsed = elapsed
+            summary["percentile_total_elapsed"] = elapsed
+            summary["percentile_rebuild_scope"] = "emit_source_shared_canonical"
+            summary["cache_or_reuse_strategy"] = "canonical_calculation"
+            summaries[str(pf.code or canonical_price_format_id)] = {"price_format_id": canonical_price_format_id, **summary}
+            logger.info(
+                "[EMIT_PERCENTILE_REBUILD] requested_format_code=%s format_code=%s price_format_id=%s rows_created=%s products_with_competitors=%s strategy=%s",
+                requested_format,
+                pf.code,
+                canonical_price_format_id,
+                summary.get("rows_created"),
+                summary.get("products_with_competitors"),
+                "canonical_calculation",
+            )
+
+        for price_format_id in touched_format_id_list:
+            if price_format_id == canonical_price_format_id:
+                continue
+            pf = db.get(PriceFormat, price_format_id)
+            if pf is None:
+                continue
+            format_started = time.perf_counter()
+            summary = fanout_emit_percentiles_from_price_format(
+                db=db,
+                source_price_format_id=canonical_price_format_id,
+                target_price_format_id=price_format_id,
+                source_price_list_ids=scoped_ids,
+            )
+            elapsed = round(time.perf_counter() - format_started, 3)
+            shared_result_reuse_count += 1
+            skipped_duplicate_rebuilds += 1
+            compatibility_rows_created += int(summary.get("compatibility_rows_created") or summary.get("rows_created") or 0)
+            persistence_elapsed = round(persistence_elapsed + elapsed, 3)
+            summary["percentile_total_elapsed"] = elapsed
+            summary["percentile_rebuild_scope"] = "emit_source_shared_fanout"
+            summary["cache_or_reuse_strategy"] = "compatibility_fanout"
+            summaries[str(pf.code or price_format_id)] = {"price_format_id": price_format_id, **summary}
+            logger.info(
+                "[EMIT_PERCENTILE_REBUILD] requested_format_code=%s format_code=%s price_format_id=%s rows_created=%s products_with_competitors=%s strategy=%s",
+                requested_format,
+                pf.code,
+                price_format_id,
+                summary.get("rows_created"),
+                summary.get("products_with_competitors"),
+                "compatibility_fanout",
+            )
+    else:
+        if touched_format_id_list:
+            logger.info(
+                "[EMIT_PERCENTILE_REBUILD] strategy=per_format reason=%s price_list_ids=%s assigned_price_format_ids=%s",
+                "non_uniform_assignments_or_unscoped_rebuild",
+                scoped_ids,
+                touched_format_id_list,
+            )
+    for price_format_id in ([] if can_share_emit_calculation and len(touched_format_id_list) > 1 else touched_format_id_list):
         pf = db.get(PriceFormat, price_format_id)
         if pf is None:
             continue
@@ -2460,7 +2909,12 @@ def _recalculate_percentiles_for_emit_rows(
             price_format_id=price_format_id,
             source_price_list_ids=ids if scope_to_price_list_ids else None,
         )
-        summary["percentile_total_elapsed"] = round(time.perf_counter() - format_started, 3)
+        expensive_calculation_count += 1
+        elapsed = round(time.perf_counter() - format_started, 3)
+        calculation_elapsed = round(calculation_elapsed + elapsed, 3)
+        summary["percentile_total_elapsed"] = elapsed
+        summary["percentile_rebuild_scope"] = "emit_format"
+        summary["cache_or_reuse_strategy"] = "per_format_calculation"
         summaries[str(pf.code or price_format_id)] = {"price_format_id": price_format_id, **summary}
         logger.info(
             "[EMIT_PERCENTILE_REBUILD] requested_format_code=%s format_code=%s price_format_id=%s rows_created=%s products_with_competitors=%s",
@@ -2473,11 +2927,38 @@ def _recalculate_percentiles_for_emit_rows(
     commit_started = time.perf_counter()
     db.commit()
     commit_elapsed = round(time.perf_counter() - commit_started, 3)
+    calculation_summaries = [
+        item
+        for item in summaries.values()
+        if item.get("cache_or_reuse_strategy") != "compatibility_fanout"
+    ]
     return {
         "summaries": summaries,
         "warnings": warnings,
         "assigned_price_format_ids": sorted(touched_format_ids),
         "assignment_propagation": propagation.to_dict() if propagation is not None else {},
+        "percentile_rebuild_scope": "emit_source_shared" if can_share_emit_calculation and len(touched_format_id_list) > 1 else "emit_format",
+        "percentile_source_key": sorted(
+            {
+                str(canonical_competitor_source_key(price_lists[price_list_id]) or "")
+                for price_list_id in scoped_ids
+                if price_list_id in price_lists
+            }
+        ),
+        "competitor_price_list_id": scoped_ids[0] if len(scoped_ids) == 1 else None,
+        "competitor_price_list_ids": scoped_ids,
+        "expensive_calculation_count": expensive_calculation_count,
+        "shared_result_reuse_count": shared_result_reuse_count,
+        "raw_price_rows_scanned": sum(int(item.get("raw_price_rows") or 0) for item in calculation_summaries),
+        "matched_product_count": sum(int(item.get("products_with_competitors") or 0) for item in calculation_summaries),
+        "percentile_rows_calculated": sum(int(item.get("rows_created") or 0) for item in calculation_summaries),
+        "percentile_rows_persisted": sum(int(item.get("rows_created") or 0) for item in summaries.values()),
+        "compatibility_rows_created": compatibility_rows_created,
+        "calculation_elapsed": calculation_elapsed,
+        "persistence_elapsed": persistence_elapsed,
+        "total_percentile_elapsed": round(time.perf_counter() - rebuild_started, 3),
+        "cache_or_reuse_strategy": "compatibility_fanout" if can_share_emit_calculation and len(touched_format_id_list) > 1 else "per_format_calculation",
+        "skipped_duplicate_rebuilds": skipped_duplicate_rebuilds,
         "percentile_commit_elapsed": commit_elapsed,
         "percentile_total_elapsed": round(time.perf_counter() - rebuild_started, 3),
     }

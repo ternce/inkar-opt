@@ -142,6 +142,20 @@ from .services.price_source_accounts import (
     upsert_account,
 )
 from .services.price_sources import VidmanPriceService
+from .services.provisor_refresh_audit import (
+    AUTH_FAILED as PROVISOR_AUDIT_AUTH_FAILED,
+    DB_REPLACE_FAILED as PROVISOR_AUDIT_DB_REPLACE_FAILED,
+    DOWNLOAD_TIMEOUT as PROVISOR_AUDIT_DOWNLOAD_TIMEOUT,
+    SKIPPED_BY_CONFIGURATION as PROVISOR_AUDIT_SKIPPED_BY_CONFIGURATION,
+    SKIPPED_DISABLED as PROVISOR_AUDIT_SKIPPED_DISABLED,
+    SKIPPED_DUPLICATE as PROVISOR_AUDIT_SKIPPED_DUPLICATE,
+    SKIPPED_SIZE_LIMIT as PROVISOR_AUDIT_SKIPPED_SIZE_LIMIT,
+    SUCCESS_NONZERO as PROVISOR_AUDIT_SUCCESS_NONZERO,
+    SUCCESS_ZERO as PROVISOR_AUDIT_SUCCESS_ZERO,
+    UNKNOWN_FAILED as PROVISOR_AUDIT_UNKNOWN_FAILED,
+    ProvisorRefreshAudit,
+    classify_exception as classify_provisor_audit_exception,
+)
 from .services.pricing_rules.rules import (
     apply_pricing_rule_to_format,
     copy_pricing_rule,
@@ -6192,6 +6206,18 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
     progress["accounts_requested"] = requested_account_ids
     progress["accounts_processed"] = processed_account_ids
     progress["accounts_skipped"] = skipped_requested_account_ids
+    provisor_accounts_for_audit = [account for account in accounts if account.source_type == "provisor"]
+    provisor_audit = ProvisorRefreshAudit(
+        refresh_id=str(payload.get("refreshId") or payload.get("refresh_id") or ""),
+        trigger_source=refresh_source,
+        requested_account_ids=requested_account_ids,
+        eligible_account_ids=[int(account.id) for account in provisor_accounts_for_audit],
+        accounts_total=len(provisor_accounts_for_audit),
+    )
+    provisor_account_positions = {
+        int(account.id): index
+        for index, account in enumerate(provisor_accounts_for_audit, start=1)
+    }
     pf_for_refresh = db.execute(select(PriceFormat).where(PriceFormat.code == format_code)).scalars().first()
     _timing(operation, "load_accounts", refresh_started_at)
     source_started_at = time.perf_counter()
@@ -6318,6 +6344,12 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
             account_started_at = time.perf_counter()
             shared_vidman_client = None
             try:
+                if account.source_type == "provisor":
+                    provisor_audit.account_start(
+                        account_id=int(account.id),
+                        account_label=str(account.login or account.id),
+                        account_index=provisor_account_positions.get(int(account.id), 0),
+                    )
                 if account.source_type == "vidman" and str(account.status or "").strip().lower() == "auth_error":
                     logger.info("[VIDMAN_AUTH_ERROR_SKIPPED] account_id=%s reason=auth_error_status", account.id)
                     status.update(
@@ -6410,6 +6442,12 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                     account.id,
                 )
                 if account.source_type == "provisor":
+                    discovered_price_lists = list(price_lists)
+                    provisor_audit.discovery(
+                        account_id=int(account.id),
+                        filials_discovered=len(discovered_price_lists),
+                        discovery_elapsed_sec=round(fetch_lists_elapsed_ms / 1000, 3),
+                    )
                     if target_provisor_filial_ids:
                         price_lists = [
                             row
@@ -6417,6 +6455,44 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                             if str(getattr(row, "price_list_id", "") or "").strip() in target_provisor_filial_ids
                         ]
                         status["total"] = len(price_lists)
+                        selected_filial_ids = {
+                            str(getattr(row, "price_list_id", "") or "").strip()
+                            for row in price_lists
+                        }
+                        for index, row in enumerate(discovered_price_lists, start=1):
+                            skipped_filial_id = str(getattr(row, "price_list_id", "") or "").strip()
+                            if skipped_filial_id and skipped_filial_id not in selected_filial_ids:
+                                provisor_audit.discovered(
+                                    account_id=int(account.id),
+                                    account_label=str(account.login or account.id),
+                                    filial_id=skipped_filial_id,
+                                    filial_name=(
+                                        getattr(row, "price_list_name", "")
+                                        or getattr(row, "distributor_name", "")
+                                        or skipped_filial_id
+                                    ),
+                                    filial_index=index,
+                                    filials_total=len(discovered_price_lists),
+                                )
+                                provisor_audit.result(
+                                    account_id=int(account.id),
+                                    filial_id=skipped_filial_id,
+                                    outcome=PROVISOR_AUDIT_SKIPPED_BY_CONFIGURATION,
+                                    reason_code="not_in_requested_filial_ids",
+                                )
+                    for index, row in enumerate(price_lists, start=1):
+                        provisor_audit.discovered(
+                            account_id=int(account.id),
+                            account_label=str(account.login or account.id),
+                            filial_id=str(getattr(row, "price_list_id", "") or "").strip(),
+                            filial_name=(
+                                getattr(row, "price_list_name", "")
+                                or getattr(row, "distributor_name", "")
+                                or getattr(row, "price_list_id", "")
+                            ),
+                            filial_index=index,
+                            filials_total=len(price_lists),
+                        )
                     has_reference_filial = any(
                         str(getattr(row, "price_list_id", "") or "").strip() in {str(x) for x in PROVISOR_REFERENCE_FILIAL_IDS}
                         for row in price_lists
@@ -6551,6 +6627,12 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                             "primary_account_id": primary_account_id,
                                         }
                                     )
+                                    provisor_audit.result(
+                                        account_id=int(account.id),
+                                        filial_id=price_list_id,
+                                        outcome=PROVISOR_AUDIT_SKIPPED_DUPLICATE,
+                                        reason_code="duplicate_external_plk_id",
+                                    )
                                     return {
                                         "ok": False,
                                         "skipped": True,
@@ -6573,6 +6655,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                             active_now = active_fetch_count
                         if canonical_plk_key:
                             inventory["started"] = int(inventory.get("started") or 0) + 1
+                            provisor_audit.filial_start(account_id=int(account.id), filial_id=price_list_id)
                             provisor_lifecycle.setdefault(canonical_plk_key, []).append(
                                 {
                                     "account_id": int(account.id),
@@ -6626,6 +6709,13 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                     f"filial_name={price_list_name} reason=excluded_emit_or_heavy_filial",
                                     flush=True,
                                 )
+                                provisor_audit.result(
+                                    account_id=int(account.id),
+                                    filial_id=price_list_id,
+                                    outcome=PROVISOR_AUDIT_SKIPPED_SIZE_LIMIT,
+                                    reason_code="excluded_emit_or_heavy_filial",
+                                    download_elapsed_sec=round(elapsed_ms / 1000, 3),
+                                )
                                 return {
                                     "ok": False,
                                     "skipped": True,
@@ -6653,6 +6743,13 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                         price_list_id,
                                         price_list_name,
                                         skip_until.isoformat(),
+                                    )
+                                    provisor_audit.result(
+                                        account_id=int(account.id),
+                                        filial_id=price_list_id,
+                                        outcome=PROVISOR_AUDIT_SKIPPED_DISABLED,
+                                        reason_code="unhealthy_timeout_cache",
+                                        download_elapsed_sec=round(elapsed_ms / 1000, 3),
                                     )
                                     return {
                                         "ok": False,
@@ -6744,6 +6841,14 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                     price_list_id,
                                     local_updated_at,
                                 )
+                                provisor_audit.result(
+                                    account_id=int(account.id),
+                                    filial_id=price_list_id,
+                                    outcome=PROVISOR_AUDIT_SKIPPED_BY_CONFIGURATION,
+                                    reason_code="ttl_unchanged_cache",
+                                    previous_rows=local_items_count,
+                                    download_elapsed_sec=round(elapsed_ms / 1000, 3),
+                                )
                                 return {
                                     "ok": False,
                                     "skipped_unchanged": True,
@@ -6825,6 +6930,17 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                             "[PROVISOR] filial=%s action=skip_unchanged updated_at=%s",
                                             price_list_id,
                                             provisor_updated_at,
+                                        )
+                                        provisor_audit.result(
+                                            account_id=int(account.id),
+                                            filial_id=price_list_id,
+                                            outcome=PROVISOR_AUDIT_SKIPPED_BY_CONFIGURATION,
+                                            reason_code="source_updated_at_unchanged",
+                                            raw_rows=len(items or []),
+                                            valid_rows=len(items or []),
+                                            positive_price_rows=sum(1 for item in (items or []) if getattr(item, "distributor_price", None) is not None and getattr(item, "distributor_price", None) > 0),
+                                            previous_rows=local_items_count,
+                                            download_elapsed_sec=round(elapsed_ms / 1000, 3),
                                         )
                                         return {
                                             "ok": False,
@@ -6944,6 +7060,14 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                 f"reason=timeout_{price_list_timeout}s elapsed_ms={elapsed_ms}",
                                 flush=True,
                             )
+                            if account.source_type == "provisor":
+                                provisor_audit.result(
+                                    account_id=int(account.id),
+                                    filial_id=price_list_id,
+                                    outcome=PROVISOR_AUDIT_DOWNLOAD_TIMEOUT,
+                                    reason_code=f"timeout_{price_list_timeout}s",
+                                    download_elapsed_sec=round(elapsed_ms / 1000, 3),
+                                )
                             logger.exception(
                                 "[TIMING] operation=%s step=exception elapsed_ms=%s",
                                 f"{account_operation}:price_list:{price_list_id}",
@@ -7062,6 +7186,16 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                     0,
                                     repr(e),
                                 )
+                            if account.source_type == "provisor":
+                                outcome, reason_code, http_status = classify_provisor_audit_exception(e)
+                                provisor_audit.result(
+                                    account_id=int(account.id),
+                                    filial_id=price_list_id,
+                                    outcome=outcome,
+                                    reason_code=reason_code,
+                                    http_status=http_status,
+                                    download_elapsed_sec=round(elapsed_ms / 1000, 3),
+                                )
                             return {"ok": False, "priceList": price_list, "error": str(e)}
                         finally:
                             async with active_fetch_lock:
@@ -7075,6 +7209,16 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                         result = await done
                         results.append(result)
                         processed_now = len(results)
+                        if account.source_type == "provisor":
+                            price_list_for_progress = result.get("priceList") if isinstance(result, dict) else None
+                            provisor_audit.maybe_progress(
+                                current_account=account.id,
+                                current_filial=(
+                                    getattr(price_list_for_progress, "price_list_id", "")
+                                    if price_list_for_progress is not None
+                                    else ""
+                                ),
+                            )
                         if job is not None:
                             progress_now = 40 + int((processed_now / total_price_lists) * 20)
                             update_job(
@@ -7352,6 +7496,19 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                             status="success_zero_items",
                             message="Проверено успешно; пустой ответ сохранил существующие строки",
                         )
+                        if account_source_type == "provisor":
+                            provisor_audit.result(
+                                account_id=account_id,
+                                filial_id=price_list_id,
+                                outcome=PROVISOR_AUDIT_SUCCESS_ZERO,
+                                reason_code="empty_response_preserved_previous_rows",
+                                raw_rows=0,
+                                valid_rows=0,
+                                inserted_rows=0,
+                                previous_rows=int(result.get("localItemsCount") or 0),
+                                download_elapsed_sec=round(float(result.get("elapsed_ms") or 0) / 1000, 3),
+                                db_elapsed_sec=round(time.perf_counter() - save_started_at, 3),
+                            )
                         refreshed.append(
                             {
                                 "sourceType": account_source_type,
@@ -7382,6 +7539,30 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                             price_list_id,
                             len(items),
                             db_replace_elapsed_ms,
+                        )
+                        provisor_audit.result(
+                            account_id=account_id,
+                            filial_id=price_list_id,
+                            outcome=PROVISOR_AUDIT_SUCCESS_NONZERO if len(items) > 0 else PROVISOR_AUDIT_SUCCESS_ZERO,
+                            reason_code="saved_with_positive_rows" if len(items) > 0 else "saved_zero_rows",
+                            raw_rows=len(items),
+                            valid_rows=len(items),
+                            positive_price_rows=sum(
+                                1
+                                for item in items
+                                if getattr(item, "distributor_price", None) is not None
+                                and getattr(item, "distributor_price", None) > 0
+                            ),
+                            zero_price_rows=sum(
+                                1
+                                for item in items
+                                if getattr(item, "distributor_price", None) is None
+                                or getattr(item, "distributor_price", None) <= 0
+                            ),
+                            inserted_rows=len(items),
+                            previous_rows=int(result.get("localItemsCount") or 0),
+                            download_elapsed_sec=round(float(result.get("elapsed_ms") or 0) / 1000, 3),
+                            db_elapsed_sec=round(db_replace_elapsed_ms / 1000, 3),
                         )
                     saved_source_type = str(saved.source_type or "")
                     saved_source_key = str(saved.source_key or "")
@@ -7431,6 +7612,18 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                 except Exception as e:
                     elapsed_ms = round((time.perf_counter() - save_started_at) * 1000, 2)
                     db.rollback()
+                    if account_source_type == "provisor":
+                        provisor_audit.result(
+                            account_id=account_id,
+                            filial_id=price_list_id,
+                            outcome=PROVISOR_AUDIT_DB_REPLACE_FAILED,
+                            reason_code=e.__class__.__name__,
+                            raw_rows=len(result.get("items") or []),
+                            valid_rows=len(result.get("items") or []),
+                            previous_rows=int(result.get("localItemsCount") or 0),
+                            download_elapsed_sec=round(float(result.get("elapsed_ms") or 0) / 1000, 3),
+                            db_elapsed_sec=round(elapsed_ms / 1000, 3),
+                        )
                     logger.exception(
                         "[TIMING] operation=%s step=exception elapsed_ms=%s",
                         f"{operation}:account:{account_id}:price_list:{price_list_id}",
@@ -7481,6 +7674,8 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
         commit_started_at = time.perf_counter()
         db.commit()
         _timing(f"{operation}:account:{account_id}", "commit", commit_started_at)
+        if account_source_type == "provisor":
+            provisor_audit.account_summary(account_id=account_id, failed=bool(int(status.get("errors") or 0)))
 
         status["ok"] = (
             saved_count
@@ -7637,6 +7832,8 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
     progress["updated_count"] = updated_count
     progress["error_count"] = error_count
     progress["skipped_heavy_count"] = int(progress.get("skipped_heavy") or 0)
+    provisor_audit_summary = provisor_audit.log_summary()
+    progress["provisor_audit"] = provisor_audit_summary
     logger.info(
         "[PROVISOR_REFRESH_INVENTORY] refresh_id=%s requested_by=%s mode=%s raw_candidates=%s unique_plk=%s duplicates=%s queued=%s started=%s succeeded=%s failed=%s timed_out=%s skipped=%s persisted_snapshots=%s preserved_previous_snapshots=%s duration_seconds=%s",
         inventory.get("refresh_id") or "",
@@ -7671,6 +7868,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
         "errors": errors,
         "accounts": account_statuses,
         "progress": progress,
+        "provisorAudit": provisor_audit_summary,
         "inventory": inventory,
         "rebuild": rebuild_summary,
         "percentileRebuild": percentile_rebuild_summary,
