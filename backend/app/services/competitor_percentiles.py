@@ -1613,8 +1613,14 @@ def recalculate_percentiles_for_price_lists(
             "priceFormatsProcessed": 0,
             "percentileSourcesProcessed": 0,
             "percentileRowsWritten": 0,
+            "eligible_price_format_count": 0,
+            "eligible_source_count": 0,
+            "rows_deleted": 0,
+            "rows_written": 0,
             "productsGrouped": 0,
+            "percentile_total_sec": 0.0,
             "percentileElapsedSec": 0.0,
+            "skipped_reason": "no_refreshed_price_list_ids",
             "summaries": {},
             "warnings": [],
         }
@@ -1666,12 +1672,22 @@ def recalculate_percentiles_for_price_lists(
             **summary,
         }
 
+    unique_source_count = len({item for ids_for_format in by_format.values() for item in ids_for_format})
+    rows_deleted = sum(int(item.get("rows_deleted") or 0) for item in summaries.values())
+    rows_written = sum(int(item.get("rows_created") or 0) for item in summaries.values())
+    percentile_total_sec = round(time.perf_counter() - started_at, 6)
     return {
         "priceFormatsProcessed": len(by_format),
-        "percentileSourcesProcessed": len({item for ids_for_format in by_format.values() for item in ids_for_format}),
-        "percentileRowsWritten": sum(int(item.get("rows_created") or 0) for item in summaries.values()),
+        "percentileSourcesProcessed": unique_source_count,
+        "percentileRowsWritten": rows_written,
+        "eligible_price_format_count": len(by_format),
+        "eligible_source_count": unique_source_count,
+        "rows_deleted": rows_deleted,
+        "rows_written": rows_written,
         "productsGrouped": sum(int(item.get("products_with_competitors") or 0) for item in summaries.values()),
-        "percentileElapsedSec": round(time.perf_counter() - started_at, 3),
+        "percentile_total_sec": percentile_total_sec,
+        "percentileElapsedSec": round(percentile_total_sec, 3),
+        "skipped_reason": "" if by_format else "no_eligible_multi_price_per_sku_assignments",
         "summaries": summaries,
         "warnings": warnings,
     }

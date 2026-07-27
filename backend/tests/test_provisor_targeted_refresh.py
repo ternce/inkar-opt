@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -134,6 +136,27 @@ class _TimeoutProvisorAdapter(_FakeProvisorAdapter):
         return []
 
 
+class _ContextManagedProvisorAdapter(_FakeProvisorAdapter):
+    def __init__(self):
+        super().__init__()
+        self.entered = False
+        self.closed = False
+        self.configured_parallel: int | None = None
+
+    def configure_http_pool(self, *, max_parallel_plk: int):
+        self.configured_parallel = max_parallel_plk
+
+    async def __aenter__(self):
+        self.entered = True
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.aclose()
+
+    async def aclose(self):
+        self.closed = True
+
+
 def _seed(db):
     pf = PriceFormat(code="FMT", name="Format")
     account = PriceSourceAccount(id=3, source_type="provisor", login="Aksai4/83", encrypted_password="x")
@@ -151,6 +174,16 @@ def _add_account(db, account_id: int, login: str):
 
 def _fake_credentials(row):
     return SimpleNamespace(id=row.id, source_type=row.source_type, login=row.login, password="", config={})
+
+
+def _benchmark_payloads(caplog):
+    out = []
+    for record in caplog.records:
+        message = record.getMessage()
+        if "[PROVISOR_PLK_BENCHMARK]" not in message:
+            continue
+        out.append(json.loads(message.split("[PROVISOR_PLK_BENCHMARK]", 1)[1].strip()))
+    return out
 
 
 def test_targeted_provisor_refresh_only_processes_requested_filials(monkeypatch):
@@ -197,6 +230,112 @@ def test_all_discovered_provisor_plk_processed_beyond_concurrency(monkeypatch):
     assert adapter.fetched_item_ids == ["100", "101", "102", "103", "105"]
     assert result["progress"]["success_with_items"] == 5
     assert result["inventory"]["unique_plk"] == 5
+
+
+def test_provisor_refresh_enters_and_closes_account_scoped_adapter(monkeypatch):
+    import backend.app.main as main
+
+    db = _session()
+    _seed(db)
+    adapter = _ContextManagedProvisorAdapter()
+    monkeypatch.setattr(main, "adapter_for_source", lambda source: adapter)
+    monkeypatch.setattr(main, "credentials_from_row", _fake_credentials)
+
+    result = asyncio.run(
+        main._run_refresh_price_lists_logic(
+            format_code="FMT",
+            payload={"source": "provisor", "accountId": 3, "forceRefresh": True, "maxParallelPlk": 2},
+            db=db,
+        )
+    )
+
+    assert result["progress"]["success_with_items"] == 2
+    assert adapter.entered is True
+    assert adapter.closed is True
+    assert adapter.configured_parallel == 2
+
+
+def test_provisor_benchmark_logs_success_without_changing_refresh_behavior(monkeypatch, caplog):
+    import backend.app.main as main
+
+    db = _session()
+    _seed(db)
+    adapter = _ManyPlkProvisorAdapter([100])
+    monkeypatch.setattr(main, "adapter_for_source", lambda source: adapter)
+    monkeypatch.setattr(main, "credentials_from_row", _fake_credentials)
+
+    with caplog.at_level(logging.INFO):
+        result = asyncio.run(
+            main._run_refresh_price_lists_logic(
+                format_code="FMT",
+                payload={"source": "provisor", "accountId": 3, "forceRefresh": True, "maxParallelPlk": 2},
+                db=db,
+            )
+        )
+
+    payloads = _benchmark_payloads(caplog)
+    assert adapter.fetched_item_ids == ["100"]
+    assert result["progress"]["success_with_items"] == 1
+    assert result["provisorBenchmark"]["refreshed"] == 1
+    assert len(payloads) == 1
+    assert payloads[0]["account_id"] == 3
+    assert payloads[0]["filial_id"] == "100"
+    assert payloads[0]["outcome"] == "refreshed"
+    assert payloads[0]["response_bytes"] is None
+    assert "Aksai4/83" not in json.dumps(payloads, ensure_ascii=False)
+    assert "password" not in json.dumps(payloads, ensure_ascii=False).lower()
+    assert "token" not in json.dumps(payloads, ensure_ascii=False).lower()
+
+
+def test_provisor_benchmark_skipped_plk_has_skip_reason(monkeypatch, caplog):
+    import backend.app.main as main
+
+    db = _session()
+    _seed(db)
+    adapter = _ManyPlkProvisorAdapter([1052])
+    monkeypatch.setattr(main, "adapter_for_source", lambda source: adapter)
+    monkeypatch.setattr(main, "credentials_from_row", _fake_credentials)
+
+    with caplog.at_level(logging.INFO):
+        result = asyncio.run(
+            main._run_refresh_price_lists_logic(
+                format_code="FMT",
+                payload={"source": "provisor", "accountId": 3, "forceRefresh": True},
+                db=db,
+            )
+        )
+
+    payloads = _benchmark_payloads(caplog)
+    assert adapter.fetched_item_ids == []
+    assert result["progress"]["skipped_heavy"] == 1
+    assert payloads
+    assert payloads[0]["outcome"] == "skipped"
+    assert payloads[0]["skip_reason"] == "excluded_emit_or_heavy_filial"
+
+
+def test_provisor_benchmark_failed_plk_has_failed_outcome(monkeypatch, caplog):
+    import backend.app.main as main
+
+    db = _session()
+    _seed(db)
+    adapter = _ManyPlkProvisorAdapter([104])
+    monkeypatch.setattr(main, "adapter_for_source", lambda source: adapter)
+    monkeypatch.setattr(main, "credentials_from_row", _fake_credentials)
+
+    with caplog.at_level(logging.INFO):
+        result = asyncio.run(
+            main._run_refresh_price_lists_logic(
+                format_code="FMT",
+                payload={"source": "provisor", "accountId": 3, "forceRefresh": True},
+                db=db,
+            )
+        )
+
+    payloads = _benchmark_payloads(caplog)
+    assert result["progress"]["errors"] == 1
+    assert payloads
+    assert payloads[0]["outcome"] == "failed"
+    assert payloads[0]["skip_reason"] == "RuntimeError"
 
 
 def test_one_provisor_plk_failure_does_not_cancel_remaining(monkeypatch):
@@ -501,7 +640,7 @@ def test_provisor_timeout_does_not_wipe_existing_items(monkeypatch):
     assert db.execute(select(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == existing.id)).scalar_one().name == "Old Item"
 
 
-def test_provisor_zero_response_does_not_wipe_existing_items(monkeypatch):
+def test_provisor_zero_response_does_not_wipe_existing_items(monkeypatch, caplog):
     import backend.app.main as main
 
     db = _session()
@@ -530,21 +669,26 @@ def test_provisor_zero_response_does_not_wipe_existing_items(monkeypatch):
     monkeypatch.setattr(main, "adapter_for_source", lambda source: adapter)
     monkeypatch.setattr(main, "credentials_from_row", _fake_credentials)
 
-    result = asyncio.run(
-        main._run_refresh_price_lists_logic(
-            format_code="FMT",
-            payload={"source": "provisor", "accountId": 3, "provisorFilialIds": [1397], "forceRefresh": True},
-            db=db,
+    with caplog.at_level(logging.INFO):
+        result = asyncio.run(
+            main._run_refresh_price_lists_logic(
+                format_code="FMT",
+                payload={"source": "provisor", "accountId": 3, "provisorFilialIds": [1397], "forceRefresh": True},
+                db=db,
+            )
         )
-    )
 
     row = db.execute(select(CompetitorPriceList).where(CompetitorPriceList.source_key == "plk:1397")).scalar_one()
     items = db.execute(select(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == row.id)).scalars().all()
+    payloads = _benchmark_payloads(caplog)
     assert result["progress"]["success_zero_items"] == 1
     assert result["provisorAudit"]["success_zero"] == 1
     assert result["provisorAudit"]["failure_skip_reasons"]["empty_response_preserved_previous_rows"] == 1
     assert row.last_refresh_status == "success_zero_items"
     assert [item.name for item in items] == ["Old Item"]
+    assert payloads
+    assert payloads[0]["outcome"] == "unchanged"
+    assert payloads[0]["skip_reason"] == "empty_response_preserved_previous_rows"
 
 
 def test_provisor_timeout_config_default_is_120(monkeypatch):

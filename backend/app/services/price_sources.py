@@ -10,11 +10,19 @@ from decimal import Decimal
 from typing import Any, Protocol
 
 from .manufacturers import resolve_manufacturer
-from .provisor import get_filials_by_context, get_prices_by_filial_id
+import httpx
+
+from .provisor import get_filials_by_context, get_prices_by_filial_id, provisor_http_limits
 from .widman_client import WidmanClient
 
 logger = logging.getLogger(__name__)
 PRICE_LIST_FETCH_TIMEOUT_SECONDS = 30
+
+
+class BenchmarkList(list):
+    def __init__(self, rows=None, *, benchmark: dict[str, Any] | None = None):
+        super().__init__(rows or [])
+        self.benchmark = benchmark or {}
 
 
 def _env_float(name: str, default: float) -> float:
@@ -114,6 +122,30 @@ class ProvisorPriceService:
 
     def __init__(self, *, base_url: str) -> None:
         self.base_url = base_url.rstrip("/")
+        self._max_parallel_plk = 1
+        self._client: httpx.AsyncClient | None = None
+
+    def configure_http_pool(self, *, max_parallel_plk: int) -> None:
+        self._max_parallel_plk = max(1, int(max_parallel_plk or 1))
+
+    async def __aenter__(self) -> "ProvisorPriceService":
+        if self._client is None:
+            # Limits are intentionally small: one account-scoped client, sized to
+            # the configured in-account PLK concurrency plus one spare slot.
+            self._client = httpx.AsyncClient(
+                base_url=self.base_url,
+                limits=provisor_http_limits(self._max_parallel_plk),
+            )
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        client = self._client
+        self._client = None
+        if client is not None:
+            await client.aclose()
 
     async def _filials(self, account: PriceSourceAccountCredentials, *, timeout_seconds: float = 60.0) -> list[dict[str, Any]]:
         filials = await get_filials_by_context(
@@ -122,6 +154,7 @@ class ProvisorPriceService:
             password=account.password,
             timeout_seconds=timeout_seconds,
             force_refresh=True,
+            client=self._client,
         )
         configured_ids = set(self._configured_filial_ids(account))
         raw_count = len(filials)
@@ -226,14 +259,17 @@ class ProvisorPriceService:
             filial_id=filial_id,
             timeout_seconds=_provisor_item_timeout_seconds(),
             force_refresh=True,
+            client=self._client,
+            connection_reuse_scope="account_refresh" if self._client is not None else "single_request",
         )
+        http_benchmark = dict(getattr(raw_items, "benchmark", {}) or {})
         fetch_elapsed_ms = round((time.perf_counter() - fetch_started_at) * 1000, 2)
         normalize_started_at = time.perf_counter()
         first = next((x for x in raw_items if isinstance(x, dict)), {})
         filial = first.get("filial") if isinstance(first.get("filial"), dict) else {}
         distributor_name = str(filial.get("name") or price_list.distributor_name or f"Provisor {filial_id}").strip()
 
-        out: list[UnifiedPriceItem] = []
+        out: BenchmarkList = BenchmarkList()
         manufacturer_cache: dict[tuple[object, str], str] = {}
         valid_rows = 0
         positive_price_rows = 0
@@ -298,7 +334,19 @@ class ProvisorPriceService:
                     raw=item,
                 )
             )
-        normalize_elapsed_ms = round((time.perf_counter() - normalize_started_at) * 1000, 2)
+        normalize_elapsed_sec = time.perf_counter() - normalize_started_at
+        normalize_elapsed_ms = round(normalize_elapsed_sec * 1000, 2)
+        invalid_or_zero_price_count = zero_price_rows + invalid_price_rows
+        out.benchmark = {
+            **http_benchmark,
+            "fetch_items_sec": round(fetch_elapsed_ms / 1000, 6),
+            "normalization_sec": round(normalize_elapsed_sec, 6),
+            "input_rows": len(raw_items),
+            "output_items": len(out),
+            "positive_price_count": positive_price_rows,
+            "invalid_or_zero_price_count": invalid_or_zero_price_count,
+            "inserted_date_scan_sec": None,
+        }
         logger.info(
             "[PROVISOR_PLK_NORMALIZATION_TIMING] account_id=%s filial_id=%s raw_rows=%s valid_rows=%s positive_price_rows=%s zero_price_rows=%s invalid_price_rows=%s rows_missing_required_identifier=%s normalized_rows=%s fetch_elapsed_ms=%s normalization_elapsed_ms=%s manufacturer_cache_size=%s",
             account.id,

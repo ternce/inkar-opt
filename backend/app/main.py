@@ -408,6 +408,111 @@ def _provisor_excluded_filial_ids(account_config: dict[str, object] | None = Non
         ids.update(_parse_id_set(config.get(key)))
     return ids
 
+
+def _bench_float(value: object, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return round(float(value), 6)
+    except Exception:
+        return default
+
+
+def _bench_int_or_none(value: object) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def _log_provisor_plk_benchmark(benchmark: dict[str, object] | None) -> dict[str, object]:
+    data = dict(benchmark or {})
+    if data.get("_queued_at_perf") is not None:
+        data["total_sec"] = round(time.perf_counter() - float(data["_queued_at_perf"]), 6)
+    payload = {
+        "account_id": data.get("account_id"),
+        "filial_id": str(data.get("filial_id") or data.get("price_list_id") or ""),
+        "price_list_id": str(data.get("price_list_id") or data.get("filial_id") or ""),
+        "queue_wait_sec": _bench_float(data.get("queue_wait_sec")),
+        "auth_sec": _bench_float(data.get("auth_sec")),
+        "http_sec": _bench_float(data.get("http_sec")),
+        "pool_wait_sec": _bench_float(data.get("pool_wait_sec")) if data.get("pool_wait_sec") is not None else None,
+        "http_attempt_count": int(data.get("http_attempt_count") or 0),
+        "auth_retry_count": int(data.get("auth_retry_count") or 0),
+        "connection_reuse_scope": str(data.get("connection_reuse_scope") or ""),
+        "response_bytes": _bench_int_or_none(data.get("response_bytes")),
+        "json_decode_sec": _bench_float(data.get("json_decode_sec")),
+        "normalize_sec": _bench_float(data.get("normalize_sec")),
+        "items_received": int(data.get("items_received") or 0),
+        "db_existing_match_sec": _bench_float(data.get("db_existing_match_sec")),
+        "db_delete_sec": _bench_float(data.get("db_delete_sec")),
+        "db_prepare_sec": _bench_float(data.get("db_prepare_sec")),
+        "raw_json_serialize_sec": _bench_float(data.get("raw_json_serialize_sec")),
+        "db_insert_sec": _bench_float(data.get("db_insert_sec")),
+        "db_flush_sec": _bench_float(data.get("db_flush_sec")),
+        "db_commit_sec": _bench_float(data.get("db_commit_sec")),
+        "db_total_sec": _bench_float(data.get("db_total_sec")),
+        "total_sec": _bench_float(data.get("total_sec")),
+        "outcome": str(data.get("outcome") or ""),
+        "skip_reason": str(data.get("skip_reason") or ""),
+    }
+    logger.info("[PROVISOR_PLK_BENCHMARK] %s", json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    return payload
+
+
+def _aggregate_provisor_benchmarks(
+    benchmarks: list[dict[str, object]],
+    *,
+    wall_clock_sec: float,
+    discovered: int,
+    percentile_total_sec: float = 0.0,
+) -> dict[str, object]:
+    def total(key: str) -> float:
+        return round(sum(_bench_float(row.get(key)) for row in benchmarks), 6)
+
+    def count_outcome(*outcomes: str) -> int:
+        expected = set(outcomes)
+        return sum(1 for row in benchmarks if str(row.get("outcome") or "") in expected)
+
+    top = sorted(
+        benchmarks,
+        key=lambda row: _bench_float(row.get("total_sec")),
+        reverse=True,
+    )[:10]
+    return {
+        "note": "Summed task timings may exceed wall-clock time when concurrency is enabled.",
+        "total_plks_discovered": discovered,
+        "attempted": len(benchmarks),
+        "refreshed": count_outcome("refreshed"),
+        "unchanged": count_outcome("unchanged"),
+        "skipped": count_outcome("skipped", "timeout"),
+        "failed": count_outcome("failed"),
+        "total_items_received": sum(int(row.get("items_received") or 0) for row in benchmarks),
+        "total_response_bytes": sum(int(row.get("response_bytes") or 0) for row in benchmarks if row.get("response_bytes") is not None),
+        "total_queue_wait_sec": total("queue_wait_sec"),
+        "total_http_sec": total("http_sec"),
+        "total_pool_wait_sec": total("pool_wait_sec"),
+        "total_http_attempts": sum(int(row.get("http_attempt_count") or 0) for row in benchmarks),
+        "total_auth_retries": sum(int(row.get("auth_retry_count") or 0) for row in benchmarks),
+        "total_normalization_sec": total("normalize_sec"),
+        "total_db_sec": total("db_total_sec"),
+        "total_percentile_sec": round(percentile_total_sec or total("percentile_sec"), 6),
+        "wall_clock_refresh_sec": round(wall_clock_sec, 6),
+        "top_10_slowest_plks": [
+            {
+                "account_id": row.get("account_id"),
+                "filial_id": str(row.get("filial_id") or row.get("price_list_id") or ""),
+                "price_list_id": str(row.get("price_list_id") or row.get("filial_id") or ""),
+                "total_sec": _bench_float(row.get("total_sec")),
+                "outcome": str(row.get("outcome") or ""),
+                "skip_reason": str(row.get("skip_reason") or ""),
+            }
+            for row in top
+        ],
+    }
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_allow_origins if settings.environment != "dev" else ["*"],
@@ -6276,6 +6381,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
     provisor_claimed_keys: dict[str, tuple[int, object]] = {}
     provisor_aliases_by_key: dict[str, list[dict[str, object]]] = {}
     provisor_lifecycle: dict[str, list[dict[str, object]]] = {}
+    provisor_plk_benchmarks: list[dict[str, object]] = []
     inventory: dict[str, object] = {
         "refresh_id": payload.get("refreshId") or payload.get("refresh_id") or "",
         "requested_by": payload.get("requestedBy") or payload.get("requested_by") or "",
@@ -6342,6 +6448,8 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
         async with account_sem:
             account_operation = f"{operation}:account:{account.id}"
             account_started_at = time.perf_counter()
+            adapter = None
+            provisor_adapter_entered = False
             shared_vidman_client = None
             try:
                 if account.source_type == "provisor":
@@ -6371,6 +6479,11 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                     return status
                 adapter = adapter_for_source(account.source_type)
                 credentials = credentials_from_row(account)
+                if account.source_type == "provisor" and hasattr(adapter, "configure_http_pool"):
+                    adapter.configure_http_pool(max_parallel_plk=provisor_plk_parallel)
+                if account.source_type == "provisor" and hasattr(adapter, "__aenter__"):
+                    await adapter.__aenter__()
+                    provisor_adapter_entered = True
                 excluded_provisor_filial_ids = _provisor_excluded_filial_ids(credentials.config) if account.source_type == "provisor" else set()
                 shared_vidman_client = (
                     adapter._client(credentials, timeout=PRICE_LIST_FETCH_TIMEOUT_SECONDS)
@@ -6582,7 +6695,11 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                     flush=True,
                 )
                 async def fetch_one(price_list):
+                    queued_at_perf = time.perf_counter()
+                    queued_at_iso = local_iso(now_kz_naive())
                     async with source_sems.get(account.source_type, asyncio.Semaphore(2)):
+                        semaphore_acquired_perf = time.perf_counter()
+                        semaphore_acquired_at_iso = local_iso(now_kz_naive())
                         nonlocal active_fetch_count
                         fetch_items_started_at = time.perf_counter()
                         fetch_items_started_wall = local_iso(now_kz_naive())
@@ -6594,6 +6711,43 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                             else PRICE_LIST_FETCH_TIMEOUT_SECONDS
                         )
                         canonical_plk_key = f"provisor:plk:{price_list_id}" if account.source_type == "provisor" else ""
+                        plk_benchmark: dict[str, object] = {}
+                        if account.source_type == "provisor":
+                            plk_benchmark = {
+                                "account_id": int(account.id),
+                                "filial_id": price_list_id,
+                                "price_list_id": price_list_id,
+                                "queued_at": queued_at_iso,
+                                "_queued_at_perf": queued_at_perf,
+                                "semaphore_acquired_at": semaphore_acquired_at_iso,
+                                "queue_wait_sec": round(semaphore_acquired_perf - queued_at_perf, 6),
+                                "auth_sec": 0.0,
+                                "http_sec": 0.0,
+                                "response_bytes": None,
+                                "json_decode_sec": 0.0,
+                                "normalize_sec": 0.0,
+                                "items_received": 0,
+                                "db_existing_match_sec": 0.0,
+                                "db_delete_sec": 0.0,
+                                "db_prepare_sec": 0.0,
+                                "raw_json_serialize_sec": 0.0,
+                                "db_insert_sec": 0.0,
+                                "db_flush_sec": 0.0,
+                                "db_commit_sec": 0.0,
+                                "db_total_sec": 0.0,
+                                "percentile_sec": 0.0,
+                                "outcome": "",
+                                "skip_reason": "",
+                            }
+
+                        def finish_result(result: dict, *, outcome: str, skip_reason: str = "") -> dict:
+                            if account.source_type == "provisor":
+                                plk_benchmark["outcome"] = outcome
+                                plk_benchmark["skip_reason"] = skip_reason
+                                plk_benchmark["total_sec"] = round(time.perf_counter() - queued_at_perf, 6)
+                                result["benchmark"] = dict(plk_benchmark)
+                            return result
+
                         if canonical_plk_key:
                             alias = {
                                 "account_id": int(account.id),
@@ -6633,7 +6787,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                         outcome=PROVISOR_AUDIT_SKIPPED_DUPLICATE,
                                         reason_code="duplicate_external_plk_id",
                                     )
-                                    return {
+                                    return finish_result({
                                         "ok": False,
                                         "skipped": True,
                                         "duplicate": True,
@@ -6649,7 +6803,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                             "deduplication_key": canonical_plk_key,
                                             "primary_account_id": primary_account_id,
                                         },
-                                    }
+                                    }, outcome="skipped", skip_reason="duplicate_external_plk_id")
                         async with active_fetch_lock:
                             active_fetch_count += 1
                             active_now = active_fetch_count
@@ -6716,7 +6870,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                     reason_code="excluded_emit_or_heavy_filial",
                                     download_elapsed_sec=round(elapsed_ms / 1000, 3),
                                 )
-                                return {
+                                return finish_result({
                                     "ok": False,
                                     "skipped": True,
                                     "skipped_heavy": True,
@@ -6732,7 +6886,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                         "fetch_duration_seconds": round(elapsed_ms / 1000, 3),
                                         "timeout_limit_seconds": price_list_timeout,
                                     },
-                                }
+                                }, outcome="skipped", skip_reason="excluded_emit_or_heavy_filial")
                             if account.source_type == "provisor" and not force_refresh:
                                 skip_until = _is_provisor_price_unhealthy(account_id=account.id, filial_id=price_list_id)
                                 if skip_until is not None:
@@ -6751,7 +6905,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                         reason_code="unhealthy_timeout_cache",
                                         download_elapsed_sec=round(elapsed_ms / 1000, 3),
                                     )
-                                    return {
+                                    return finish_result({
                                         "ok": False,
                                         "skipped": True,
                                         "priceList": price_list,
@@ -6766,7 +6920,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                         "fetch_duration_seconds": round(elapsed_ms / 1000, 3),
                                         "timeout_limit_seconds": price_list_timeout,
                                     },
-                                }
+                                }, outcome="skipped", skip_reason="unhealthy_timeout_cache")
                             if account.source_type == "vidman":
                                 logger.info(
                                     "[VW_PRICE_LIST_REFRESH_START] account_id=%s price_id=%s price_name=%s old_date=%s new_date=%s items_count=%s",
@@ -6818,7 +6972,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                             "action": "skip_unchanged",
                                         },
                                     )
-                                return {
+                                return finish_result({
                                     "ok": False,
                                     "skipped_unchanged": True,
                                     "priceList": price_list,
@@ -6826,7 +6980,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                     "localItemsCount": local_items_count,
                                     "elapsed_ms": elapsed_ms,
                                     "timeout_limit_seconds": price_list_timeout,
-                                }
+                                }, outcome="unchanged", skip_reason="ttl_unchanged_cache")
                             if (
                                 account.source_type == "provisor"
                                 and not force_refresh
@@ -6899,6 +7053,22 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                             timeout_stage = "parsing"
                             if account.source_type == "vidman" and isinstance(adapter, VidmanPriceService):
                                 items = adapter._unified_items_from_rows(price_list=price_list, rows=items)
+                            if account.source_type == "provisor":
+                                item_benchmark = dict(getattr(items, "benchmark", {}) or {})
+                                plk_benchmark.update(
+                                    {
+                                        "auth_sec": _bench_float(item_benchmark.get("auth_wait_sec")),
+                                        "http_sec": _bench_float(item_benchmark.get("http_request_sec")),
+                                        "pool_wait_sec": item_benchmark.get("pool_wait_sec"),
+                                        "http_attempt_count": int(item_benchmark.get("http_attempt_count") or 0),
+                                        "auth_retry_count": int(item_benchmark.get("auth_retry_count") or 0),
+                                        "connection_reuse_scope": str(item_benchmark.get("connection_reuse_scope") or ""),
+                                        "response_bytes": item_benchmark.get("response_bytes"),
+                                        "json_decode_sec": _bench_float(item_benchmark.get("json_decode_sec")),
+                                        "normalize_sec": _bench_float(item_benchmark.get("normalization_sec")),
+                                        "items_received": int(item_benchmark.get("input_rows") or len(items or [])),
+                                    }
+                                )
                             elapsed_ms = round((time.perf_counter() - fetch_items_started_at) * 1000, 2)
                             if account.source_type == "vidman":
                                 logger.info(
@@ -6916,12 +7086,14 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                     price_list = replace(price_list, source_aliases=aliases)
                                 _record_provisor_price_success(account_id=account.id, filial_id=price_list_id)
                                 provisor_updated_at = ""
+                                inserted_date_scan_started_at = time.perf_counter()
                                 for item in items or []:
                                     raw_item = getattr(item, "raw", None)
                                     if isinstance(raw_item, dict):
                                         provisor_updated_at = str(raw_item.get("insertedDate") or "").strip()
                                         if provisor_updated_at:
                                             break
+                                plk_benchmark["inserted_date_scan_sec"] = round(time.perf_counter() - inserted_date_scan_started_at, 6)
                                 if provisor_updated_at:
                                     price_list = replace(price_list, source_updated_at=provisor_updated_at)
                                     if local_updated_at == provisor_updated_at and local_items_count > 0:
@@ -6942,7 +7114,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                             previous_rows=local_items_count,
                                             download_elapsed_sec=round(elapsed_ms / 1000, 3),
                                         )
-                                        return {
+                                        return finish_result({
                                             "ok": False,
                                             "skipped_unchanged": True,
                                             "priceList": price_list,
@@ -6950,7 +7122,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                             "localItemsCount": local_items_count,
                                             "elapsed_ms": elapsed_ms,
                                             "timeout_limit_seconds": price_list_timeout,
-                                        }
+                                        }, outcome="unchanged", skip_reason="source_updated_at_unchanged")
                                     logger.info(
                                         "[PROVISOR] filial=%s action=fetch_changed updated_at=%s local_updated_at=%s",
                                         price_list_id,
@@ -6996,7 +7168,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                 getattr(price_list, "price_list_id", ""),
                                 len(items or []),
                             )
-                            return {
+                            return finish_result({
                                 "ok": True,
                                 "priceList": price_list,
                                 "items": items,
@@ -7005,7 +7177,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                 "localItemsCount": local_items_count,
                                 "elapsed_ms": elapsed_ms,
                                 "timeout_limit_seconds": price_list_timeout,
-                            }
+                            }, outcome="refreshed")
                         except (asyncio.TimeoutError, httpx.TimeoutException):
                             price_list_name = str(getattr(price_list, "price_list_name", "") or getattr(price_list, "distributor_name", "") or price_list_id)
                             warning_message = f"Прайс {price_list_id} пропущен (timeout {PRICE_LIST_FETCH_TIMEOUT_SECONDS}s)"
@@ -7100,7 +7272,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                         "reason": f"timeout_{price_list_timeout}s",
                                     },
                                 )
-                            return {
+                            return finish_result({
                                 "ok": False,
                                 "timeout": True,
                                 "priceList": price_list,
@@ -7116,7 +7288,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                     "fetch_duration_seconds": round(elapsed_ms / 1000, 3),
                                     "timeout_limit_seconds": price_list_timeout,
                                 },
-                            }
+                            }, outcome="timeout", skip_reason=f"timeout_{price_list_timeout}s")
                         except WidmanInvalidCredentialsError:
                             elapsed_ms = round((time.perf_counter() - fetch_items_started_at) * 1000, 2)
                             logger.warning(
@@ -7196,7 +7368,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                     http_status=http_status,
                                     download_elapsed_sec=round(elapsed_ms / 1000, 3),
                                 )
-                            return {"ok": False, "priceList": price_list, "error": str(e)}
+                            return finish_result({"ok": False, "priceList": price_list, "error": str(e)}, outcome="failed", skip_reason=e.__class__.__name__)
                         finally:
                             async with active_fetch_lock:
                                 active_fetch_count = max(0, active_fetch_count - 1)
@@ -7318,6 +7490,14 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                             f"Обновлено: {status['success']}, без изменений: {status.get('skipped_unchanged', 0)}, "
                             f"timeout: {status.get('skipped_timeout', 0)}, heavy: {status.get('skipped_heavy_count', 0)}, ошибки: {status['errors']}"
                         )
+            except asyncio.CancelledError:
+                if shared_vidman_client is not None:
+                    await shared_vidman_client.close()
+                    shared_vidman_client = None
+                if provisor_adapter_entered and hasattr(adapter, "aclose"):
+                    await adapter.aclose()
+                    provisor_adapter_entered = False
+                raise
             except WidmanInvalidCredentialsError:
                 logger.exception("[TIMING] operation=%s step=exception elapsed_ms=%s", account_operation, round((time.perf_counter() - account_started_at) * 1000, 2))
                 logger.warning(
@@ -7354,6 +7534,8 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                 status["message"] = str(e)
             if shared_vidman_client is not None:
                 await shared_vidman_client.close()
+            if provisor_adapter_entered and hasattr(adapter, "aclose"):
+                await adapter.aclose()
             if account.source_type == "vidman":
                 logger.info(
                     "[VW_REFRESH_DONE] account_id=%s price_id=%s price_name=%s old_date=%s new_date=%s items_count=%s reason=%s",
@@ -7427,6 +7609,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
         saving_index = 0
         for result in result_rows:
             price_list = result.get("priceList")
+            benchmark = dict(result.get("benchmark") or {})
             if price_list is not None and result.get("skipped_unchanged"):
                 try:
                     mark_unified_price_list_checked(
@@ -7443,6 +7626,9 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                         account_id,
                         getattr(price_list, "price_list_id", ""),
                     )
+                if benchmark:
+                    logged = _log_provisor_plk_benchmark(benchmark)
+                    provisor_plk_benchmarks.append(logged)
             elif price_list is not None and result.get("timeout"):
                 try:
                     mark_unified_price_list_checked(
@@ -7459,6 +7645,9 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                         account_id,
                         getattr(price_list, "price_list_id", ""),
                     )
+                if benchmark:
+                    logged = _log_provisor_plk_benchmark(benchmark)
+                    provisor_plk_benchmarks.append(logged)
             if result.get("ok") and price_list is not None:
                 saving_index += 1
                 price_list_id = str(getattr(price_list, "price_list_id", "") or "")
@@ -7522,6 +7711,11 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                 "timeoutLimitSeconds": result.get("timeout_limit_seconds"),
                             }
                         )
+                        if benchmark:
+                            benchmark["outcome"] = "unchanged"
+                            benchmark["skip_reason"] = "empty_response_preserved_previous_rows"
+                            logged = _log_provisor_plk_benchmark(benchmark)
+                            provisor_plk_benchmarks.append(logged)
                         continue
                     saved = upsert_unified_price_list(
                         db=db,
@@ -7532,6 +7726,24 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                         run_matching=False,
                     )
                     db_replace_elapsed_ms = round((time.perf_counter() - save_started_at) * 1000, 2)
+                    db_benchmark = dict(getattr(saved, "_benchmark", {}) or {})
+                    if benchmark and db_benchmark:
+                        benchmark.update(
+                            {
+                                "db_existing_match_sec": db_benchmark.get("load_existing_match_fields_sec", 0.0),
+                                "db_delete_sec": db_benchmark.get("delete_old_items_sec", 0.0),
+                                "db_prepare_sec": db_benchmark.get("prepare_rows_sec", 0.0),
+                                "raw_json_serialize_sec": db_benchmark.get("raw_json_serialize_sec", 0.0),
+                                "db_insert_sec": db_benchmark.get("bulk_insert_sec", 0.0),
+                                "db_flush_sec": db_benchmark.get("flush_sec", 0.0),
+                                "db_commit_sec": db_benchmark.get("commit_sec", 0.0),
+                                "db_total_sec": db_benchmark.get("total_sec", 0.0),
+                                "db_existing_rows_count": db_benchmark.get("existing_rows_count", 0),
+                                "db_preserved_match_fields_count": db_benchmark.get("preserved_match_fields_count", 0),
+                                "db_deleted_rows_count": db_benchmark.get("deleted_rows_count", 0),
+                                "db_inserted_rows_count": db_benchmark.get("inserted_rows_count", 0),
+                            }
+                        )
                     if account_source_type == "provisor":
                         logger.info(
                             "[PROVISOR_PLK_DB_REPLACE_TIMING] account_id=%s filial_id=%s rows=%s db_replace_elapsed_ms=%s",
@@ -7609,6 +7821,9 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                 "itemsCount": len(items),
                             },
                         )
+                    if benchmark:
+                        logged = _log_provisor_plk_benchmark(benchmark)
+                        provisor_plk_benchmarks.append(logged)
                 except Exception as e:
                     elapsed_ms = round((time.perf_counter() - save_started_at) * 1000, 2)
                     db.rollback()
@@ -7654,8 +7869,20 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                     status["errors"] = int(status.get("errors") or 0) + 1
                     status["success"] = max(0, int(status.get("success") or 0) - 1)
                     errors.append(f"{account_source_type} / {account_login} / {price_list_name}: {e}")
+                    if benchmark:
+                        benchmark["outcome"] = "failed"
+                        benchmark["skip_reason"] = e.__class__.__name__
+                        benchmark["total_sec"] = round(time.perf_counter() - save_started_at + _bench_float(benchmark.get("total_sec")), 6)
+                        logged = _log_provisor_plk_benchmark(benchmark)
+                        provisor_plk_benchmarks.append(logged)
             elif result.get("error"):
                 errors.append(f"{account_source_type} / {account_login}: {result.get('error')}")
+                if benchmark:
+                    logged = _log_provisor_plk_benchmark(benchmark)
+                    provisor_plk_benchmarks.append(logged)
+            elif benchmark and not result.get("skipped_unchanged") and not result.get("timeout"):
+                logged = _log_provisor_plk_benchmark(benchmark)
+                provisor_plk_benchmarks.append(logged)
 
         account_row = db.get(PriceSourceAccount, account_id)
         if account_row is not None:
@@ -7834,6 +8061,14 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
     progress["skipped_heavy_count"] = int(progress.get("skipped_heavy") or 0)
     provisor_audit_summary = provisor_audit.log_summary()
     progress["provisor_audit"] = provisor_audit_summary
+    provisor_benchmark_summary = _aggregate_provisor_benchmarks(
+        provisor_plk_benchmarks,
+        wall_clock_sec=time.perf_counter() - refresh_started_at,
+        discovered=int(inventory.get("raw_plk_candidates") or 0),
+        percentile_total_sec=_bench_float(percentile_rebuild_summary.get("percentile_total_sec") if isinstance(percentile_rebuild_summary, dict) else 0),
+    )
+    progress["provisor_benchmark"] = provisor_benchmark_summary
+    logger.info("[PROVISOR_REFRESH_BENCHMARK] %s", json.dumps(provisor_benchmark_summary, ensure_ascii=False, sort_keys=True))
     logger.info(
         "[PROVISOR_REFRESH_INVENTORY] refresh_id=%s requested_by=%s mode=%s raw_candidates=%s unique_plk=%s duplicates=%s queued=%s started=%s succeeded=%s failed=%s timed_out=%s skipped=%s persisted_snapshots=%s preserved_previous_snapshots=%s duration_seconds=%s",
         inventory.get("refresh_id") or "",
@@ -7869,6 +8104,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
         "accounts": account_statuses,
         "progress": progress,
         "provisorAudit": provisor_audit_summary,
+        "provisorBenchmark": provisor_benchmark_summary,
         "inventory": inventory,
         "rebuild": rebuild_summary,
         "percentileRebuild": percentile_rebuild_summary,

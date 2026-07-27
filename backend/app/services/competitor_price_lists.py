@@ -260,16 +260,27 @@ def _competitor_item_identity_keys(
     return keys
 
 
-def _identity_keys_for_existing_item(item: CompetitorPriceListItem, source: str) -> list[tuple[str, ...]]:
+def _identity_keys_for_existing_item_columns(
+    *,
+    source: str,
+    price_list_id: object,
+    provisor_id: object,
+    provisor_goods_id: object,
+    distributor_goods_id: object,
+    distributor_goods_name: object,
+    name: object,
+    raw_manufacturer: object,
+    expiry_date: object,
+) -> list[tuple[str, ...]]:
     return _competitor_item_identity_keys(
         source=source,
-        price_list_id=item.filial_id or item.price_list_id,
-        provisor_id=item.provisor_id,
-        provisor_goods_id=item.provisor_goods_id,
-        distributor_goods_id=item.distributor_goods_id,
-        name=item.distributor_goods_name or item.name,
-        producer=item.raw_manufacturer,
-        shelf_life=item.expiry_date,
+        price_list_id=price_list_id,
+        provisor_id=provisor_id,
+        provisor_goods_id=provisor_goods_id,
+        distributor_goods_id=distributor_goods_id,
+        name=distributor_goods_name or name,
+        producer=raw_manufacturer,
+        shelf_life=expiry_date,
     )
 
 
@@ -648,6 +659,20 @@ def upsert_unified_price_list(
     run_matching: bool = True,
 ) -> CompetitorPriceList:
     total_started_at = time.perf_counter()
+    benchmark: dict[str, object] = {
+        "load_existing_match_fields_sec": 0.0,
+        "existing_rows_count": 0,
+        "preserved_match_fields_count": 0,
+        "delete_old_items_sec": 0.0,
+        "deleted_rows_count": 0,
+        "prepare_rows_sec": 0.0,
+        "raw_json_serialize_sec": 0.0,
+        "bulk_insert_sec": 0.0,
+        "inserted_rows_count": 0,
+        "flush_sec": 0.0,
+        "commit_sec": 0.0,
+        "total_sec": 0.0,
+    }
     pf = _ensure_price_format(db, price_format_code)
     today = as_of or date.today()
     source_key = _source_key_for_unified(price_list)
@@ -731,21 +756,45 @@ def upsert_unified_price_list(
     preserved_match_fields: dict[tuple[str, ...], tuple[int | None, str, float | None, str]] = {}
     existing_count = 0
     if not run_matching:
-        existing_items = (
-            db.execute(select(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == row.id))
-            .scalars()
-            .all()
-        )
-        existing_count = len(existing_items)
-        for existing_item in existing_items:
+        existing_rows = db.execute(
+            select(
+                CompetitorPriceListItem.price_list_id,
+                CompetitorPriceListItem.product_id,
+                CompetitorPriceListItem.provisor_id,
+                CompetitorPriceListItem.provisor_goods_id,
+                CompetitorPriceListItem.distributor_goods_id,
+                CompetitorPriceListItem.distributor_goods_name,
+                CompetitorPriceListItem.name,
+                CompetitorPriceListItem.raw_manufacturer,
+                CompetitorPriceListItem.expiry_date,
+                CompetitorPriceListItem.match_type,
+                CompetitorPriceListItem.match_score,
+                CompetitorPriceListItem.matched_sku,
+            ).where(CompetitorPriceListItem.price_list_id == row.id)
+        ).all()
+        existing_count = len(existing_rows)
+        for existing_row in existing_rows:
             fields = (
-                existing_item.product_id,
-                str(existing_item.match_type or "unmatched"),
-                float(existing_item.match_score) if existing_item.match_score is not None else None,
-                str(existing_item.matched_sku or ""),
+                existing_row.product_id,
+                str(existing_row.match_type or "unmatched"),
+                float(existing_row.match_score) if existing_row.match_score is not None else None,
+                str(existing_row.matched_sku or ""),
             )
-            for key in _identity_keys_for_existing_item(existing_item, price_list.source):
+            for key in _identity_keys_for_existing_item_columns(
+                source=price_list.source,
+                price_list_id=existing_row.price_list_id,
+                provisor_id=existing_row.provisor_id,
+                provisor_goods_id=existing_row.provisor_goods_id,
+                distributor_goods_id=existing_row.distributor_goods_id,
+                distributor_goods_name=existing_row.distributor_goods_name,
+                name=existing_row.name,
+                raw_manufacturer=existing_row.raw_manufacturer,
+                expiry_date=existing_row.expiry_date,
+            ):
                 preserved_match_fields.setdefault(key, fields)
+    benchmark["load_existing_match_fields_sec"] = round(time.perf_counter() - stage_started_at, 6)
+    benchmark["existing_rows_count"] = existing_count
+    benchmark["preserved_match_fields_count"] = len(preserved_match_fields)
     _db_save_timing(price_list_id=row.id, stage="load_existing_match_fields", rows=existing_count, started_at=stage_started_at)
 
     stage_started_at = time.perf_counter()
@@ -754,6 +803,8 @@ def upsert_unified_price_list(
         .where(CompetitorPriceListItem.price_list_id == row.id)
         .execution_options(synchronize_session=False)
     )
+    benchmark["delete_old_items_sec"] = round(time.perf_counter() - stage_started_at, 6)
+    benchmark["deleted_rows_count"] = int(delete_result.rowcount or 0)
     _db_save_timing(price_list_id=row.id, stage="delete_old_items", rows=int(delete_result.rowcount or 0), started_at=stage_started_at)
 
     code_to_id: dict[str, int] = {}
@@ -809,9 +860,13 @@ def upsert_unified_price_list(
     _prepare_rows_timing(price_list_id=row.id, stage="manufacturer_assignment", rows=len(raw_manufacturers), started_at=stage_started_at)
 
     stage_started_at = time.perf_counter()
-    preserved_fields_by_index: list[tuple[int | None, str, float | None, str] | None] = []
-    if not run_matching:
-        for index, item in enumerate(items):
+    empty_structure_fields = _empty_match_structure_fields()
+    raw_json_serialize_sec = 0.0
+    for index, item in enumerate(items):
+        item_name = item_names[index]
+        raw_manufacturer = raw_manufacturers[index]
+        preserved_fields = None
+        if not run_matching:
             raw = raw_values[index]
             keys = _competitor_item_identity_keys(
                 source=item.source,
@@ -820,21 +875,11 @@ def upsert_unified_price_list(
                 provisor_goods_id=provisor_goods_ids[index],
                 distributor_goods_id=item.distributor_product_id,
                 name=item.distributor_product_name or item.product_name,
-                producer=raw_manufacturers[index],
+                producer=raw_manufacturer,
                 shelf_life=expiry_dates[index],
                 batch=raw.get("batch") or raw.get("series") or raw.get("batchNumber"),
             )
-            preserved_fields_by_index.append(next((preserved_match_fields[key] for key in keys if key in preserved_match_fields), None))
-    _prepare_rows_timing(price_list_id=row.id, stage="build_preserve_keys", rows=len(preserved_fields_by_index), started_at=stage_started_at)
-
-    stage_started_at = time.perf_counter()
-    empty_structure_fields = _empty_match_structure_fields()
-    for index, item in enumerate(items):
-        item_name = item_names[index]
-        raw_manufacturer = raw_manufacturers[index]
-        preserved_fields = None
-        if not run_matching:
-            preserved_fields = preserved_fields_by_index[index]
+            preserved_fields = next((preserved_match_fields[key] for key in keys if key in preserved_match_fields), None)
             if preserved_fields is not None:
                 preserved_count += 1
             else:
@@ -852,6 +897,22 @@ def upsert_unified_price_list(
             match_type = "unmatched"
             match_score = None
             matched_sku = ""
+        raw_json_started_at = time.perf_counter()
+        raw_json = json.dumps(
+            {
+                "source": item.source,
+                "accountId": item.account_id,
+                "priceListId": item.price_list_id,
+                "priceListName": item.price_list_name,
+                "distributorName": item.distributor_name,
+                "manufacturer": raw_manufacturer,
+                "expiryDate": item.expiry_date,
+                "raw": item.raw,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+        raw_json_serialize_sec += time.perf_counter() - raw_json_started_at
         mapping = {
             **empty_structure_fields,
             "price_list_id": row.id,
@@ -872,20 +933,7 @@ def upsert_unified_price_list(
             "matched_sku": matched_sku,
             "raw_name": item_name,
             "raw_manufacturer": raw_manufacturer,
-            "raw_json": json.dumps(
-                {
-                    "source": item.source,
-                    "accountId": item.account_id,
-                    "priceListId": item.price_list_id,
-                    "priceListName": item.price_list_name,
-                    "distributorName": item.distributor_name,
-                    "manufacturer": raw_manufacturer,
-                    "expiryDate": item.expiry_date,
-                    "raw": item.raw,
-                },
-                ensure_ascii=False,
-                default=str,
-            ),
+            "raw_json": raw_json,
         }
         if run_matching and price_list.source == "vidman":
             row_item = CompetitorPriceListItem(**mapping)
@@ -895,6 +943,8 @@ def upsert_unified_price_list(
         row_mappings.append(mapping)
     _prepare_rows_timing(price_list_id=row.id, stage="build_row_mapping_loop", rows=len(row_mappings), started_at=stage_started_at)
     _prepare_rows_timing(price_list_id=row.id, stage="total", rows=len(row_mappings), started_at=prepare_total_started_at)
+    benchmark["prepare_rows_sec"] = round(time.perf_counter() - prepare_total_started_at, 6)
+    benchmark["raw_json_serialize_sec"] = round(raw_json_serialize_sec, 6)
     _db_save_timing(price_list_id=row.id, stage="prepare_rows", rows=len(row_mappings), started_at=prepare_total_started_at)
     if not run_matching:
         logger.info("[MATCH_FIELDS_PRESERVED] price_list_id=%s preserved_count=%s", row.id, preserved_count)
@@ -903,10 +953,13 @@ def upsert_unified_price_list(
     stage_started_at = time.perf_counter()
     if row_mappings:
         db.bulk_insert_mappings(CompetitorPriceListItem, row_mappings)
+    benchmark["bulk_insert_sec"] = round(time.perf_counter() - stage_started_at, 6)
+    benchmark["inserted_rows_count"] = len(row_mappings)
     _db_save_timing(price_list_id=row.id, stage="bulk_insert", rows=len(row_mappings), started_at=stage_started_at)
 
     stage_started_at = time.perf_counter()
     db.flush()
+    benchmark["flush_sec"] = round(time.perf_counter() - stage_started_at, 6)
     _db_save_timing(price_list_id=row.id, stage="flush", rows=len(row_mappings), started_at=stage_started_at)
     if price_list.source == "provisor" and _as_int(price_list.price_list_id) in PROVISOR_REFERENCE_FILIAL_IDS:
         _sync_provisor_reference_mapping_from_items(db, account_id=price_list.account_id)
@@ -918,6 +971,9 @@ def upsert_unified_price_list(
         recalculate_competitor_percentiles_if_needed(db=db, price_format_id=pf.id)
     stage_started_at = time.perf_counter()
     db.commit()
+    benchmark["commit_sec"] = round(time.perf_counter() - stage_started_at, 6)
+    benchmark["total_sec"] = round(time.perf_counter() - total_started_at, 6)
+    setattr(row, "_benchmark", benchmark)
     _db_save_timing(price_list_id=row.id, stage="commit", rows=len(row_mappings), started_at=stage_started_at)
     _db_save_timing(price_list_id=row.id, stage="total", rows=len(row_mappings), started_at=total_started_at)
     return row
