@@ -1,2 +1,0 @@
-import{G as g}from"./localization.js";async function c(){g()}var i=(s=>(s[s.SupportChecking=0]="SupportChecking",s[s.PasswordChecking=1]="PasswordChecking",s[s.Autoreg=2]="Autoreg",s[s.Sharing=3]="Sharing",s[s.WithoutCards=4]="WithoutCards",s[s.CallableProxyArguments=5]="CallableProxyArguments",s[s.EmitterContexts=6]="EmitterContexts",s))(i||{});export{i as C,c as b};
-//# sourceMappingURL=controllerFeature.js.map
