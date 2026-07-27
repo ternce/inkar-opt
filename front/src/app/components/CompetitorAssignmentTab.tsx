@@ -91,6 +91,22 @@ const activePhysicalAssignmentCount = (data: any) => {
     return kind === 'physical' && row.active !== false;
   }).length;
 };
+const stableSourceTypes = ['manual', 'percentile', 'provisor'];
+const formatPercentileCount = (count: number) => {
+  const safeCount = Number.isFinite(count) ? Math.max(0, Math.trunc(count)) : 0;
+  const mod100 = safeCount % 100;
+  const mod10 = safeCount % 10;
+  if (mod100 >= 11 && mod100 <= 14) return `${safeCount} персентилей`;
+  if (mod10 === 1) return `${safeCount} персентиль`;
+  if (mod10 >= 2 && mod10 <= 4) return `${safeCount} персентиля`;
+  return `${safeCount} персентилей`;
+};
+const formatAssignmentSummaryCount = (summary: FormatSummary) => {
+  const percentileSourceCount = Number(summary.percentileSourceCount || 0);
+  const physicalCount = Number(summary.assignmentsCount || 0);
+  if (percentileSourceCount <= 0) return `${physicalCount} ПЛК`;
+  return `${physicalCount} ПЛК • ${formatPercentileCount(percentileSourceCount)}`;
+};
 
 const branchKey = (value: any) => String(value || '').trim().toLocaleLowerCase('ru-RU');
 const isSameBranch = (left: any, right: any) => branchKey(left) === branchKey(right);
@@ -300,7 +316,7 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
   );
 
   const sourceTypeOptions = useMemo(
-    () => Array.from(new Set(availableSources.map((row) => row.sourceType).filter(Boolean))).sort(),
+    () => Array.from(new Set([...stableSourceTypes, ...availableSources.map((row) => row.sourceType).filter(Boolean)])).sort(),
     [availableSources]
   );
 
@@ -489,7 +505,7 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
                 >
                   <div className="assignment-format-head">
                     <strong>{format.code}</strong>
-                    <span>{summary.assignmentsCount} ПЛК</span>
+                    <span>{formatAssignmentSummaryCount(summary)}</span>
                   </div>
                   <div className="assignment-format-name">{format.name || format.code}</div>
                   <dl>
