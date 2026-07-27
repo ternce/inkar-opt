@@ -49,6 +49,7 @@ from .competitor_source_config import ensure_canonical_source_key
 from .manufacturers import resolve_manufacturer
 from .price_sources import UnifiedPriceItem, UnifiedPriceList
 from .sku import normalize_external_sku, normalize_sku, normalize_sku_variants
+from .provisor import process_memory_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,36 @@ def _prepare_rows_timing(*, price_list_id: int | str, stage: str, rows: int, sta
         stage,
         rows,
         round((time.perf_counter() - started_at) * 1000, 2),
+    )
+
+
+def _identity_map_size(db: Session) -> int | None:
+    try:
+        return len(db.identity_map)
+    except Exception:
+        return None
+
+
+def _db_memory_snapshot(
+    *,
+    db: Session,
+    price_list_id: int | str,
+    stage: str,
+    rows: int,
+    benchmark: dict[str, object],
+) -> None:
+    memory = process_memory_snapshot()
+    rss_mb = memory.get("rss_mb")
+    identity_map_size = _identity_map_size(db)
+    benchmark[f"rss_{stage}_mb"] = rss_mb
+    benchmark[f"identity_map_{stage}"] = identity_map_size
+    logger.info(
+        "[PROVISOR_PLK_MEMORY] price_list_id=%s stage=%s rows=%s rss_mb=%s identity_map_size=%s",
+        price_list_id,
+        stage,
+        rows,
+        rss_mb,
+        identity_map_size,
     )
 
 
@@ -956,11 +987,13 @@ def upsert_unified_price_list(
     benchmark["bulk_insert_sec"] = round(time.perf_counter() - stage_started_at, 6)
     benchmark["inserted_rows_count"] = len(row_mappings)
     _db_save_timing(price_list_id=row.id, stage="bulk_insert", rows=len(row_mappings), started_at=stage_started_at)
+    _db_memory_snapshot(db=db, price_list_id=row.id, stage="after_insert", rows=len(row_mappings), benchmark=benchmark)
 
     stage_started_at = time.perf_counter()
     db.flush()
     benchmark["flush_sec"] = round(time.perf_counter() - stage_started_at, 6)
     _db_save_timing(price_list_id=row.id, stage="flush", rows=len(row_mappings), started_at=stage_started_at)
+    _db_memory_snapshot(db=db, price_list_id=row.id, stage="after_flush", rows=len(row_mappings), benchmark=benchmark)
     if price_list.source == "provisor" and _as_int(price_list.price_list_id) in PROVISOR_REFERENCE_FILIAL_IDS:
         _sync_provisor_reference_mapping_from_items(db, account_id=price_list.account_id)
     if run_matching:
@@ -976,6 +1009,9 @@ def upsert_unified_price_list(
     setattr(row, "_benchmark", benchmark)
     _db_save_timing(price_list_id=row.id, stage="commit", rows=len(row_mappings), started_at=stage_started_at)
     _db_save_timing(price_list_id=row.id, stage="total", rows=len(row_mappings), started_at=total_started_at)
+    _db_memory_snapshot(db=db, price_list_id=row.id, stage="after_commit", rows=len(row_mappings), benchmark=benchmark)
+    row_mappings.clear()
+    preserved_match_fields.clear()
     return row
 
 
@@ -1046,13 +1082,7 @@ def list_competitor_price_lists(
         account_id=str(account_id or "").strip() or None,
         region=str(region or "").strip() or None,
     )
-    counts = dict(
-        db.execute(
-            select(CompetitorPriceListItem.price_list_id, func.count(CompetitorPriceListItem.id))
-            .where(CompetitorPriceListItem.price_list_id.in_([row.id for row in rows]))
-            .group_by(CompetitorPriceListItem.price_list_id)
-        ).all()
-    ) if rows else {}
+    counts = {int(row.id): int(getattr(row, "_visible_item_count", 0)) for row in rows}
     assignments = {
         int(item.price_list.id): item.assignment
         for item in get_assigned_competitor_price_lists(db=db, price_format_id=int(pf.id), active_only=False)

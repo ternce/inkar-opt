@@ -101,7 +101,7 @@ from .services.pricing import (
     margin_percent_from_price,
     normalize_list_type,
 )
-from .services.provisor import ProvisorAuthError, get_prices_by_filial_id
+from .services.provisor import ProvisorAuthError, get_prices_by_filial_id, process_memory_snapshot
 from .services.widman_client import WidmanInvalidCredentialsError
 from .services.competitor_persist import persist_phcenter_report, persist_provisor_prices
 from .services.competitor_price_lists import (
@@ -427,6 +427,55 @@ def _bench_int_or_none(value: object) -> int | None:
         return None
 
 
+def _identity_map_size(db: Session | None) -> int | None:
+    if db is None:
+        return None
+    try:
+        return len(db.identity_map)
+    except Exception:
+        return None
+
+
+def _record_provisor_plk_memory(
+    benchmark: dict[str, object] | None,
+    *,
+    stage: str,
+    db: Session | None = None,
+    rows: int | None = None,
+) -> dict[str, object]:
+    memory = process_memory_snapshot()
+    rss_mb = memory.get("rss_mb")
+    identity_map_size = _identity_map_size(db)
+    if benchmark is not None:
+        benchmark[f"rss_{stage}_mb"] = rss_mb
+        benchmark[f"identity_map_{stage}"] = identity_map_size
+    payload = {
+        "account_id": benchmark.get("account_id") if benchmark else None,
+        "filial_id": str((benchmark or {}).get("filial_id") or (benchmark or {}).get("price_list_id") or ""),
+        "price_list_id": str((benchmark or {}).get("price_list_id") or (benchmark or {}).get("filial_id") or ""),
+        "stage": stage,
+        "rows": rows,
+        "rss_mb": rss_mb,
+        "identity_map_size": identity_map_size,
+    }
+    logger.info("[PROVISOR_PLK_MEMORY] %s", json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    return payload
+
+
+def _release_provisor_result_payload(
+    result: dict,
+    benchmark: dict[str, object] | None,
+    *,
+    db: Session,
+) -> None:
+    items = result.get("items")
+    rows = len(items) if isinstance(items, list) else 0
+    if isinstance(items, list):
+        items.clear()
+    result["items"] = []
+    _record_provisor_plk_memory(benchmark, stage="after_cleanup", db=db, rows=rows)
+
+
 def _log_provisor_plk_benchmark(benchmark: dict[str, object] | None) -> dict[str, object]:
     data = dict(benchmark or {})
     if data.get("_queued_at_perf") is not None:
@@ -457,6 +506,19 @@ def _log_provisor_plk_benchmark(benchmark: dict[str, object] | None) -> dict[str
         "total_sec": _bench_float(data.get("total_sec")),
         "outcome": str(data.get("outcome") or ""),
         "skip_reason": str(data.get("skip_reason") or ""),
+        "rss_before_fetch_mb": data.get("rss_before_fetch_mb"),
+        "rss_after_http_decode_mb": data.get("rss_after_http_decode_mb"),
+        "rss_after_normalization_mb": data.get("rss_after_normalization_mb"),
+        "rss_before_db_replacement_mb": data.get("rss_before_db_replacement_mb"),
+        "rss_after_insert_mb": data.get("rss_after_insert_mb"),
+        "rss_after_flush_mb": data.get("rss_after_flush_mb"),
+        "rss_after_commit_mb": data.get("rss_after_commit_mb"),
+        "rss_after_cleanup_mb": data.get("rss_after_cleanup_mb"),
+        "identity_map_before_db_replacement": data.get("identity_map_before_db_replacement"),
+        "identity_map_after_insert": data.get("identity_map_after_insert"),
+        "identity_map_after_flush": data.get("identity_map_after_flush"),
+        "identity_map_after_commit": data.get("identity_map_after_commit"),
+        "identity_map_after_cleanup": data.get("identity_map_after_cleanup"),
     }
     logger.info("[PROVISOR_PLK_BENCHMARK] %s", json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return payload
@@ -476,6 +538,22 @@ def _aggregate_provisor_benchmarks(
         expected = set(outcomes)
         return sum(1 for row in benchmarks if str(row.get("outcome") or "") in expected)
 
+    rss_keys = [
+        "rss_before_fetch_mb",
+        "rss_after_http_decode_mb",
+        "rss_after_normalization_mb",
+        "rss_before_db_replacement_mb",
+        "rss_after_insert_mb",
+        "rss_after_flush_mb",
+        "rss_after_commit_mb",
+        "rss_after_cleanup_mb",
+    ]
+    rss_values = [
+        float(row[key])
+        for row in benchmarks
+        for key in rss_keys
+        if row.get(key) is not None
+    ]
     top = sorted(
         benchmarks,
         key=lambda row: _bench_float(row.get("total_sec")),
@@ -499,6 +577,15 @@ def _aggregate_provisor_benchmarks(
         "total_normalization_sec": total("normalize_sec"),
         "total_db_sec": total("db_total_sec"),
         "total_percentile_sec": round(percentile_total_sec or total("percentile_sec"), 6),
+        "peak_rss_mb": round(max(rss_values), 2) if rss_values else None,
+        "last_cleanup_rss_mb": next(
+            (
+                row.get("rss_after_cleanup_mb")
+                for row in reversed(benchmarks)
+                if row.get("rss_after_cleanup_mb") is not None
+            ),
+            None,
+        ),
         "wall_clock_refresh_sec": round(wall_clock_sec, 6),
         "top_10_slowest_plks": [
             {
@@ -4766,12 +4853,13 @@ def get_competitor_assignments(
         .all()
     )
     cfg_by_source_name = {cfg.source_name: cfg for cfg in percentile_cfgs}
-    for percentile_source in ("emit", "competitor"):
-        for source in list_percentile_sources(db=db, price_format_code=format_code, percentile_source=percentile_source):
-            source_id = str(source.get("id") or "")
-            cfg = cfg_by_source_name.get(_assignment_percentile_source_name(source_id))
-            if cfg is not None:
-                rows.append(_assignment_row_from_percentile(source, cfg))
+    if cfg_by_source_name:
+        for percentile_source in ("emit", "competitor"):
+            for source in list_percentile_sources(db=db, price_format_code=format_code, percentile_source=percentile_source):
+                source_id = str(source.get("id") or "")
+                cfg = cfg_by_source_name.get(_assignment_percentile_source_name(source_id))
+                if cfg is not None:
+                    rows.append(_assignment_row_from_percentile(source, cfg))
     summary = {
         "activePhysicalPlkCount": sum(1 for row in rows if row.get("assignmentKind") == "physical" and row.get("active") is not False),
         "inactivePhysicalPlkCount": sum(1 for row in rows if row.get("assignmentKind") == "physical" and row.get("active") is False),
@@ -7023,6 +7111,8 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                 )
                                 logger.info("[VIDMAN] price_list=%s action=fetch_items start", price_list_id)
                             logger.info("[REFRESH] source=%s price_list=%s action=fetch", account.source_type, price_list_id)
+                            if account.source_type == "provisor":
+                                _record_provisor_plk_memory(plk_benchmark, stage="before_fetch", db=db)
                             if shared_vidman_client is not None and isinstance(adapter, VidmanPriceService):
                                 async with shared_vidman_login_lock:
                                     if not shared_vidman_client._logged_in:
@@ -7067,6 +7157,8 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                         "json_decode_sec": _bench_float(item_benchmark.get("json_decode_sec")),
                                         "normalize_sec": _bench_float(item_benchmark.get("normalization_sec")),
                                         "items_received": int(item_benchmark.get("input_rows") or len(items or [])),
+                                        "rss_after_http_decode_mb": item_benchmark.get("rss_after_http_decode_mb"),
+                                        "rss_after_normalization_mb": item_benchmark.get("rss_after_normalization_mb"),
                                     }
                                 )
                             elapsed_ms = round((time.perf_counter() - fetch_items_started_at) * 1000, 2)
@@ -7675,6 +7767,8 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                 save_started_at = time.perf_counter()
                 try:
                     items = result.get("items") or []
+                    if account_source_type == "provisor":
+                        _record_provisor_plk_memory(benchmark, stage="before_db_replacement", db=db, rows=len(items))
                     if not items and int(result.get("localItemsCount") or 0) > 0:
                         if account_source_type == "provisor":
                             inventory["preserved_previous_snapshots"] = int(inventory.get("preserved_previous_snapshots") or 0) + 1
@@ -7714,6 +7808,8 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                         if benchmark:
                             benchmark["outcome"] = "unchanged"
                             benchmark["skip_reason"] = "empty_response_preserved_previous_rows"
+                            if account_source_type == "provisor":
+                                _release_provisor_result_payload(result, benchmark, db=db)
                             logged = _log_provisor_plk_benchmark(benchmark)
                             provisor_plk_benchmarks.append(logged)
                         continue
@@ -7742,6 +7838,12 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                 "db_preserved_match_fields_count": db_benchmark.get("preserved_match_fields_count", 0),
                                 "db_deleted_rows_count": db_benchmark.get("deleted_rows_count", 0),
                                 "db_inserted_rows_count": db_benchmark.get("inserted_rows_count", 0),
+                                "rss_after_insert_mb": db_benchmark.get("rss_after_insert_mb"),
+                                "rss_after_flush_mb": db_benchmark.get("rss_after_flush_mb"),
+                                "rss_after_commit_mb": db_benchmark.get("rss_after_commit_mb"),
+                                "identity_map_after_insert": db_benchmark.get("identity_map_after_insert"),
+                                "identity_map_after_flush": db_benchmark.get("identity_map_after_flush"),
+                                "identity_map_after_commit": db_benchmark.get("identity_map_after_commit"),
                             }
                         )
                     if account_source_type == "provisor":
@@ -7822,6 +7924,8 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                             },
                         )
                     if benchmark:
+                        if account_source_type == "provisor":
+                            _release_provisor_result_payload(result, benchmark, db=db)
                         logged = _log_provisor_plk_benchmark(benchmark)
                         provisor_plk_benchmarks.append(logged)
                 except Exception as e:
@@ -7873,6 +7977,8 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                         benchmark["outcome"] = "failed"
                         benchmark["skip_reason"] = e.__class__.__name__
                         benchmark["total_sec"] = round(time.perf_counter() - save_started_at + _bench_float(benchmark.get("total_sec")), 6)
+                        if account_source_type == "provisor":
+                            _release_provisor_result_payload(result, benchmark, db=db)
                         logged = _log_provisor_plk_benchmark(benchmark)
                         provisor_plk_benchmarks.append(logged)
             elif result.get("error"):

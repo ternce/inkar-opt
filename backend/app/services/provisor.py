@@ -20,6 +20,27 @@ class ProvisorResponseRows(list):
         self.benchmark = benchmark or {}
 
 
+def process_memory_snapshot() -> dict[str, float | None]:
+    rss_mb: float | None = None
+    try:
+        import psutil  # type: ignore
+
+        rss_mb = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+    except Exception:
+        if os.name == "posix":
+            try:
+                with open("/proc/self/status", "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        if line.startswith("VmRSS:"):
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                rss_mb = float(parts[1]) / 1024
+                            break
+            except Exception:
+                rss_mb = None
+    return {"rss_mb": round(rss_mb, 2) if rss_mb is not None else None}
+
+
 def _env_float(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, str(default)))
@@ -461,13 +482,15 @@ async def get_prices_by_filial_id(
         if not isinstance(data, list):
             raise ProvisorAuthError("Price/GetByFilialId returned non-list JSON")
 
+        memory_after_decode = process_memory_snapshot()
         logger.info(
-            "[PROVISOR_PLK_FETCH_TIMING] filial_id=%s rows=%s response_size_mb=%s http_fetch_elapsed_ms=%s json_decode_elapsed_ms=%s",
+            "[PROVISOR_PLK_FETCH_TIMING] filial_id=%s rows=%s response_size_mb=%s http_fetch_elapsed_ms=%s json_decode_elapsed_ms=%s rss_mb=%s",
             filial_id,
             len(data),
             round(response_bytes / (1024 * 1024), 3) if response_bytes is not None else None,
             http_elapsed_ms,
             decode_elapsed_ms,
+            memory_after_decode.get("rss_mb"),
         )
         return ProvisorResponseRows(
             data,
@@ -482,6 +505,7 @@ async def get_prices_by_filial_id(
                 "http_attempt_count": http_attempt_count,
                 "auth_retry_count": auth_retry_count,
                 "connection_reuse_scope": connection_reuse_scope,
+                "rss_after_http_decode_mb": memory_after_decode.get("rss_mb"),
             },
         )
     finally:

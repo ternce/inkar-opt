@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { ExternalLink, Percent, PlusCircle, RefreshCw, Search, Trash2, Users, X } from 'lucide-react';
 import { Button } from './ui/button';
@@ -205,10 +205,17 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
   const [searchTerm, setSearchTerm] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const sourceLoadRequestsRef = useRef<Record<string, Promise<void>>>({});
+  const summaryLoadRequestsRef = useRef<Record<string, Promise<FormatSummary>>>({});
+  const summariesRef = useRef<Record<string, FormatSummary>>({});
 
   useEffect(() => {
     setSelectedFormatCode(formatCode);
   }, [formatCode]);
+
+  useEffect(() => {
+    summariesRef.current = summaries;
+  }, [summaries]);
 
   const branchFormats = useMemo(
     () => priceFormats.filter((format) => !branch || isSameBranch(format.branch, branch)),
@@ -233,41 +240,53 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
 
   const loadSources = async () => {
     if (!selectedFormat?.code) return;
-    setIsLoading(true);
-    setError(null);
-    try {
-      const [sourcesRes, emitPercentileRes, competitorPercentileRes, assignmentRows] = await Promise.all([
-        fetch(`/api/competitors/price-lists?format_code=${encodeURIComponent(selectedFormat.code)}`),
-        fetch(`/api/competitors/percentiles?format_code=${encodeURIComponent(selectedFormat.code)}&percentile_source=emit`),
-        fetch(`/api/competitors/percentiles?format_code=${encodeURIComponent(selectedFormat.code)}&percentile_source=competitor`),
-        loadAssignments(selectedFormat.code),
-      ]);
-      const sourcesText = await sourcesRes.text();
-      const emitPercentileText = await emitPercentileRes.text();
-      const competitorPercentileText = await competitorPercentileRes.text();
-      const sourcesData = parseJsonOrNull(sourcesText);
-      const emitPercentileData = parseJsonOrNull(emitPercentileText);
-      const competitorPercentileData = parseJsonOrNull(competitorPercentileText);
-      const percentileRes = emitPercentileRes;
-      const percentileText = emitPercentileText;
-      const percentileData = [
-        ...(Array.isArray(emitPercentileData) ? emitPercentileData : []),
-        ...(Array.isArray(competitorPercentileData) ? competitorPercentileData : []),
-      ];
-      if (!sourcesRes.ok) throw new Error(sourcesData?.detail || sourcesText || 'Не удалось загрузить источники цен');
-      if (!percentileRes.ok) throw new Error(percentileData?.detail || percentileText || 'Не удалось загрузить источники персентилей');
-      if (!competitorPercentileRes.ok) throw new Error(competitorPercentileData?.detail || competitorPercentileText || 'percentile sources request failed');
-      const rows = [
-        ...(Array.isArray(sourcesData) ? sourcesData.map(normalizeSource) : []),
-        ...(Array.isArray(percentileData) ? percentileData.map(percentileToSource) : []),
-      ];
-      const assignedKeys = new Set(assignmentRows.map((row) => `${row.sourceType}:${row.sourceId}`));
-      setAvailableSources(rows.map((row) => ({ ...row, isSelected: assignedKeys.has(`${row.sourceType}:${row.sourceId}`) })));
-    } catch (e: any) {
-      setError(e?.message || 'Ошибка загрузки раздела');
-    } finally {
-      setIsLoading(false);
+    const format = selectedFormat;
+    const code = format.code;
+    if (sourceLoadRequestsRef.current[code]) {
+      await sourceLoadRequestsRef.current[code];
+      return;
     }
+    const request = (async () => {
+      setIsLoading(true);
+      setError(null);
+      try {
+        const [sourcesRes, emitPercentileRes, competitorPercentileRes, assignmentRows] = await Promise.all([
+          fetch(`/api/competitors/price-lists?format_code=${encodeURIComponent(code)}`),
+          fetch(`/api/competitors/percentiles?format_code=${encodeURIComponent(code)}&percentile_source=emit`),
+          fetch(`/api/competitors/percentiles?format_code=${encodeURIComponent(code)}&percentile_source=competitor`),
+          loadAssignments(code),
+        ]);
+        const sourcesText = await sourcesRes.text();
+        const emitPercentileText = await emitPercentileRes.text();
+        const competitorPercentileText = await competitorPercentileRes.text();
+        const sourcesData = parseJsonOrNull(sourcesText);
+        const emitPercentileData = parseJsonOrNull(emitPercentileText);
+        const competitorPercentileData = parseJsonOrNull(competitorPercentileText);
+        const percentileRes = emitPercentileRes;
+        const percentileText = emitPercentileText;
+        const percentileData = [
+          ...(Array.isArray(emitPercentileData) ? emitPercentileData : []),
+          ...(Array.isArray(competitorPercentileData) ? competitorPercentileData : []),
+        ];
+        if (!sourcesRes.ok) throw new Error(sourcesData?.detail || sourcesText || 'Не удалось загрузить источники цен');
+        if (!percentileRes.ok) throw new Error(percentileData?.detail || percentileText || 'Не удалось загрузить источники персентилей');
+        if (!competitorPercentileRes.ok) throw new Error(competitorPercentileData?.detail || competitorPercentileText || 'percentile sources request failed');
+        const rows = [
+          ...(Array.isArray(sourcesData) ? sourcesData.map(normalizeSource) : []),
+          ...(Array.isArray(percentileData) ? percentileData.map(percentileToSource) : []),
+        ];
+        const assignedKeys = new Set(assignmentRows.map((row) => `${row.sourceType}:${row.sourceId}`));
+        setAvailableSources(rows.map((row) => ({ ...row, isSelected: assignedKeys.has(`${row.sourceType}:${row.sourceId}`) })));
+        void loadFormatSummary(format, assignmentRows);
+      } catch (e: any) {
+        setError(e?.message || 'Ошибка загрузки раздела');
+      } finally {
+        setIsLoading(false);
+        delete sourceLoadRequestsRef.current[code];
+      }
+    })();
+    sourceLoadRequestsRef.current[code] = request;
+    await request;
   };
 
   useEffect(() => {
@@ -275,40 +294,47 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedFormat?.code]);
 
-  useEffect(() => {
-    let cancelled = false;
-    const loadSummaries = async () => {
-      const next: Record<string, FormatSummary> = {};
-      await Promise.all(
-        branchFormats.map(async (format) => {
-          try {
-            const [settingsRes, latestRes, assignmentsRes] = await Promise.all([
-              fetch(`/api/price-formats/${encodeURIComponent(format.code)}/settings`),
-              fetch(`/api/price-lists/latest?format_code=${encodeURIComponent(format.code)}`),
-              fetch(`/api/price-formats/${encodeURIComponent(format.code)}/competitor-assignments?include_summary=1`),
-            ]);
-            const settings = parseJsonOrNull(await settingsRes.text());
-            const latest = parseJsonOrNull(await latestRes.text());
-            const assigned = parseJsonOrNull(await assignmentsRes.text());
-            next[format.code] = {
-              pricingRule: settings?.pricingRule || '—',
-              assignmentsCount: activePhysicalAssignmentCount(assigned),
-              percentileSourceCount: Number(assigned?.summary?.percentileSourceCount || 0),
-              totalRowsCount: Number(assigned?.summary?.totalRowsCount || assignmentItems(assigned).length),
-              lastGeneratedAt: latest?.date || '',
-            };
-          } catch {
-            next[format.code] = { pricingRule: '—', assignmentsCount: 0, lastGeneratedAt: '' };
-          }
-        })
-      );
-      if (!cancelled) setSummaries(next);
-    };
-    void loadSummaries();
-    return () => {
-      cancelled = true;
-    };
-  }, [branchFormats]);
+  const loadFormatSummary = async (format: PriceFormat, assignedRows: AssignmentRow[]): Promise<FormatSummary> => {
+    if (summariesRef.current[format.code]) return summariesRef.current[format.code];
+    if (summaryLoadRequestsRef.current[format.code]) return summaryLoadRequestsRef.current[format.code];
+    const request = (async () => {
+      try {
+        const [settingsRes, latestRes] = await Promise.all([
+          fetch(`/api/price-formats/${encodeURIComponent(format.code)}/settings`),
+          fetch(`/api/price-lists/latest?format_code=${encodeURIComponent(format.code)}`),
+        ]);
+        const settings = parseJsonOrNull(await settingsRes.text());
+        const latest = parseJsonOrNull(await latestRes.text());
+        const summary = {
+          pricingRule: settings?.pricingRule || '—',
+          assignmentsCount: activePhysicalAssignmentCount(assignedRows),
+          percentileSourceCount: assignmentItems(assignedRows).filter((row: any) => row.assignmentKind === 'percentile_config').length,
+          totalRowsCount: assignmentItems(assignedRows).length,
+          lastGeneratedAt: latest?.date || '',
+        };
+        setSummaries((prev) => {
+          if (prev[format.code]) return prev;
+          const next = { ...prev, [format.code]: summary };
+          summariesRef.current = next;
+          return next;
+        });
+        return summary;
+      } catch {
+        const summary = { pricingRule: '—', assignmentsCount: 0, lastGeneratedAt: '' };
+        setSummaries((prev) => {
+          if (prev[format.code]) return prev;
+          const next = { ...prev, [format.code]: summary };
+          summariesRef.current = next;
+          return next;
+        });
+        return summary;
+      } finally {
+        delete summaryLoadRequestsRef.current[format.code];
+      }
+    })();
+    summaryLoadRequestsRef.current[format.code] = request;
+    return request;
+  };
 
   const competitorOptions = useMemo(
     () => Array.from(new Set(availableSources.map((row) => row.competitorName).filter(Boolean))).sort((a, b) => a.localeCompare(b, 'ru')),

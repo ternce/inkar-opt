@@ -1,0 +1,2 @@
+import{r as s}from"./router.js";import{p as c}from"./postOnpageMessage.js";function a(t,u,o){const e=s.useCallback(()=>{if(!t.current)return;const r=t.current.getBoundingClientRect().height;c(o,{message:u,height:r})},[t,u,o]);s.useEffect(()=>{e()}),s.useLayoutEffect(()=>{const r=new MutationObserver(e);return r.observe(t.current,{subtree:!0,attributes:!0,childList:!0}),e(),()=>r.disconnect()},[e,t])}export{a as u};
+//# sourceMappingURL=useSizeEffect.js.map

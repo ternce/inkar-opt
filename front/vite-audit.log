@@ -1,0 +1,16 @@
+
+> @figma/my-make-file@0.0.1 dev
+> vite --host 127.0.0.1 --port 5173
+
+
+  [32m[1mVITE[22m v6.3.5[39m  [2mready in [0m[1m6314[22m[2m[0m ms[22m
+
+  [32m➜[39m  [1mLocal[22m:   [36mhttp://127.0.0.1:[1m5173[22m/[39m
+[2m23:14:05[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/app/components/CompetitorAssignmentTab.tsx, /src/styles/index.css[22m
+[2m23:14:10[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/app/components/CompetitorAssignmentTab.tsx, /src/styles/index.css[22m
+[2m23:14:27[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/app/components/CompetitorAssignmentTab.tsx, /src/styles/index.css[22m
+[2m23:15:25[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/app/components/CompetitorAssignmentTab.tsx, /src/styles/index.css[22m
+[2m23:15:39[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/app/components/CompetitorAssignmentTab.tsx, /src/styles/index.css[22m
+[2m23:22:47[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/app/components/CompetitorAssignmentTab.tsx, /src/styles/index.css[22m
+[2m23:29:45[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/app/components/CompetitorAssignmentTab.tsx, /src/styles/index.css[22m
+[2m23:29:55[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/app/components/CompetitorAssignmentTab.tsx, /src/styles/index.css[22m

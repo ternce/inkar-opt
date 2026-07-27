@@ -122,6 +122,8 @@ def list_global_competitor_price_lists_for_format(
     if branch_scoped or region:
         rows = [row for row in rows if bool(getattr(row, "_visible_for_format_branch", False))]
     counts = visible_item_counts(db, rows)
+    for row in rows:
+        setattr(row, "_visible_item_count", int(counts.get(int(row.id), 0)))
     rows = [row for row in rows if int(counts.get(int(row.id), 0)) > 0]
     return _dedupe_global_rows(rows)
 

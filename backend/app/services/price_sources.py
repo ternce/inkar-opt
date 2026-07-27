@@ -12,7 +12,7 @@ from typing import Any, Protocol
 from .manufacturers import resolve_manufacturer
 import httpx
 
-from .provisor import get_filials_by_context, get_prices_by_filial_id, provisor_http_limits
+from .provisor import get_filials_by_context, get_prices_by_filial_id, process_memory_snapshot, provisor_http_limits
 from .widman_client import WidmanClient
 
 logger = logging.getLogger(__name__)
@@ -337,6 +337,7 @@ class ProvisorPriceService:
         normalize_elapsed_sec = time.perf_counter() - normalize_started_at
         normalize_elapsed_ms = round(normalize_elapsed_sec * 1000, 2)
         invalid_or_zero_price_count = zero_price_rows + invalid_price_rows
+        memory_after_normalization = process_memory_snapshot()
         out.benchmark = {
             **http_benchmark,
             "fetch_items_sec": round(fetch_elapsed_ms / 1000, 6),
@@ -346,9 +347,11 @@ class ProvisorPriceService:
             "positive_price_count": positive_price_rows,
             "invalid_or_zero_price_count": invalid_or_zero_price_count,
             "inserted_date_scan_sec": None,
+            "rss_after_http_decode_mb": http_benchmark.get("rss_after_http_decode_mb"),
+            "rss_after_normalization_mb": memory_after_normalization.get("rss_mb"),
         }
         logger.info(
-            "[PROVISOR_PLK_NORMALIZATION_TIMING] account_id=%s filial_id=%s raw_rows=%s valid_rows=%s positive_price_rows=%s zero_price_rows=%s invalid_price_rows=%s rows_missing_required_identifier=%s normalized_rows=%s fetch_elapsed_ms=%s normalization_elapsed_ms=%s manufacturer_cache_size=%s",
+            "[PROVISOR_PLK_NORMALIZATION_TIMING] account_id=%s filial_id=%s raw_rows=%s valid_rows=%s positive_price_rows=%s zero_price_rows=%s invalid_price_rows=%s rows_missing_required_identifier=%s normalized_rows=%s fetch_elapsed_ms=%s normalization_elapsed_ms=%s manufacturer_cache_size=%s rss_mb=%s",
             account.id,
             filial_id,
             len(raw_items),
@@ -361,6 +364,7 @@ class ProvisorPriceService:
             fetch_elapsed_ms,
             normalize_elapsed_ms,
             len(manufacturer_cache),
+            memory_after_normalization.get("rss_mb"),
         )
         return out
 

@@ -186,6 +186,18 @@ def _benchmark_payloads(caplog):
     return out
 
 
+def _memory_payloads(caplog):
+    out = []
+    for record in caplog.records:
+        message = record.getMessage()
+        if "[PROVISOR_PLK_MEMORY]" not in message:
+            continue
+        raw = message.split("[PROVISOR_PLK_MEMORY]", 1)[1].strip()
+        if raw.startswith("{"):
+            out.append(json.loads(raw))
+    return out
+
+
 def test_targeted_provisor_refresh_only_processes_requested_filials(monkeypatch):
     import backend.app.main as main
 
@@ -285,6 +297,43 @@ def test_provisor_benchmark_logs_success_without_changing_refresh_behavior(monke
     assert "Aksai4/83" not in json.dumps(payloads, ensure_ascii=False)
     assert "password" not in json.dumps(payloads, ensure_ascii=False).lower()
     assert "token" not in json.dumps(payloads, ensure_ascii=False).lower()
+
+
+def test_provisor_memory_logs_are_scalar_and_do_not_expose_credentials(monkeypatch, caplog):
+    import backend.app.main as main
+
+    db = _session()
+    _seed(db)
+    adapter = _ManyPlkProvisorAdapter([100])
+    monkeypatch.setattr(main, "adapter_for_source", lambda source: adapter)
+    monkeypatch.setattr(main, "credentials_from_row", _fake_credentials)
+    monkeypatch.setattr(main, "process_memory_snapshot", lambda: {"rss_mb": 123.45})
+
+    with caplog.at_level(logging.INFO):
+        result = asyncio.run(
+            main._run_refresh_price_lists_logic(
+                format_code="FMT",
+                payload={"source": "provisor", "accountId": 3, "forceRefresh": True},
+                db=db,
+            )
+        )
+
+    direct_memory_payload = main._record_provisor_plk_memory(
+        {"account_id": 3, "filial_id": "100", "price_list_id": "100"},
+        stage="test_stage",
+        db=db,
+        rows=1,
+    )
+    serialized_direct_memory = json.dumps(direct_memory_payload, ensure_ascii=False).lower()
+
+    assert result["progress"]["success_with_items"] == 1
+    assert direct_memory_payload["stage"] == "test_stage"
+    assert direct_memory_payload["rss_mb"] == 123.45
+    assert direct_memory_payload["identity_map_size"] is not None
+    assert "password" not in serialized_direct_memory
+    assert "token" not in serialized_direct_memory
+    assert result["provisorBenchmark"]["peak_rss_mb"] == 123.45
+    assert result["provisorBenchmark"]["last_cleanup_rss_mb"] == 123.45
 
 
 def test_provisor_benchmark_skipped_plk_has_skip_reason(monkeypatch, caplog):

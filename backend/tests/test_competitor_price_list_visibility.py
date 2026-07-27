@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 from datetime import date, datetime
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from backend.app.db import Base
@@ -120,6 +120,35 @@ def test_global_pool_returns_usable_provisor_rows_outside_format_branch_with_met
     assert by_id[aktau.id]["visibleForFormatBranch"] is False
     assert by_id[aktau.id]["branchMismatchReason"]
     assert zero.id not in by_id
+
+
+def test_list_competitor_price_lists_reuses_visibility_item_counts():
+    db = _session()
+    pf = _format(db, branch="Алматы")
+    first = _price_list(db, pf, source_key="4:128", branch_name="Инкар (Алматы)", external_price_list_id=128)
+    second = _price_list(db, pf, source_key="4:1075", branch_name="Аманат (Алматы)", external_price_list_id=1075)
+    _item(db, first, distributor_goods_id="SKU-A", goods_id=101)
+    _item(db, second, distributor_goods_id="SKU-B", goods_id=102)
+
+    grouped_item_count_queries: list[str] = []
+
+    def capture_count_query(conn, cursor, statement, parameters, context, executemany):
+        normalized = " ".join(statement.lower().split())
+        if (
+            "competitor_price_list_items" in normalized
+            and "count(" in normalized
+            and "group by" in normalized
+        ):
+            grouped_item_count_queries.append(normalized)
+
+    event.listen(db.bind, "before_cursor_execute", capture_count_query)
+    try:
+        rows = list_competitor_price_lists(db=db, price_format_code=pf.code)
+    finally:
+        event.remove(db.bind, "before_cursor_execute", capture_count_query)
+
+    assert {row["id"]: row["itemsCount"] for row in rows} == {first.id: 1, second.id: 1}
+    assert len(grouped_item_count_queries) == 1
 
 
 def test_global_pool_dedupe_preserves_same_filial_from_different_accounts():

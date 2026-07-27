@@ -252,3 +252,32 @@ def test_replacement_row_count_matches_input_count():
 
     assert len(_items(db)) == len(inputs)
     assert row._benchmark["inserted_rows_count"] == len(inputs)
+
+
+def test_replacement_memory_metrics_do_not_change_saved_rows(monkeypatch):
+    import backend.app.services.competitor_price_lists as service
+
+    db = _session()
+    _seed(db)
+    monkeypatch.setattr(service, "process_memory_snapshot", lambda: {"rss_mb": 77.7})
+    inputs = [
+        _item(goods_id=1001, distributor_goods_id="DG-1", raw_extra={"keep": ["raw"]}),
+        _item(goods_id=1002, distributor_goods_id="DG-2"),
+    ]
+
+    row = upsert_unified_price_list(
+        db=db,
+        price_format_code="FMT",
+        price_list=_price_list(),
+        items=inputs,
+        run_matching=False,
+    )
+    saved = _items(db)
+    first_raw = json.loads(saved[0].raw_json)
+
+    assert len(saved) == 2
+    assert first_raw["raw"]["keep"] == ["raw"]
+    assert row._benchmark["rss_after_insert_mb"] == 77.7
+    assert row._benchmark["rss_after_flush_mb"] == 77.7
+    assert row._benchmark["rss_after_commit_mb"] == 77.7
+    assert isinstance(row._benchmark["identity_map_after_flush"], int)

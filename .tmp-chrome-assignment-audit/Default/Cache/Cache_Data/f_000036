@@ -1,0 +1,269 @@
+import { createHotContext as __vite__createHotContext } from "/@vite/client";import.meta.hot = __vite__createHotContext("/@fs/D:\\apteka2704\\front\\src\\app\\components\\ui\\dialog.tsx");import __vite__cjsImport0_react_jsxDevRuntime from "/node_modules/.vite/deps/react_jsx-dev-runtime.js?v=3735631c"; const jsxDEV = __vite__cjsImport0_react_jsxDevRuntime["jsxDEV"];
+import * as RefreshRuntime from "/@react-refresh";
+const inWebWorker = typeof WorkerGlobalScope !== "undefined" && self instanceof WorkerGlobalScope;
+let prevRefreshReg;
+let prevRefreshSig;
+if (import.meta.hot && !inWebWorker) {
+  if (!window.$RefreshReg$) {
+    throw new Error(
+      "@vitejs/plugin-react can't detect preamble. Something is wrong."
+    );
+  }
+  prevRefreshReg = window.$RefreshReg$;
+  prevRefreshSig = window.$RefreshSig$;
+  window.$RefreshReg$ = RefreshRuntime.getRefreshReg("D:/apteka2704/front/src/app/components/ui/dialog.tsx");
+  window.$RefreshSig$ = RefreshRuntime.createSignatureFunctionForTransform;
+}
+"use client";
+import * as DialogPrimitive from "/node_modules/.vite/deps/@radix-ui_react-dialog.js?v=3735631c";
+import { XIcon } from "/node_modules/.vite/deps/lucide-react.js?v=3735631c";
+import { cn } from "/src/app/components/ui/utils.ts";
+function Dialog({
+  ...props
+}) {
+  return /* @__PURE__ */ jsxDEV(DialogPrimitive.Root, { "data-slot": "dialog", ...props }, void 0, false, {
+    fileName: "D:/apteka2704/front/src/app/components/ui/dialog.tsx",
+    lineNumber: 31,
+    columnNumber: 10
+  }, this);
+}
+_c = Dialog;
+function DialogTrigger({
+  ...props
+}) {
+  return /* @__PURE__ */ jsxDEV(DialogPrimitive.Trigger, { "data-slot": "dialog-trigger", ...props }, void 0, false, {
+    fileName: "D:/apteka2704/front/src/app/components/ui/dialog.tsx",
+    lineNumber: 37,
+    columnNumber: 10
+  }, this);
+}
+_c2 = DialogTrigger;
+function DialogPortal({
+  ...props
+}) {
+  return /* @__PURE__ */ jsxDEV(DialogPrimitive.Portal, { "data-slot": "dialog-portal", ...props }, void 0, false, {
+    fileName: "D:/apteka2704/front/src/app/components/ui/dialog.tsx",
+    lineNumber: 43,
+    columnNumber: 10
+  }, this);
+}
+_c3 = DialogPortal;
+function DialogClose({
+  ...props
+}) {
+  return /* @__PURE__ */ jsxDEV(DialogPrimitive.Close, { "data-slot": "dialog-close", ...props }, void 0, false, {
+    fileName: "D:/apteka2704/front/src/app/components/ui/dialog.tsx",
+    lineNumber: 49,
+    columnNumber: 10
+  }, this);
+}
+_c4 = DialogClose;
+function DialogOverlay({
+  className,
+  ...props
+}) {
+  return /* @__PURE__ */ jsxDEV(
+    DialogPrimitive.Overlay,
+    {
+      "data-slot": "dialog-overlay",
+      className: cn(
+        "data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 fixed inset-0 z-50 bg-black/50",
+        className
+      ),
+      ...props
+    },
+    void 0,
+    false,
+    {
+      fileName: "D:/apteka2704/front/src/app/components/ui/dialog.tsx",
+      lineNumber: 57,
+      columnNumber: 5
+    },
+    this
+  );
+}
+_c5 = DialogOverlay;
+function DialogContent({
+  className,
+  children,
+  ...props
+}) {
+  return /* @__PURE__ */ jsxDEV(DialogPortal, { "data-slot": "dialog-portal", children: [
+    /* @__PURE__ */ jsxDEV(DialogOverlay, {}, void 0, false, {
+      fileName: "D:/apteka2704/front/src/app/components/ui/dialog.tsx",
+      lineNumber: 75,
+      columnNumber: 7
+    }, this),
+    /* @__PURE__ */ jsxDEV(
+      DialogPrimitive.Content,
+      {
+        "data-slot": "dialog-content",
+        className: cn(
+          "bg-background data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 fixed top-[50%] left-[50%] z-50 grid max-h-[90vh] max-h-[90dvh] w-full max-w-[calc(100%-2rem)] grid-rows-[minmax(0,1fr)] translate-x-[-50%] translate-y-[-50%] gap-4 overflow-hidden rounded-lg border p-6 shadow-lg duration-200 sm:max-w-lg",
+          className
+        ),
+        ...props,
+        children: [
+          /* @__PURE__ */ jsxDEV("div", { "data-slot": "dialog-scroll-body", className: "min-h-0 min-w-0 overflow-x-hidden overflow-y-auto overscroll-contain break-words", children }, void 0, false, {
+            fileName: "D:/apteka2704/front/src/app/components/ui/dialog.tsx",
+            lineNumber: 84,
+            columnNumber: 9
+          }, this),
+          /* @__PURE__ */ jsxDEV(DialogPrimitive.Close, { className: "ring-offset-background focus:ring-ring data-[state=open]:bg-accent data-[state=open]:text-muted-foreground absolute top-4 right-4 rounded-xs opacity-70 transition-opacity hover:opacity-100 focus:ring-2 focus:ring-offset-2 focus:outline-hidden disabled:pointer-events-none [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4", children: [
+            /* @__PURE__ */ jsxDEV(XIcon, {}, void 0, false, {
+              fileName: "D:/apteka2704/front/src/app/components/ui/dialog.tsx",
+              lineNumber: 88,
+              columnNumber: 11
+            }, this),
+            /* @__PURE__ */ jsxDEV("span", { className: "sr-only", children: "Закрыть" }, void 0, false, {
+              fileName: "D:/apteka2704/front/src/app/components/ui/dialog.tsx",
+              lineNumber: 89,
+              columnNumber: 11
+            }, this)
+          ] }, void 0, true, {
+            fileName: "D:/apteka2704/front/src/app/components/ui/dialog.tsx",
+            lineNumber: 87,
+            columnNumber: 9
+          }, this)
+        ]
+      },
+      void 0,
+      true,
+      {
+        fileName: "D:/apteka2704/front/src/app/components/ui/dialog.tsx",
+        lineNumber: 76,
+        columnNumber: 7
+      },
+      this
+    )
+  ] }, void 0, true, {
+    fileName: "D:/apteka2704/front/src/app/components/ui/dialog.tsx",
+    lineNumber: 74,
+    columnNumber: 5
+  }, this);
+}
+_c6 = DialogContent;
+function DialogHeader({ className, ...props }) {
+  return /* @__PURE__ */ jsxDEV(
+    "div",
+    {
+      "data-slot": "dialog-header",
+      className: cn("bg-background sticky top-0 z-10 flex flex-col gap-2 pb-2 pr-8 text-center sm:text-left", className),
+      ...props
+    },
+    void 0,
+    false,
+    {
+      fileName: "D:/apteka2704/front/src/app/components/ui/dialog.tsx",
+      lineNumber: 98,
+      columnNumber: 5
+    },
+    this
+  );
+}
+_c7 = DialogHeader;
+function DialogFooter({ className, ...props }) {
+  return /* @__PURE__ */ jsxDEV(
+    "div",
+    {
+      "data-slot": "dialog-footer",
+      className: cn(
+        "flex flex-col-reverse gap-2 sm:flex-row sm:justify-end",
+        className
+      ),
+      ...props
+    },
+    void 0,
+    false,
+    {
+      fileName: "D:/apteka2704/front/src/app/components/ui/dialog.tsx",
+      lineNumber: 108,
+      columnNumber: 5
+    },
+    this
+  );
+}
+_c8 = DialogFooter;
+function DialogTitle({
+  className,
+  ...props
+}) {
+  return /* @__PURE__ */ jsxDEV(
+    DialogPrimitive.Title,
+    {
+      "data-slot": "dialog-title",
+      className: cn("text-lg leading-none font-semibold", className),
+      ...props
+    },
+    void 0,
+    false,
+    {
+      fileName: "D:/apteka2704/front/src/app/components/ui/dialog.tsx",
+      lineNumber: 124,
+      columnNumber: 5
+    },
+    this
+  );
+}
+_c9 = DialogTitle;
+function DialogDescription({
+  className,
+  ...props
+}) {
+  return /* @__PURE__ */ jsxDEV(
+    DialogPrimitive.Description,
+    {
+      "data-slot": "dialog-description",
+      className: cn("text-muted-foreground text-sm", className),
+      ...props
+    },
+    void 0,
+    false,
+    {
+      fileName: "D:/apteka2704/front/src/app/components/ui/dialog.tsx",
+      lineNumber: 137,
+      columnNumber: 5
+    },
+    this
+  );
+}
+_c0 = DialogDescription;
+export {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogOverlay,
+  DialogPortal,
+  DialogTitle,
+  DialogTrigger
+};
+var _c, _c2, _c3, _c4, _c5, _c6, _c7, _c8, _c9, _c0;
+$RefreshReg$(_c, "Dialog");
+$RefreshReg$(_c2, "DialogTrigger");
+$RefreshReg$(_c3, "DialogPortal");
+$RefreshReg$(_c4, "DialogClose");
+$RefreshReg$(_c5, "DialogOverlay");
+$RefreshReg$(_c6, "DialogContent");
+$RefreshReg$(_c7, "DialogHeader");
+$RefreshReg$(_c8, "DialogFooter");
+$RefreshReg$(_c9, "DialogTitle");
+$RefreshReg$(_c0, "DialogDescription");
+if (import.meta.hot && !inWebWorker) {
+  window.$RefreshReg$ = prevRefreshReg;
+  window.$RefreshSig$ = prevRefreshSig;
+}
+if (import.meta.hot && !inWebWorker) {
+  RefreshRuntime.__hmr_import(import.meta.url).then((currentExports) => {
+    RefreshRuntime.registerExportsForReactRefresh("D:/apteka2704/front/src/app/components/ui/dialog.tsx", currentExports);
+    import.meta.hot.accept((nextExports) => {
+      if (!nextExports) return;
+      const invalidateMessage = RefreshRuntime.validateRefreshBoundaryAndEnqueueUpdate("D:/apteka2704/front/src/app/components/ui/dialog.tsx", currentExports, nextExports);
+      if (invalidateMessage) import.meta.hot.invalidate(invalidateMessage);
+    });
+  });
+}
+
+//# sourceMappingURL=data:application/json;base64,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QUFBRyxLQUFBRyxLQUFBRSxLQUFBRSxLQUFBRSxLQUFBRTtBQUFBLGFBQUFwQixJQUFBO0FBQUEsYUFBQUUsS0FBQTtBQUFBLGFBQUFFLEtBQUE7QUFBQSxhQUFBRSxLQUFBO0FBQUEsYUFBQUcsS0FBQTtBQUFBLGFBQUFHLEtBQUE7QUFBQSxhQUFBRSxLQUFBO0FBQUEsYUFBQUUsS0FBQTtBQUFBLGFBQUFFLEtBQUE7QUFBQSxhQUFBRSxLQUFBIiwibmFtZXMiOlsiRGlhbG9nUHJpbWl0aXZlIiwiWEljb24iLCJjbiIsIkRpYWxvZyIsInByb3BzIiwiX2MiLCJEaWFsb2dUcmlnZ2VyIiwiX2MyIiwiRGlhbG9nUG9ydGFsIiwiX2MzIiwiRGlhbG9nQ2xvc2UiLCJfYzQiLCJEaWFsb2dPdmVybGF5IiwiY2xhc3NOYW1lIiwiX2M1IiwiRGlhbG9nQ29udGVudCIsImNoaWxkcmVuIiwiX2M2IiwiRGlhbG9nSGVhZGVyIiwiX2M3IiwiRGlhbG9nRm9vdGVyIiwiX2M4IiwiRGlhbG9nVGl0bGUiLCJfYzkiLCJEaWFsb2dEZXNjcmlwdGlvbiIsIl9jMCJdLCJpZ25vcmVMaXN0IjpbXSwic291cmNlcyI6WyJkaWFsb2cudHN4Il0sInNvdXJjZXNDb250ZW50IjpbIlwidXNlIGNsaWVudFwiO1xuXG5pbXBvcnQgKiBhcyBSZWFjdCBmcm9tIFwicmVhY3RcIjtcbmltcG9ydCAqIGFzIERpYWxvZ1ByaW1pdGl2ZSBmcm9tIFwiQHJhZGl4LXVpL3JlYWN0LWRpYWxvZ1wiO1xuaW1wb3J0IHsgWEljb24gfSBmcm9tIFwibHVjaWRlLXJlYWN0XCI7XG5cbmltcG9ydCB7IGNuIH0gZnJvbSBcIi4vdXRpbHNcIjtcblxuZnVuY3Rpb24gRGlhbG9nKHtcbiAgLi4ucHJvcHNcbn06IFJlYWN0LkNvbXBvbmVudFByb3BzPHR5cGVvZiBEaWFsb2dQcmltaXRpdmUuUm9vdD4pIHtcbiAgcmV0dXJuIDxEaWFsb2dQcmltaXRpdmUuUm9vdCBkYXRhLXNsb3Q9XCJkaWFsb2dcIiB7Li4ucHJvcHN9IC8+O1xufVxuXG5mdW5jdGlvbiBEaWFsb2dUcmlnZ2VyKHtcbiAgLi4ucHJvcHNcbn06IFJlYWN0LkNvbXBvbmVudFByb3BzPHR5cGVvZiBEaWFsb2dQcmltaXRpdmUuVHJpZ2dlcj4pIHtcbiAgcmV0dXJuIDxEaWFsb2dQcmltaXRpdmUuVHJpZ2dlciBkYXRhLXNsb3Q9XCJkaWFsb2ctdHJpZ2dlclwiIHsuLi5wcm9wc30gLz47XG59XG5cbmZ1bmN0aW9uIERpYWxvZ1BvcnRhbCh7XG4gIC4uLnByb3BzXG59OiBSZWFjdC5Db21wb25lbnRQcm9wczx0eXBlb2YgRGlhbG9nUHJpbWl0aXZlLlBvcnRhbD4pIHtcbiAgcmV0dXJuIDxEaWFsb2dQcmltaXRpdmUuUG9ydGFsIGRhdGEtc2xvdD1cImRpYWxvZy1wb3J0YWxcIiB7Li4ucHJvcHN9IC8+O1xufVxuXG5mdW5jdGlvbiBEaWFsb2dDbG9zZSh7XG4gIC4uLnByb3BzXG59OiBSZWFjdC5Db21wb25lbnRQcm9wczx0eXBlb2YgRGlhbG9nUHJpbWl0aXZlLkNsb3NlPikge1xuICByZXR1cm4gPERpYWxvZ1ByaW1pdGl2ZS5DbG9zZSBkYXRhLXNsb3Q9XCJkaWFsb2ctY2xvc2VcIiB7Li4ucHJvcHN9IC8+O1xufVxuXG5mdW5jdGlvbiBEaWFsb2dPdmVybGF5KHtcbiAgY2xhc3NOYW1lLFxuICAuLi5wcm9wc1xufTogUmVhY3QuQ29tcG9uZW50UHJvcHM8dHlwZW9mIERpYWxvZ1ByaW1pdGl2ZS5PdmVybGF5Pikge1xuICByZXR1cm4gKFxuICAgIDxEaWFsb2dQcmltaXRpdmUuT3ZlcmxheVxuICAgICAgZGF0YS1zbG90PVwiZGlhbG9nLW92ZXJsYXlcIlxuICAgICAgY2xhc3NOYW1lPXtjbihcbiAgICAgICAgXCJkYXRhLVtzdGF0ZT1vcGVuXTphbmltYXRlLWluIGRhdGEtW3N0YXRlPWNsb3NlZF06YW5pbWF0ZS1vdXQgZGF0YS1bc3RhdGU9Y2xvc2VkXTpmYWRlLW91dC0wIGRhdGEtW3N0YXRlPW9wZW5dOmZhZGUtaW4tMCBmaXhlZCBpbnNldC0wIHotNTAgYmctYmxhY2svNTBcIixcbiAgICAgICAgY2xhc3NOYW1lLFxuICAgICAgKX1cbiAgICAgIHsuLi5wcm9wc31cbiAgICAvPlxuICApO1xufVxuXG5mdW5jdGlvbiBEaWFsb2dDb250ZW50KHtcbiAgY2xhc3NOYW1lLFxuICBjaGlsZHJlbixcbiAgLi4ucHJvcHNcbn06IFJlYWN0LkNvbXBvbmVudFByb3BzPHR5cGVvZiBEaWFsb2dQcmltaXRpdmUuQ29udGVudD4pIHtcbiAgcmV0dXJuIChcbiAgICA8RGlhbG9nUG9ydGFsIGRhdGEtc2xvdD1cImRpYWxvZy1wb3J0YWxcIj5cbiAgICAgIDxEaWFsb2dPdmVybGF5IC8+XG4gICAgICA8RGlhbG9nUHJpbWl0aXZlLkNvbnRlbnRcbiAgICAgICAgZGF0YS1zbG90PVwiZGlhbG9nLWNvbnRlbnRcIlxuICAgICAgICBjbGFzc05hbWU9e2NuKFxuICAgICAgICAgIFwiYmctYmFja2dyb3VuZCBkYXRhLVtzdGF0ZT1vcGVuXTphbmltYXRlLWluIGRhdGEtW3N0YXRlPWNsb3NlZF06YW5pbWF0ZS1vdXQgZGF0YS1bc3RhdGU9Y2xvc2VkXTpmYWRlLW91dC0wIGRhdGEtW3N0YXRlPW9wZW5dOmZhZGUtaW4tMCBkYXRhLVtzdGF0ZT1jbG9zZWRdOnpvb20tb3V0LTk1IGRhdGEtW3N0YXRlPW9wZW5dOnpvb20taW4tOTUgZml4ZWQgdG9wLVs1MCVdIGxlZnQtWzUwJV0gei01MCBncmlkIG1heC1oLVs5MHZoXSBtYXgtaC1bOTBkdmhdIHctZnVsbCBtYXgtdy1bY2FsYygxMDAlLTJyZW0pXSBncmlkLXJvd3MtW21pbm1heCgwLDFmcildIHRyYW5zbGF0ZS14LVstNTAlXSB0cmFuc2xhdGUteS1bLTUwJV0gZ2FwLTQgb3ZlcmZsb3ctaGlkZGVuIHJvdW5kZWQtbGcgYm9yZGVyIHAtNiBzaGFkb3ctbGcgZHVyYXRpb24tMjAwIHNtOm1heC13LWxnXCIsXG4gICAgICAgICAgY2xhc3NOYW1lLFxuICAgICAgICApfVxuICAgICAgICB7Li4ucHJvcHN9XG4gICAgICA+XG4gICAgICAgIDxkaXYgZGF0YS1zbG90PVwiZGlhbG9nLXNjcm9sbC1ib2R5XCIgY2xhc3NOYW1lPVwibWluLWgtMCBtaW4tdy0wIG92ZXJmbG93LXgtaGlkZGVuIG92ZXJmbG93LXktYXV0byBvdmVyc2Nyb2xsLWNvbnRhaW4gYnJlYWstd29yZHNcIj5cbiAgICAgICAgICB7Y2hpbGRyZW59XG4gICAgICAgIDwvZGl2PlxuICAgICAgICA8RGlhbG9nUHJpbWl0aXZlLkNsb3NlIGNsYXNzTmFtZT1cInJpbmctb2Zmc2V0LWJhY2tncm91bmQgZm9jdXM6cmluZy1yaW5nIGRhdGEtW3N0YXRlPW9wZW5dOmJnLWFjY2VudCBkYXRhLVtzdGF0ZT1vcGVuXTp0ZXh0LW11dGVkLWZvcmVncm91bmQgYWJzb2x1dGUgdG9wLTQgcmlnaHQtNCByb3VuZGVkLXhzIG9wYWNpdHktNzAgdHJhbnNpdGlvbi1vcGFjaXR5IGhvdmVyOm9wYWNpdHktMTAwIGZvY3VzOnJpbmctMiBmb2N1czpyaW5nLW9mZnNldC0yIGZvY3VzOm91dGxpbmUtaGlkZGVuIGRpc2FibGVkOnBvaW50ZXItZXZlbnRzLW5vbmUgWyZfc3ZnXTpwb2ludGVyLWV2ZW50cy1ub25lIFsmX3N2Z106c2hyaW5rLTAgWyZfc3ZnOm5vdChbY2xhc3MqPSdzaXplLSddKV06c2l6ZS00XCI+XG4gICAgICAgICAgPFhJY29uIC8+XG4gICAgICAgICAgPHNwYW4gY2xhc3NOYW1lPVwic3Itb25seVwiPtCX0LDQutGA0YvRgtGMPC9zcGFuPlxuICAgICAgICA8L0RpYWxvZ1ByaW1pdGl2ZS5DbG9zZT5cbiAgICAgIDwvRGlhbG9nUHJpbWl0aXZlLkNvbnRlbnQ+XG4gICAgPC9EaWFsb2dQb3J0YWw+XG4gICk7XG59XG5cbmZ1bmN0aW9uIERpYWxvZ0hlYWRlcih7IGNsYXNzTmFtZSwgLi4ucHJvcHMgfTogUmVhY3QuQ29tcG9uZW50UHJvcHM8XCJkaXZcIj4pIHtcbiAgcmV0dXJuIChcbiAgICA8ZGl2XG4gICAgICBkYXRhLXNsb3Q9XCJkaWFsb2ctaGVhZGVyXCJcbiAgICAgIGNsYXNzTmFtZT17Y24oXCJiZy1iYWNrZ3JvdW5kIHN0aWNreSB0b3AtMCB6LTEwIGZsZXggZmxleC1jb2wgZ2FwLTIgcGItMiBwci04IHRleHQtY2VudGVyIHNtOnRleHQtbGVmdFwiLCBjbGFzc05hbWUpfVxuICAgICAgey4uLnByb3BzfVxuICAgIC8+XG4gICk7XG59XG5cbmZ1bmN0aW9uIERpYWxvZ0Zvb3Rlcih7IGNsYXNzTmFtZSwgLi4ucHJvcHMgfTogUmVhY3QuQ29tcG9uZW50UHJvcHM8XCJkaXZcIj4pIHtcbiAgcmV0dXJuIChcbiAgICA8ZGl2XG4gICAgICBkYXRhLXNsb3Q9XCJkaWFsb2ctZm9vdGVyXCJcbiAgICAgIGNsYXNzTmFtZT17Y24oXG4gICAgICAgIFwiZmxleCBmbGV4LWNvbC1yZXZlcnNlIGdhcC0yIHNtOmZsZXgtcm93IHNtOmp1c3RpZnktZW5kXCIsXG4gICAgICAgIGNsYXNzTmFtZSxcbiAgICAgICl9XG4gICAgICB7Li4ucHJvcHN9XG4gICAgLz5cbiAgKTtcbn1cblxuZnVuY3Rpb24gRGlhbG9nVGl0bGUoe1xuICBjbGFzc05hbWUsXG4gIC4uLnByb3BzXG59OiBSZWFjdC5Db21wb25lbnRQcm9wczx0eXBlb2YgRGlhbG9nUHJpbWl0aXZlLlRpdGxlPikge1xuICByZXR1cm4gKFxuICAgIDxEaWFsb2dQcmltaXRpdmUuVGl0bGVcbiAgICAgIGRhdGEtc2xvdD1cImRpYWxvZy10aXRsZVwiXG4gICAgICBjbGFzc05hbWU9e2NuKFwidGV4dC1sZyBsZWFkaW5nLW5vbmUgZm9udC1zZW1pYm9sZFwiLCBjbGFzc05hbWUpfVxuICAgICAgey4uLnByb3BzfVxuICAgIC8+XG4gICk7XG59XG5cbmZ1bmN0aW9uIERpYWxvZ0Rlc2NyaXB0aW9uKHtcbiAgY2xhc3NOYW1lLFxuICAuLi5wcm9wc1xufTogUmVhY3QuQ29tcG9uZW50UHJvcHM8dHlwZW9mIERpYWxvZ1ByaW1pdGl2ZS5EZXNjcmlwdGlvbj4pIHtcbiAgcmV0dXJuIChcbiAgICA8RGlhbG9nUHJpbWl0aXZlLkRlc2NyaXB0aW9uXG4gICAgICBkYXRhLXNsb3Q9XCJkaWFsb2ctZGVzY3JpcHRpb25cIlxuICAgICAgY2xhc3NOYW1lPXtjbihcInRleHQtbXV0ZWQtZm9yZWdyb3VuZCB0ZXh0LXNtXCIsIGNsYXNzTmFtZSl9XG4gICAgICB7Li4ucHJvcHN9XG4gICAgLz5cbiAgKTtcbn1cblxuZXhwb3J0IHtcbiAgRGlhbG9nLFxuICBEaWFsb2dDbG9zZSxcbiAgRGlhbG9nQ29udGVudCxcbiAgRGlhbG9nRGVzY3JpcHRpb24sXG4gIERpYWxvZ0Zvb3RlcixcbiAgRGlhbG9nSGVhZGVyLFxuICBEaWFsb2dPdmVybGF5LFxuICBEaWFsb2dQb3J0YWwsXG4gIERpYWxvZ1RpdGxlLFxuICBEaWFsb2dUcmlnZ2VyLFxufTtcbiJdLCJmaWxlIjoiRDovYXB0ZWthMjcwNC9mcm9udC9zcmMvYXBwL2NvbXBvbmVudHMvdWkvZGlhbG9nLnRzeCJ9
