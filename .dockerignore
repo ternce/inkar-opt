@@ -30,3 +30,14 @@ backend/app.db
 Thumbs.db
 
 *.log
+
+
+# Chrome audit
+.tmp-chrome-assignment-audit/
+
+# Audit logs
+*.log
+vite-audit.log
+preview-proxy*.log
+prod-proxy*.log
+local-audit-uvicorn.log
