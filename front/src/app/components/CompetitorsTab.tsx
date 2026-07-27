@@ -303,6 +303,8 @@ type Props = {
   formatCode: string;
 };
 
+type CompetitorsInternalTab = 'price-lists' | 'percentiles' | 'mappings';
+
 const parseJsonOrNull = (text: string) => {
   try {
     return text ? JSON.parse(text) : null;
@@ -610,6 +612,7 @@ function PercentileBrowser({
 }
 
 export function CompetitorsTab({ formatCode }: Props) {
+  const [activeTab, setActiveTab] = useState<CompetitorsInternalTab>('price-lists');
   const [sources, setSources] = useState<CompetitorSource[]>([]);
   const [sourceSearch, setSourceSearch] = useState('');
   const [sourceFilter, setSourceFilter] = useState('__all__');
@@ -739,6 +742,18 @@ export function CompetitorsTab({ formatCode }: Props) {
     setProvisorDiagnostics(data);
   };
 
+  const requestProvisorDiagnostics = async () => {
+    setIsLoading(true);
+    setError(null);
+    try {
+      await loadProvisorDiagnostics();
+    } catch (e: any) {
+      setError(e?.message || 'Не удалось загрузить диагностику Provisor');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   const loadProvisorAccounts = async () => {
     const res = await fetch('/api/provisor/accounts');
     const text = await res.text();
@@ -775,11 +790,11 @@ export function CompetitorsTab({ formatCode }: Props) {
     if (controller && mappingRequestRef.current === controller) mappingRequestRef.current = null;
   };
 
-  const loadAll = async () => {
+  const loadPriceListTab = async () => {
     setIsLoading(true);
     setError(null);
     try {
-      await Promise.all([loadSources(), loadPercentileRows(), loadProvisorDiagnostics(), loadProvisorAccounts()]);
+      await Promise.all([loadSources(), loadProvisorAccounts()]);
     } catch (e: any) {
       setError(e?.message || 'Ошибка загрузки');
     } finally {
@@ -797,9 +812,10 @@ export function CompetitorsTab({ formatCode }: Props) {
   }, [formatCode, percentileSource]);
 
   useEffect(() => {
-    void loadAll();
+    if (activeTab !== 'price-lists') return;
+    void loadPriceListTab();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [formatCode, percentileSource]);
+  }, [formatCode, activeTab]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -810,14 +826,16 @@ export function CompetitorsTab({ formatCode }: Props) {
   }, [percentileSearch]);
 
   useEffect(() => {
+    if (activeTab !== 'percentiles') return;
     setIsLoading(true);
     void loadPercentileRows()
       .catch((e: any) => setError(e?.message || 'Не удалось загрузить персентили'))
       .finally(() => setIsLoading(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [formatCode, percentileSource, percentileRegion, percentileCompetitor, percentileSourceKey, appliedPercentileSearch, percentileFilter, percentileCompetitorFilter, percentileSort, percentileDirection, percentilePage]);
+  }, [activeTab, formatCode, percentileSource, percentileRegion, percentileCompetitor, percentileSourceKey, appliedPercentileSearch, percentileFilter, percentileCompetitorFilter, percentileSort, percentileDirection, percentilePage]);
 
   useEffect(() => {
+    if (activeTab !== 'mappings') return;
     mappingRequestRef.current?.abort();
     const controller = new AbortController();
     mappingRequestRef.current = controller;
@@ -839,7 +857,7 @@ export function CompetitorsTab({ formatCode }: Props) {
       mappingRequestRef.current?.abort();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mappingPlatform, mappingStatus, appliedSourceQuery, appliedProductQuery, mappingPage, formatCode]);
+  }, [activeTab, mappingPlatform, mappingStatus, appliedSourceQuery, appliedProductQuery, mappingPage, formatCode]);
 
   const submitMappingSearch = () => {
     setAppliedSourceQuery(sourceQuery.trim());
@@ -895,7 +913,7 @@ export function CompetitorsTab({ formatCode }: Props) {
       if (!data?.job_id) throw new Error('Сервер не вернул идентификатор задачи');
       setActiveJob({ id: data.job_id, status: data.status || 'pending', progress: 0, message: data.message || 'Обновляем источники' });
       await pollJob(data.job_id);
-      await Promise.all([loadSources(), loadPercentileRows(), loadCodeMappings(), loadProvisorDiagnostics(), loadProvisorAccounts()]);
+      await loadPriceListTab();
       toast.success(`${platformLabel(source)} обновлен`);
     } catch (e: any) {
       setError(e?.message || 'Ошибка обновления');
@@ -958,7 +976,7 @@ export function CompetitorsTab({ formatCode }: Props) {
       const text = await res.text();
       const data = parseJsonOrNull(text);
       if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить Excel');
-      await Promise.all([loadSources(), loadProvisorDiagnostics()]);
+      await loadSources();
       setManualReport(data);
       setManualTargetId(null);
       setExcelFile(null);
@@ -1608,7 +1626,7 @@ export function CompetitorsTab({ formatCode }: Props) {
         </div>
       ) : null}
 
-      <Tabs defaultValue="price-lists" className="w-full">
+      <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as CompetitorsInternalTab)} className="w-full">
         <TabsList className="w-full justify-start border-b border-gray-200 rounded-none h-auto p-0 bg-transparent">
           <TabsTrigger value="price-lists" className="rounded-none border-b border-transparent data-[state=active]:border-blue-600 data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:text-blue-700 px-4 py-2">
             Прайс-листы конкурентов
@@ -1672,7 +1690,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                       ЦФ {provisorDiagnostics.formatCode}, филиал {provisorDiagnostics.branch || 'все филиалы'}
                     </p>
                   </div>
-                  <Button variant="outline" size="sm" onClick={() => void loadProvisorDiagnostics()} disabled={isLoading}>
+                  <Button variant="outline" size="sm" onClick={() => void requestProvisorDiagnostics()} disabled={isLoading}>
                     <RefreshCw className="mr-2 h-4 w-4" />
                     Обновить диагностику
                   </Button>
@@ -1757,7 +1775,20 @@ export function CompetitorsTab({ formatCode }: Props) {
                   </div>
                 </div>
               </div>
-            ) : null}
+            ) : (
+              <div className="admin-card p-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <h3 className="text-sm font-semibold text-gray-900">Диагностика Provisor</h3>
+                    <p className="mt-1 text-sm text-gray-600">Диагностика загружается по запросу.</p>
+                  </div>
+                  <Button variant="outline" size="sm" onClick={() => void requestProvisorDiagnostics()} disabled={isLoading}>
+                    <RefreshCw className={`mr-2 h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} />
+                    Загрузить диагностику
+                  </Button>
+                </div>
+              </div>
+            )}
 
             <div className="admin-card p-4">
               <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
@@ -1946,48 +1977,50 @@ export function CompetitorsTab({ formatCode }: Props) {
         </TabsContent>
 
         <TabsContent value="percentiles" className="m-0 pt-4">
-          <PercentileBrowser
-            rows={percentileRows}
-            summary={percentileSummary}
-            total={percentileTotal}
-            page={percentilePage}
-            pageCount={percentilePageCount}
-            groups={percentileGroups}
-            percentileSource={percentileSource}
-            selectedRegion={percentileRegion}
-            selectedCompetitor={percentileCompetitor}
-            selectedSourceKey={percentileSourceKey}
-            priceColumns={percentilePriceColumns}
-            percentileNumbers={percentileNumbers}
-            search={percentileSearch}
-            percentileFilter={percentileFilter}
-            competitorFilter={percentileCompetitorFilter}
-            sort={percentileSort}
-            direction={percentileDirection}
-            onSearch={setPercentileSearch}
-            onPercentileFilter={(value) => { setPercentileFilter(value); setPercentilePage(1); }}
-            onCompetitorFilter={(value) => { setPercentileCompetitorFilter(value); setPercentilePage(1); }}
-            onPercentileSource={(value) => {
-              setPercentileSource(value);
-              setPercentileRegion('');
-              setPercentileCompetitor('');
-              setPercentileSourceKey('');
-              setPercentilePage(1);
-            }}
-            onSort={(value) => { setPercentileSort(value); setPercentilePage(1); }}
-            onDirection={(value) => { setPercentileDirection(value); setPercentilePage(1); }}
-            onRegion={(value) => { setPercentileRegion(value); setPercentileCompetitor(''); setPercentilePage(1); }}
-            onCompetitor={(value) => { setPercentileCompetitor(value); setPercentilePage(1); }}
-            onSourceKey={(value) => {
-              const group = percentileGroups.find((item) => (item.sourceKey || item.id) === value);
-              setPercentileSourceKey(value);
-              setPercentileRegion(group?.region || '');
-              setPercentileCompetitor(group?.competitor || '');
-              setPercentilePage(1);
-            }}
-            onPage={setPercentilePage}
-            onExport={exportPercentiles}
-          />
+          {activeTab === 'percentiles' ? (
+            <PercentileBrowser
+              rows={percentileRows}
+              summary={percentileSummary}
+              total={percentileTotal}
+              page={percentilePage}
+              pageCount={percentilePageCount}
+              groups={percentileGroups}
+              percentileSource={percentileSource}
+              selectedRegion={percentileRegion}
+              selectedCompetitor={percentileCompetitor}
+              selectedSourceKey={percentileSourceKey}
+              priceColumns={percentilePriceColumns}
+              percentileNumbers={percentileNumbers}
+              search={percentileSearch}
+              percentileFilter={percentileFilter}
+              competitorFilter={percentileCompetitorFilter}
+              sort={percentileSort}
+              direction={percentileDirection}
+              onSearch={setPercentileSearch}
+              onPercentileFilter={(value) => { setPercentileFilter(value); setPercentilePage(1); }}
+              onCompetitorFilter={(value) => { setPercentileCompetitorFilter(value); setPercentilePage(1); }}
+              onPercentileSource={(value) => {
+                setPercentileSource(value);
+                setPercentileRegion('');
+                setPercentileCompetitor('');
+                setPercentileSourceKey('');
+                setPercentilePage(1);
+              }}
+              onSort={(value) => { setPercentileSort(value); setPercentilePage(1); }}
+              onDirection={(value) => { setPercentileDirection(value); setPercentilePage(1); }}
+              onRegion={(value) => { setPercentileRegion(value); setPercentileCompetitor(''); setPercentilePage(1); }}
+              onCompetitor={(value) => { setPercentileCompetitor(value); setPercentilePage(1); }}
+              onSourceKey={(value) => {
+                const group = percentileGroups.find((item) => (item.sourceKey || item.id) === value);
+                setPercentileSourceKey(value);
+                setPercentileRegion(group?.region || '');
+                setPercentileCompetitor(group?.competitor || '');
+                setPercentilePage(1);
+              }}
+              onPage={setPercentilePage}
+              onExport={exportPercentiles}
+            />
+          ) : null}
         </TabsContent>
 
         <TabsContent value="percentiles-legacy" className="m-0 pt-4">
@@ -2024,7 +2057,7 @@ export function CompetitorsTab({ formatCode }: Props) {
         </TabsContent>
 
         <TabsContent value="mappings" className="m-0 pt-4">
-          {renderMappingsWorkflow()}
+          {activeTab === 'mappings' ? renderMappingsWorkflow() : null}
           {false && (
           <div className="space-y-4">
             <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
