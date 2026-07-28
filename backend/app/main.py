@@ -125,6 +125,7 @@ from .services.competitor_assignments import (
     upsert_assignment,
 )
 from .services.competitor_coefficients import effective_price_coefficient, validate_price_coefficient
+from .services.percentile_export import load_percentile_export_prices
 from .services.manual_price_list_import import (
     deactivate_manual_price_list,
     delete_manual_price_list,
@@ -2385,18 +2386,28 @@ def _competitor_prices_by_product(
     if not product_ids or not columns:
         return {}
     source_names = [str(column.get("key") or "") for column in columns if column.get("key")]
+    percentile_source_names = {source_name for source_name in source_names if source_name.startswith("percentile:")}
+    physical_source_names = [source_name for source_name in source_names if not source_name.startswith("percentile:")]
     coefficient_by_source = {str(column.get("key") or ""): float(column.get("priceCoefficient") or column.get("coefficient") or 1) for column in columns}
-    rows = (
-        db.execute(
-            select(CompetitorPrice)
-            .where(CompetitorPrice.price_format_id == pf.id)
-            .where(CompetitorPrice.product_id.in_(product_ids))
-            .where(CompetitorPrice.source_name.in_(source_names))
-            .where(CompetitorPrice.source_price.is_not(None))
-            .order_by(CompetitorPrice.product_id.asc(), CompetitorPrice.source_name.asc(), CompetitorPrice.source_price.asc())
+    rows = []
+    if physical_source_names:
+        rows = (
+            db.execute(
+                select(CompetitorPrice)
+                .where(CompetitorPrice.price_format_id == pf.id)
+                .where(CompetitorPrice.product_id.in_(product_ids))
+                .where(CompetitorPrice.source_name.in_(physical_source_names))
+                .where(CompetitorPrice.source_price.is_not(None))
+                .order_by(CompetitorPrice.product_id.asc(), CompetitorPrice.source_name.asc(), CompetitorPrice.source_price.asc())
+            )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
+    percentile_prices = load_percentile_export_prices(
+        db=db,
+        price_format_id=int(pf.id),
+        product_ids=product_ids,
+        selected_source_names=percentile_source_names,
     )
     out: dict[int, dict[str, dict]] = {}
     for row in rows:
@@ -2423,6 +2434,22 @@ def _competitor_prices_by_product(
             "isManualMapping": match_type == "manual_code_mapping",
             "isSubstitute": match_type == "provisor_manual_substitute",
         }
+    for product_id, values_by_source in percentile_prices.items():
+        for source_name, value in values_by_source.items():
+            price = float(value)
+            out.setdefault(product_id, {})[source_name] = {
+                "price": price,
+                "adjustedPrice": price,
+                "sourcePrice": price,
+                "originalPrice": price,
+                "coefficient": 1.0,
+                "priceCoefficient": 1.0,
+                "sourceName": source_name,
+                "matchedBy": "competitor_price_percentiles",
+                "isManualMapping": False,
+                "isSubstitute": False,
+                "isPercentile": True,
+            }
     return out
 
 

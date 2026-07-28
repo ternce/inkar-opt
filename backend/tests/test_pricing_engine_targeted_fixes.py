@@ -43,9 +43,10 @@ from backend.app.services.competitors.percentiles.read_models import (
     list_percentile_sources,
     percentile_coverage_audit,
 )
-from backend.app.main import _competitor_column_title, _generated_item_dict, app
+from backend.app.main import _competitor_column_title, _competitor_prices_by_product, _generated_item_dict, app
 from backend.app.services.competitor_percentiles import KAZAKHSTAN_REGION, KAZAKHSTAN_SCOPE, REGIONAL_SCOPE, recalculate_competitor_percentiles
 from backend.app.services.competitor_source_config import MULTI_PRICE_PERCENTILE_MODE
+from backend.app.services.competitors.percentiles.sources import PERCENTILE_SOURCE_EMIT, percentile_source_id
 from backend.app.services.competitor_matching import rebuild_competitor_prices_for_selected
 from backend.app.services.pricing import (
     MISSING_STOCK_REFERENCE_ERROR,
@@ -92,6 +93,40 @@ def _competitor(db, pf, product, source, price):
     db.flush()
 
 
+def _emit_percentile_column_key(pf, *, source_key, region, competitor, percentile, scope=REGIONAL_SCOPE):
+    source_id = percentile_source_id(
+        percentile_source=PERCENTILE_SOURCE_EMIT,
+        price_format_id=pf.id,
+        scope=scope,
+        source_key=source_key,
+        region=region,
+        competitor=competitor,
+        percentile=percentile,
+    )
+    return f"percentile:{source_id}"
+
+
+def _stored_percentile(db, pf, product, *, source_key, region, competitor, percentile, value, scope=REGIONAL_SCOPE):
+    db.add(
+        CompetitorPricePercentile(
+            price_format_id=pf.id,
+            product_id=product.id,
+            source_type="emit" if str(source_key).startswith("emit:") else "provisor",
+            source_key=source_key,
+            branch_name=region,
+            competitor_name=competitor,
+            percentile_scope=scope,
+            percentile=percentile,
+            value=value,
+            source_count=1,
+            price_count=1,
+            used_price_count=1,
+            status="Calculated",
+        )
+    )
+    db.flush()
+
+
 def _branch_stock(db, product, *, branch_id="1", stock=1):
     db.add(BranchStock(branch_id=branch_id, product_id=product.id, sku=product.code, stock=stock))
     db.flush()
@@ -128,6 +163,198 @@ def _active_cost_reference(db, *, branch_id="1", rows_count=None):
     db.add(row)
     db.flush()
     return row
+
+
+def test_export_lookup_populates_percentile_column_without_competitor_price_row():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, code="PCT-ONLY", cost=100)
+    source_key = "emit:1108"
+    column_key = _emit_percentile_column_key(
+        pf,
+        source_key=source_key,
+        region="Almaty",
+        competitor="Emit Almaty",
+        percentile=10,
+    )
+    _stored_percentile(
+        db,
+        pf,
+        product,
+        source_key=source_key,
+        region="Almaty",
+        competitor="Emit Almaty",
+        percentile=10,
+        value=Decimal("123.45"),
+    )
+
+    values = _competitor_prices_by_product(
+        db,
+        pf=pf,
+        product_ids=[product.id],
+        columns=[{"key": column_key, "title": "Emit P10"}],
+    )
+
+    assert values[product.id][column_key]["price"] == pytest.approx(123.45)
+
+
+def test_export_lookup_keeps_percentile_levels_separate():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, code="PCT-LEVELS", cost=100)
+    source_key = "emit:1108"
+    p10_key = _emit_percentile_column_key(
+        pf,
+        source_key=source_key,
+        region="Almaty",
+        competitor="Emit Almaty",
+        percentile=10,
+    )
+    p50_key = _emit_percentile_column_key(
+        pf,
+        source_key=source_key,
+        region="Almaty",
+        competitor="Emit Almaty",
+        percentile=50,
+    )
+    _stored_percentile(db, pf, product, source_key=source_key, region="Almaty", competitor="Emit Almaty", percentile=10, value=Decimal("100"))
+    _stored_percentile(db, pf, product, source_key=source_key, region="Almaty", competitor="Emit Almaty", percentile=50, value=Decimal("500"))
+
+    values = _competitor_prices_by_product(
+        db,
+        pf=pf,
+        product_ids=[product.id],
+        columns=[{"key": p10_key}, {"key": p50_key}],
+    )
+
+    assert values[product.id][p10_key]["price"] == pytest.approx(100)
+    assert values[product.id][p50_key]["price"] == pytest.approx(500)
+
+
+def test_export_lookup_keeps_local_and_kazakhstan_percentile_scopes_separate():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, code="PCT-SCOPES", cost=100)
+    local_key = _emit_percentile_column_key(
+        pf,
+        source_key="emit:1108",
+        region="Almaty",
+        competitor="Emit",
+        percentile=10,
+    )
+    kz_key = _emit_percentile_column_key(
+        pf,
+        source_key="emit:kazakhstan:Emit",
+        region=KAZAKHSTAN_REGION,
+        competitor="Emit",
+        percentile=10,
+        scope=KAZAKHSTAN_SCOPE,
+    )
+    _stored_percentile(db, pf, product, source_key="emit:1108", region="Almaty", competitor="Emit", percentile=10, value=Decimal("111"))
+    _stored_percentile(
+        db,
+        pf,
+        product,
+        source_key="emit:kazakhstan:Emit",
+        region=KAZAKHSTAN_REGION,
+        competitor="Emit",
+        percentile=10,
+        value=Decimal("999"),
+        scope=KAZAKHSTAN_SCOPE,
+    )
+
+    values = _competitor_prices_by_product(
+        db,
+        pf=pf,
+        product_ids=[product.id],
+        columns=[{"key": local_key}, {"key": kz_key}],
+    )
+
+    assert values[product.id][local_key]["price"] == pytest.approx(111)
+    assert values[product.id][kz_key]["price"] == pytest.approx(999)
+
+
+def test_export_lookup_leaves_missing_percentile_cell_empty():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, code="PCT-MISSING", cost=100)
+    column_key = _emit_percentile_column_key(
+        pf,
+        source_key="emit:1108",
+        region="Almaty",
+        competitor="Emit",
+        percentile=10,
+    )
+
+    values = _competitor_prices_by_product(
+        db,
+        pf=pf,
+        product_ids=[product.id],
+        columns=[{"key": column_key}],
+    )
+
+    assert values.get(product.id, {}).get(column_key) is None
+
+
+def test_export_lookup_keeps_ordinary_competitor_columns_unchanged():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, code="PHYSICAL", cost=100)
+    _competitor(db, pf, product, "manual:source", 321)
+
+    values = _competitor_prices_by_product(
+        db,
+        pf=pf,
+        product_ids=[product.id],
+        columns=[{"key": "manual:source", "coefficient": 1}],
+    )
+
+    assert values[product.id]["manual:source"]["price"] == pytest.approx(321)
+    assert values[product.id]["manual:source"]["matchedBy"] == ""
+
+
+def test_export_lookup_batches_percentile_rows_in_one_query():
+    db = _session()
+    pf = _format(db)
+    products = [_product(db, code=f"PCT-BATCH-{idx}", cost=100) for idx in range(3)]
+    column_key = _emit_percentile_column_key(
+        pf,
+        source_key="emit:1108",
+        region="Almaty",
+        competitor="Emit",
+        percentile=10,
+    )
+    for idx, product in enumerate(products):
+        _stored_percentile(
+            db,
+            pf,
+            product,
+            source_key="emit:1108",
+            region="Almaty",
+            competitor="Emit",
+            percentile=10,
+            value=Decimal(str(100 + idx)),
+        )
+    query_count = 0
+
+    def _count_percentile_query(_conn, _cursor, statement, _parameters, _context, _executemany):
+        nonlocal query_count
+        if "competitor_price_percentiles" in statement:
+            query_count += 1
+
+    event.listen(db.get_bind(), "before_cursor_execute", _count_percentile_query)
+    try:
+        values = _competitor_prices_by_product(
+            db,
+            pf=pf,
+            product_ids=[product.id for product in products],
+            columns=[{"key": column_key}],
+        )
+    finally:
+        event.remove(db.get_bind(), "before_cursor_execute", _count_percentile_query)
+
+    assert query_count == 1
+    assert [values[product.id][column_key]["price"] for product in products] == pytest.approx([100, 101, 102])
 
 
 def _activate_all_products_for_generation(db, *, branch_id="1"):

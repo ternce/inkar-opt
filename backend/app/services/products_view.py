@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from ..models import CalculatedPrice, CompetitorPrice, CompetitorPriceList, PriceFormat, PriceList, Product, ProductExtra
 from .competitor_assignments import get_assigned_competitor_price_lists
+from .percentile_export import load_percentile_export_prices
 from .regions import allowed_provisor_source_names_for_city_id, city_id_from_branch
 
 
@@ -116,6 +117,8 @@ def get_products_with_competitor_top5(
             ):
                 continue
             coeff_by_source[src] = _as_decimal(cfg.coefficient) or Decimal("1")
+            if src.startswith("percentile:"):
+                label_by_source[src] = cfg.supplier or src
             selected_sources.append(src)
 
         if selected_sources:
@@ -123,42 +126,63 @@ def get_products_with_competitor_top5(
                 src = f"{pl_row.source_type}:{pl_row.source_key}"
                 label_by_source[src] = pl_row.display_name or pl_row.supplier or src
 
-        price_rows_stmt = (
-            select(CompetitorPrice)
-            .where(CompetitorPrice.price_format_id == pf.id)
-            .where(CompetitorPrice.product_id.is_not(None))
+        physical_sources = [source for source in selected_sources if not source.startswith("percentile:")]
+        if physical_sources:
+            price_rows_stmt = (
+                select(CompetitorPrice)
+                .where(CompetitorPrice.price_format_id == pf.id)
+                .where(CompetitorPrice.product_id.is_not(None))
+                .where(CompetitorPrice.source_name.in_(physical_sources))
+            )
+            if product_id is not None:
+                price_rows_stmt = price_rows_stmt.where(CompetitorPrice.product_id == product_id)
+            price_rows = db.execute(price_rows_stmt).scalars().all()
+            for row in price_rows:
+                if row.product_id is None:
+                    continue
+                src = (row.source_name or "").strip()
+                if (
+                    allowed_provisor_sources is not None
+                    and src.startswith("provisor:")
+                    and src not in explicitly_selected_sources
+                    and src not in allowed_provisor_sources
+                ):
+                    continue
+                sp = _as_decimal(row.source_price)
+                if sp is None or sp <= 0:
+                    continue
+                coeff = coeff_by_source.get(src, Decimal("1"))
+                computed = sp * coeff
+                pid = int(row.product_id)
+                prev = prices_by_product_id[pid].get(src)
+                if prev is None or computed < prev:
+                    prices_by_product_id[pid][src] = computed
+                    price_meta_by_product_id[pid][src] = {
+                        "sourceType": src.split(":", 1)[0],
+                        "matchType": row.match_type or "",
+                        "matchKind": "substitute" if row.match_type == "provisor_manual_substitute" else "primary",
+                        "sourceGoodsId": int(row.source_goods_id) if row.source_goods_id is not None else None,
+                        "sourceDistributorGoodsId": row.source_distributor_goods_id or "",
+                        "sourceManufacturer": row.source_manufacturer or "",
+                        "sourceItemId": int(row.source_item_id) if row.source_item_id is not None else None,
+                    }
+
+        percentile_sources = {source for source in selected_sources if source.startswith("percentile:")}
+        percentile_product_ids = [int(row[0].id) for row in products]
+        percentile_prices = load_percentile_export_prices(
+            db=db,
+            price_format_id=int(pf.id),
+            product_ids=percentile_product_ids,
+            selected_source_names=percentile_sources,
         )
-        if product_id is not None:
-            price_rows_stmt = price_rows_stmt.where(CompetitorPrice.product_id == product_id)
-        price_rows = db.execute(price_rows_stmt).scalars().all()
-        for row in price_rows:
-            if row.product_id is None:
-                continue
-            src = (row.source_name or "").strip()
-            if (
-                allowed_provisor_sources is not None
-                and src.startswith("provisor:")
-                and src not in explicitly_selected_sources
-                and src not in allowed_provisor_sources
-            ):
-                continue
-            sp = _as_decimal(row.source_price)
-            if sp is None or sp <= 0:
-                continue
-            coeff = coeff_by_source.get(src, Decimal("1"))
-            computed = sp * coeff
-            pid = int(row.product_id)
-            prev = prices_by_product_id[pid].get(src)
-            if prev is None or computed < prev:
-                prices_by_product_id[pid][src] = computed
+        for pid, values_by_source in percentile_prices.items():
+            for src, value in values_by_source.items():
+                prices_by_product_id[pid][src] = value
                 price_meta_by_product_id[pid][src] = {
-                    "sourceType": src.split(":", 1)[0],
-                    "matchType": row.match_type or "",
-                    "matchKind": "substitute" if row.match_type == "provisor_manual_substitute" else "primary",
-                    "sourceGoodsId": int(row.source_goods_id) if row.source_goods_id is not None else None,
-                    "sourceDistributorGoodsId": row.source_distributor_goods_id or "",
-                    "sourceManufacturer": row.source_manufacturer or "",
-                    "sourceItemId": int(row.source_item_id) if row.source_item_id is not None else None,
+                    "sourceType": "percentile",
+                    "matchType": "competitor_price_percentiles",
+                    "matchKind": "percentile",
+                    "isPercentile": True,
                 }
 
     out: list[dict] = []
