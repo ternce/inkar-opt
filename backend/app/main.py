@@ -4624,9 +4624,16 @@ def get_provisor_diagnostics(
 def get_competitor_percentile_sources(
     format_code: str | None = Query(None),
     percentile_source: str = Query("emit"),
+    visibility: str = Query("eligible"),
     db: Session = Depends(get_db),
 ):
-    return list_percentile_sources(db=db, price_format_code=format_code, percentile_source=percentile_source)
+    include_ineligible = str(visibility or "").strip().casefold() in {"assignment", "all", "stored"}
+    return list_percentile_sources(
+        db=db,
+        price_format_code=format_code,
+        percentile_source=percentile_source,
+        include_ineligible=include_ineligible,
+    )
 
 
 @app.get("/api/competitors/percentile-rows")
@@ -4808,6 +4815,8 @@ def _assignment_row_from_percentile(source: dict, cfg: CompetitorPrice | None = 
         "itemsCount": int(source.get("skuCount") or 0),
         "active": True,
         "isPercentile": True,
+        "eligibleForPricing": source.get("eligibleForPricing") is not False,
+        "pricingEligibilityReason": source.get("pricingEligibilityReason") or "",
     }
 
 
@@ -4855,7 +4864,12 @@ def get_competitor_assignments(
     cfg_by_source_name = {cfg.source_name: cfg for cfg in percentile_cfgs}
     if cfg_by_source_name:
         for percentile_source in ("emit", "competitor"):
-            for source in list_percentile_sources(db=db, price_format_code=format_code, percentile_source=percentile_source):
+            for source in list_percentile_sources(
+                db=db,
+                price_format_code=format_code,
+                percentile_source=percentile_source,
+                include_ineligible=True,
+            ):
                 source_id = str(source.get("id") or "")
                 cfg = cfg_by_source_name.get(_assignment_percentile_source_name(source_id))
                 if cfg is not None:

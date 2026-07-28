@@ -1235,7 +1235,10 @@ def sync_selected_competitor_configs(*, db: Session, price_format_id: int) -> No
         .all()
     )
     for cfg in existing:
-        if (cfg.source_name or "") not in selected_sources:
+        source_name = cfg.source_name or ""
+        if source_name.startswith("percentile:"):
+            continue
+        if source_name not in selected_sources:
             db.delete(cfg)
 
     for item in selected:

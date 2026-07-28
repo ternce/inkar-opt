@@ -48,6 +48,7 @@ def list_percentile_sources(
     db: Session,
     price_format_code: str | None = None,
     percentile_source: str = PERCENTILE_SOURCE_DEFAULT,
+    include_ineligible: bool = False,
 ) -> list[dict]:
     """Group stored percentile rows into source-like UI records.
 
@@ -57,7 +58,11 @@ def list_percentile_sources(
 
     provider = get_percentile_provider(percentile_source)
     if provider.key == PERCENTILE_SOURCE_COMPETITOR:
-        return _list_competitor_percentile_sources(db=db, price_format_code=price_format_code)
+        return _list_competitor_percentile_sources(
+            db=db,
+            price_format_code=price_format_code,
+            include_ineligible=include_ineligible,
+        )
 
     allowed_groups_by_format: dict[int, set[tuple[str, str, str]]] = {}
     stmt = (
@@ -91,7 +96,7 @@ def list_percentile_sources(
         if pf is None:
             return []
         allowed_groups = emit_percentile_group_keys(db=db, price_format_id=int(pf.id))
-        if not allowed_groups:
+        if not allowed_groups and not include_ineligible:
             return []
         allowed_groups_by_format[int(pf.id)] = allowed_groups
         stmt = stmt.where(CompetitorPricePercentile.price_format_id == pf.id)
@@ -103,13 +108,12 @@ def list_percentile_sources(
         if allowed_groups is None:
             allowed_groups = emit_percentile_group_keys(db=db, price_format_id=int(row.price_format_id))
             allowed_groups_by_format[int(row.price_format_id)] = allowed_groups
+        eligible_for_pricing = False
         if row.percentile_scope == REGIONAL_SCOPE:
-            if _group_key(row.branch_name, row.competitor_name, row.source_key) not in allowed_groups:
-                continue
+            eligible_for_pricing = _group_key(row.branch_name, row.competitor_name, row.source_key) in allowed_groups
         elif row.percentile_scope == KAZAKHSTAN_SCOPE:
-            if not any(competitor == str(row.competitor_name or "").strip() for _branch, competitor, _source_key in allowed_groups):
-                continue
-        else:
+            eligible_for_pricing = any(competitor == str(row.competitor_name or "").strip() for _branch, competitor, _source_key in allowed_groups)
+        if not eligible_for_pricing and not include_ineligible:
             continue
         generated_at = row.generated_at.isoformat() if row.generated_at else ""
         out.append(
@@ -136,12 +140,19 @@ def list_percentile_sources(
                 "sourceCount": int(row.source_count or 0),
                 "generatedAt": generated_at,
                 "sourceType": "percentile",
+                "eligibleForPricing": eligible_for_pricing,
+                "pricingEligibilityReason": "" if eligible_for_pricing else "no_active_physical_emit_assignment",
             }
         )
     return out
 
 
-def _list_competitor_percentile_sources(*, db: Session, price_format_code: str | None = None) -> list[dict]:
+def _list_competitor_percentile_sources(
+    *,
+    db: Session,
+    price_format_code: str | None = None,
+    include_ineligible: bool = False,
+) -> list[dict]:
     provider = get_percentile_provider(PERCENTILE_SOURCE_COMPETITOR)
     allowed_by_format: dict[int, set[tuple[str, str]]] = {}
     stmt = (
@@ -183,7 +194,8 @@ def _list_competitor_percentile_sources(*, db: Session, price_format_code: str |
                 price_format_id=price_format_id,
             )
         source_key = str(row.source_key or "").strip()
-        if (competitor, source_key) not in allowed_by_format[price_format_id]:
+        eligible_for_pricing = (competitor, source_key) in allowed_by_format[price_format_id]
+        if not eligible_for_pricing and not include_ineligible:
             continue
         generated_at = row.generated_at.isoformat() if row.generated_at else ""
         out.append(
@@ -210,6 +222,8 @@ def _list_competitor_percentile_sources(*, db: Session, price_format_code: str |
                 "sourceCount": int(row.source_count or 0),
                 "generatedAt": generated_at,
                 "sourceType": "percentile",
+                "eligibleForPricing": eligible_for_pricing,
+                "pricingEligibilityReason": "" if eligible_for_pricing else "no_active_physical_percentile_assignment",
             }
         )
     return out

@@ -28,8 +28,10 @@ from backend.app.services.competitors.percentiles.read_models import (
 )
 from backend.app.services.competitors.percentiles.sources import (
     PERCENTILE_SOURCE_COMPETITOR,
+    PERCENTILE_SOURCE_EMIT,
     percentile_source_id,
 )
+from backend.app.services.competitor_price_lists import sync_selected_competitor_configs
 
 
 def _session_factory_static():
@@ -108,6 +110,19 @@ def _percentile_config_name(pf_id: int, source_key: str, competitor: str, pct: i
         scope="global",
         source_key=source_key,
         region="",
+        competitor=competitor,
+        percentile=pct,
+    )
+    return f"percentile:{source_id}"
+
+
+def _emit_percentile_config_name(pf_id: int, source_key: str, region: str, competitor: str, pct: int = 10) -> str:
+    source_id = percentile_source_id(
+        percentile_source=PERCENTILE_SOURCE_EMIT,
+        price_format_id=pf_id,
+        scope="regional",
+        source_key=source_key,
+        region=region,
         competitor=competitor,
         percentile=pct,
     )
@@ -289,3 +304,88 @@ def test_competitor_percentile_rows_survive_reload_only_for_active_matching_assi
     )
     assert hidden["groups"] == []
     assert hidden["summary"]["productsWithPercentile"] == 0
+
+
+def test_assignment_visibility_keeps_stored_emit_percentile_sources_after_physical_assignment_removed():
+    import backend.app.main as main
+
+    Session = _session_factory_static()
+    with Session() as db:
+        pf = _format(db, code="ASSIGN-PCT")
+        pf_id = int(pf.id)
+        product = _product(db)
+        source_key = "emit:302"
+        competitor = "Emiti"
+        price_list = _price_list(db, pf, source_key=source_key, competitor=competitor, external_price_list_id="302")
+        price_list.source_type = "emit"
+        assignment = _assign(db, pf, price_list, percentile_mode=MULTI_PRICE_PERCENTILE_MODE)
+        db.add(
+            CompetitorPricePercentile(
+                price_format_id=pf.id,
+                product_id=product.id,
+                competitor_price_list_id=price_list.id,
+                source_type="emit",
+                source_key=source_key,
+                branch_name=price_list.branch_name,
+                competitor_name=competitor,
+                percentile_scope="regional",
+                percentile=10,
+                value=Decimal("100.00"),
+                source_count=1,
+                price_count=1,
+                used_price_count=1,
+                status="Calculated",
+            )
+        )
+        db.add(
+            CompetitorPrice(
+                price_format_id=pf.id,
+                source_name=_emit_percentile_config_name(pf_id, source_key, price_list.branch_name, competitor),
+                supplier=competitor,
+                coefficient=1,
+            )
+        )
+        db.commit()
+
+        visible_for_pricing = list_percentile_sources(
+            db=db,
+            price_format_code=pf.code,
+            percentile_source=PERCENTILE_SOURCE_EMIT,
+        )
+        assert len(visible_for_pricing) == 1
+        assert visible_for_pricing[0]["eligibleForPricing"] is True
+
+        assignment.is_active = False
+        sync_selected_competitor_configs(db=db, price_format_id=pf.id)
+        db.commit()
+
+        assert db.execute(
+            select(CompetitorPrice).where(CompetitorPrice.source_name.like("percentile:%"))
+        ).scalar_one_or_none() is not None
+        assert list_percentile_sources(
+            db=db,
+            price_format_code=pf.code,
+            percentile_source=PERCENTILE_SOURCE_EMIT,
+        ) == []
+        assignment_visible = list_percentile_sources(
+            db=db,
+            price_format_code=pf.code,
+            percentile_source=PERCENTILE_SOURCE_EMIT,
+            include_ineligible=True,
+        )
+        assert len(assignment_visible) == 1
+        assert assignment_visible[0]["sourceKey"] == source_key
+        assert assignment_visible[0]["eligibleForPricing"] is False
+
+    main.app.dependency_overrides[main.get_db] = lambda: Session()
+    try:
+        response = TestClient(main.app).get("/api/price-formats/ASSIGN-PCT/competitor-assignments")
+    finally:
+        main.app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    percentile_rows = [row for row in payload if row["assignmentKind"] == "percentile_config"]
+    assert len(percentile_rows) == 1
+    assert percentile_rows[0]["sourceKey"].startswith(f"{pf_id}:regional:{source_key}:")
+    assert percentile_rows[0]["eligibleForPricing"] is False

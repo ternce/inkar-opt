@@ -47,6 +47,8 @@ type SourceRow = {
   active?: boolean;
   isSelected?: boolean;
   isPercentile?: boolean;
+  eligibleForPricing?: boolean;
+  pricingEligibilityReason?: string;
   rowType?: 'physical_plk' | 'percentile_config' | string;
   assignmentKind?: 'physical' | 'percentile_config' | string;
   percentile?: number;
@@ -165,6 +167,8 @@ const normalizeSource = (row: any): SourceRow => ({
   priceCoefficient: Number(row.priceCoefficient ?? row.coefficient ?? 1),
   active: Boolean(row.active ?? row.isSelected ?? true),
   isSelected: Boolean(row.isSelected),
+  eligibleForPricing: row.eligibleForPricing !== false,
+  pricingEligibilityReason: String(row.pricingEligibilityReason || ''),
   rowType: String(row.rowType || (row.sourceType === 'percentile' || row.isPercentile ? 'percentile_config' : 'physical_plk')),
   assignmentKind: String(row.assignmentKind || (row.sourceType === 'percentile' || row.isPercentile ? 'percentile_config' : 'physical')),
   isPercentile: row.sourceType === 'percentile' || Boolean(row.isPercentile),
@@ -190,9 +194,18 @@ const percentileToSource = (row: any): SourceRow =>
     generatedAt: row.generatedAt,
     itemsCount: row.skuCount,
     skuCount: row.skuCount,
+    eligibleForPricing: row.eligibleForPricing,
+    pricingEligibilityReason: row.pricingEligibilityReason,
     percentile: row.percentile,
     isPercentile: true,
   });
+
+const pricingEligibilityLabel = (row: SourceRow) => {
+  if (!row.isPercentile || row.eligibleForPricing !== false) return '';
+  return 'Недоступен для расчета';
+};
+
+const pricingEligibilityClassName = (row: SourceRow) => (pricingEligibilityLabel(row) ? 'warn' : '');
 
 export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFormatChange, onNavigate }: Props) {
   const [selectedFormatCode, setSelectedFormatCode] = useState(formatCode);
@@ -252,8 +265,8 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
       try {
         const [sourcesRes, emitPercentileRes, competitorPercentileRes, assignmentRows] = await Promise.all([
           fetch(`/api/competitors/price-lists?format_code=${encodeURIComponent(code)}`),
-          fetch(`/api/competitors/percentiles?format_code=${encodeURIComponent(code)}&percentile_source=emit`),
-          fetch(`/api/competitors/percentiles?format_code=${encodeURIComponent(code)}&percentile_source=competitor`),
+          fetch(`/api/competitors/percentiles?format_code=${encodeURIComponent(code)}&percentile_source=emit&visibility=assignment`),
+          fetch(`/api/competitors/percentiles?format_code=${encodeURIComponent(code)}&percentile_source=competitor&visibility=assignment`),
           loadAssignments(code),
         ]);
         const sourcesText = await sourcesRes.text();
@@ -583,7 +596,9 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
                 formatLocalDateTime(competitorLastSuccessfulCheck(row)),
                 formatLocalDateTime(competitorLastDataReplacement(row)),
                 Number(row.itemsCount || 0).toLocaleString('ru-RU'),
-                <span key={`${row.id}-fresh`} className={`status-pill ${competitorFreshnessClassName(row)}`}>{competitorFreshnessLabel(row)}</span>,
+                pricingEligibilityLabel(row)
+                  ? <span key={`${row.id}-eligibility`} className={`status-pill ${pricingEligibilityClassName(row)}`}>{pricingEligibilityLabel(row)}</span>
+                  : <span key={`${row.id}-fresh`} className={`status-pill ${competitorFreshnessClassName(row)}`}>{competitorFreshnessLabel(row)}</span>,
                 <Button key={`${row.id}-add`} variant="ghost" size="sm" onClick={() => addSource(row)} disabled={isLoading || row.isSelected}>
                   <PlusCircle className="mr-1 h-4 w-4" />
                   {row.isSelected ? 'Назначен' : 'Добавить'}
@@ -619,7 +634,9 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
                 formatLocalDate(row.priceDate),
                 formatLocalDateTime(competitorLastSuccessfulCheck(row)),
                 formatLocalDateTime(competitorLastDataReplacement(row)),
-                <span key={`${row.id}-fresh`} className={`status-pill ${competitorFreshnessClassName(row)}`}>{competitorFreshnessLabel(row)}</span>,
+                pricingEligibilityLabel(row)
+                  ? <span key={`${row.id}-eligibility`} className={`status-pill ${pricingEligibilityClassName(row)}`}>{pricingEligibilityLabel(row)}</span>
+                  : <span key={`${row.id}-fresh`} className={`status-pill ${competitorFreshnessClassName(row)}`}>{competitorFreshnessLabel(row)}</span>,
                 <input
                   key={`${row.id}-active`}
                   type="checkbox"
