@@ -53,7 +53,7 @@ from .models import (
     CompetitorPrice,
     CompetitorPriceList,
     CompetitorPriceListItem,
-    CompetitorPriceListItem,
+    CompetitorPricePercentile,
     ListItem,
     MarkupRange,
     NoCompetitorMarkupRange,
