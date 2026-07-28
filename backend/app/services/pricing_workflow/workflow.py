@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from ...models import (
     CalculatedPrice,
+    CompetitorPrice,
     CompetitorPriceList,
     PriceFormat,
     PriceList,
@@ -34,6 +35,49 @@ def _loads(value: str | None, fallback: object) -> object:
         return json.loads(value or "")
     except Exception:
         return fallback
+
+
+def _price_mode(pf: PriceFormat) -> str:
+    mode = str(pf.competitor_price_mode or "regular").strip().lower()
+    return mode if mode in {"regular", "percentile", "mixed"} else "regular"
+
+
+def _save_selected_percentile_configs(*, db: Session, pf: PriceFormat, percentile_sources: list[dict]) -> int:
+    selected: dict[str, dict] = {}
+    for item in percentile_sources:
+        if not isinstance(item, dict) or item.get("enabled") is False:
+            continue
+        source_id = str(item.get("id") or item.get("sourceId") or "").strip()
+        if not source_id:
+            continue
+        selected[f"percentile:{source_id}"] = item
+
+    existing = (
+        db.execute(
+            select(CompetitorPrice)
+            .where(CompetitorPrice.price_format_id == pf.id)
+            .where(CompetitorPrice.product_id.is_(None))
+            .where(CompetitorPrice.source_name.like("percentile:%"))
+        )
+        .scalars()
+        .all()
+    )
+    by_source = {str(row.source_name or ""): row for row in existing}
+    for source_name, row in by_source.items():
+        if source_name not in selected:
+            db.delete(row)
+
+    for source_name, item in selected.items():
+        row = by_source.get(source_name)
+        if row is None:
+            row = CompetitorPrice(price_format_id=pf.id, product_id=None, source_name=source_name)
+            db.add(row)
+        row.supplier = str(item.get("sourceName") or item.get("name") or source_name)
+        try:
+            row.coefficient = float(item.get("coefficient") or 1)
+        except Exception:
+            row.coefficient = 1.0
+    return len(selected)
 
 
 def _apply_snapshot(target: object, snapshot: dict) -> None:
@@ -125,8 +169,18 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
             coefficients[source_id] = float(item.get("coefficient") or 1)
         except Exception:
             coefficients[source_id] = 1.0
-    if not selected_ids:
+    selected_percentile_count = sum(
+        1
+        for item in percentile_sources
+        if isinstance(item, dict) and item.get("enabled") is not False and str(item.get("id") or item.get("sourceId") or "").strip()
+    )
+    mode = _price_mode(pf)
+    if mode == "regular" and not selected_ids:
         raise ValueError("select at least one competitor source")
+    if mode == "percentile" and selected_percentile_count <= 0:
+        raise ValueError("select at least one percentile source")
+    if mode == "mixed" and not selected_ids and selected_percentile_count <= 0:
+        raise ValueError("select at least one competitor or percentile source")
 
     run = PricingWorkflowRun(
         pricing_context_id=context.id,
@@ -149,11 +203,16 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
             selected_ids=selected_ids,
             coefficients=coefficients,
         )
+        if mode in {"percentile", "mixed"}:
+            selected_percentile_count = _save_selected_percentile_configs(db=db, pf=pf, percentile_sources=percentile_sources)
+        else:
+            selected_percentile_count = 0
         selected_count = len(get_assigned_competitor_price_lists(db=db, price_format_id=int(pf.id)))
-        if selected_count <= 0:
+        if mode == "regular" and selected_count <= 0:
             raise ValueError("selected competitor sources are not available for calculation")
-        percentile_mode = (pf.competitor_price_mode or "regular") == "percentile"
-        if not percentile_mode:
+        if mode == "percentile" and selected_percentile_count <= 0:
+            raise ValueError("selected percentile sources are not available for calculation")
+        if mode in {"regular", "mixed"}:
             rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id, commit_between_lists=True)
             recalculate_competitor_percentiles_if_needed(db=db, price_format_id=pf.id)
         db.commit()

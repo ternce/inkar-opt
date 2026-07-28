@@ -12,6 +12,7 @@ from ...models import (
     BendRange,
     BranchCost,
     BranchStock,
+    CompetitorPrice,
     CompetitorPriceList,
     CompetitorPriceListItem,
     CompetitorPricePercentile,
@@ -136,9 +137,39 @@ def _sources_snapshot(db: Session, pf: PriceFormat, requested_sources: list[dict
                 .group_by(CompetitorPriceListItem.price_list_id)
             ).all()
         )
+    percentile_configs = (
+        db.execute(
+            select(CompetitorPrice)
+            .where(CompetitorPrice.price_format_id == pf.id)
+            .where(CompetitorPrice.product_id.is_(None))
+            .where(CompetitorPrice.source_name.like("percentile:%"))
+        )
+        .scalars()
+        .all()
+    )
+    requested_percentile_by_id = {
+        str(item.get("id") or item.get("sourceId") or "").strip(): item
+        for item in requested_percentiles
+        if isinstance(item, dict)
+    }
     return {
         "requestedCompetitorSources": requested_sources,
         "requestedPercentileSources": requested_percentiles,
+        "selectedPercentileSources": [
+            {
+                "id": str(cfg.source_name or "").removeprefix("percentile:"),
+                "sourceType": "percentile",
+                "sourceKey": str(cfg.source_name or "").removeprefix("percentile:"),
+                "displayName": requested_percentile_by_id.get(str(cfg.source_name or "").removeprefix("percentile:"), {}).get("name")
+                or requested_percentile_by_id.get(str(cfg.source_name or "").removeprefix("percentile:"), {}).get("sourceName")
+                or cfg.supplier
+                or cfg.source_name,
+                "supplier": cfg.supplier,
+                "coefficient": _jsonable(cfg.coefficient),
+                "priceDate": cfg.price_date,
+            }
+            for cfg in percentile_configs
+        ],
         "selectedCompetitorSources": [
             {
                 "id": row.id,

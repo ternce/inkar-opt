@@ -43,7 +43,7 @@ from backend.app.services.competitors.percentiles.read_models import (
     list_percentile_sources,
     percentile_coverage_audit,
 )
-from backend.app.main import _competitor_column_title, _competitor_prices_by_product, _generated_item_dict, app
+from backend.app.main import _competitor_column_title, _competitor_columns_for_price_list, _competitor_prices_by_product, _generated_item_dict, app
 from backend.app.services.competitor_percentiles import KAZAKHSTAN_REGION, KAZAKHSTAN_SCOPE, REGIONAL_SCOPE, recalculate_competitor_percentiles
 from backend.app.services.competitor_source_config import MULTI_PRICE_PERCENTILE_MODE
 from backend.app.services.competitors.percentiles.sources import PERCENTILE_SOURCE_EMIT, percentile_source_id
@@ -125,6 +125,30 @@ def _stored_percentile(db, pf, product, *, source_key, region, competitor, perce
         )
     )
     db.flush()
+
+
+def _assign_emit_percentile_config(db, pf, *, source_key, region, competitor, percentile, coefficient=1):
+    source_id = percentile_source_id(
+        percentile_source=PERCENTILE_SOURCE_EMIT,
+        price_format_id=pf.id,
+        scope=REGIONAL_SCOPE,
+        source_key=source_key,
+        region=region,
+        competitor=competitor,
+        percentile=percentile,
+    )
+    source_name = f"percentile:{source_id}"
+    db.add(
+        CompetitorPrice(
+            price_format_id=pf.id,
+            product_id=None,
+            source_name=source_name,
+            supplier=f"{region} — {competitor} — P{percentile}",
+            coefficient=coefficient,
+        )
+    )
+    db.flush()
+    return source_name
 
 
 def _branch_stock(db, product, *, branch_id="1", stock=1):
@@ -1561,6 +1585,174 @@ def test_percentile_price_generation_does_not_recalculate_from_raw_rows(monkeypa
     calculated = db.query(CalculatedPrice).filter(CalculatedPrice.product_id == product.id).one()
     assert calculated.used_percentile is True
     assert float(calculated.lowest_competitor_price) == 130.0
+
+
+def test_mixed_price_generation_selects_physical_when_it_wins():
+    db = _session()
+    pf = _format(db)
+    pf.competitor_price_mode = "mixed"
+    product = _product(db, code="MIX-PHYSICAL-WINS", cost=100)
+    _competitor(db, pf, product, "provisor:arai", Decimal("200"))
+    percentile_source = _assign_emit_percentile_config(
+        db,
+        pf,
+        source_key="emit:1106",
+        region="Kazakhstan",
+        competitor="Emit International 1106",
+        percentile=10,
+    )
+    _stored_percentile(
+        db,
+        pf,
+        product,
+        source_key="emit:1106",
+        region="Kazakhstan",
+        competitor="Emit International 1106",
+        percentile=10,
+        value=Decimal("220"),
+    )
+    _activate_all_products_for_generation(db)
+
+    calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="MIX-PHYSICAL-WINS-PL",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        force_new_price_list=True,
+    )
+
+    cp = db.query(CalculatedPrice).filter(CalculatedPrice.product_id == product.id).one()
+    assert cp.used_percentile is False
+    assert cp.applied_source_name == "provisor:arai"
+    assert float(cp.competitor_price) == pytest.approx(200)
+
+    pl = db.query(PriceList).filter(PriceList.number == "MIX-PHYSICAL-WINS-PL").one()
+    columns = _competitor_columns_for_price_list(db, pl, pf)
+    prices = _competitor_prices_by_product(db, pf=pf, product_ids=[product.id], columns=columns)
+    assert prices[product.id][percentile_source]["price"] == pytest.approx(220)
+
+
+def test_mixed_price_generation_selects_percentile_when_it_wins_and_applies_coefficient_once():
+    db = _session()
+    pf = _format(db)
+    pf.competitor_price_mode = "mixed"
+    product = _product(db, code="MIX-PCT-WINS", cost=80)
+    _competitor(db, pf, product, "provisor:arai", Decimal("150"))
+    percentile_source = _assign_emit_percentile_config(
+        db,
+        pf,
+        source_key="emit:1106",
+        region="Kazakhstan",
+        competitor="Emit International 1106",
+        percentile=10,
+        coefficient=Decimal("1.10"),
+    )
+    _stored_percentile(
+        db,
+        pf,
+        product,
+        source_key="emit:1106",
+        region="Kazakhstan",
+        competitor="Emit International 1106",
+        percentile=10,
+        value=Decimal("100"),
+    )
+    _activate_all_products_for_generation(db)
+
+    calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="MIX-PCT-WINS-PL",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        force_new_price_list=True,
+    )
+
+    cp = db.query(CalculatedPrice).filter(CalculatedPrice.product_id == product.id).one()
+    stored = db.query(CompetitorPricePercentile).one()
+    assert cp.used_percentile is True
+    assert cp.applied_source_name == percentile_source
+    assert float(cp.competitor_price) == pytest.approx(110)
+    assert float(stored.value) == pytest.approx(100)
+
+
+def test_mixed_price_generation_keeps_p10_and_p30_separate_candidates():
+    db = _session()
+    pf = _format(db)
+    pf.competitor_price_mode = "mixed"
+    product = _product(db, code="MIX-P10-P30", cost=100)
+    _competitor(db, pf, product, "provisor:arai", Decimal("250"))
+    p10 = _assign_emit_percentile_config(
+        db,
+        pf,
+        source_key="emit:1106",
+        region="Kazakhstan",
+        competitor="Emit International 1106",
+        percentile=10,
+    )
+    p30 = _assign_emit_percentile_config(
+        db,
+        pf,
+        source_key="emit:1106",
+        region="Kazakhstan",
+        competitor="Emit International 1106",
+        percentile=30,
+    )
+    _stored_percentile(db, pf, product, source_key="emit:1106", region="Kazakhstan", competitor="Emit International 1106", percentile=10, value=Decimal("180"))
+    _stored_percentile(db, pf, product, source_key="emit:1106", region="Kazakhstan", competitor="Emit International 1106", percentile=30, value=Decimal("170"))
+    _activate_all_products_for_generation(db)
+
+    calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="MIX-P10-P30-PL",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        force_new_price_list=True,
+    )
+
+    cp = db.query(CalculatedPrice).filter(CalculatedPrice.product_id == product.id).one()
+    pl = db.query(PriceList).filter(PriceList.number == "MIX-P10-P30-PL").one()
+    columns = _competitor_columns_for_price_list(db, pl, pf)
+    prices = _competitor_prices_by_product(db, pf=pf, product_ids=[product.id], columns=columns)
+    assert cp.applied_source_name == p30
+    assert p10 in prices[product.id]
+    assert p30 in prices[product.id]
+    assert prices[product.id][p10]["price"] == pytest.approx(180)
+    assert prices[product.id][p30]["price"] == pytest.approx(170)
+
+
+def test_regular_and_percentile_modes_remain_exclusive_with_mixed_available():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, code="MODE-COMPAT", cost=100)
+    _competitor(db, pf, product, "provisor:arai", Decimal("200"))
+    percentile_source = _assign_emit_percentile_config(
+        db,
+        pf,
+        source_key="emit:1106",
+        region="Kazakhstan",
+        competitor="Emit International 1106",
+        percentile=10,
+    )
+    _stored_percentile(db, pf, product, source_key="emit:1106", region="Kazakhstan", competitor="Emit International 1106", percentile=10, value=Decimal("150"))
+    _activate_all_products_for_generation(db)
+
+    pf.competitor_price_mode = ""
+    calculate_prices(db=db, price_format_code=pf.code, price_list_number="MODE-REGULAR-PL", as_of=date.today(), activation_date=None, user="test", force_new_price_list=True)
+    regular_cp = db.query(CalculatedPrice).join(PriceList).filter(PriceList.number == "MODE-REGULAR-PL").one()
+    assert regular_cp.used_percentile is False
+    assert regular_cp.applied_source_name == "provisor:arai"
+
+    pf.competitor_price_mode = "percentile"
+    calculate_prices(db=db, price_format_code=pf.code, price_list_number="MODE-PCT-PL", as_of=date.today(), activation_date=None, user="test", force_new_price_list=True)
+    percentile_cp = db.query(CalculatedPrice).join(PriceList).filter(PriceList.number == "MODE-PCT-PL").one()
+    assert percentile_cp.used_percentile is True
+    assert percentile_cp.applied_source_name == percentile_source
 
 
 def test_rebuild_competitor_prices_skips_multi_price_emit_raw_items():

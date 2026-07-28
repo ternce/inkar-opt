@@ -1649,6 +1649,28 @@ def _format_readiness(db: Session, pf: PriceFormat, branch_id: str) -> dict:
     )
     assignments = _format_assignments(db, pf)
     active_assignments = assignments
+    mode = str(pf.competitor_price_mode or "regular").strip().lower()
+    if mode not in {"regular", "percentile", "mixed"}:
+        mode = "regular"
+    physical_sources_ready = bool(active_assignments)
+    percentile_cfg_count = int(
+        db.execute(
+            select(func.count(CompetitorPrice.id))
+            .where(CompetitorPrice.price_format_id == pf.id)
+            .where(CompetitorPrice.product_id.is_(None))
+            .where(CompetitorPrice.source_name.like("percentile:%"))
+        ).scalar()
+        or 0
+    )
+    percentile_row_count = int(
+        db.execute(
+            select(func.count(CompetitorPricePercentile.id))
+            .where(CompetitorPricePercentile.price_format_id == pf.id)
+            .where(CompetitorPricePercentile.value.is_not(None))
+        ).scalar()
+        or 0
+    )
+    percentile_sources_ready = percentile_cfg_count > 0 and percentile_row_count > 0
     stale_sources = [row for row in active_assignments if (_date_days_old(row.price_date) or 999) > 2]
     missing_dates = [row for row in active_assignments if row.price_date is None]
     markup_count = int(db.execute(select(func.count(MarkupRange.id)).where(MarkupRange.price_format_id == pf.id)).scalar() or 0)
@@ -1665,8 +1687,14 @@ def _format_readiness(db: Session, pf: PriceFormat, branch_id: str) -> dict:
         _readiness_item(
             "competitors",
             "Назначенные ПЛК",
-            "ok" if active_assignments else "error",
+            "ok" if active_assignments else ("warning" if mode == "percentile" else "error"),
             f"Активных источников: {len(active_assignments)}",
+        ),
+        _readiness_item(
+            "percentile_sources",
+            "Назначенные персентили",
+            "ok" if percentile_sources_ready else ("warning" if mode == "mixed" else "error" if mode == "percentile" else "ok"),
+            f"Источников: {percentile_cfg_count}, строк: {percentile_row_count}",
         ),
         _readiness_item(
             "competitor_freshness",
@@ -1695,6 +1723,8 @@ def _format_readiness(db: Session, pf: PriceFormat, branch_id: str) -> dict:
         "items": items,
         "errors": errors,
         "warnings": warnings,
+        "physicalSourcesReady": physical_sources_ready,
+        "percentileSourcesReady": percentile_sources_ready,
     }
 
 
@@ -2321,6 +2351,14 @@ def _competitor_column_title(value: object, fallback: object = "") -> str:
 def _competitor_columns_for_price_list(db: Session, pl: PriceList, pf: PriceFormat) -> list[dict]:
     run_sources = loads_snapshot(pl.run_sources_json, {})
     selected = (run_sources.get("selectedCompetitorSources") or []) if isinstance(run_sources, dict) else []
+    selected_percentiles = (run_sources.get("selectedPercentileSources") or []) if isinstance(run_sources, dict) else []
+    if isinstance(run_sources, dict) and not selected_percentiles:
+        requested_percentiles = run_sources.get("requestedPercentileSources") or []
+        selected_percentiles = [
+            item
+            for item in requested_percentiles
+            if isinstance(item, dict) and item.get("enabled") is not False and str(item.get("id") or item.get("sourceId") or "").strip()
+        ]
     columns: list[dict] = []
     if isinstance(selected, list) and selected:
         for index, source in enumerate(selected):
@@ -2346,6 +2384,33 @@ def _competitor_columns_for_price_list(db: Session, pl: PriceList, pf: PriceForm
                     "priceDate": source.get("priceDate") or "",
                 }
             )
+    if isinstance(selected_percentiles, list) and selected_percentiles:
+        offset = len(columns)
+        for index, source in enumerate(selected_percentiles):
+            if not isinstance(source, dict):
+                continue
+            source_id = str(source.get("sourceKey") or source.get("id") or source.get("sourceId") or "").strip()
+            if not source_id:
+                continue
+            key = f"percentile:{source_id}"
+            title = _competitor_column_title(
+                source.get("displayName") or source.get("name") or source.get("sourceName") or source.get("supplier"),
+                key,
+            )
+            columns.append(
+                {
+                    "id": source.get("id") or source_id or offset + index + 1,
+                    "key": key,
+                    "title": title,
+                    "sourceType": "percentile",
+                    "priceListId": source.get("priceListId"),
+                    "competitorName": source.get("competitorName") or source.get("competitor") or title,
+                    "sourceKey": source_id,
+                    "coefficient": float(source.get("priceCoefficient") or source.get("coefficient") or 1),
+                    "priceCoefficient": float(source.get("priceCoefficient") or source.get("coefficient") or 1),
+                    "priceDate": source.get("priceDate") or "",
+                }
+            )
     if columns:
         seen: set[str] = set()
         out: list[dict] = []
@@ -2356,7 +2421,7 @@ def _competitor_columns_for_price_list(db: Session, pl: PriceList, pf: PriceForm
             out.append(column)
         return out
 
-    return [
+    fallback_columns = [
         {
             "id": item.price_list.id,
             "key": _competitor_column_key(item.price_list.source_type, item.price_list.source_key),
@@ -2374,6 +2439,36 @@ def _competitor_columns_for_price_list(db: Session, pl: PriceList, pf: PriceForm
         }
         for item in get_assigned_competitor_price_lists(db=db, price_format_id=int(pf.id))
     ]
+    percentile_cfgs = (
+        db.execute(
+            select(CompetitorPrice)
+            .where(CompetitorPrice.price_format_id == pf.id)
+            .where(CompetitorPrice.product_id.is_(None))
+            .where(CompetitorPrice.source_name.like("percentile:%"))
+        )
+        .scalars()
+        .all()
+    )
+    for cfg in percentile_cfgs:
+        source_name = str(cfg.source_name or "").strip()
+        if not source_name:
+            continue
+        source_id = source_name.removeprefix("percentile:")
+        fallback_columns.append(
+            {
+                "id": source_id,
+                "key": source_name,
+                "title": _competitor_column_title(cfg.supplier or source_name, source_name),
+                "sourceType": "percentile",
+                "priceListId": None,
+                "competitorName": cfg.supplier or source_name,
+                "sourceKey": source_id,
+                "coefficient": float(cfg.coefficient or 1),
+                "priceCoefficient": float(cfg.coefficient or 1),
+                "priceDate": cfg.price_date.isoformat() if cfg.price_date else "",
+            }
+        )
+    return fallback_columns
 
 
 def _competitor_prices_by_product(
@@ -2436,14 +2531,16 @@ def _competitor_prices_by_product(
         }
     for product_id, values_by_source in percentile_prices.items():
         for source_name, value in values_by_source.items():
-            price = float(value)
+            raw_price = float(value)
+            coefficient = coefficient_by_source.get(source_name, 1.0)
+            price = raw_price * coefficient
             out.setdefault(product_id, {})[source_name] = {
                 "price": price,
                 "adjustedPrice": price,
-                "sourcePrice": price,
-                "originalPrice": price,
-                "coefficient": 1.0,
-                "priceCoefficient": 1.0,
+                "sourcePrice": raw_price,
+                "originalPrice": raw_price,
+                "coefficient": coefficient,
+                "priceCoefficient": coefficient,
                 "sourceName": source_name,
                 "matchedBy": "competitor_price_percentiles",
                 "isManualMapping": False,
@@ -8320,13 +8417,17 @@ def _run_generate_price_job_sync(db: Session, job: Job, *, price_format_id: int,
         selected_price_lists_count,
     )
     pf_for_generation = db.get(PriceFormat, price_format_id)
-    percentile_mode = bool(pf_for_generation and (pf_for_generation.competitor_price_mode or "regular") == "percentile")
-    if percentile_mode:
+    mode = str((pf_for_generation.competitor_price_mode if pf_for_generation else None) or "regular").strip().lower()
+    if mode not in {"regular", "percentile", "mixed"}:
+        mode = "regular"
+    percentile_mode = mode in {"percentile", "mixed"}
+    physical_mode = mode in {"regular", "mixed"}
+    if percentile_mode and not physical_mode:
         summary = {"percentile_mode": {"skippedRawCompetitorPriceRebuild": True}}
     else:
         summary = rebuild_competitor_prices_for_selected(db=db, price_format_id=price_format_id, commit_between_lists=True)
     update_job(db, job, status="running", progress=70, message="Пересборка competitor_prices завершена", result={"summary": summary}, log_level="info")
-    if not percentile_mode:
+    if physical_mode:
         recalculate_competitor_percentiles_if_needed(db=db, price_format_id=price_format_id)
     db.commit()
     competitor_prices_loaded = int(
@@ -8337,7 +8438,7 @@ def _run_generate_price_job_sync(db: Session, job: Job, *, price_format_id: int,
         ).scalar_one()
         or 0
     )
-    if percentile_mode:
+    if percentile_mode and not physical_mode:
         competitor_prices_loaded = int(
             db.execute(
                 select(func.count(CompetitorPricePercentile.id))
@@ -8500,7 +8601,7 @@ def put_settings_for_format(
         except Exception:
             db.rollback()
             raise
-    if payload.get("competitorPriceMode") in {"regular", "percentile"}:
+    if payload.get("competitorPriceMode") in {"regular", "percentile", "mixed"}:
         pf.competitor_price_mode = payload["competitorPriceMode"]
     if payload.get("percentileNumber") is not None:
         try:
@@ -9090,7 +9191,20 @@ def generate_price_list(payload: dict = Body(...), db: Session = Depends(get_db)
             raise HTTPException(status_code=400, detail=f"Формат прайса не найден: {price_format_code}")
 
         selected_count = len(get_assigned_competitor_price_lists(db=db, price_format_id=int(pf_for_selection.id)))
-        if selected_count <= 0:
+        percentile_selected_count = int(
+            db.execute(
+                select(func.count(CompetitorPrice.id))
+                .where(CompetitorPrice.price_format_id == pf_for_selection.id)
+                .where(CompetitorPrice.product_id.is_(None))
+                .where(CompetitorPrice.source_name.like("percentile:%"))
+            ).scalar()
+            or 0
+        )
+        mode = str(pf_for_selection.competitor_price_mode or "regular").strip().lower()
+        if mode not in {"regular", "percentile", "mixed"}:
+            mode = "regular"
+        required_source_count = percentile_selected_count if mode == "percentile" else selected_count
+        if required_source_count <= 0:
             raise HTTPException(
                 status_code=400,
                 detail="Выберите хотя бы один прайс-лист конкурента перед формированием прайса.",

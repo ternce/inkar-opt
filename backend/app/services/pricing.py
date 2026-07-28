@@ -36,7 +36,7 @@ from ..timezone import local_iso
 from .competitor_matching import rebuild_competitor_prices_for_selected
 from .competitor_percentiles import emit_percentile_group_keys, recalculate_competitor_percentiles_if_needed
 from .competitor_percentiles import REGIONAL_SCOPE
-from .competitors.percentiles.sources import PERCENTILE_SOURCE_COMPETITOR, is_emit_source_key, percentile_source_id
+from .competitors.percentiles.sources import PERCENTILE_SOURCE_COMPETITOR, PERCENTILE_SOURCE_EMIT, is_emit_source_key, percentile_source_id
 from .competitor_assignments import get_assigned_competitor_price_lists, propagate_emit_assignments_to_new_price_format
 from .references.types import canonical_branch_id
 from .regions import allowed_provisor_source_names_for_city_id, city_id_from_branch
@@ -158,7 +158,8 @@ class CompetitorResolvedMany:
     details: dict[str, dict[str, Decimal]] | None = None
 
 
-PercentilePriceCache = dict[int, dict[int, list[tuple[Decimal, str]]]]
+PercentilePriceCache = dict[int, dict[int, list[tuple[Decimal, str, Decimal, Decimal, int]]]]
+COMPETITOR_PRICE_MODES = {"regular", "percentile", "mixed"}
 
 
 @dataclass(frozen=True)
@@ -401,7 +402,16 @@ def zone_reference_for_product(
     product_id: int,
     percentile_price_cache: PercentilePriceCache | None = None,
 ) -> Decimal | None:
-    if (price_format.competitor_price_mode or "regular") == "percentile" and percentile_price_cache is not None:
+    mode = _competitor_price_mode(price_format)
+    if mode == "mixed":
+        resolved = resolve_all_competitor_prices(
+            db,
+            price_format,
+            product_id,
+            percentile_price_cache=percentile_price_cache,
+        )
+        return resolved.prices[0][0] if resolved.prices else None
+    if mode == "percentile" and percentile_price_cache is not None:
         zone_percentile_number = int(price_format.percentile_number or 10)
         zone_resolved = resolve_percentile_prices_from_cache(
             percentile_price_cache,
@@ -410,6 +420,11 @@ def zone_reference_for_product(
         )
         return zone_resolved.prices[0][0] if zone_resolved.prices else None
     return lowest_available_competitor_price(db, price_format.id, product_id)
+
+
+def _competitor_price_mode(price_format: PriceFormat) -> str:
+    mode = str(price_format.competitor_price_mode or "regular").strip().lower()
+    return mode if mode in COMPETITOR_PRICE_MODES else "regular"
 
 
 def calculate_price_zone(
@@ -678,9 +693,136 @@ def resolve_percentile_prices(
     *,
     percentile_number: int,
 ) -> CompetitorResolvedMany:
+    cache = load_percentile_price_cache(db, price_format_id)
+    return resolve_percentile_prices_from_cache(cache, product_id, percentile_number=percentile_number)
+
+
+def _assigned_percentile_configs(*, db: Session, price_format_id: int) -> dict[str, CompetitorPrice]:
+    rows = (
+        db.execute(
+            select(CompetitorPrice)
+            .where(CompetitorPrice.price_format_id == price_format_id)
+            .where(CompetitorPrice.product_id.is_(None))
+            .where(CompetitorPrice.source_name.like("percentile:%"))
+        )
+        .scalars()
+        .all()
+    )
+    return {str(row.source_name or ""): row for row in rows if str(row.source_name or "").strip()}
+
+
+def _percentile_source_name_for_row(row: CompetitorPricePercentile, price_format_id: int) -> str:
+    source_key = str(getattr(row, "source_key", "") or "")
+    branch = str(row.branch_name or "")
+    competitor = str(row.competitor_name or "")
+    if is_emit_source_key(source_key) or str(row.percentile_scope or "") == REGIONAL_SCOPE:
+        source_id = percentile_source_id(
+            percentile_source=PERCENTILE_SOURCE_EMIT,
+            price_format_id=price_format_id,
+            scope=row.percentile_scope or REGIONAL_SCOPE,
+            source_key=source_key,
+            region=branch,
+            competitor=competitor,
+            percentile=row.percentile,
+        )
+    else:
+        source_id = percentile_source_id(
+            percentile_source=PERCENTILE_SOURCE_COMPETITOR,
+            price_format_id=price_format_id,
+            scope="global",
+            source_key=source_key,
+            region="",
+            competitor=competitor,
+            percentile=row.percentile,
+        )
+    return f"percentile:{source_id}"
+
+
+def _legacy_emit_percentile_source_name(row: CompetitorPricePercentile) -> str:
+    return f"percentile:{row.source_key}:{row.competitor_name}:{row.branch_name}:p{row.percentile}"
+
+
+def _percentile_cache_entry(
+    *,
+    row: CompetitorPricePercentile,
+    source_name: str,
+    coefficient: Decimal,
+) -> tuple[Decimal, str, Decimal, Decimal, int] | None:
+    original = _as_decimal(row.value)
+    if original is None or original <= 0:
+        return None
+    adjusted = original * coefficient
+    return (adjusted, source_name, original, coefficient, int(row.percentile))
+
+
+def _resolve_percentile_rows(
+    *,
+    rows: list[CompetitorPricePercentile],
+    price_format_id: int,
+    active_groups: set[tuple[str, str, str]],
+    assigned_configs: dict[str, CompetitorPrice],
+    legacy_percentile_number: int | None = None,
+) -> CompetitorResolvedMany:
+    assigned_source_names = set(assigned_configs)
+    out: list[tuple[Decimal, str]] = []
+    details: dict[str, dict[str, Decimal]] = {}
+    for row in rows:
+        source_key = str(getattr(row, "source_key", "") or "")
+        branch = str(row.branch_name or "")
+        competitor = str(row.competitor_name or "")
+        source_name = _percentile_source_name_for_row(row, price_format_id)
+        cfg = assigned_configs.get(source_name)
+        is_assigned_source = source_name in assigned_source_names
+        is_active_emit_row = (branch, competitor, source_key) in active_groups or (
+            not source_key
+            and any(active_branch == branch and active_competitor == competitor for active_branch, active_competitor, _active_source_key in active_groups)
+        )
+
+        if is_emit_source_key(source_key) or is_active_emit_row:
+            if row.percentile_scope != REGIONAL_SCOPE:
+                continue
+            if not is_assigned_source:
+                if legacy_percentile_number is None or int(row.percentile) != int(legacy_percentile_number):
+                    continue
+                if (branch, competitor, source_key) not in active_groups and (
+                    source_key or not any(active_branch == branch and active_competitor == competitor for active_branch, active_competitor, _active_source_key in active_groups)
+                ):
+                    continue
+                source_name = _legacy_emit_percentile_source_name(row)
+                coefficient = Decimal("1")
+            else:
+                coefficient = _as_decimal(getattr(cfg, "coefficient", None), Decimal("1")) or Decimal("1")
+        else:
+            if not is_assigned_source:
+                continue
+            coefficient = _as_decimal(getattr(cfg, "coefficient", None), Decimal("1")) or Decimal("1")
+
+        entry = _percentile_cache_entry(row=row, source_name=source_name, coefficient=coefficient)
+        if entry is None:
+            continue
+        adjusted, src, original, coeff, pct = entry
+        out.append((adjusted, src))
+        details[src] = {
+            "original_price": original,
+            "price_coefficient": coeff,
+            "adjusted_price": adjusted,
+            "percentile_number": Decimal(pct),
+            "is_percentile": Decimal("1"),
+        }
+    out.sort(key=lambda x: x[0])
+    return CompetitorResolvedMany(out, details)
+
+
+def _resolve_percentile_prices_from_rows(
+    db: Session,
+    price_format_id: int,
+    product_id: int,
+    *,
+    percentile_number: int,
+) -> CompetitorResolvedMany:
     active_groups = emit_percentile_group_keys(db=db, price_format_id=price_format_id)
-    assigned_source_ids = _assigned_percentile_source_ids(db=db, price_format_id=price_format_id)
-    if not active_groups and not assigned_source_ids:
+    assigned_configs = _assigned_percentile_configs(db=db, price_format_id=price_format_id)
+    if not active_groups and not assigned_configs:
         return CompetitorResolvedMany([])
     rows = (
         db.execute(
@@ -693,74 +835,27 @@ def resolve_percentile_prices(
         .scalars()
         .all()
     )
-    out: list[tuple[Decimal, str]] = []
-    for row in rows:
-        source_key = str(getattr(row, "source_key", "") or "")
-        branch = str(row.branch_name or "")
-        competitor = str(row.competitor_name or "")
-        is_active_emit_row = (branch, competitor, source_key) in active_groups or (
-            not source_key
-            and any(active_branch == branch and active_competitor == competitor for active_branch, active_competitor, _active_source_key in active_groups)
-        )
-        if is_emit_source_key(source_key) or is_active_emit_row:
-            if row.percentile_scope != REGIONAL_SCOPE:
-                continue
-            if (branch, competitor, source_key) not in active_groups and (
-                source_key or not any(active_branch == branch and active_competitor == competitor for active_branch, active_competitor, _active_source_key in active_groups)
-            ):
-                continue
-            src = f"percentile:{row.source_key}:{row.competitor_name}:{row.branch_name}:p{row.percentile}"
-        else:
-            source_id = percentile_source_id(
-                percentile_source=PERCENTILE_SOURCE_COMPETITOR,
-                price_format_id=price_format_id,
-                scope="global",
-                source_key=source_key,
-                region="",
-                competitor=competitor,
-                percentile=row.percentile,
-            )
-            if source_id not in assigned_source_ids:
-                continue
-            src = f"percentile:{source_id}"
-        value = _as_decimal(row.value)
-        if value is None or value <= 0:
-            continue
-        out.append((value, src))
-    out.sort(key=lambda x: x[0])
-    return CompetitorResolvedMany(out)
+    return _resolve_percentile_rows(
+        rows=rows,
+        price_format_id=price_format_id,
+        active_groups=active_groups,
+        assigned_configs=assigned_configs,
+        legacy_percentile_number=percentile_number,
+    )
 
 
 def _assigned_percentile_source_ids(*, db: Session, price_format_id: int) -> set[str]:
-    rows = (
-        db.execute(
-            select(CompetitorPrice.source_name)
-            .where(CompetitorPrice.price_format_id == price_format_id)
-            .where(CompetitorPrice.product_id.is_(None))
-            .where(CompetitorPrice.source_name.like("percentile:%"))
-        )
-        .scalars()
-        .all()
-    )
-    return {str(row or "").removeprefix("percentile:").strip() for row in rows if str(row or "").strip()}
+    return {source_name.removeprefix("percentile:").strip() for source_name in _assigned_percentile_configs(db=db, price_format_id=price_format_id)}
 
 
 def load_percentile_price_cache(db: Session, price_format_id: int) -> PercentilePriceCache:
     active_groups = emit_percentile_group_keys(db=db, price_format_id=price_format_id)
-    assigned_source_ids = _assigned_percentile_source_ids(db=db, price_format_id=price_format_id)
-    if not active_groups and not assigned_source_ids:
+    assigned_configs = _assigned_percentile_configs(db=db, price_format_id=price_format_id)
+    if not active_groups and not assigned_configs:
         return {}
     rows = (
         db.execute(
-            select(
-                CompetitorPricePercentile.product_id,
-                CompetitorPricePercentile.percentile,
-                CompetitorPricePercentile.value,
-                CompetitorPricePercentile.competitor_name,
-                CompetitorPricePercentile.branch_name,
-                CompetitorPricePercentile.source_key,
-                CompetitorPricePercentile.percentile_scope,
-            )
+            select(CompetitorPricePercentile)
             .where(CompetitorPricePercentile.price_format_id == price_format_id)
             .where(CompetitorPricePercentile.value.is_not(None))
             .order_by(
@@ -769,42 +864,26 @@ def load_percentile_price_cache(db: Session, price_format_id: int) -> Percentile
                 CompetitorPricePercentile.value.asc(),
             )
         )
+        .scalars()
         .all()
     )
     cache: PercentilePriceCache = {}
-    for product_id, percentile, value, competitor_name, branch_name, source_key, percentile_scope in rows:
-        source_key = str(source_key or "")
-        branch_name = str(branch_name or "")
-        competitor_name = str(competitor_name or "")
-        is_active_emit_row = (branch_name, competitor_name, source_key) in active_groups or (
-            not source_key
-            and any(active_branch == branch_name and active_competitor == competitor_name for active_branch, active_competitor, _active_source_key in active_groups)
+    for row in rows:
+        resolved = _resolve_percentile_rows(
+            rows=[row],
+            price_format_id=price_format_id,
+            active_groups=active_groups,
+            assigned_configs=assigned_configs,
+            legacy_percentile_number=int(row.percentile),
         )
-        if is_emit_source_key(source_key) or is_active_emit_row:
-            if percentile_scope != REGIONAL_SCOPE:
-                continue
-            if (branch_name, competitor_name, source_key) not in active_groups and (
-                source_key or not any(active_branch == branch_name and active_competitor == competitor_name for active_branch, active_competitor, _active_source_key in active_groups)
-            ):
-                continue
-            src = f"percentile:{source_key}:{competitor_name}:{branch_name}:p{percentile}"
-        else:
-            source_id = percentile_source_id(
-                percentile_source=PERCENTILE_SOURCE_COMPETITOR,
-                price_format_id=price_format_id,
-                scope="global",
-                source_key=source_key,
-                region="",
-                competitor=competitor_name,
-                percentile=percentile,
+        for price, src in resolved.prices:
+            details = (resolved.details or {}).get(src, {})
+            original = details.get("original_price", price)
+            coefficient = details.get("price_coefficient", Decimal("1"))
+            percentile_number = int(details.get("percentile_number", Decimal(row.percentile)))
+            cache.setdefault(int(row.product_id), {}).setdefault(percentile_number, []).append(
+                (price, src, original, coefficient, percentile_number)
             )
-            if source_id not in assigned_source_ids:
-                continue
-            src = f"percentile:{source_id}"
-        price = _as_decimal(value)
-        if price is None or price <= 0:
-            continue
-        cache.setdefault(int(product_id), {}).setdefault(int(percentile), []).append((price, src))
     return cache
 
 
@@ -812,11 +891,80 @@ def resolve_percentile_prices_from_cache(
     cache: PercentilePriceCache,
     product_id: int,
     *,
-    percentile_number: int,
+    percentile_number: int | None,
 ) -> CompetitorResolvedMany:
-    prices = list(cache.get(int(product_id), {}).get(int(percentile_number), []))
+    buckets = cache.get(int(product_id), {})
+    entries: list[tuple] = []
+    if percentile_number is None:
+        for bucket in buckets.values():
+            entries.extend(bucket)
+    else:
+        entries = list(buckets.get(int(percentile_number), []))
+    prices: list[tuple[Decimal, str]] = []
+    details: dict[str, dict[str, Decimal]] = {}
+    for entry in entries:
+        if len(entry) >= 5:
+            price, src, original, coefficient, pct = entry[:5]
+        else:
+            price, src = entry[:2]
+            original = price
+            coefficient = Decimal("1")
+            pct = percentile_number or 0
+        prices.append((price, src))
+        details[src] = {
+            "original_price": original,
+            "price_coefficient": coefficient,
+            "adjusted_price": price,
+            "percentile_number": Decimal(int(pct or 0)),
+            "is_percentile": Decimal("1"),
+        }
     prices.sort(key=lambda x: x[0])
-    return CompetitorResolvedMany(prices)
+    return CompetitorResolvedMany(prices, details)
+
+
+def resolve_all_competitor_prices(
+    db: Session,
+    price_format: PriceFormat,
+    product_id: int,
+    *,
+    allowed_provisor_sources: set[str] | None = None,
+    percentile_price_cache: PercentilePriceCache | None = None,
+    percentile_number: int | None = None,
+) -> CompetitorResolvedMany:
+    mode = _competitor_price_mode(price_format)
+    details: dict[str, dict[str, Decimal]] = {}
+    prices: list[tuple[Decimal, str]] = []
+
+    if mode in {"regular", "mixed"}:
+        regular = resolve_competitor_prices(
+            db,
+            price_format.id,
+            product_id,
+            allowed_provisor_sources=allowed_provisor_sources,
+        )
+        prices.extend(regular.prices)
+        details.update(regular.details or {})
+
+    if mode in {"percentile", "mixed"}:
+        pct = None if mode == "mixed" else int(percentile_number or price_format.percentile_number or 10)
+        if percentile_price_cache is not None:
+            percentile = resolve_percentile_prices_from_cache(
+                percentile_price_cache,
+                product_id,
+                percentile_number=pct,
+            )
+        else:
+            percentile = resolve_percentile_prices(
+                db,
+                price_format.id,
+                product_id,
+                percentile_number=int(pct or price_format.percentile_number or 10),
+            )
+        prices.extend(percentile.prices)
+        details.update(percentile.details or {})
+
+    prices.sort(key=lambda x: x[0])
+    return CompetitorResolvedMany(prices, details)
 
 
 def _active_lists_query(db: Session, price_format_id: int, as_of: date):
@@ -1283,27 +1431,14 @@ def calculate_price_for_product(
         percentile_number = max(1, min(99, int(percentile_value)))
         percentile_effect = _list_effect(list_id, LIST_TYPE_PERCENTILE_OVERRIDE, percentile_value, "percentile_override")
 
-    if (price_format.competitor_price_mode or "regular") == "percentile":
-        if percentile_price_cache is not None:
-            resolved_many = resolve_percentile_prices_from_cache(
-                percentile_price_cache,
-                product.id,
-                percentile_number=percentile_number,
-            )
-        else:
-            resolved_many = resolve_percentile_prices(
-                db,
-                price_format.id,
-                product.id,
-                percentile_number=percentile_number,
-            )
-    else:
-        resolved_many = resolve_competitor_prices(
-            db,
-            price_format.id,
-            product.id,
-            allowed_provisor_sources=allowed_provisor_sources,
-        )
+    resolved_many = resolve_all_competitor_prices(
+        db,
+        price_format,
+        product.id,
+        allowed_provisor_sources=allowed_provisor_sources,
+        percentile_price_cache=percentile_price_cache,
+        percentile_number=percentile_number,
+    )
 
     critical_markup_match = _find_item_match(db, active_lists, product.id, LIST_TYPE_CRITICAL_MARKUP)
     if critical_markup_match is not None and resolved_many.prices:
@@ -1841,8 +1976,10 @@ def calculate_prices(
     if not ranges:
         raise ValueError("Markup ranges are required")
 
-    percentile_mode = (pf.competitor_price_mode or "regular") == "percentile"
-    if percentile_mode:
+    competitor_price_mode = _competitor_price_mode(pf)
+    percentile_mode = competitor_price_mode in {"percentile", "mixed"}
+    physical_mode = competitor_price_mode in {"regular", "mixed"}
+    if percentile_mode and not physical_mode:
         existing_percentile_rows = (
             db.execute(
                 select(CompetitorPricePercentile.id)
@@ -1856,7 +1993,7 @@ def calculate_prices(
         )
         if existing_percentile_rows is None:
             raise ValueError("Percentile rows are required before price generation. Refresh/recalculate competitors first.")
-    else:
+    if physical_mode:
         existing_competitor_rows = (
             db.execute(
                 select(CompetitorPrice.id)
@@ -1871,6 +2008,19 @@ def calculate_prices(
             rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id)
             recalculate_competitor_percentiles_if_needed(db=db, price_format_id=pf.id)
             db.flush()
+    if percentile_mode and physical_mode:
+        recalculate_competitor_percentiles_if_needed(db=db, price_format_id=pf.id)
+        existing_percentile_rows = (
+            db.execute(
+                select(CompetitorPricePercentile.id)
+                .where(CompetitorPricePercentile.price_format_id == pf.id)
+                .where(CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
+                .where(CompetitorPricePercentile.value.is_not(None))
+                .limit(1)
+            )
+            .scalars()
+            .first()
+        )
 
     pl = db.execute(select(PriceList).where(PriceList.number == price_list_number)).scalars().first()
     if pl is not None and force_new_price_list:

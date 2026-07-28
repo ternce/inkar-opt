@@ -584,6 +584,8 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
     lastSkuCount: latestGenerated?.skuCount,
   };
   const activeAssignments = assignments.filter((row) => row.active !== false);
+  const activePercentileAssignments = activeAssignments.filter((row: any) => row.isPercentile || row.assignmentKind === 'percentile_config');
+  const hasPercentileAssignments = activePercentileAssignments.length > 0;
   const activeLists = universalLists.filter((row) => row.active);
   const ruleTables = appliedRule?.tablesUpdated?.length ? appliedRule.tablesUpdated : ['markup', 'bend', 'no_competitor', 'rounding'];
   const readinessGroups = [
@@ -798,15 +800,31 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="regular">Обычные цены</SelectItem>
-                <SelectItem value="percentile">Персентиль</SelectItem>
+                <SelectItem value="regular">Минимальная цена конкурента</SelectItem>
+                <SelectItem value="percentile">Только перцентили</SelectItem>
+                <SelectItem value="mixed">Обычные ПЛК + перцентили</SelectItem>
               </SelectContent>
             </Select>
+            {competitorPriceMode === 'mixed' ? (
+              <div className="rounded-md border border-blue-100 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+                При формировании цены обычные конкуренты и назначенные перцентили участвуют в едином списке кандидатов.
+              </div>
+            ) : null}
+            {competitorPriceMode === 'mixed' && !hasPercentileAssignments ? (
+              <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                Для смешанного режима назначьте хотя бы один percentile-источник.
+              </div>
+            ) : null}
+            {competitorPriceMode === 'percentile' && !hasPercentileAssignments ? (
+              <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                Для режима перцентилей назначьте хотя бы один percentile-источник.
+              </div>
+            ) : null}
           </div>
 
           <div className="space-y-2">
             <Label htmlFor="percentile-number">Персентиль</Label>
-            <Select value={percentileNumber || '10'} onValueChange={setPercentileNumber} disabled={isLoading || competitorPriceMode !== 'percentile'}>
+            <Select value={percentileNumber || '10'} onValueChange={setPercentileNumber} disabled={isLoading || competitorPriceMode === 'regular'}>
               <SelectTrigger id="percentile-number">
                 <SelectValue />
               </SelectTrigger>
