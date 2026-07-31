@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from ..config import get_settings
 from ..models import PriceSourceAccount
 from .price_source_security import decrypt_secret, encrypt_secret
-from .competitor_price_lists import upsert_unified_price_list
+from .competitor_price_lists import upsert_unified_price_list_metadata
 from .price_sources import (
     PriceSourceAccountCredentials,
     ProvisorPriceService,
@@ -166,13 +166,11 @@ async def test_account_connection(*, db: Session, account_id: int, price_format_
                 saved_count = 0
                 for price_list in price_lists:
                     try:
-                        upsert_unified_price_list(
+                        upsert_unified_price_list_metadata(
                             db=db,
                             price_format_code=price_format_code,
                             price_list=price_list,
-                            items=[],
                             status="listed",
-                            run_matching=False,
                         )
                         saved_count += 1
                     except Exception:

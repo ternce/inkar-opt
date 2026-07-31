@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { Copy, Plus, Save, Trash2 } from 'lucide-react';
 import { Button } from './ui/button';
@@ -7,6 +7,21 @@ import { Label } from './ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './ui/tabs';
 import { PricingSettingsTab } from './PricingSettingsTab';
+import {
+  NO_COPY_SOURCE,
+  applyPricingRuleCreateSuccess,
+  buildPricingRuleCreatePayload,
+  canSubmitPricingRuleCreate,
+  draftFromCopySource,
+  pricingRuleCreateErrorMessage,
+} from '../pricingRuleCreateFlow';
+import {
+  CREATE_NEW_TEMPLATE,
+  CURRENT_FORMAT_SETTINGS,
+  appliedTemplateIdForKind,
+  resolveInitialRoundingSelection,
+  resolveInitialTemplateSelection,
+} from '../pricingTemplateSelection';
 
 type RangeRow = {
   id?: number;
@@ -61,6 +76,16 @@ type AppliedRuleStatus = {
   roundingRuleName?: string;
 };
 
+type PriceFormatSettings = {
+  appliedMarkupTemplateId?: number | null;
+  appliedBendTemplateId?: number | null;
+  appliedNoCompetitorTemplateId?: number | null;
+  appliedRoundingRuleId?: number | null;
+  recommendedMarkups?: Array<{ lowerBound?: number | string; upperBound?: number | string | null; markupPercent?: number | string }>;
+  bendRanges?: Array<{ priceFrom?: number | string; bendPercent?: number | string }>;
+  noCompetitorMarkups?: Array<{ lowerBound?: number | string; upperBound?: number | string | null; markupPercent?: number | string }>;
+};
+
 type Props = {
   formatCode: string;
   onNavigate?: (section: 'pricing-workflow' | 'analytics' | 'pricelists' | 'competitors' | 'pricing' | 'universal-lists') => void;
@@ -102,24 +127,59 @@ const toPayloadRows = (rows: RangeRow[], valueKey: 'markupPercent' | 'bendPercen
     sortOrder: index,
   }));
 
+const rowsFromFormatSettings = (
+  settings: PriceFormatSettings | null,
+  kind: 'markup' | 'bend' | 'noCompetitor'
+): RangeRow[] => {
+  if (!settings) return [];
+  if (kind === 'bend') {
+    return (settings.bendRanges || []).map((row, index) => ({
+      costFrom: String(row.priceFrom ?? '0'),
+      costTo: '',
+      bendPercent: String(row.bendPercent ?? ''),
+      sortOrder: index,
+    }));
+  }
+  const source = kind === 'noCompetitor' ? settings.noCompetitorMarkups : settings.recommendedMarkups;
+  return (source || []).map((row, index) => ({
+    costFrom: String(row.lowerBound ?? '0'),
+    costTo: row.upperBound == null ? '' : String(row.upperBound),
+    markupPercent: String(row.markupPercent ?? ''),
+    sortOrder: index,
+  }));
+};
+
 function TemplateEditor({
   title,
   endpoint,
   kind,
   valueKey,
   valueLabel,
+  settings,
 }: {
   title: string;
   endpoint: string;
   kind: 'markup' | 'bend' | 'noCompetitor';
   valueKey: 'markupPercent' | 'bendPercent';
   valueLabel: string;
+  settings: PriceFormatSettings | null;
 }) {
   const [items, setItems] = useState<Template[]>([]);
-  const [selectedId, setSelectedId] = useState<string>('new');
+  const [selectedId, setSelectedId] = useState<string>(CURRENT_FORMAT_SETTINGS);
   const [draft, setDraft] = useState<Template>(() => emptyTemplate(kind));
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const preserveSelectionRef = useRef<string | null>(null);
+  const appliedTemplateId = appliedTemplateIdForKind(settings, kind);
+  const currentRows = useMemo(() => rowsFromFormatSettings(settings, kind), [settings, kind]);
+  const currentSettingsDraft = useMemo(
+    () => ({
+      ...emptyTemplate(kind),
+      name: appliedTemplateId ? 'Текущие настройки ЦФ (шаблон недоступен)' : 'Текущие настройки ЦФ',
+      rows: currentRows.length ? currentRows : emptyTemplate(kind).rows,
+    }),
+    [appliedTemplateId, currentRows, kind]
+  );
 
   const load = async () => {
     setIsLoading(true);
@@ -131,9 +191,26 @@ function TemplateEditor({
       if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить шаблоны');
       const rows = Array.isArray(data) ? data : [];
       setItems(rows);
-      if (selectedId !== 'new') {
-        const current = rows.find((row: Template) => String(row.id) === selectedId);
-        if (current) setDraft(normalizeTemplate(current, kind));
+      if (preserveSelectionRef.current) {
+        const preservedId = preserveSelectionRef.current;
+        preserveSelectionRef.current = null;
+        const current = rows.find((row: Template) => String(row.id) === preservedId);
+        if (current) {
+          setSelectedId(preservedId);
+          setDraft(normalizeTemplate(current, kind));
+          return;
+        }
+      }
+      const resolvedSelection = resolveInitialTemplateSelection(settings, kind, rows);
+      if (resolvedSelection.mode === 'applied') {
+        const applied = rows.find((row: Template) => String(row.id) === resolvedSelection.selectedId);
+        if (applied) {
+          setSelectedId(String(applied.id));
+          setDraft(normalizeTemplate(applied, kind));
+        }
+      } else {
+        setSelectedId(CURRENT_FORMAT_SETTINGS);
+        setDraft(currentSettingsDraft);
       }
     } catch (e: any) {
       setError(e?.message || 'Ошибка загрузки');
@@ -145,12 +222,16 @@ function TemplateEditor({
   useEffect(() => {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [endpoint]);
+  }, [endpoint, appliedTemplateId, settings]);
 
   const select = (value: string) => {
     setSelectedId(value);
-    if (value === 'new') {
+    if (value === CREATE_NEW_TEMPLATE) {
       setDraft(emptyTemplate(kind));
+      return;
+    }
+    if (value === CURRENT_FORMAT_SETTINGS) {
+      setDraft(currentSettingsDraft);
       return;
     }
     const row = items.find((item) => String(item.id) === value);
@@ -168,7 +249,7 @@ function TemplateEditor({
         isActive: draft.isActive,
         rows: toPayloadRows(draft.rows, valueKey),
       };
-      const isNew = selectedId === 'new' || !draft.id;
+      const isNew = selectedId === CREATE_NEW_TEMPLATE || !draft.id;
       const res = await fetch(isNew ? endpoint : `${endpoint}/${draft.id}`, {
         method: isNew ? 'POST' : 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -179,6 +260,7 @@ function TemplateEditor({
       if (!res.ok) throw new Error(data?.detail || text || 'Не удалось сохранить шаблон');
       setSelectedId(String(data.id));
       setDraft(normalizeTemplate(data, kind));
+      preserveSelectionRef.current = String(data.id);
       await load();
       toast.success('Шаблон сохранён');
     } catch (e: any) {
@@ -199,6 +281,7 @@ function TemplateEditor({
       if (!res.ok) throw new Error(data?.detail || text || 'Не удалось копировать шаблон');
       setSelectedId(String(data.id));
       setDraft(normalizeTemplate(data, kind));
+      preserveSelectionRef.current = String(data.id);
       await load();
     } catch (e: any) {
       setError(e?.message || 'Ошибка копирования');
@@ -233,14 +316,22 @@ function TemplateEditor({
           <Select value={selectedId} onValueChange={select}>
             <SelectTrigger><SelectValue placeholder="Шаблон" /></SelectTrigger>
             <SelectContent>
-              <SelectItem value="new">Новый шаблон</SelectItem>
-              {items.map((item) => <SelectItem key={item.id} value={String(item.id)}>{item.name}</SelectItem>)}
+              {!appliedTemplateId ? <SelectItem value={CURRENT_FORMAT_SETTINGS}>Текущие настройки ЦФ</SelectItem> : null}
+              {appliedTemplateId && !items.some((item) => Number(item.id) === Number(appliedTemplateId)) ? (
+                <SelectItem value={CURRENT_FORMAT_SETTINGS}>Текущие настройки ЦФ (шаблон недоступен)</SelectItem>
+              ) : null}
+              {items.map((item) => (
+                <SelectItem key={item.id} value={String(item.id)}>
+                  {item.name}{Number(item.id) === Number(appliedTemplateId) ? ' — применён' : ''}
+                </SelectItem>
+              ))}
+              <SelectItem value={CREATE_NEW_TEMPLATE}>+ Новый шаблон</SelectItem>
             </SelectContent>
           </Select>
-          <Input value={draft.name} onChange={(e) => setDraft((prev) => ({ ...prev, name: e.target.value }))} placeholder="Название" />
-          <Input value={draft.code} onChange={(e) => setDraft((prev) => ({ ...prev, code: e.target.value }))} placeholder="Код" />
+          <Input value={draft.name} onChange={(e) => setDraft((prev) => ({ ...prev, name: e.target.value }))} placeholder="Название" disabled={selectedId === CURRENT_FORMAT_SETTINGS} />
+          <Input value={draft.code} onChange={(e) => setDraft((prev) => ({ ...prev, code: e.target.value }))} placeholder="Код" disabled={selectedId === CURRENT_FORMAT_SETTINGS} />
           <div className="flex gap-2">
-            <Button size="sm" onClick={save} disabled={isLoading} className="bg-blue-600 hover:bg-blue-700">
+            <Button size="sm" onClick={save} disabled={isLoading || selectedId === CURRENT_FORMAT_SETTINGS} className="bg-blue-600 hover:bg-blue-700">
               <Save className="mr-2 h-4 w-4" />Сохранить
             </Button>
             <Button size="sm" variant="outline" onClick={copy} disabled={isLoading || !draft.id}>
@@ -249,14 +340,19 @@ function TemplateEditor({
           </div>
         </div>
         <div className="mt-3">
-          <Input value={draft.description} onChange={(e) => setDraft((prev) => ({ ...prev, description: e.target.value }))} placeholder="Описание" />
+          <Input value={draft.description} onChange={(e) => setDraft((prev) => ({ ...prev, description: e.target.value }))} placeholder="Описание" disabled={selectedId === CURRENT_FORMAT_SETTINGS} />
+          {selectedId === CURRENT_FORMAT_SETTINGS ? (
+            <div className="mt-2 text-xs text-gray-500">
+              Показаны сохранённые настройки текущего ЦФ без выбранного шаблона. Выберите существующий шаблон или “+ Новый шаблон”, чтобы редактировать шаблон.
+            </div>
+          ) : null}
         </div>
       </div>
 
       <div className="admin-card p-5 space-y-4">
         <div className="flex items-center justify-between">
           <h3 className="text-sm font-semibold text-gray-900">{title}</h3>
-          <Button variant="outline" size="sm" onClick={addRow}><Plus className="mr-2 h-4 w-4" />Добавить строку</Button>
+          <Button variant="outline" size="sm" onClick={addRow} disabled={selectedId === CURRENT_FORMAT_SETTINGS}><Plus className="mr-2 h-4 w-4" />Добавить строку</Button>
         </div>
         <div className="admin-table-card">
           <table className="admin-table">
@@ -271,11 +367,11 @@ function TemplateEditor({
             <tbody>
               {draft.rows.map((row, index) => (
                 <tr key={index}>
-                  <td className="px-4 py-3"><Input className="numeric-input" value={row.costFrom} onChange={(e) => updateRow(index, { costFrom: e.target.value })} /></td>
-                  <td className="px-4 py-3"><Input className="numeric-input" value={row.costTo} onChange={(e) => updateRow(index, { costTo: e.target.value })} placeholder="∞" /></td>
-                  <td className="px-4 py-3"><Input className="numeric-input" value={String(row[valueKey] || '')} onChange={(e) => updateRow(index, { [valueKey]: e.target.value })} /></td>
+                  <td className="px-4 py-3"><Input className="numeric-input" value={row.costFrom} onChange={(e) => updateRow(index, { costFrom: e.target.value })} disabled={selectedId === CURRENT_FORMAT_SETTINGS} /></td>
+                  <td className="px-4 py-3"><Input className="numeric-input" value={row.costTo} onChange={(e) => updateRow(index, { costTo: e.target.value })} placeholder="∞" disabled={selectedId === CURRENT_FORMAT_SETTINGS} /></td>
+                  <td className="px-4 py-3"><Input className="numeric-input" value={String(row[valueKey] || '')} onChange={(e) => updateRow(index, { [valueKey]: e.target.value })} disabled={selectedId === CURRENT_FORMAT_SETTINGS} /></td>
                   <td className="px-4 py-3 text-right">
-                    <Button variant="ghost" size="sm" className="text-red-600 hover:text-red-700" onClick={() => removeRow(index)}>
+                    <Button variant="ghost" size="sm" className="text-red-600 hover:text-red-700" onClick={() => removeRow(index)} disabled={selectedId === CURRENT_FORMAT_SETTINGS}>
                       <Trash2 className="mr-1 h-4 w-4" />Удалить
                     </Button>
                   </td>
@@ -310,12 +406,16 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
   const [roundings, setRoundings] = useState<RoundingRule[]>([]);
   const [selectedRuleId, setSelectedRuleId] = useState<string>('new');
   const [draft, setDraft] = useState<PricingRule>(() => emptyRule());
+  const [copyFromRuleId, setCopyFromRuleId] = useState<string>(NO_COPY_SOURCE);
   const [formatRuleId, setFormatRuleId] = useState<string>('none');
   const [appliedRule, setAppliedRule] = useState<AppliedRuleStatus | null>(null);
+  const [formatSettings, setFormatSettings] = useState<PriceFormatSettings | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const loadRequestRef = useRef(0);
 
   const load = async () => {
+    const requestId = ++loadRequestRef.current;
     setIsLoading(true);
     setError(null);
     try {
@@ -335,6 +435,7 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
         roundingsRes.text().then(parseJsonOrNull),
         settingsRes.text().then(parseJsonOrNull),
       ]);
+      if (requestId !== loadRequestRef.current) return;
       setRules(Array.isArray(rulesData) ? rulesData : []);
       setMarkups(Array.isArray(markupsData) ? markupsData : []);
       setBends(Array.isArray(bendsData) ? bendsData : []);
@@ -342,10 +443,11 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
       setRoundings(Array.isArray(roundingsData) ? roundingsData : []);
       setFormatRuleId(settingsData?.pricingRuleId ? String(settingsData.pricingRuleId) : 'none');
       setAppliedRule(settingsData?.appliedRule || null);
+      setFormatSettings(settingsData || null);
     } catch (e: any) {
       setError(e?.message || 'Ошибка загрузки правил');
     } finally {
-      setIsLoading(false);
+      if (requestId === loadRequestRef.current) setIsLoading(false);
     }
   };
 
@@ -360,15 +462,43 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
     setSelectedRuleId(value);
     if (value === 'new') {
       setDraft(emptyRule());
+      setCopyFromRuleId(NO_COPY_SOURCE);
       return;
     }
+    setCopyFromRuleId(NO_COPY_SOURCE);
     const res = await fetch(`/api/pricing-rules/${value}`);
     const text = await res.text();
     const data = parseJsonOrNull(text);
     if (res.ok && data) setDraft(normalizeRule(data));
   };
 
+  const selectCopySource = async (value: string) => {
+    setCopyFromRuleId(value);
+    if (value === NO_COPY_SOURCE) {
+      setDraft((prev) => ({
+        ...emptyRule(),
+        code: prev.code,
+        name: prev.name,
+      }));
+      return;
+    }
+    setIsLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/pricing-rules/${value}`);
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить правило-источник');
+      setDraft((prev) => draftFromCopySource(prev, normalizeRule(data)));
+    } catch (e: any) {
+      setError(e?.message || 'Ошибка загрузки правила-источника');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   const saveRule = async () => {
+    if (!canSubmitPricingRuleCreate(isLoading)) return;
     setIsLoading(true);
     setError(null);
     try {
@@ -376,13 +506,16 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
       const res = await fetch(isNew ? '/api/pricing-rules' : `/api/pricing-rules/${draft.id}`, {
         method: isNew ? 'POST' : 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(draft),
+        body: JSON.stringify(isNew ? buildPricingRuleCreatePayload(draft, copyFromRuleId) : draft),
       });
       const text = await res.text();
       const data = parseJsonOrNull(text);
-      if (!res.ok) throw new Error(data?.detail || text || 'Не удалось сохранить правило');
-      setSelectedRuleId(String(data.id));
-      setDraft(normalizeRule(data));
+      if (!res.ok) throw new Error(pricingRuleCreateErrorMessage(data, text));
+      const normalized = normalizeRule(data);
+      const next = isNew ? applyPricingRuleCreateSuccess(normalized) : { selectedRuleId: String(data.id), draft: normalized, copyFromRuleId };
+      setSelectedRuleId(next.selectedRuleId);
+      setDraft(next.draft);
+      setCopyFromRuleId(next.copyFromRuleId);
       await load();
       toast.success('Правило ЦО сохранено');
     } catch (e: any) {
@@ -394,14 +527,10 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
 
   const copyRule = async () => {
     if (!draft.id) return;
-    const res = await fetch(`/api/pricing-rules/${draft.id}/copy`, { method: 'POST' });
-    const text = await res.text();
-    const data = parseJsonOrNull(text);
-    if (res.ok && data) {
-      setSelectedRuleId(String(data.id));
-      setDraft(normalizeRule(data));
-      await load();
-    }
+    const source = normalizeRule(draft);
+    setSelectedRuleId('new');
+    setCopyFromRuleId(String(source.id));
+    setDraft(draftFromCopySource(emptyRule(), source));
   };
 
   const deleteRule = async () => {
@@ -427,6 +556,7 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
       const text = await res.text();
       const data = parseJsonOrNull(text);
       if (!res.ok) throw new Error(data?.detail || text || 'Не удалось применить правило');
+      await load();
       toast.success('Правило применено к ценовому формату');
     } catch (e: any) {
       setError(e?.message || 'Ошибка применения');
@@ -478,26 +608,45 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
               <Input value={draft.name} onChange={(e) => setDraft((prev) => ({ ...prev, name: e.target.value }))} placeholder="Название" />
               <Input value={draft.code} onChange={(e) => setDraft((prev) => ({ ...prev, code: e.target.value }))} placeholder="Код" />
               <div className="flex gap-2">
-                <Button size="sm" onClick={saveRule} disabled={isLoading} className="bg-blue-600 hover:bg-blue-700"><Save className="mr-2 h-4 w-4" />Сохранить</Button>
-                <Button size="sm" variant="outline" onClick={copyRule} disabled={!draft.id}><Copy className="mr-2 h-4 w-4" />Копировать</Button>
-                <Button size="sm" variant="ghost" className="text-red-600 hover:text-red-700" onClick={deleteRule} disabled={!draft.id}><Trash2 className="mr-2 h-4 w-4" />Удалить</Button>
+                <Button size="sm" onClick={saveRule} disabled={!canSubmitPricingRuleCreate(isLoading)} className="bg-blue-600 hover:bg-blue-700"><Save className="mr-2 h-4 w-4" />Сохранить</Button>
+                <Button size="sm" variant="outline" onClick={copyRule} disabled={isLoading || !draft.id}><Copy className="mr-2 h-4 w-4" />Копировать</Button>
+                <Button size="sm" variant="ghost" className="text-red-600 hover:text-red-700" onClick={deleteRule} disabled={isLoading || !draft.id}><Trash2 className="mr-2 h-4 w-4" />Удалить</Button>
               </div>
             </div>
+            {selectedRuleId === 'new' ? (
+              <div className="grid grid-cols-1 gap-3 lg:grid-cols-[260px_1fr]">
+                <div className="space-y-2">
+                  <Label>Копировать из существующего правила</Label>
+                  <Select value={copyFromRuleId} onValueChange={selectCopySource} disabled={isLoading}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={NO_COPY_SOURCE}>Не копировать</SelectItem>
+                      {rules.map((rule) => <SelectItem key={rule.id} value={String(rule.id)}>{rule.name}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-700">
+                  {copyFromRuleId !== NO_COPY_SOURCE
+                    ? `Копируется из: ${ruleById.get(copyFromRuleId)?.name || 'выбранное правило'}`
+                    : 'Новое правило будет создано без копирования связанных шаблонов.'}
+                </div>
+              </div>
+            ) : null}
             <Input value={draft.description} onChange={(e) => setDraft((prev) => ({ ...prev, description: e.target.value }))} placeholder="Описание" />
             <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-              <FieldSelect label="Рекомендованные наценки" value={draft.markupTemplateId} items={markups} onChange={(id) => setDraft((prev) => ({ ...prev, markupTemplateId: id }))} />
-              <FieldSelect label="Прогибы" value={draft.bendTemplateId} items={bends} onChange={(id) => setDraft((prev) => ({ ...prev, bendTemplateId: id }))} />
-              <FieldSelect label="Наценки без конкурентов" value={draft.noCompetitorTemplateId} items={noCompetitors} onChange={(id) => setDraft((prev) => ({ ...prev, noCompetitorTemplateId: id }))} />
-              <FieldSelect label="Округление" value={draft.roundingRuleId} items={roundings} onChange={(id) => setDraft((prev) => ({ ...prev, roundingRuleId: id }))} />
+              <FieldSelect label="Рекомендованные наценки" value={draft.markupTemplateId} items={markups} disabled={selectedRuleId === 'new' && copyFromRuleId !== NO_COPY_SOURCE} onChange={(id) => setDraft((prev) => ({ ...prev, markupTemplateId: id }))} />
+              <FieldSelect label="Прогибы" value={draft.bendTemplateId} items={bends} disabled={selectedRuleId === 'new' && copyFromRuleId !== NO_COPY_SOURCE} onChange={(id) => setDraft((prev) => ({ ...prev, bendTemplateId: id }))} />
+              <FieldSelect label="Наценки без конкурентов" value={draft.noCompetitorTemplateId} items={noCompetitors} disabled={selectedRuleId === 'new' && copyFromRuleId !== NO_COPY_SOURCE} onChange={(id) => setDraft((prev) => ({ ...prev, noCompetitorTemplateId: id }))} />
+              <FieldSelect label="Округление" value={draft.roundingRuleId} items={roundings} disabled={selectedRuleId === 'new' && copyFromRuleId !== NO_COPY_SOURCE} onChange={(id) => setDraft((prev) => ({ ...prev, roundingRuleId: id }))} />
             </div>
           </div>
         </div>
       </TabsContent>
 
-      <TabsContent value="markups" className="m-0 pt-4"><TemplateEditor title="Диапазоны рекомендованных наценок" endpoint="/api/pricing-rules/markup-templates" kind="markup" valueKey="markupPercent" valueLabel="Наценка (%)" /></TabsContent>
-      <TabsContent value="bends" className="m-0 pt-4"><TemplateEditor title="Диапазоны прогибов" endpoint="/api/pricing-rules/bend-templates" kind="bend" valueKey="bendPercent" valueLabel="Прогиб (%)" /></TabsContent>
-      <TabsContent value="no-comp" className="m-0 pt-4"><TemplateEditor title="Диапазоны наценок без конкурентов" endpoint="/api/pricing-rules/no-competitor-templates" kind="noCompetitor" valueKey="markupPercent" valueLabel="Наценка (%)" /></TabsContent>
-      <TabsContent value="rounding" className="m-0 pt-4"><RoundingEditor items={roundings} onReload={load} /></TabsContent>
+      <TabsContent value="markups" className="m-0 pt-4"><TemplateEditor title="Диапазоны рекомендованных наценок" endpoint="/api/pricing-rules/markup-templates" kind="markup" valueKey="markupPercent" valueLabel="Наценка (%)" settings={formatSettings} /></TabsContent>
+      <TabsContent value="bends" className="m-0 pt-4"><TemplateEditor title="Диапазоны прогибов" endpoint="/api/pricing-rules/bend-templates" kind="bend" valueKey="bendPercent" valueLabel="Прогиб (%)" settings={formatSettings} /></TabsContent>
+      <TabsContent value="no-comp" className="m-0 pt-4"><TemplateEditor title="Диапазоны наценок без конкурентов" endpoint="/api/pricing-rules/no-competitor-templates" kind="noCompetitor" valueKey="markupPercent" valueLabel="Наценка (%)" settings={formatSettings} /></TabsContent>
+      <TabsContent value="rounding" className="m-0 pt-4"><RoundingEditor items={roundings} appliedRoundingRuleId={formatSettings?.appliedRoundingRuleId ?? null} onReload={load} /></TabsContent>
       <TabsContent value="format" className="m-0 pt-4"><PricingSettingsTab formatCode={formatCode} onNavigate={onNavigate} /></TabsContent>
     </Tabs>
   );
@@ -520,11 +669,11 @@ function AppliedRulePanel({ appliedRule }: { appliedRule: AppliedRuleStatus }) {
   );
 }
 
-function FieldSelect({ label, value, items, onChange }: { label: string; value: number | null; items: Array<{ id: number; name: string }>; onChange: (id: number | null) => void }) {
+function FieldSelect({ label, value, items, disabled = false, onChange }: { label: string; value: number | null; items: Array<{ id: number; name: string }>; disabled?: boolean; onChange: (id: number | null) => void }) {
   return (
     <div className="space-y-2">
       <Label>{label}</Label>
-      <Select value={value ? String(value) : 'none'} onValueChange={(v) => onChange(v === 'none' ? null : Number(v))}>
+      <Select value={value ? String(value) : 'none'} onValueChange={(v) => onChange(v === 'none' ? null : Number(v))} disabled={disabled}>
         <SelectTrigger><SelectValue /></SelectTrigger>
         <SelectContent>
           <SelectItem value="none">Не выбрано</SelectItem>
@@ -562,15 +711,44 @@ function normalizeRule(rule: PricingRule): PricingRule {
   };
 }
 
-function RoundingEditor({ items, onReload }: { items: RoundingRule[]; onReload: () => Promise<void> }) {
-  const [selectedId, setSelectedId] = useState('new');
+function RoundingEditor({ items, appliedRoundingRuleId, onReload }: { items: RoundingRule[]; appliedRoundingRuleId: number | null; onReload: () => Promise<void> }) {
+  const [selectedId, setSelectedId] = useState<string>(CURRENT_FORMAT_SETTINGS);
   const [draft, setDraft] = useState<RoundingRule>({ id: 0, code: '', name: '', mode: 'math', precision: 2, step: 0.01, isActive: true });
   const [error, setError] = useState<string | null>(null);
+  const preserveSelectionRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (preserveSelectionRef.current) {
+      const preservedId = preserveSelectionRef.current;
+      preserveSelectionRef.current = null;
+      const row = items.find((item) => String(item.id) === preservedId);
+      if (row) {
+        setSelectedId(preservedId);
+        setDraft(row);
+        return;
+      }
+    }
+    const resolvedSelection = resolveInitialRoundingSelection({ appliedRoundingRuleId }, items);
+    if (resolvedSelection.mode === 'applied') {
+      const row = items.find((item) => String(item.id) === resolvedSelection.selectedId);
+      if (row) {
+        setSelectedId(String(row.id));
+        setDraft(row);
+        return;
+      }
+    }
+    setSelectedId(CURRENT_FORMAT_SETTINGS);
+    setDraft({ id: 0, code: '', name: appliedRoundingRuleId ? 'Текущее округление ЦФ (правило недоступно)' : 'Без шаблона', mode: 'math', precision: 2, step: 0.01, isActive: true });
+  }, [items, appliedRoundingRuleId]);
 
   const select = (value: string) => {
     setSelectedId(value);
-    if (value === 'new') {
+    if (value === CREATE_NEW_TEMPLATE) {
       setDraft({ id: 0, code: '', name: '', mode: 'math', precision: 2, step: 0.01, isActive: true });
+      return;
+    }
+    if (value === CURRENT_FORMAT_SETTINGS) {
+      setDraft({ id: 0, code: '', name: appliedRoundingRuleId ? 'Текущее округление ЦФ (правило недоступно)' : 'Без шаблона', mode: 'math', precision: 2, step: 0.01, isActive: true });
       return;
     }
     const row = items.find((item) => String(item.id) === value);
@@ -579,7 +757,7 @@ function RoundingEditor({ items, onReload }: { items: RoundingRule[]; onReload: 
 
   const save = async () => {
     setError(null);
-    const isNew = selectedId === 'new' || !draft.id;
+    const isNew = selectedId === CREATE_NEW_TEMPLATE || !draft.id;
     const res = await fetch(isNew ? '/api/pricing-rules/rounding-rules' : `/api/pricing-rules/rounding-rules/${draft.id}`, {
       method: isNew ? 'POST' : 'PATCH',
       headers: { 'Content-Type': 'application/json' },
@@ -593,6 +771,7 @@ function RoundingEditor({ items, onReload }: { items: RoundingRule[]; onReload: 
     }
     setSelectedId(String(data.id));
     setDraft(data);
+    preserveSelectionRef.current = String(data.id);
     await onReload();
   };
 
@@ -604,13 +783,21 @@ function RoundingEditor({ items, onReload }: { items: RoundingRule[]; onReload: 
           <Select value={selectedId} onValueChange={select}>
             <SelectTrigger><SelectValue /></SelectTrigger>
             <SelectContent>
-              <SelectItem value="new">Новое округление</SelectItem>
-              {items.map((item) => <SelectItem key={item.id} value={String(item.id)}>{item.name}</SelectItem>)}
+              {!appliedRoundingRuleId ? <SelectItem value={CURRENT_FORMAT_SETTINGS}>Без шаблона</SelectItem> : null}
+              {appliedRoundingRuleId && !items.some((item) => Number(item.id) === Number(appliedRoundingRuleId)) ? (
+                <SelectItem value={CURRENT_FORMAT_SETTINGS}>Текущее округление ЦФ (правило недоступно)</SelectItem>
+              ) : null}
+              {items.map((item) => (
+                <SelectItem key={item.id} value={String(item.id)}>
+                  {item.name}{Number(item.id) === Number(appliedRoundingRuleId) ? ' — применено' : ''}
+                </SelectItem>
+              ))}
+              <SelectItem value={CREATE_NEW_TEMPLATE}>+ Новое округление</SelectItem>
             </SelectContent>
           </Select>
-          <Input value={draft.name} onChange={(e) => setDraft((prev) => ({ ...prev, name: e.target.value }))} placeholder="Название" />
-          <Input value={draft.code} onChange={(e) => setDraft((prev) => ({ ...prev, code: e.target.value }))} placeholder="Код" />
-          <Select value={draft.mode} onValueChange={(mode) => setDraft((prev) => ({ ...prev, mode }))}>
+          <Input value={draft.name} onChange={(e) => setDraft((prev) => ({ ...prev, name: e.target.value }))} placeholder="Название" disabled={selectedId === CURRENT_FORMAT_SETTINGS} />
+          <Input value={draft.code} onChange={(e) => setDraft((prev) => ({ ...prev, code: e.target.value }))} placeholder="Код" disabled={selectedId === CURRENT_FORMAT_SETTINGS} />
+          <Select value={draft.mode} onValueChange={(mode) => setDraft((prev) => ({ ...prev, mode }))} disabled={selectedId === CURRENT_FORMAT_SETTINGS}>
             <SelectTrigger><SelectValue /></SelectTrigger>
             <SelectContent>
               <SelectItem value="math">Математическое</SelectItem>
@@ -618,9 +805,9 @@ function RoundingEditor({ items, onReload }: { items: RoundingRule[]; onReload: 
               <SelectItem value="down">Вниз</SelectItem>
             </SelectContent>
           </Select>
-          <Input value={String(draft.precision)} onChange={(e) => setDraft((prev) => ({ ...prev, precision: Number(e.target.value) }))} placeholder="Точность" />
-          <Input value={draft.step == null ? '' : String(draft.step)} onChange={(e) => setDraft((prev) => ({ ...prev, step: e.target.value === '' ? null : Number(e.target.value) }))} placeholder="Шаг" />
-          <Button onClick={save} className="bg-blue-600 hover:bg-blue-700"><Save className="mr-2 h-4 w-4" />Сохранить</Button>
+          <Input value={String(draft.precision)} onChange={(e) => setDraft((prev) => ({ ...prev, precision: Number(e.target.value) }))} placeholder="Точность" disabled={selectedId === CURRENT_FORMAT_SETTINGS} />
+          <Input value={draft.step == null ? '' : String(draft.step)} onChange={(e) => setDraft((prev) => ({ ...prev, step: e.target.value === '' ? null : Number(e.target.value) }))} placeholder="Шаг" disabled={selectedId === CURRENT_FORMAT_SETTINGS} />
+          <Button onClick={save} disabled={selectedId === CURRENT_FORMAT_SETTINGS} className="bg-blue-600 hover:bg-blue-700"><Save className="mr-2 h-4 w-4" />Сохранить</Button>
         </div>
       </div>
       <div className="admin-table-card">

@@ -14,10 +14,7 @@ from ..models import (
     CompetitorPriceListItem,
     PriceFormatCompetitorAssignment,
 )
-
-
-def canonical_provisor_source_key(external_price_list_id: object) -> str:
-    return f"plk:{str(external_price_list_id or '').strip()}"
+from .competitor_source_config import canonical_provisor_source_key
 
 
 def _json_loads(value: str | None, fallback: Any) -> Any:
@@ -106,6 +103,7 @@ def _row_rank(row: CompetitorPriceList, item_count: int) -> tuple[int, datetime,
 
 @dataclass(frozen=True)
 class _GroupPlan:
+    account_id: str
     external_price_list_id: str
     canonical_key: str
     winner_id: int
@@ -137,23 +135,26 @@ def _load_groups(db: Session) -> tuple[dict[int, int], list[list[CompetitorPrice
         if row_ids
         else {}
     )
-    groups_by_external: dict[str, list[CompetitorPriceList]] = {}
+    groups_by_identity: dict[tuple[str, str], list[CompetitorPriceList]] = {}
     for row in rows:
+        account_id = str(row.account_id or "").strip()
         external_id = str(row.external_price_list_id or "").strip()
-        if external_id:
-            groups_by_external.setdefault(external_id, []).append(row)
-    return {int(key): int(value) for key, value in item_counts.items()}, list(groups_by_external.values())
+        if account_id and external_id:
+            groups_by_identity.setdefault((account_id, external_id), []).append(row)
+    return {int(key): int(value) for key, value in item_counts.items()}, list(groups_by_identity.values())
 
 
 def _plan_group(group: list[CompetitorPriceList], item_counts: dict[int, int]) -> _GroupPlan | None:
+    account_id = str(group[0].account_id or "").strip()
     external_id = str(group[0].external_price_list_id or "").strip()
-    canonical_key = canonical_provisor_source_key(external_id)
+    canonical_key = canonical_provisor_source_key(account_id, external_id)
     needs_key_update = any(str(row.source_key or "") != canonical_key for row in group)
     if len(group) == 1 and not needs_key_update:
         return None
     winner = max(group, key=lambda row: _row_rank(row, int(item_counts.get(int(row.id), 0))))
     losers = [row for row in group if int(row.id) != int(winner.id)]
     return _GroupPlan(
+        account_id=account_id,
         external_price_list_id=external_id,
         canonical_key=canonical_key,
         winner_id=int(winner.id),
@@ -210,6 +211,7 @@ def normalize_provisor_plk_rows(*, db: Session, apply: bool = False) -> dict[str
         "groups": [
             {
                 "external_price_list_id": plan.external_price_list_id,
+                "account_id": plan.account_id,
                 "canonical_key": plan.canonical_key,
                 "winner_id": plan.winner_id,
                 "loser_ids": plan.loser_ids,

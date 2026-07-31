@@ -513,13 +513,14 @@ def selected_refresh_targets(db: Session) -> dict[str, dict[str, set[str]]]:
         .all()
     )
     targets: dict[str, dict[str, set[str]]] = {}
-    seen_plk: set[str] = set()
+    seen_plk: set[tuple[str, str]] = set()
     for format_code, account_id, filial_id in rows:
         account_s = str(account_id or "").strip()
         filial_s = str(filial_id or "").strip()
-        if not account_s or not filial_s or filial_s in seen_plk:
+        key = (account_s, filial_s)
+        if not account_s or not filial_s or key in seen_plk:
             continue
-        seen_plk.add(filial_s)
+        seen_plk.add(key)
         targets.setdefault(str(format_code), {}).setdefault(account_s, set()).add(filial_s)
     return targets
 

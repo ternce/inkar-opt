@@ -17,9 +17,9 @@ from ...models import (
     Product,
 )
 from ..competitor_matching import rebuild_competitor_prices_for_selected
-from ..competitor_percentiles import recalculate_competitor_percentiles_if_needed
 from ..competitor_price_lists import list_competitor_price_lists, save_selected_competitor_price_lists_only
 from ..competitor_assignments import get_assigned_competitor_price_lists
+from ..percentile_preparation import enqueue_percentile_preparation, ensure_percentile_ready_for_generation
 from ..pricing import AMBIGUOUS_LIST_TYPES, calculate_price_zone, calculate_prices
 from ...timezone import local_iso, now_kz_naive
 from .analytics import build_workflow_analytics
@@ -205,6 +205,7 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
         )
         if mode in {"percentile", "mixed"}:
             selected_percentile_count = _save_selected_percentile_configs(db=db, pf=pf, percentile_sources=percentile_sources)
+            enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="workflow_percentile_selection_changed")
         else:
             selected_percentile_count = 0
         selected_count = len(get_assigned_competitor_price_lists(db=db, price_format_id=int(pf.id)))
@@ -214,8 +215,9 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
             raise ValueError("selected percentile sources are not available for calculation")
         if mode in {"regular", "mixed"}:
             rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id, commit_between_lists=True)
-            recalculate_competitor_percentiles_if_needed(db=db, price_format_id=pf.id)
         db.commit()
+        if mode in {"percentile", "mixed"}:
+            ensure_percentile_ready_for_generation(db, pf)
 
         activation_date = None
         raw_activation = payload.get("activation_date") or payload.get("activationDate")

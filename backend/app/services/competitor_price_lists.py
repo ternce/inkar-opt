@@ -4,7 +4,10 @@ import csv
 import io
 import json
 import logging
+import os
+import asyncio
 import time
+import tracemalloc
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
@@ -44,14 +47,31 @@ from .competitor_assignments import (
     set_competitor_assignments,
 )
 from .competitor_coefficients import effective_price_coefficient, validate_price_coefficient
-from .competitor_percentiles import DEFAULT_BRANCH, recalculate_competitor_percentiles_if_needed
-from .competitor_source_config import ensure_canonical_source_key
+from .competitor_percentiles import DEFAULT_BRANCH
+from .percentile_preparation import enqueue_percentile_preparation
+from .competitor_source_config import canonical_provisor_source_key, ensure_canonical_source_key
 from .manufacturers import resolve_manufacturer
 from .price_sources import UnifiedPriceItem, UnifiedPriceList
 from .sku import normalize_external_sku, normalize_sku, normalize_sku_variants
 from .provisor import process_memory_snapshot
 
 logger = logging.getLogger(__name__)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = str(os.getenv(name, "1" if default else "0")).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+PROVISOR_INSERT_BATCH_SIZE = max(1, _env_int("PROVISOR_DB_INSERT_BATCH_SIZE", 2000))
+STORE_PROVISOR_RAW_JSON = _env_bool("STORE_PROVISOR_RAW_JSON", True)
 
 
 def _timing(operation: str, step: str, started_at: float) -> None:
@@ -85,6 +105,30 @@ def _identity_map_size(db: Session) -> int | None:
         return None
 
 
+def _session_size(db: Session, name: str) -> int | None:
+    try:
+        return len(getattr(db, name))
+    except Exception:
+        return None
+
+
+def _python_memory_snapshot() -> tuple[float | None, float | None]:
+    try:
+        if not tracemalloc.is_tracing():
+            tracemalloc.start()
+        current, peak = tracemalloc.get_traced_memory()
+        return round(current / (1024 * 1024), 2), round(peak / (1024 * 1024), 2)
+    except Exception:
+        return None, None
+
+
+def _alive_async_tasks() -> int | None:
+    try:
+        return sum(1 for task in asyncio.all_tasks() if not task.done())
+    except Exception:
+        return None
+
+
 def _db_memory_snapshot(
     *,
     db: Session,
@@ -92,12 +136,24 @@ def _db_memory_snapshot(
     stage: str,
     rows: int,
     benchmark: dict[str, object],
+    account_id: object | None = None,
+    external_price_list_id: object | None = None,
+    decoded_rows: int | None = None,
+    normalized_rows: int | None = None,
+    mapping_rows: int | None = None,
+    manufacturer_cache_size: int | None = None,
+    product_cache_size: int | None = None,
+    match_cache_size: int | None = None,
 ) -> None:
+    started_at = time.perf_counter()
     memory = process_memory_snapshot()
     rss_mb = memory.get("rss_mb")
+    python_current_mb, python_peak_mb = _python_memory_snapshot()
     identity_map_size = _identity_map_size(db)
     benchmark[f"rss_{stage}_mb"] = rss_mb
     benchmark[f"identity_map_{stage}"] = identity_map_size
+    benchmark[f"python_current_{stage}_mb"] = python_current_mb
+    benchmark[f"python_peak_{stage}_mb"] = python_peak_mb
     logger.info(
         "[PROVISOR_PLK_MEMORY] price_list_id=%s stage=%s rows=%s rss_mb=%s identity_map_size=%s",
         price_list_id,
@@ -105,6 +161,37 @@ def _db_memory_snapshot(
         rows,
         rss_mb,
         identity_map_size,
+    )
+    logger.info(
+        "[PROVISOR_MEMORY] %s",
+        json.dumps(
+            {
+                "account_id": account_id,
+                "external_price_list_id": str(external_price_list_id or ""),
+                "filial_id": str(external_price_list_id or ""),
+                "stage": stage,
+                "rows": rows,
+                "rss_mb": rss_mb,
+                "python_current_mb": python_current_mb,
+                "python_peak_mb": python_peak_mb,
+                "identity_map_size": identity_map_size,
+                "session_new": _session_size(db, "new"),
+                "session_dirty": _session_size(db, "dirty"),
+                "session_deleted": _session_size(db, "deleted"),
+                "decoded_rows": decoded_rows,
+                "normalized_rows": normalized_rows,
+                "mapping_rows": mapping_rows,
+                "results_entries": None,
+                "status_results_entries": None,
+                "manufacturer_cache_size": manufacturer_cache_size,
+                "product_cache_size": product_cache_size,
+                "match_cache_size": match_cache_size,
+                "alive_async_tasks": _alive_async_tasks(),
+                "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
     )
 
 
@@ -150,7 +237,7 @@ def _source_name(row: CompetitorPriceList) -> str:
 
 def _source_key_for_unified(price_list: UnifiedPriceList) -> str:
     if price_list.source == "provisor":
-        return f"plk:{price_list.price_list_id}"
+        return canonical_provisor_source_key(price_list.account_id, price_list.price_list_id)
     return f"{price_list.account_id}:{price_list.price_list_id}"
 
 
@@ -554,6 +641,8 @@ def upsert_provisor_price_list(
     filial_id: int,
     items: list[dict[str, Any]],
     region: str = "",
+    account_id: object = "",
+    account_login: str = "",
     as_of: date | None = None,
     run_matching: bool = True,
 ) -> CompetitorPriceList:
@@ -562,26 +651,41 @@ def upsert_provisor_price_list(
     first = next((x for x in items if isinstance(x, dict)), {})
     display_name = _display_name_from_provisor_item(first, filial_id)
 
+    account_id_s = str(account_id or "").strip()
+    source_key = canonical_provisor_source_key(account_id_s, filial_id)
     row = (
         db.execute(
             select(CompetitorPriceList)
             .where(CompetitorPriceList.source_type == "provisor")
-            .where(CompetitorPriceList.source_key == str(filial_id))
+            .where(CompetitorPriceList.source_key == source_key)
             .order_by(CompetitorPriceList.updated_at.desc(), CompetitorPriceList.id.desc())
         )
         .scalars()
         .first()
     )
+    if row is None and account_id_s:
+        row = (
+            db.execute(
+                select(CompetitorPriceList)
+                .where(CompetitorPriceList.source_type == "provisor")
+                .where(CompetitorPriceList.account_id == account_id_s)
+                .where(CompetitorPriceList.external_price_list_id == str(filial_id))
+                .order_by(CompetitorPriceList.updated_at.desc(), CompetitorPriceList.id.desc())
+            )
+            .scalars()
+            .first()
+        )
     if row is None:
         row = CompetitorPriceList(
             price_format_id=pf.id,
             source_type="provisor",
-            source_key=str(filial_id),
+            source_key=source_key,
             coefficient=1.0,
         )
         db.add(row)
         db.flush()
 
+    row.source_key = source_key
     row.display_name = display_name
     row.supplier = display_name
     row.region = region
@@ -589,8 +693,8 @@ def upsert_provisor_price_list(
     row.branch_code = str(filial_id)
     row.branch_name = display_name or DEFAULT_BRANCH
     row.competitor_name = display_name
-    row.account_id = ""
-    row.account_login = ""
+    row.account_id = account_id_s
+    row.account_login = str(account_login or "")
     row.external_price_list_id = str(filial_id)
     row.sync_batch_id = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
     row.price_date = today
@@ -674,8 +778,9 @@ def upsert_provisor_price_list(
         _replace_legacy_price_rows_for_list(db=db, price_list=row)
         sync_selected_competitor_configs(db=db, price_format_id=pf.id)
         rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id)
-        recalculate_competitor_percentiles_if_needed(db=db, price_format_id=pf.id)
     db.commit()
+    if run_matching:
+        enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="price_list_upserted")
     return row
 
 
@@ -691,6 +796,9 @@ def upsert_unified_price_list(
 ) -> CompetitorPriceList:
     total_started_at = time.perf_counter()
     benchmark: dict[str, object] = {
+        "account_id": price_list.account_id,
+        "external_price_list_id": price_list.price_list_id,
+        "filial_id": price_list.price_list_id,
         "load_existing_match_fields_sec": 0.0,
         "existing_rows_count": 0,
         "preserved_match_fields_count": 0,
@@ -718,11 +826,17 @@ def upsert_unified_price_list(
         .scalars()
         .first()
     )
-    if row is None and price_list.source == "provisor" and str(price_list.price_list_id or "").strip():
+    if (
+        row is None
+        and price_list.source == "provisor"
+        and str(price_list.price_list_id or "").strip()
+        and str(price_list.account_id or "").strip()
+    ):
         row = (
             db.execute(
                 select(CompetitorPriceList)
                 .where(CompetitorPriceList.source_type == price_list.source)
+                .where(CompetitorPriceList.account_id == str(price_list.account_id).strip())
                 .where(CompetitorPriceList.external_price_list_id == str(price_list.price_list_id).strip())
                 .order_by(
                     CompetitorPriceList.last_success_at.desc().nullslast(),
@@ -873,41 +987,59 @@ def upsert_unified_price_list(
     _prepare_rows_timing(price_list_id=row.id, stage="resolve_manufacturers_bulk_or_cache", rows=len(manufacturer_cache), started_at=stage_started_at)
 
     stage_started_at = time.perf_counter()
-    expiry_dates = [_clean_expiry_date(item.expiry_date) for item in items]
-    _prepare_rows_timing(price_list_id=row.id, stage="date_cleanup", rows=len(expiry_dates), started_at=stage_started_at)
-
-    stage_started_at = time.perf_counter()
-    raw_values = [item.raw if isinstance(item.raw, dict) else {} for item in items]
-    provisor_ids = [_as_int(raw.get("id")) for raw in raw_values]
-    provisor_goods_ids = [_as_int(raw.get("goodsId")) for raw in raw_values]
-    filial_ids = [_as_int(item.price_list_id) if item.source == "provisor" else None for item in items]
-    _prepare_rows_timing(price_list_id=row.id, stage="stable_key_generation", rows=len(items), started_at=stage_started_at)
-
-    stage_started_at = time.perf_counter()
-    raw_manufacturers = [
-        manufacturer_cache.get(_manufacturer_cache_key(item.manufacturer, item_names[index]), "")
-        for index, item in enumerate(items)
-    ]
-    _prepare_rows_timing(price_list_id=row.id, stage="manufacturer_assignment", rows=len(raw_manufacturers), started_at=stage_started_at)
-
-    stage_started_at = time.perf_counter()
     empty_structure_fields = _empty_match_structure_fields()
     raw_json_serialize_sec = 0.0
+    bulk_insert_sec = 0.0
+    inserted_rows_count = 0
+    max_batch_size = 0
+
+    def flush_batch() -> None:
+        nonlocal bulk_insert_sec, inserted_rows_count, max_batch_size
+        if not row_mappings:
+            return
+        batch_size = len(row_mappings)
+        max_batch_size = max(max_batch_size, batch_size)
+        batch_started_at = time.perf_counter()
+        db.bulk_insert_mappings(CompetitorPriceListItem, row_mappings)
+        db.flush()
+        bulk_insert_sec += time.perf_counter() - batch_started_at
+        inserted_rows_count += batch_size
+        _db_save_timing(price_list_id=row.id, stage="bulk_insert_batch", rows=batch_size, started_at=batch_started_at)
+        _db_memory_snapshot(
+            db=db,
+            price_list_id=row.id,
+            stage="after_batch_insert",
+            rows=batch_size,
+            benchmark=benchmark,
+            account_id=price_list.account_id,
+            external_price_list_id=price_list.price_list_id,
+            decoded_rows=len(items),
+            normalized_rows=len(items),
+            mapping_rows=batch_size,
+            manufacturer_cache_size=len(manufacturer_cache),
+            match_cache_size=len(preserved_match_fields),
+        )
+        row_mappings.clear()
+
     for index, item in enumerate(items):
         item_name = item_names[index]
-        raw_manufacturer = raw_manufacturers[index]
+        raw_manufacturer = manufacturer_cache.get(_manufacturer_cache_key(item.manufacturer, item_name), "")
+        expiry_date = _clean_expiry_date(item.expiry_date)
+        raw = item.raw if isinstance(item.raw, dict) else {}
+        provisor_id = _as_int(raw.get("id"))
+        provisor_goods_id = _as_int(raw.get("goodsId"))
+        filial_id = _as_int(item.price_list_id) if item.source == "provisor" else None
         preserved_fields = None
         if not run_matching:
-            raw = raw_values[index]
             keys = _competitor_item_identity_keys(
                 source=item.source,
                 price_list_id=item.price_list_id,
-                provisor_id=provisor_ids[index],
-                provisor_goods_id=provisor_goods_ids[index],
+                provisor_id=provisor_id,
+                provisor_goods_id=provisor_goods_id,
                 distributor_goods_id=item.distributor_product_id,
                 name=item.distributor_product_name or item.product_name,
                 producer=raw_manufacturer,
-                shelf_life=expiry_dates[index],
+                shelf_life=expiry_date,
                 batch=raw.get("batch") or raw.get("series") or raw.get("batchNumber"),
             )
             preserved_fields = next((preserved_match_fields[key] for key in keys if key in preserved_match_fields), None)
@@ -928,29 +1060,31 @@ def upsert_unified_price_list(
             match_type = "unmatched"
             match_score = None
             matched_sku = ""
-        raw_json_started_at = time.perf_counter()
-        raw_json = json.dumps(
-            {
-                "source": item.source,
-                "accountId": item.account_id,
-                "priceListId": item.price_list_id,
-                "priceListName": item.price_list_name,
-                "distributorName": item.distributor_name,
-                "manufacturer": raw_manufacturer,
-                "expiryDate": item.expiry_date,
-                "raw": item.raw,
-            },
-            ensure_ascii=False,
-            default=str,
-        )
-        raw_json_serialize_sec += time.perf_counter() - raw_json_started_at
+        raw_json = ""
+        if STORE_PROVISOR_RAW_JSON or item.source != "provisor":
+            raw_json_started_at = time.perf_counter()
+            raw_json = json.dumps(
+                {
+                    "source": item.source,
+                    "accountId": item.account_id,
+                    "priceListId": item.price_list_id,
+                    "priceListName": item.price_list_name,
+                    "distributorName": item.distributor_name,
+                    "manufacturer": raw_manufacturer,
+                    "expiryDate": item.expiry_date,
+                    "raw": item.raw,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+            raw_json_serialize_sec += time.perf_counter() - raw_json_started_at
         mapping = {
             **empty_structure_fields,
             "price_list_id": row.id,
             "product_id": product_id,
-            "provisor_id": provisor_ids[index],
-            "provisor_goods_id": provisor_goods_ids[index],
-            "filial_id": filial_ids[index],
+            "provisor_id": provisor_id,
+            "provisor_goods_id": provisor_goods_id,
+            "filial_id": filial_id,
             "name": item_name,
             "reg_number": item.registration_number,
             "distributor_goods_name": item.distributor_product_name or item.product_name,
@@ -958,7 +1092,7 @@ def upsert_unified_price_list(
             "distributor_price": float(item.distributor_price) if item.distributor_price is not None and item.distributor_price > 0 else None,
             "stock": float(item.stock) if item.stock is not None else None,
             "package_count": float(item.pack_quantity) if item.pack_quantity is not None else None,
-            "expiry_date": expiry_dates[index],
+            "expiry_date": expiry_date,
             "match_type": match_type,
             "match_score": match_score,
             "matched_sku": matched_sku,
@@ -972,28 +1106,56 @@ def upsert_unified_price_list(
             for key in empty_structure_fields:
                 mapping[key] = getattr(row_item, key)
         row_mappings.append(mapping)
-    _prepare_rows_timing(price_list_id=row.id, stage="build_row_mapping_loop", rows=len(row_mappings), started_at=stage_started_at)
-    _prepare_rows_timing(price_list_id=row.id, stage="total", rows=len(row_mappings), started_at=prepare_total_started_at)
+        if len(row_mappings) >= PROVISOR_INSERT_BATCH_SIZE:
+            flush_batch()
+    pending_rows = len(row_mappings)
+    _prepare_rows_timing(price_list_id=row.id, stage="build_row_mapping_loop", rows=inserted_rows_count + pending_rows, started_at=stage_started_at)
+    _prepare_rows_timing(price_list_id=row.id, stage="total", rows=inserted_rows_count + pending_rows, started_at=prepare_total_started_at)
     benchmark["prepare_rows_sec"] = round(time.perf_counter() - prepare_total_started_at, 6)
     benchmark["raw_json_serialize_sec"] = round(raw_json_serialize_sec, 6)
-    _db_save_timing(price_list_id=row.id, stage="prepare_rows", rows=len(row_mappings), started_at=prepare_total_started_at)
+    benchmark["max_insert_batch_size"] = max(max_batch_size, pending_rows)
+    _db_save_timing(price_list_id=row.id, stage="prepare_rows", rows=inserted_rows_count + pending_rows, started_at=prepare_total_started_at)
     if not run_matching:
         logger.info("[MATCH_FIELDS_PRESERVED] price_list_id=%s preserved_count=%s", row.id, preserved_count)
         logger.info("[MATCH_FIELDS_RESET] price_list_id=%s reset_count=%s", row.id, reset_count)
 
-    stage_started_at = time.perf_counter()
-    if row_mappings:
-        db.bulk_insert_mappings(CompetitorPriceListItem, row_mappings)
-    benchmark["bulk_insert_sec"] = round(time.perf_counter() - stage_started_at, 6)
-    benchmark["inserted_rows_count"] = len(row_mappings)
-    _db_save_timing(price_list_id=row.id, stage="bulk_insert", rows=len(row_mappings), started_at=stage_started_at)
-    _db_memory_snapshot(db=db, price_list_id=row.id, stage="after_insert", rows=len(row_mappings), benchmark=benchmark)
+    flush_batch()
+    benchmark["bulk_insert_sec"] = round(bulk_insert_sec, 6)
+    benchmark["inserted_rows_count"] = inserted_rows_count
+    _db_save_timing(price_list_id=row.id, stage="bulk_insert", rows=inserted_rows_count, started_at=prepare_total_started_at)
+    _db_memory_snapshot(
+        db=db,
+        price_list_id=row.id,
+        stage="after_insert",
+        rows=inserted_rows_count,
+        benchmark=benchmark,
+        account_id=price_list.account_id,
+        external_price_list_id=price_list.price_list_id,
+        decoded_rows=len(items),
+        normalized_rows=len(items),
+        mapping_rows=0,
+        manufacturer_cache_size=len(manufacturer_cache),
+        match_cache_size=len(preserved_match_fields),
+    )
 
     stage_started_at = time.perf_counter()
     db.flush()
     benchmark["flush_sec"] = round(time.perf_counter() - stage_started_at, 6)
-    _db_save_timing(price_list_id=row.id, stage="flush", rows=len(row_mappings), started_at=stage_started_at)
-    _db_memory_snapshot(db=db, price_list_id=row.id, stage="after_flush", rows=len(row_mappings), benchmark=benchmark)
+    _db_save_timing(price_list_id=row.id, stage="flush", rows=inserted_rows_count, started_at=stage_started_at)
+    _db_memory_snapshot(
+        db=db,
+        price_list_id=row.id,
+        stage="after_flush",
+        rows=inserted_rows_count,
+        benchmark=benchmark,
+        account_id=price_list.account_id,
+        external_price_list_id=price_list.price_list_id,
+        decoded_rows=len(items),
+        normalized_rows=len(items),
+        mapping_rows=0,
+        manufacturer_cache_size=len(manufacturer_cache),
+        match_cache_size=len(preserved_match_fields),
+    )
     if price_list.source == "provisor" and _as_int(price_list.price_list_id) in PROVISOR_REFERENCE_FILIAL_IDS:
         _sync_provisor_reference_mapping_from_items(db, account_id=price_list.account_id)
     if run_matching:
@@ -1001,17 +1163,161 @@ def upsert_unified_price_list(
         _replace_legacy_price_rows_for_list(db=db, price_list=row)
         sync_selected_competitor_configs(db=db, price_format_id=pf.id)
         rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id)
-        recalculate_competitor_percentiles_if_needed(db=db, price_format_id=pf.id)
     stage_started_at = time.perf_counter()
     db.commit()
+    if run_matching:
+        enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="price_list_upserted")
     benchmark["commit_sec"] = round(time.perf_counter() - stage_started_at, 6)
     benchmark["total_sec"] = round(time.perf_counter() - total_started_at, 6)
     setattr(row, "_benchmark", benchmark)
-    _db_save_timing(price_list_id=row.id, stage="commit", rows=len(row_mappings), started_at=stage_started_at)
-    _db_save_timing(price_list_id=row.id, stage="total", rows=len(row_mappings), started_at=total_started_at)
-    _db_memory_snapshot(db=db, price_list_id=row.id, stage="after_commit", rows=len(row_mappings), benchmark=benchmark)
+    _db_save_timing(price_list_id=row.id, stage="commit", rows=inserted_rows_count, started_at=stage_started_at)
+    _db_save_timing(price_list_id=row.id, stage="total", rows=inserted_rows_count, started_at=total_started_at)
+    _db_memory_snapshot(
+        db=db,
+        price_list_id=row.id,
+        stage="after_commit",
+        rows=inserted_rows_count,
+        benchmark=benchmark,
+        account_id=price_list.account_id,
+        external_price_list_id=price_list.price_list_id,
+        decoded_rows=len(items),
+        normalized_rows=len(items),
+        mapping_rows=0,
+        manufacturer_cache_size=len(manufacturer_cache),
+        match_cache_size=len(preserved_match_fields),
+    )
+    final_items_count = int(
+        db.execute(
+            select(func.count(CompetitorPriceListItem.id)).where(CompetitorPriceListItem.price_list_id == row.id)
+        ).scalar_one()
+        or 0
+    )
+    logger.info(
+        "[PROVISOR_ACCOUNT_PLK_ROUTE] account_id=%s external_price_list_id=%s source_key=%s "
+        "competitor_price_list_id=%s download_rows=%s deleted_rows=%s inserted_rows=%s final_items_count=%s",
+        row.account_id or "",
+        row.external_price_list_id or "",
+        row.source_key or "",
+        int(row.id),
+        len(items),
+        int(benchmark.get("deleted_rows_count") or 0),
+        int(benchmark.get("inserted_rows_count") or 0),
+        final_items_count,
+    )
     row_mappings.clear()
     preserved_match_fields.clear()
+    return row
+
+
+def upsert_unified_price_list_metadata(
+    *,
+    db: Session,
+    price_format_code: str,
+    price_list: UnifiedPriceList,
+    status: str = "listed",
+) -> CompetitorPriceList:
+    """Create/update a source header without replacing downloaded item rows."""
+
+    pf = _ensure_price_format(db, price_format_code)
+    today = date.today()
+    source_key = _source_key_for_unified(price_list)
+    row = (
+        db.execute(
+            select(CompetitorPriceList)
+            .where(CompetitorPriceList.source_type == price_list.source)
+            .where(CompetitorPriceList.source_key == source_key)
+            .order_by(CompetitorPriceList.updated_at.desc(), CompetitorPriceList.id.desc())
+        )
+        .scalars()
+        .first()
+    )
+    if (
+        row is None
+        and price_list.source == "provisor"
+        and str(price_list.price_list_id or "").strip()
+        and str(price_list.account_id or "").strip()
+    ):
+        row = (
+            db.execute(
+                select(CompetitorPriceList)
+                .where(CompetitorPriceList.source_type == price_list.source)
+                .where(CompetitorPriceList.account_id == str(price_list.account_id).strip())
+                .where(CompetitorPriceList.external_price_list_id == str(price_list.price_list_id).strip())
+                .order_by(
+                    CompetitorPriceList.last_success_at.desc().nullslast(),
+                    CompetitorPriceList.updated_at.desc(),
+                    CompetitorPriceList.id.desc(),
+                )
+            )
+            .scalars()
+            .first()
+        )
+    created = False
+    if row is None:
+        row = CompetitorPriceList(
+            price_format_id=pf.id,
+            source_type=price_list.source,
+            source_key=source_key,
+            coefficient=1.0,
+        )
+        db.add(row)
+        db.flush()
+        created = True
+
+    row.source_key = source_key
+    branch_name = getattr(price_list, "branch_name", "") or "Р‘РµР· С„РёР»РёР°Р»Р°"
+    competitor_name = getattr(price_list, "competitor_name", "") or price_list.distributor_name or price_list.price_list_name
+    account_login = getattr(price_list, "account_login", "") or price_list.account_id
+    row.display_name = f"{branch_name} вЂ” {competitor_name} вЂ” {account_login}"
+    row.supplier = price_list.distributor_name or price_list.price_list_name
+    row.branch_id = getattr(price_list, "branch_id", "") or branch_name
+    row.branch_code = getattr(price_list, "branch_code", "") or branch_name
+    row.branch_name = branch_name
+    row.competitor_name = competitor_name
+    row.account_id = price_list.account_id
+    row.account_login = account_login
+    row.external_price_list_id = price_list.price_list_id
+    ensure_canonical_source_key(row)
+    source_updated_at = getattr(price_list, "source_updated_at", "") or ""
+    if source_updated_at:
+        row.source_updated_at = source_updated_at
+    row.last_checked_at = datetime.utcnow()
+    if created and status:
+        row.last_refresh_status = status
+    elif not str(row.last_refresh_status or "").strip() and status:
+        row.last_refresh_status = status
+    row.last_refresh_message = ""
+    visible_status = ""
+    if getattr(price_list, "enabled", None) is True:
+        visible_status = "; visible:on"
+    elif getattr(price_list, "enabled", None) is False:
+        visible_status = "; visible:off"
+    row.region = (
+        f"branch:{branch_name}; competitor:{competitor_name}; account:{price_list.account_id}; "
+        f"accountLogin:{account_login}; status:{row.last_refresh_status or status}{visible_status}"
+    )
+    if row.price_date is None:
+        row.price_date = today
+    row.updated_at = datetime.utcnow()
+    db.flush()
+    final_items_count = int(
+        db.execute(
+            select(func.count(CompetitorPriceListItem.id)).where(CompetitorPriceListItem.price_list_id == row.id)
+        ).scalar_one()
+        or 0
+    )
+    logger.info(
+        "[PROVISOR_ACCOUNT_PLK_ROUTE] account_id=%s external_price_list_id=%s source_key=%s "
+        "competitor_price_list_id=%s download_rows=%s deleted_rows=%s inserted_rows=%s final_items_count=%s",
+        row.account_id or "",
+        row.external_price_list_id or "",
+        row.source_key or "",
+        int(row.id),
+        0,
+        0,
+        0,
+        final_items_count,
+    )
     return row
 
 
@@ -1036,11 +1342,17 @@ def mark_unified_price_list_checked(
         .scalars()
         .first()
     )
-    if row is None and price_list.source == "provisor" and str(price_list.price_list_id or "").strip():
+    if (
+        row is None
+        and price_list.source == "provisor"
+        and str(price_list.price_list_id or "").strip()
+        and str(price_list.account_id or "").strip()
+    ):
         row = (
             db.execute(
                 select(CompetitorPriceList)
                 .where(CompetitorPriceList.source_type == price_list.source)
+                .where(CompetitorPriceList.account_id == str(price_list.account_id).strip())
                 .where(CompetitorPriceList.external_price_list_id == str(price_list.price_list_id).strip())
                 .order_by(
                     CompetitorPriceList.last_success_at.desc().nullslast(),
@@ -1155,6 +1467,7 @@ def list_competitor_price_lists(
             "isSelected": bool(assignments.get(int(row.id)) is not None and assignments[int(row.id)].is_active),
             "itemsCount": int(counts.get(row.id, 0)),
             "items_count": int(counts.get(row.id, 0)),
+            "sourceVisibilityState": str(getattr(row, "_source_visibility_state", "")),
             "visibleForFormatBranch": bool(getattr(row, "_visible_for_format_branch", True)),
             "branchMatchReason": str(getattr(row, "_branch_match_reason", "")),
             "branchMismatchReason": str(getattr(row, "_branch_mismatch_reason", "")),
@@ -1291,10 +1604,7 @@ def set_selected_competitor_price_lists(
     db.commit()
     _timing(operation, "flush/commit", commit_started_at)
 
-    recalculate_competitor_percentiles_if_needed(db=db, price_format_id=pf.id)
-    commit_started_at = time.perf_counter()
-    db.commit()
-    _timing(operation, "flush/commit", commit_started_at)
+    enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="competitor_selection_changed")
     _timing(operation, "finish", started_at)
     _timing(operation, "total_ms", started_at)
     return list_competitor_price_lists(db=db, price_format_code=price_format_code)
@@ -1456,8 +1766,8 @@ def import_manual_price_list_excel(
 
     db.flush()
     _replace_legacy_price_rows_for_list(db=db, price_list=row)
-    recalculate_competitor_percentiles_if_needed(db=db, price_format_id=pf.id)
     db.commit()
+    enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="price_list_imported")
     return row
 
 

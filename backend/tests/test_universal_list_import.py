@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta
 import pytest
 from fastapi.testclient import TestClient
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import PatternFill
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
@@ -63,6 +64,17 @@ def _xlsx(rows: list[list[object]]) -> bytes:
     return bio.getvalue()
 
 
+def _xlsx_with_styled_tail(rows: list[list[object]], *, styled_row: int) -> bytes:
+    workbook = Workbook()
+    worksheet = workbook.active
+    for row in rows:
+        worksheet.append(row)
+    worksheet.cell(row=styled_row, column=1).fill = PatternFill(fill_type="solid", fgColor="FFFF00")
+    bio = io.BytesIO()
+    workbook.save(bio)
+    return bio.getvalue()
+
+
 def _activate_all_products_for_generation(db, *, branch_id="1"):
     products = db.query(Product).all()
     for product in products:
@@ -114,8 +126,9 @@ def _seed_products(Session):
     try:
         db.add_all(
             [
-                Product(code="12345", name="Product 12345", cost=1),
-                Product(code="A-77", name="Article A77", cost=1),
+                Product(code="12345", name="Product 12345", cost=1, provisor_goods_id=1003437),
+                Product(code="A-77", name="Article A77", cost=1, provisor_goods_id=1005949),
+                Product(code="000000000001005594", name="Ко-Ирбесан 300мг/12,5мг №14 таб", cost=1, provisor_goods_id=777777),
                 Product(code="PC-9", name="Product Code 9", cost=1),
                 Product(code="000000000000000222", name="Padded Product", cost=1),
             ]
@@ -518,6 +531,599 @@ def test_lists_management_import_excel_adds_items_to_existing_list():
     assert card["itemsCount"] == 2
     values = {item["sku"]: item["value"] for item in card["items"]}
     assert values == {"12345": 20.0, "A-77": 30.0}
+
+
+def test_memorandum_import_excel_accepts_business_headers_and_reports_row_errors():
+    client, Session = _client()
+    _seed_products(Session)
+    created = client.post(
+        "/api/lists-management",
+        json={"code": "MEMO-IMPORT", "name": "Memorandum", "type": "memorandum", "active": True},
+    )
+    list_id = created.json()["id"]
+
+    content = _xlsx(
+        [
+            ["Материал", "Артикул", "Производитель", "Меморандум"],
+            ["12345", "Product 12345", "Maker", "6325,5"],
+            ["A-77", "Article A77", "Maker", 1800],
+            ["A-77", "Article A77 duplicate", "Maker", "1700.5"],
+            ["", "No SKU", "Maker", 100],
+            ["PC-9", "Bad price", "Maker", 0],
+            ["UNKNOWN", "Unknown", "Maker", 200],
+        ]
+    )
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={"file": ("memo.xlsx", content, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is False
+    assert payload["totalRows"] == 6
+    assert payload["importedRows"] == 2
+    assert payload["updatedRows"] == 0
+    assert payload["failedRows"] == 3
+    assert payload["skippedRows"] == 3
+    assert payload["summary"]["duplicates"] == 1
+    assert payload["warnings"][0]["code"] == "duplicate_row"
+    messages = [error["message"] for error in payload["errors"]]
+    assert "Идентификатор товара обязателен" in messages
+    assert "Цена должна быть больше нуля" in messages
+    assert "Товар с указанным SKU не найден" in messages
+    assert any(error["column"] == "Меморандум" for error in payload["errors"])
+
+    card = client.get(f"/api/lists-management/{list_id}").json()
+    values = {item["sku"]: item["value"] for item in card["items"]}
+    assert values == {"12345": 6325.5, "A-77": 1700.5}
+
+
+@pytest.mark.parametrize("price_header", ["Максимальная цена", "Цена меморандума", "Максимальная цена по меморандуму", "Предельная цена"])
+@pytest.mark.parametrize("sku_header", ["Материал", "SKU", "Код", "GoodsID"])
+def test_memorandum_import_excel_accepts_header_aliases(sku_header, price_header):
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = client.post(
+        "/api/lists-management",
+        json={"code": f"MEMO-{sku_header}-{price_header}", "name": "Memorandum", "type": "memorandum", "active": True},
+    ).json()["id"]
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "memo.xlsx",
+                _xlsx([[sku_header, price_header], ["12345", "99,5"]]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["summary"]["processed"] == 1
+    assert client.get(f"/api/lists-management/{list_id}").json()["items"][0]["value"] == 99.5
+
+
+def test_memorandum_import_excel_invalid_file_returns_safe_400_not_500():
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = client.post(
+        "/api/lists-management",
+        json={"code": "MEMO-BAD-FILE", "name": "Memorandum", "type": "memorandum", "active": True},
+    ).json()["id"]
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={"file": ("memo.xlsx", b"not an xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+
+    assert response.status_code == 400
+    assert response.status_code != 500
+
+
+def test_memorandum_import_counts_only_meaningful_rows_with_styled_tail_beyond_limit(monkeypatch):
+    client, Session = _client()
+    _seed_products(Session)
+    monkeypatch.setenv("LIST_IMPORT_MAX_ROWS", "2000")
+    list_id = client.post(
+        "/api/lists-management",
+        json={"code": "MEMO-STYLED-TAIL", "name": "Memorandum", "type": "memorandum", "active": True},
+    ).json()["id"]
+    rows = [["ID", "Name", "Предельная цена для оптовой реализации"]]
+    rows.extend([[f"9{idx:06d}", f"Registry item {idx}", 100] for idx in range(1091)])
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "memo.xlsx",
+                _xlsx_with_styled_tail(rows, styled_row=60000),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["totalRows"] == 1091
+    assert payload["summary"]["meaningfulDataRows"] == 1091
+    assert payload["summary"]["physicalRowsVisited"] > 50000
+    assert payload["summary"]["emptyRowsIgnored"] > 50000
+
+
+def test_memorandum_import_ignores_empty_styled_and_whitespace_rows(monkeypatch):
+    client, Session = _client()
+    _seed_products(Session)
+    monkeypatch.setenv("LIST_IMPORT_MAX_ROWS", "1")
+    list_id = client.post(
+        "/api/lists-management",
+        json={"code": "MEMO-EMPTY-ROWS", "name": "Memorandum", "type": "memorandum", "active": True},
+    ).json()["id"]
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "memo.xlsx",
+                _xlsx_with_styled_tail(
+                    [
+                        ["Материал", "Артикул", "Меморандум"],
+                        ["   ", "\t", "  "],
+                        [None, None, None],
+                        ["12345", "Product 12345", 100],
+                    ],
+                    styled_row=100,
+                ),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["totalRows"] == 1
+    assert payload["importedRows"] == 1
+    assert payload["summary"]["emptyRowsIgnored"] >= 2
+
+
+def test_universal_import_header_row_does_not_count_toward_row_limit(monkeypatch):
+    client, Session = _client()
+    _seed_products(Session)
+    monkeypatch.setenv("LIST_IMPORT_MAX_ROWS", "1")
+    list_id = client.post(
+        "/api/lists-management",
+        json={"code": "UL-HEADER-NOT-COUNTED", "name": "Fixed", "type": "fixed_price", "active": True},
+    ).json()["id"]
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={"file": ("fixed.xlsx", _xlsx([["Материал", "Фикс цена"], ["12345", 100]]), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["totalRows"] == 1
+
+
+def test_universal_import_exact_row_limit_is_accepted(monkeypatch):
+    client, Session = _client()
+    _seed_products(Session)
+    monkeypatch.setenv("LIST_IMPORT_MAX_ROWS", "3")
+    list_id = client.post(
+        "/api/lists-management",
+        json={"code": "UL-EXACT-LIMIT", "name": "Fixed", "type": "fixed_price", "active": True},
+    ).json()["id"]
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "fixed.xlsx",
+                _xlsx([["Материал", "Фикс цена"], ["12345", 100], ["A-77", 200], ["PC-9", 300]]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["totalRows"] == 3
+    assert response.json()["importedRows"] == 3
+
+
+def test_universal_import_meaningful_rows_over_limit_returns_structured_400_and_stops(monkeypatch):
+    client, Session = _client()
+    _seed_products(Session)
+    monkeypatch.setenv("LIST_IMPORT_MAX_ROWS", "2")
+    list_id = client.post(
+        "/api/lists-management",
+        json={"code": "UL-OVER-LIMIT", "name": "Fixed", "type": "fixed_price", "active": True},
+    ).json()["id"]
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "fixed.xlsx",
+                _xlsx([["Материал", "Фикс цена"], ["12345", 100], [None, None], ["A-77", 200], ["PC-9", 300], ["UNKNOWN", "bad"]]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.status_code != 500
+    detail = response.json()["detail"]
+    assert detail["detail"] == "Количество заполненных строк превышает допустимый лимит 2"
+    assert detail["limit"] == 2
+    assert detail["meaningfulRowsDetected"] == 3
+    assert client.get(f"/api/lists-management/{list_id}").json()["items"] == []
+
+
+def _create_memorandum_list(client: TestClient, code: str = "MEMO-TEST") -> int:
+    return client.post(
+        "/api/lists-management",
+        json={"code": code, "name": "Memorandum", "type": "memorandum", "active": True},
+    ).json()["id"]
+
+
+def test_memorandum_import_excel_accepts_gos_reestr_id_name_wholesale_price():
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = _create_memorandum_list(client, "MEMO-GOS-REESTR")
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "Гос Реестр.xlsx",
+                _xlsx(
+                    [
+                        ["ID", "Name", "Предельная цена для оптовой реализации"],
+                        [1005594, "Ко-Ирбесан 300мг/12,5мг №14 таб", 6545.96],
+                    ]
+                ),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["importedRows"] == 1
+    assert payload["matchedRows"] == 1
+    assert payload["unmatchedRows"] == 0
+    assert payload["selectedIdentifierColumn"] == "ID"
+    assert payload["selectedPriceColumn"] == "Предельная цена для оптовой реализации"
+    assert payload["summary"]["resolvedIdentifierFields"] == ["Product.code"]
+    item = client.get(f"/api/lists-management/{list_id}").json()["items"][0]
+    assert item["sku"] == "000000000001005594"
+    assert item["value"] == 6545.96
+
+
+@pytest.mark.parametrize("identifier_header", ["ID", "ИД", "ID товара", "Product ID", "ProductID"])
+def test_memorandum_import_excel_resolves_new_id_aliases_by_normalized_product_code(identifier_header):
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = _create_memorandum_list(client, f"MEMO-ID-{identifier_header}")
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "memo.xlsx",
+                _xlsx([[identifier_header, "Меморандум"], [1005594, 100]]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["summary"]["resolvedIdentifierFields"] == ["Product.code"]
+    assert client.get(f"/api/lists-management/{list_id}").json()["items"][0]["sku"] == "000000000001005594"
+
+
+@pytest.mark.parametrize("identifier_header", ["Материал", "SKU", "Код", "GoodsID", "Код товара"])
+def test_memorandum_import_excel_keeps_existing_code_identifier_aliases(identifier_header):
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = _create_memorandum_list(client, f"MEMO-CODE-{identifier_header}")
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "memo.xlsx",
+                _xlsx([[identifier_header, "Меморандум"], ["12345", "11,5"]]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["summary"]["resolvedIdentifierFields"] == ["Product.code"]
+    assert client.get(f"/api/lists-management/{list_id}").json()["items"][0]["value"] == 11.5
+
+
+@pytest.mark.parametrize(
+    "price_header",
+    [
+        "Предельная цена для оптовой реализации",
+        "Предельная цена для розничной реализации",
+        "Предельная оптовая цена",
+        "Предельная розничная цена",
+        "Максимальная оптовая цена",
+        "Максимальная розничная цена",
+        "Цена для оптовой реализации",
+        "Цена для розничной реализации",
+        "Регулируемая цена",
+        "Государственная предельная цена",
+        "Цена по госреестру",
+        "Предельная стоимость",
+    ],
+)
+def test_memorandum_import_excel_accepts_new_price_aliases(price_header):
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = _create_memorandum_list(client, f"MEMO-PRICE-{price_header}")
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "memo.xlsx",
+                _xlsx([["ID", price_header], [1005594, "77.7"]]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["selectedPriceColumn"] == price_header
+    assert client.get(f"/api/lists-management/{list_id}").json()["items"][0]["value"] == 77.7
+
+
+def test_memorandum_import_excel_header_normalization_spaces_breaks_nbsp_and_yo():
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = _create_memorandum_list(client, "MEMO-NORMALIZED-HEADERS")
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "memo.xlsx",
+                _xlsx([[" id ", "Цена\u00a0по\nгосреёстру"], [1005594.0, "12,25"]]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    assert client.get(f"/api/lists-management/{list_id}").json()["items"][0]["value"] == 12.25
+
+
+def test_memorandum_import_excel_numeric_id_string_with_decimal_resolves_when_integer():
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = _create_memorandum_list(client, "MEMO-ID-DECIMAL-STRING")
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "memo.xlsx",
+                _xlsx([["ID", "Меморандум"], ["1005594.0", "20,5"]]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    assert client.get(f"/api/lists-management/{list_id}").json()["items"][0]["sku"] == "000000000001005594"
+
+
+def test_memorandum_import_excel_unknown_id_reports_row_error():
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = _create_memorandum_list(client, "MEMO-UNKNOWN-ID")
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "memo.xlsx",
+                _xlsx([["ID", "Name", "Меморандум"], [1003437, "FDP MEDLAC 5г фл+р-р", 20]]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["failedRows"] == 1
+    assert payload["unmatchedRows"] == 1
+    assert payload["rowErrors"][0]["identifier"] == "1003437"
+    assert payload["rowErrors"][0]["name"] == "FDP MEDLAC 5г фл+р-р"
+    assert payload["rowErrors"][0]["message"] == "Товар с указанным ID отсутствует в локальном справочнике"
+
+
+def test_memorandum_import_excel_missing_products_do_not_abort_valid_registry_rows():
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = _create_memorandum_list(client, "MEMO-MIXED-REGISTRY")
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "memo.xlsx",
+                _xlsx(
+                    [
+                        ["ID", "Name", "Предельная цена для оптовой реализации"],
+                        [1003437, "FDP MEDLAC 5г фл+р-р", 10],
+                        [1005594, "Ко-Ирбесан 300мг/12,5мг №14 таб", 20],
+                    ]
+                ),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["matchedRows"] == 1
+    assert payload["unmatchedRows"] == 1
+    assert payload["importedRows"] == 1
+    assert client.get(f"/api/lists-management/{list_id}").json()["items"][0]["value"] == 20.0
+
+
+def test_memorandum_import_excel_does_not_use_provisor_goods_id_for_registry_id():
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = _create_memorandum_list(client, "MEMO-NO-PROVISOR-ID")
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "memo.xlsx",
+                _xlsx([["ID", "Меморандум"], [1003437, 100]]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["matchedRows"] == 0
+    assert payload["unmatchedRows"] == 1
+    assert client.get(f"/api/lists-management/{list_id}").json()["items"] == []
+
+
+def test_memorandum_import_excel_does_not_match_by_name_alone():
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = _create_memorandum_list(client, "MEMO-NO-NAME-MATCH")
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "memo.xlsx",
+                _xlsx([["ID", "Name", "Меморандум"], [9999999, "Ко-Ирбесан 300мг/12,5мг №14 таб", 100]]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["unmatchedRows"] == 1
+    assert client.get(f"/api/lists-management/{list_id}").json()["items"] == []
+
+
+@pytest.mark.parametrize("price", ["4 699,50", "4\u00a0699,50", "4699.50"])
+def test_memorandum_import_excel_registry_prices_parse_spaces_nbsp_comma_and_dot(price):
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = _create_memorandum_list(client, f"MEMO-PRICE-FORMAT-{price}")
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "memo.xlsx",
+                _xlsx([["ID", "Предельная цена для оптовой реализации"], [1005594, price]]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    assert client.get(f"/api/lists-management/{list_id}").json()["items"][0]["value"] == 4699.5
+
+
+def test_memorandum_import_excel_duplicate_registry_ids_use_last_row():
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = _create_memorandum_list(client, "MEMO-DUP-REGISTRY-ID")
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "memo.xlsx",
+                _xlsx(
+                    [
+                        ["ID", "Name", "Меморандум"],
+                        [1005594, "Ко-Ирбесан 300мг/12,5мг №14 таб", 100],
+                        [1005594, "Ко-Ирбесан 300мг/12,5мг №14 таб", 200],
+                    ]
+                ),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["duplicateRows"] == 1
+    assert payload["warnings"][0]["code"] == "duplicate_row"
+    assert client.get(f"/api/lists-management/{list_id}").json()["items"][0]["value"] == 200.0
+
+
+def test_memorandum_import_excel_multiple_price_columns_returns_422():
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = _create_memorandum_list(client, "MEMO-MULTI-PRICE")
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "memo.xlsx",
+                _xlsx(
+                    [
+                        ["ID", "Предельная цена для розничной реализации", "Предельная цена для оптовой реализации"],
+                        [1005594, 999, 111],
+                    ]
+                ),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["detail"] == "Найдено несколько колонок предельной цены"
+    assert detail["detectedPriceColumns"] == [
+        "Предельная цена для розничной реализации",
+        "Предельная цена для оптовой реализации",
+    ]
+
+
+def test_memorandum_import_excel_unsupported_headers_return_structured_422_not_500():
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = _create_memorandum_list(client, "MEMO-BAD-HEADERS")
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={
+            "file": (
+                "memo.xlsx",
+                _xlsx([["Unknown", "Some Price"], ["12345", 10]]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.status_code != 500
+    detail = response.json()["detail"]
+    assert detail["detectedHeaders"] == ["Unknown", "Some Price"]
+    assert "product_identifier" in detail["missingFields"]
+    assert "product_code" in detail["supportedAliases"]
 
 
 def test_critical_markup_manual_save_accepts_dash_and_keeps_empty_invalid():

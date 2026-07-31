@@ -24,6 +24,16 @@ from .competitor_source_config import (
 logger = logging.getLogger(__name__)
 
 INACTIVE_REFRESH_STATUSES = {"failed", "error", "stale"}
+PLACEHOLDER_REFRESH_STATUSES = {"", "listed", "pending", "placeholder"}
+ATTEMPTED_ZERO_REFRESH_STATUSES = {
+    "updated",
+    "success",
+    "success_zero_items",
+    "checked_unchanged",
+    "timeout",
+    "failed",
+    "error",
+}
 
 
 def source_name(row: CompetitorPriceList) -> str:
@@ -102,6 +112,25 @@ def visible_item_counts(db: Session, rows: list[CompetitorPriceList]) -> dict[in
     )
 
 
+def source_visibility_state(row: CompetitorPriceList, item_count: int) -> str:
+    if int(item_count or 0) > 0:
+        return "populated"
+    status = str(row.last_refresh_status or "").strip().casefold()
+    if status in PLACEHOLDER_REFRESH_STATUSES:
+        return "placeholder"
+    if status in {"success_zero_items", "updated", "success"}:
+        return "empty_success"
+    if status in {"timeout", "failed", "error", "stale"}:
+        return "failed_empty"
+    if status in ATTEMPTED_ZERO_REFRESH_STATUSES:
+        return "empty_success"
+    return "placeholder"
+
+
+def is_visible_source_row(row: CompetitorPriceList, item_count: int) -> bool:
+    return source_visibility_state(row, item_count) != "placeholder"
+
+
 def list_global_competitor_price_lists_for_format(
     *,
     db: Session,
@@ -124,7 +153,8 @@ def list_global_competitor_price_lists_for_format(
     counts = visible_item_counts(db, rows)
     for row in rows:
         setattr(row, "_visible_item_count", int(counts.get(int(row.id), 0)))
-    rows = [row for row in rows if int(counts.get(int(row.id), 0)) > 0]
+        setattr(row, "_source_visibility_state", source_visibility_state(row, int(counts.get(int(row.id), 0))))
+    rows = [row for row in rows if is_visible_source_row(row, int(counts.get(int(row.id), 0)))]
     return _dedupe_global_rows(rows)
 
 

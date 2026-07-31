@@ -10,10 +10,13 @@ from sqlalchemy.orm import Session
 from ...models import (
     BendRange,
     BendTemplate,
+    BendTemplateRow,
     MarkupRange,
     MarkupTemplate,
+    MarkupTemplateRow,
     NoCompetitorMarkupRange,
     NoCompetitorMarkupTemplate,
+    NoCompetitorMarkupTemplateRow,
     PriceFormat,
     PricingRule,
     RoundingRule,
@@ -25,7 +28,7 @@ from ...timezone import local_iso, now_kz_naive
 
 
 def pricing_rule_to_dict(row: PricingRule, *, include_templates: bool = True) -> dict:
-    return {
+    data = {
         "id": row.id,
         "code": row.code,
         "name": row.name,
@@ -44,6 +47,10 @@ def pricing_rule_to_dict(row: PricingRule, *, include_templates: bool = True) ->
         "noCompetitorTemplate": template_to_dict(row.no_competitor_template, "no_competitor") if include_templates and getattr(row, "no_competitor_template", None) else None,
         "roundingRule": rounding_to_dict(row.rounding_rule) if include_templates and getattr(row, "rounding_rule", None) else None,
     }
+    warnings = getattr(row, "copy_warnings", None)
+    if warnings:
+        data["copyWarnings"] = warnings
+    return data
 
 
 def _attach_templates(db: Session, rows: list[PricingRule]) -> None:
@@ -207,12 +214,144 @@ def delete_pricing_rule(*, db: Session, rule_id: int) -> None:
     db.commit()
 
 
-def copy_pricing_rule(*, db: Session, rule_id: int) -> PricingRule:
+def _unique_code(db: Session, model, base: str) -> str:
+    root = "".join(ch if ch.isalnum() else "_" for ch in base.strip()).strip("_") or "copy"
+    root = root[:80]
+    candidate = root
+    suffix = 1
+    while db.execute(select(model).where(model.code == candidate)).scalars().first() is not None:
+        suffix += 1
+        candidate = f"{root}_{suffix}"
+    return candidate
+
+
+def _copy_template(db: Session, *, source, template_model, row_model, value_attr: str, code: str, name: str):
+    copied = template_model(
+        code=_unique_code(db, template_model, code),
+        name=name,
+        description=source.description,
+        is_active=source.is_active,
+    )
+    db.add(copied)
+    db.flush()
+    for item in sorted(source.rows, key=lambda x: (x.sort_order, float(x.cost_from))):
+        db.add(
+            row_model(
+                template_id=copied.id,
+                cost_from=float(item.cost_from),
+                cost_to=float(item.cost_to) if item.cost_to is not None else None,
+                **{value_attr: float(getattr(item, value_attr))},
+                sort_order=item.sort_order,
+            )
+        )
+    db.flush()
+    return copied
+
+
+def _copy_rounding_rule(db: Session, *, source: RoundingRule, code: str, name: str) -> RoundingRule:
+    copied = RoundingRule(
+        code=_unique_code(db, RoundingRule, code),
+        name=name,
+        mode=source.mode,
+        precision=source.precision,
+        step=float(source.step) if source.step is not None else None,
+        is_active=source.is_active,
+    )
+    db.add(copied)
+    db.flush()
+    return copied
+
+
+def copy_pricing_rule(*, db: Session, rule_id: int, payload: dict | None = None) -> PricingRule:
     source = get_pricing_rule(db=db, rule_id=rule_id)
-    payload = pricing_rule_to_dict(source, include_templates=False)
-    payload["code"] = f"{payload['code']}_copy_{int(now_kz_naive().timestamp())}"
-    payload["name"] = f"{payload['name']} (копия)"
-    return upsert_pricing_rule(db=db, payload=payload)
+    payload = payload or {}
+    name = str(payload.get("name") or "").strip()
+    code = str(payload.get("code") or "").strip()
+    if not name:
+        raise ValueError("name is required")
+    if not code:
+        raise ValueError("code is required")
+    if int(source.id) == int(payload.get("id") or 0):
+        raise ValueError("cannot copy pricing rule into itself")
+    if db.execute(select(PricingRule).where(PricingRule.code == code)).scalars().first() is not None:
+        raise ValueError("code must be unique")
+    if db.execute(select(PricingRule).where(PricingRule.name == name)).scalars().first() is not None:
+        raise ValueError("name must be unique")
+
+    warnings: list[str] = []
+    try:
+        row = PricingRule(
+            code=code,
+            name=name,
+            description=str(payload.get("description") if payload.get("description") is not None else source.description or "").strip(),
+            region_scope=str(payload.get("regionScope") if payload.get("regionScope") is not None else source.region_scope or "").strip(),
+            branch_scope=str(payload.get("branchScope") if payload.get("branchScope") is not None else source.branch_scope or "").strip(),
+            is_active=bool(payload.get("isActive")) if payload.get("isActive") is not None else bool(source.is_active),
+        )
+        db.add(row)
+        db.flush()
+
+        if source.markup_template_id:
+            if source.markup_template is None:
+                warnings.append("markupTemplate missing")
+            else:
+                copied = _copy_template(
+                    db,
+                    source=source.markup_template,
+                    template_model=MarkupTemplate,
+                    row_model=MarkupTemplateRow,
+                    value_attr="markup_percent",
+                    code=f"{code}_markup",
+                    name=f"{name} — наценка",
+                )
+                row.markup_template_id = copied.id
+
+        if source.bend_template_id:
+            if source.bend_template is None:
+                warnings.append("bendTemplate missing")
+            else:
+                copied = _copy_template(
+                    db,
+                    source=source.bend_template,
+                    template_model=BendTemplate,
+                    row_model=BendTemplateRow,
+                    value_attr="bend_percent",
+                    code=f"{code}_bend",
+                    name=f"{name} — прогиб",
+                )
+                row.bend_template_id = copied.id
+
+        if source.no_competitor_template_id:
+            if source.no_competitor_template is None:
+                warnings.append("noCompetitorTemplate missing")
+            else:
+                copied = _copy_template(
+                    db,
+                    source=source.no_competitor_template,
+                    template_model=NoCompetitorMarkupTemplate,
+                    row_model=NoCompetitorMarkupTemplateRow,
+                    value_attr="markup_percent",
+                    code=f"{code}_no_competitor",
+                    name=f"{name} — без конкурентов",
+                )
+                row.no_competitor_template_id = copied.id
+
+        if source.rounding_rule_id:
+            if source.rounding_rule is None:
+                warnings.append("roundingRule missing")
+            else:
+                copied = _copy_rounding_rule(db, source=source.rounding_rule, code=f"{code}_rounding", name=f"{name} — округление")
+                row.rounding_rule_id = copied.id
+
+        touch(row)
+        db.commit()
+        db.refresh(row)
+        _attach_templates(db, [row])
+        row.copy_warnings = warnings
+        return row
+    except Exception:
+        db.rollback()
+        raise
 
 
 def apply_pricing_rule_to_format(*, db: Session, format_code: str, rule_id: int) -> dict:
@@ -226,6 +365,9 @@ def apply_pricing_rule_to_format(*, db: Session, format_code: str, rule_id: int)
     pf.pricing_rule_id = rule.id
     pf.pricing_rule = rule.code
     pf.rounding_rule_id = rule.rounding_rule_id
+    pf.applied_markup_template_id = rule.markup_template_id if rule.markup_template is not None else None
+    pf.applied_bend_template_id = rule.bend_template_id if rule.bend_template is not None else None
+    pf.applied_no_competitor_template_id = rule.no_competitor_template_id if rule.no_competitor_template is not None else None
     pf.pricing_rule_applied_at = now_kz_naive()
     updated_tables: list[str] = []
 

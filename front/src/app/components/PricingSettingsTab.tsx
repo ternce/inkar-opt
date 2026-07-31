@@ -3,9 +3,18 @@ import { Input } from './ui/input';
 import { Label } from './ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { BarChart3, FileText, ListChecks, Save, Settings, Trash2, PlugZap, RefreshCw, Percent, SlidersHorizontal, TrendingDown } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { listTypeLabel } from './listTypeLabels';
+import { resolvePricingRuleSettings } from '../pricingRuleSettings';
+import {
+  canRetryPercentilePreparation,
+  percentilePreparationClassName,
+  percentilePreparationMessage,
+  percentilePreparationStatusText,
+  shouldPollPercentilePreparation,
+  type PercentilePreparation,
+} from '../percentilePreparationStatus';
 import {
   competitorFreshnessClassName,
   competitorFreshnessLabel,
@@ -129,6 +138,7 @@ type FormatReadiness = {
   status: 'ok' | 'warning' | 'error' | string;
   canGenerate: boolean;
   items: ReadinessItem[];
+  percentilePreparation?: PercentilePreparation;
 };
 
 const DEFAULT_MARKUPS: MarkupRow[] = [
@@ -201,6 +211,8 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
   const [roundingRuleId, setRoundingRuleId] = useState('none');
   const [roundingRules, setRoundingRules] = useState<RoundingRuleOption[]>([]);
   const [appliedRule, setAppliedRule] = useState<AppliedRuleStatus | null>(null);
+  const [ruleConfigLoading, setRuleConfigLoading] = useState(false);
+  const [ruleConfigMessage, setRuleConfigMessage] = useState<string | null>(null);
   const [competitorPriceMode, setCompetitorPriceMode] = useState('regular');
   const [percentileNumber, setPercentileNumber] = useState('10');
   const [deflectionPercent, setDeflectionPercent] = useState('0');
@@ -213,11 +225,16 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
   const [universalLists, setUniversalLists] = useState<UniversalListRow[]>([]);
   const [generatedLists, setGeneratedLists] = useState<GeneratedPriceListRow[]>([]);
   const [readiness, setReadiness] = useState<FormatReadiness | null>(null);
+  const [percentilePreparation, setPercentilePreparation] = useState<PercentilePreparation | null>(null);
+  const [percentilePreparationBusy, setPercentilePreparationBusy] = useState(false);
   const [accountSource, setAccountSource] = useState('provisor');
   const [accountLogin, setAccountLogin] = useState('');
   const [accountPassword, setAccountPassword] = useState('');
   const [accountConfig, setAccountConfig] = useState('{"filialIds": []}');
   const [accountBusyId, setAccountBusyId] = useState<number | null>(null);
+  const ruleConfigRequestRef = useRef(0);
+  const ruleConfigAbortRef = useRef<AbortController | null>(null);
+  const percentilePreparationRequestRef = useRef(0);
 
   const parseJsonOrNull = (text: string) => {
     try {
@@ -274,7 +291,11 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
       ));
     }
     if (generatedRes.ok) setGeneratedLists(Array.isArray(generatedData) ? generatedData : []);
-    if (readinessRes.ok) setReadiness(Array.isArray(readinessData?.items) ? readinessData.items[0] || null : null);
+    if (readinessRes.ok) {
+      const nextReadiness = Array.isArray(readinessData?.items) ? readinessData.items[0] || null : null;
+      setReadiness(nextReadiness);
+      if (nextReadiness?.percentilePreparation) setPercentilePreparation(nextReadiness.percentilePreparation);
+    }
   };
 
   useEffect(() => {
@@ -305,9 +326,11 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
         setPricingRuleId(data?.pricingRuleId ? String(data.pricingRuleId) : 'none');
         setRoundingRuleId(data?.roundingRuleId ? String(data.roundingRuleId) : 'none');
         setAppliedRule(data?.appliedRule || null);
+        setRuleConfigMessage(null);
         setCompetitorPriceMode(String(data?.competitorPriceMode ?? 'regular'));
         setPercentileNumber(String(data?.percentileNumber ?? '10'));
         setDeflectionPercent(String(data?.deflectionPercent ?? '0'));
+        setPercentilePreparation(data?.percentilePreparation || null);
 
         const rec = Array.isArray(data?.recommendedMarkups) ? data.recommendedMarkups : [];
         if (rec.length) {
@@ -360,6 +383,60 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
     void load();
     void loadAccounts().catch((e: any) => setError(e?.message || 'Ошибка загрузки аккаунтов'));
   }, [formatCode]);
+
+  useEffect(() => () => {
+    ruleConfigAbortRef.current?.abort();
+  }, []);
+
+  const loadPercentilePreparationStatus = async (priceFormatId: number) => {
+    const requestId = ++percentilePreparationRequestRef.current;
+    const res = await fetch(`/api/price-formats/${priceFormatId}/percentile-preparation-status`);
+    const text = await res.text();
+    const data = parseJsonOrNull(text);
+    if (!res.ok) throw new Error((data && data.detail) || text || 'Не удалось загрузить статус подготовки персентилей');
+    if (requestId === percentilePreparationRequestRef.current) {
+      setPercentilePreparation(data || null);
+    }
+    return data as PercentilePreparation;
+  };
+
+  useEffect(() => {
+    const priceFormatId = percentilePreparation?.priceFormatId;
+    if (!priceFormatId || !shouldPollPercentilePreparation(percentilePreparation.status)) return;
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      try {
+        await loadPercentilePreparationStatus(Number(priceFormatId));
+        if (!cancelled) await loadPassportData(branch);
+      } catch (e: any) {
+        if (!cancelled) setError(e?.message || 'Не удалось обновить статус подготовки персентилей');
+      }
+    }, 2500);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [percentilePreparation?.priceFormatId, percentilePreparation?.status, branch]);
+
+  const retryPercentilePreparation = async () => {
+    const priceFormatId = percentilePreparation?.priceFormatId;
+    if (!priceFormatId) return;
+    setPercentilePreparationBusy(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/price-formats/${priceFormatId}/percentile-preparation/retry`, { method: 'POST' });
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) throw new Error((data && data.detail) || text || 'Не удалось повторить подготовку персентилей');
+      setPercentilePreparation(data || null);
+      toast.success('Подготовка персентилей запущена');
+    } catch (e: any) {
+      setError(e?.message || 'Не удалось повторить подготовку персентилей');
+      toast.error(e?.message || 'Не удалось повторить подготовку персентилей');
+    } finally {
+      setPercentilePreparationBusy(false);
+    }
+  };
 
   const saveAccount = async () => {
     setIsLoading(true);
@@ -449,7 +526,66 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
     return 'Не проверено';
   };
 
-  const canSave = useMemo(() => !isLoading, [isLoading]);
+  const canSave = useMemo(() => !isLoading && !ruleConfigLoading, [isLoading, ruleConfigLoading]);
+  const isSettingsBusy = isLoading || ruleConfigLoading;
+
+  const clearResolvedRuleSettings = () => {
+    setRecommendedMarkups([]);
+    setNoCompetitorMarkups([]);
+    setBendRanges([]);
+    setRoundingRuleId('none');
+    setRuleConfigMessage(null);
+  };
+
+  const handlePricingRuleChange = async (value: string) => {
+    ruleConfigAbortRef.current?.abort();
+    const requestId = ruleConfigRequestRef.current + 1;
+    ruleConfigRequestRef.current = requestId;
+    setPricingRuleId(value);
+    clearResolvedRuleSettings();
+
+    if (value === 'none') {
+      setPricingRule('');
+      setRuleConfigLoading(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    ruleConfigAbortRef.current = controller;
+    setRuleConfigLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/pricing-rules/${encodeURIComponent(value)}`, { signal: controller.signal });
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) throw new Error((data && data.detail) || text || 'Не удалось загрузить настройки правила ЦО');
+      if (requestId !== ruleConfigRequestRef.current) return;
+
+      const resolved = resolvePricingRuleSettings(data);
+      setPricingRule(resolved.pricingRule);
+      setRoundingRuleId(resolved.roundingRuleId);
+      setRecommendedMarkups(resolved.recommendedMarkups);
+      setNoCompetitorMarkups(resolved.noCompetitorMarkups);
+      setBendRanges(resolved.bendRanges);
+      if (resolved.missingLinkedTemplates.length) {
+        setRuleConfigMessage('Связанный шаблон недоступен. Проверьте настройки выбранного правила.');
+      } else if (!resolved.hasLinkedSettings) {
+        setRuleConfigMessage('Для выбранного правила настройки ещё не заданы');
+      } else {
+        setRuleConfigMessage(null);
+      }
+    } catch (e: any) {
+      if (e?.name === 'AbortError' || requestId !== ruleConfigRequestRef.current) return;
+      clearResolvedRuleSettings();
+      const message = e?.message || 'Ошибка загрузки настроек правила ЦО';
+      setRuleConfigMessage(message);
+      setError(message);
+    } finally {
+      if (requestId === ruleConfigRequestRef.current) {
+        setRuleConfigLoading(false);
+      }
+    }
+  };
 
   const applyRuleToFormat = async () => {
     if (pricingRuleId === 'none') return;
@@ -473,6 +609,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
         setPricingRuleId(settings?.pricingRuleId ? String(settings.pricingRuleId) : 'none');
         setRoundingRuleId(settings?.roundingRuleId ? String(settings.roundingRuleId) : 'none');
         setAppliedRule(settings?.appliedRule || data?.appliedRule || null);
+        setRuleConfigMessage(null);
         setRecommendedMarkups((settings.recommendedMarkups || []).map((r: any, idx: number) => ({ id: Number(r?.id ?? idx + 1), lowerBound: String(r?.lowerBound ?? ''), upperBound: String(r?.upperBound ?? ''), markupPercent: String(r?.markupPercent ?? '') })));
         setNoCompetitorMarkups((settings.noCompetitorMarkups || []).map((r: any, idx: number) => ({ id: Number(r?.id ?? idx + 1), lowerBound: String(r?.lowerBound ?? ''), upperBound: String(r?.upperBound ?? ''), markupPercent: String(r?.markupPercent ?? '') })));
         setBendRanges((settings.bendRanges || []).map((r: any, idx: number) => ({ id: Number(r?.id ?? idx + 1), priceFrom: String(r?.priceFrom ?? ''), bendPercent: String(r?.bendPercent ?? '') })));
@@ -532,9 +669,11 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
       setPricingRuleId(data?.pricingRuleId ? String(data.pricingRuleId) : 'none');
       setRoundingRuleId(data?.roundingRuleId ? String(data.roundingRuleId) : 'none');
       setAppliedRule(data?.appliedRule || null);
+      setRuleConfigMessage(null);
       setCompetitorPriceMode(String(data?.competitorPriceMode ?? 'regular'));
       setPercentileNumber(String(data?.percentileNumber ?? '10'));
       setDeflectionPercent(String(data?.deflectionPercent ?? '0'));
+      setPercentilePreparation(data?.percentilePreparation || null);
       if (Array.isArray(data?.recommendedMarkups)) {
         setRecommendedMarkups(
           data.recommendedMarkups.map((r: any, idx: number) => ({
@@ -590,7 +729,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
   const ruleTables = appliedRule?.tablesUpdated?.length ? appliedRule.tablesUpdated : ['markup', 'bend', 'no_competitor', 'rounding'];
   const readinessGroups = [
     { title: 'Справочники', items: readiness?.items?.filter((item) => ['products', 'rating_global', 'rating_local'].includes(item.kind)) || [] },
-    { title: 'ПЛК', items: readiness?.items?.filter((item) => ['competitors', 'competitor_freshness'].includes(item.kind)) || [] },
+    { title: 'ПЛК', items: readiness?.items?.filter((item) => ['competitors', 'competitor_freshness', 'percentile_sources', 'percentile_preparation'].includes(item.kind)) || [] },
     { title: 'Правило ЦО', items: readiness?.items?.filter((item) => ['pricing_rule', 'markup', 'bend', 'no_competitor'].includes(item.kind)) || [] },
     { title: 'Списки', items: [{ kind: 'lists', label: 'Универсальные списки', status: activeLists.length ? 'ok' : 'warning', message: `Активных списков: ${activeLists.length}` }] },
     { title: 'Себестоимость/остатки', items: readiness?.items?.filter((item) => ['cost', 'stock'].includes(item.kind)) || [] },
@@ -661,6 +800,34 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
             <Button variant="outline" onClick={() => onNavigate?.('pricing')}><Settings className="mr-2 h-4 w-4" />Изменить правило ЦО</Button>
             <Button variant="outline" onClick={() => onNavigate?.('universal-lists')}><ListChecks className="mr-2 h-4 w-4" />Универсальные списки</Button>
           </div>
+        </div>
+      </section>
+
+      <section className="admin-card p-5 space-y-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <h3 className="text-base font-semibold text-gray-900">Подготовка персентилей</h3>
+            <p className="mt-1 text-sm text-gray-600">{percentilePreparationMessage(percentilePreparation)}</p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className={`status-pill ${percentilePreparationClassName(percentilePreparation?.status)}`}>
+              {percentilePreparationStatusText(percentilePreparation?.status)}
+            </span>
+            {shouldPollPercentilePreparation(percentilePreparation?.status) ? (
+              <RefreshCw className="h-4 w-4 animate-spin text-gray-500" />
+            ) : null}
+            {canRetryPercentilePreparation(percentilePreparation?.status) ? (
+              <Button variant="outline" size="sm" onClick={retryPercentilePreparation} disabled={percentilePreparationBusy}>
+                <RefreshCw className={`mr-2 h-4 w-4 ${percentilePreparationBusy ? 'animate-spin' : ''}`} />
+                Повторить
+              </Button>
+            ) : null}
+          </div>
+        </div>
+        <div className="grid grid-cols-1 gap-3 text-sm sm:grid-cols-3">
+          <div><div className="text-gray-500">Строк персентилей</div><strong className="text-gray-900">{fmtNumber(percentilePreparation?.rowsCount)}</strong></div>
+          <div><div className="text-gray-500">Источник обновлён</div><strong className="text-gray-900">{fmtDateTime(percentilePreparation?.sourceRefreshedAt)}</strong></div>
+          <div><div className="text-gray-500">Завершено</div><strong className="text-gray-900">{fmtDateTime(percentilePreparation?.completedAt || percentilePreparation?.failedAt)}</strong></div>
         </div>
       </section>
 
@@ -775,7 +942,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
           <div className="space-y-2 col-span-2">
             <Label htmlFor="rule">Правило ЦО</Label>
             <div className="grid grid-cols-1 gap-3 lg:grid-cols-[1fr_auto]">
-              <Select value={pricingRuleId} onValueChange={setPricingRuleId} disabled={isLoading}>
+              <Select value={pricingRuleId} onValueChange={handlePricingRuleChange} disabled={isLoading}>
                 <SelectTrigger id="rule">
                   <SelectValue placeholder="Выберите правило ЦО" />
                 </SelectTrigger>
@@ -786,16 +953,25 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
                   ))}
                 </SelectContent>
               </Select>
-              <Button type="button" onClick={applyRuleToFormat} disabled={isLoading || pricingRuleId === 'none'} className="bg-blue-600 hover:bg-blue-700">
+              <Button type="button" onClick={applyRuleToFormat} disabled={isSettingsBusy || pricingRuleId === 'none'} className="bg-blue-600 hover:bg-blue-700">
                 Применить к ЦФ
               </Button>
             </div>
             {appliedRule ? <AppliedRuleStatusCard appliedRule={appliedRule} /> : null}
+            {ruleConfigLoading ? (
+              <div className="rounded-md border border-blue-100 bg-blue-50 px-3 py-2 text-sm text-blue-800">
+                Загрузка настроек выбранного правила...
+              </div>
+            ) : ruleConfigMessage ? (
+              <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                {ruleConfigMessage}
+              </div>
+            ) : null}
           </div>
 
           <div className="space-y-2">
             <Label htmlFor="competitor-mode">Источник цены конкурента</Label>
-            <Select value={competitorPriceMode || 'regular'} onValueChange={setCompetitorPriceMode} disabled={isLoading}>
+            <Select value={competitorPriceMode || 'regular'} onValueChange={setCompetitorPriceMode} disabled={isSettingsBusy}>
               <SelectTrigger id="competitor-mode">
                 <SelectValue />
               </SelectTrigger>
@@ -824,7 +1000,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
 
           <div className="space-y-2">
             <Label htmlFor="percentile-number">Персентиль</Label>
-            <Select value={percentileNumber || '10'} onValueChange={setPercentileNumber} disabled={isLoading || competitorPriceMode === 'regular'}>
+            <Select value={percentileNumber || '10'} onValueChange={setPercentileNumber} disabled={isSettingsBusy || competitorPriceMode === 'regular'}>
               <SelectTrigger id="percentile-number">
                 <SelectValue />
               </SelectTrigger>
@@ -838,7 +1014,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
 
           <div className="space-y-2 col-span-2">
             <Label htmlFor="rounding-rule">Округление</Label>
-            <Select value={roundingRuleId} onValueChange={setRoundingRuleId} disabled={isLoading}>
+            <Select value={roundingRuleId} onValueChange={setRoundingRuleId} disabled={isSettingsBusy}>
               <SelectTrigger id="rounding-rule">
                 <SelectValue placeholder="Правило округления" />
               </SelectTrigger>
@@ -857,7 +1033,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
               id="deflection"
               value={deflectionPercent}
               onChange={(e) => setDeflectionPercent(e.target.value)}
-              disabled={isLoading}
+              disabled={isSettingsBusy}
             />
             <div className="text-xs text-gray-500">
               Используется как запасной вариант, если таблица прогиба ниже пустая.

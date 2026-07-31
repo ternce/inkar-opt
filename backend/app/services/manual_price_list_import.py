@@ -27,7 +27,8 @@ from ..models import (
 )
 from .competitor_persist import _ensure_price_format
 from .competitor_matching import rebuild_competitor_prices_for_selected, rematch_price_list_items_by_product
-from .competitor_percentiles import DEFAULT_BRANCH, recalculate_competitor_percentiles_if_needed
+from .competitor_percentiles import DEFAULT_BRANCH
+from .percentile_preparation import enqueue_percentile_preparation
 from .sku import normalize_sku, normalize_sku_variants
 from ..timezone import now_kz_naive
 
@@ -584,8 +585,8 @@ def import_manual_price_list(
             metadata={"priceListId": int(row.id), "sourceKey": source_key},
         )
         rebuild_competitor_prices_for_selected(db=db, price_format_id=int(pf.id))
-        recalculate_competitor_percentiles_if_needed(db=db, price_format_id=int(pf.id))
         db.commit()
+        enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="manual_price_list_imported")
         inventory = {
             "mode": "apply",
             "price_list_id": int(row.id),

@@ -84,7 +84,7 @@ const parseJson = (text: string) => {
 };
 
 const formatScope = (row: ListRow) => {
-  if (row.scope === 'global') return 'Глобально';
+  if (row.scope === 'global') return 'Глобально: все ЦФ';
   if (!row.priceFormats.length) return 'Не привязан';
   return row.priceFormats.map((format) => format.code).join(', ');
 };
@@ -132,6 +132,7 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
   const [isImporting, setIsImporting] = useState(false);
 
   const selectedCodes = useMemo(() => new Set(form.formatCodes), [form.formatCodes]);
+  const memorandumRows = useMemo(() => rows.filter((row) => row.type === 'memorandum' || listTypeLabel(row.type, row.typeLabel) === 'Меморандум'), [rows]);
 
   const loadRows = async () => {
     setIsLoading(true);
@@ -187,6 +188,11 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
       formatCodes: row?.priceFormats.map((format) => format.code) || (selectedFormatCode ? [selectedFormatCode] : []),
     });
     setEditorOpen(true);
+  };
+
+  const openMemorandumEditor = () => {
+    openEditor();
+    setForm((prev) => ({ ...prev, type: 'memorandum' }));
   };
 
   const saveList = async () => {
@@ -350,6 +356,27 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
             <SelectItem value="inactive">Неактивные вручную</SelectItem>
           </SelectContent>
         </Select>
+      </div>
+
+      <div className="business-grid">
+        <section className="business-panel">
+          <div className="panel-head">
+            <h3>Меморандум</h3>
+            <span>{memorandumRows.length} шт.</span>
+          </div>
+          <div className="details-grid">
+            <div><span>Назначение</span><strong>Регулируемый максимум цены</strong></div>
+            <div><span>Применение</span><strong>После расчета и округления</strong></div>
+            <div><span>Глобальный список</span><strong>Без привязанных ЦФ применяется ко всем ЦФ</strong></div>
+          </div>
+          <div className="business-actions mt-3">
+            <Button onClick={() => setTypeFilter('memorandum')}>Показать меморандумы</Button>
+            <Button onClick={openMemorandumEditor}>
+              <Plus className="h-4 w-4 mr-2" />
+              Создать меморандум
+            </Button>
+          </div>
+        </section>
       </div>
 
       {error && <div className="business-alert bad">{error}</div>}
@@ -552,8 +579,13 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
           <div className="format-picker">
             <div className="format-picker-head">
               <strong>Привязанные ЦФ</strong>
-              <Button variant="ghost" size="sm" onClick={() => setForm((prev) => ({ ...prev, formatCodes: [] }))}>Глобально</Button>
+              <Button variant="ghost" size="sm" onClick={() => setForm((prev) => ({ ...prev, formatCodes: [] }))}>Глобально: все ЦФ</Button>
             </div>
+            {!form.formatCodes.length ? (
+              <div className="business-alert warn">
+                Глобальный список применяется ко всем ЦФ. Для ограничения области выберите один или несколько ЦФ ниже.
+              </div>
+            ) : null}
             <div className="format-chip-grid">
               {priceFormats.map((format) => (
                 <label key={format.code} className={`format-chip ${selectedCodes.has(format.code) ? 'selected' : ''}`}>

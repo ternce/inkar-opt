@@ -80,6 +80,12 @@ type PriceItem = {
   bestCompetitorPrice: number | null;
   priceAfterBend: number | null;
   finalPrice: number;
+  memorandumMaxPrice?: number | null;
+  priceBeforeMemorandum?: number | null;
+  memorandumApplied?: boolean;
+  memorandumBelowMdc?: boolean;
+  memorandumListName?: string;
+  memorandumReason?: string;
   markupPercent: number | null;
   zone: string | null;
   priceSource: string;
@@ -473,7 +479,7 @@ export function PriceListsTab({ formatCode, initialPriceListNumber = '' }: Price
             </div>
             <CompactTable
               empty="По выбранным фильтрам нет товаров"
-              columns={['SKU', 'Рейтинг глобальный', 'Рейтинг локальный', 'Наименование', 'Производитель', 'Остаток', 'Себестоимость', 'Базовая цена', 'МДЦ', 'Лучший конкурент', ...competitorColumns.map((column) => column.title || column.key), 'После прогиба', 'Финальная цена', 'Наценка %', 'Зона', 'Источник', 'Персентиль', 'Причина']}
+              columns={['SKU', 'Рейтинг глобальный', 'Рейтинг локальный', 'Наименование', 'Производитель', 'Остаток', 'Себестоимость', 'Базовая цена', 'МДЦ', 'Лучший конкурент', ...competitorColumns.map((column) => column.title || column.key), 'После прогиба', 'Финальная цена', 'Цена по меморандуму', 'Наценка %', 'Зона', 'Источник', 'Персентиль', 'Причина']}
               rows={items.map((row) => [
                 row.sku,
                 fmtNumber(row.globalRating),
@@ -488,6 +494,15 @@ export function PriceListsTab({ formatCode, initialPriceListNumber = '' }: Price
                 ...competitorColumns.map((column) => renderCompetitorCell(row, column)),
                 fmtNumber(row.priceAfterBend),
                 <strong key={`${row.sku}-final`}>{fmtNumber(row.finalPrice)}</strong>,
+                row.memorandumMaxPrice ? (
+                  <div key={`${row.sku}-memo`} className="text-xs">
+                    <span className={`status-pill ${row.memorandumBelowMdc ? 'bad' : row.memorandumApplied ? 'warn' : 'ok'}`}>
+                      Меморандум: {fmtNumber(row.memorandumMaxPrice)}
+                    </span>
+                    {row.memorandumApplied ? <div className="text-amber-700">Цена ограничена меморандумом</div> : null}
+                    {row.memorandumBelowMdc ? <div className="text-red-700">Меморандум ниже МДЦ</div> : null}
+                  </div>
+                ) : DASH,
                 row.markupPercent != null ? `${fmtNumber(row.markupPercent)}%` : DASH,
                 <ZoneBadge key={`${row.sku}-zone`} zone={row.zone} showList={Boolean(row.listOverrideLog)} />,
                 row.priceSource || DASH,
@@ -560,6 +575,16 @@ export function PriceListsTab({ formatCode, initialPriceListNumber = '' }: Price
                   <p>Поле: {selectedItem.listOverrideLog.affectedField || 'Параметр расчёта'}</p>
                   <p className="mt-2 font-medium">{selectedItem.listOverrideLog.action}</p>
                   {selectedItem.listOverrideLog.ambiguous ? <p className="mt-2 font-semibold">Статус: правило требует бизнес-подтверждения.</p> : null}
+                </div>
+              ) : null}
+              {selectedItem.memorandumMaxPrice ? (
+                <div className="rounded-md border border-amber-300 bg-amber-50 p-4 text-sm text-amber-950">
+                  <strong className="block mb-2">Меморандум</strong>
+                  <p>Максимальная цена: {fmtNumber(selectedItem.memorandumMaxPrice)}</p>
+                  <p>Цена до меморандума: {fmtNumber(selectedItem.priceBeforeMemorandum)}</p>
+                  <p>Список: {selectedItem.memorandumListName || DASH}</p>
+                  <p className="mt-2 font-medium">{selectedItem.memorandumReason || (selectedItem.memorandumApplied ? 'Цена ограничена меморандумом' : 'Цена ниже ограничения')}</p>
+                  {selectedItem.memorandumBelowMdc ? <p className="mt-2 font-semibold text-red-700">Меморандум ниже МДЦ</p> : null}
                 </div>
               ) : null}
               {selectedItem.log.map((line) => (

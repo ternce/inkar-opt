@@ -11,6 +11,7 @@ export const LIST_TYPE_LABELS: Record<string, string> = {
 };
 
 LIST_TYPE_LABELS.fixed_markup = 'Фиксированная наценка';
+LIST_TYPE_LABELS.memorandum = 'Меморандум';
 
 const LABEL_TO_CODE = Object.fromEntries(
   Object.entries(LIST_TYPE_LABELS).map(([code, label]) => [label.toLocaleLowerCase('ru-RU'), code])
@@ -27,6 +28,9 @@ export const listTypeLabel = (value?: string, fallback?: string) => {
 };
 
 export const listTypeImpact = (value?: string) => {
+  if (String(value || '').trim() === 'memorandum' || listTypeLabel(value) === 'Меморандум') {
+    return 'ограничивает финальную цену регулируемым максимумом';
+  }
   const label = listTypeLabel(value);
   switch (label) {
     case 'Фиксированная цена':

@@ -33,6 +33,7 @@ from backend.app.models import (
     ProductRating,
     ReferenceImportJob,
     ReferenceUpdateStatus,
+    RegularCompetitorPricePercentile,
     RoundingRule,
     UniversalList,
     UniversalListPriceFormat,
@@ -44,9 +45,15 @@ from backend.app.services.competitors.percentiles.read_models import (
     percentile_coverage_audit,
 )
 from backend.app.main import _competitor_column_title, _competitor_columns_for_price_list, _competitor_prices_by_product, _generated_item_dict, app
-from backend.app.services.competitor_percentiles import KAZAKHSTAN_REGION, KAZAKHSTAN_SCOPE, REGIONAL_SCOPE, recalculate_competitor_percentiles
+from backend.app.services.competitor_percentiles import (
+    KAZAKHSTAN_REGION,
+    KAZAKHSTAN_SCOPE,
+    REGIONAL_SCOPE,
+    REGULAR_COMPETITOR_SCOPE,
+    recalculate_competitor_percentiles,
+)
 from backend.app.services.competitor_source_config import MULTI_PRICE_PERCENTILE_MODE
-from backend.app.services.competitors.percentiles.sources import PERCENTILE_SOURCE_EMIT, percentile_source_id
+from backend.app.services.competitors.percentiles.sources import PERCENTILE_SOURCE_COMPETITOR, PERCENTILE_SOURCE_EMIT, percentile_source_id
 from backend.app.services.competitor_matching import rebuild_competitor_prices_for_selected
 from backend.app.services.pricing import (
     MISSING_STOCK_REFERENCE_ERROR,
@@ -106,6 +113,19 @@ def _emit_percentile_column_key(pf, *, source_key, region, competitor, percentil
     return f"percentile:{source_id}"
 
 
+def _regular_percentile_column_key(pf, *, identity, competitor, percentile):
+    source_id = percentile_source_id(
+        percentile_source=PERCENTILE_SOURCE_COMPETITOR,
+        price_format_id=pf.id,
+        scope=REGULAR_COMPETITOR_SCOPE,
+        source_key=identity,
+        region="",
+        competitor=competitor,
+        percentile=percentile,
+    )
+    return f"percentile:{source_id}"
+
+
 def _stored_percentile(db, pf, product, *, source_key, region, competitor, percentile, value, scope=REGIONAL_SCOPE):
     db.add(
         CompetitorPricePercentile(
@@ -122,6 +142,35 @@ def _stored_percentile(db, pf, product, *, source_key, region, competitor, perce
             price_count=1,
             used_price_count=1,
             status="Calculated",
+        )
+    )
+    db.flush()
+
+
+def _stored_regular_percentile(
+    db,
+    product,
+    *,
+    identity,
+    competitor,
+    percentile,
+    value,
+    sample_count=3,
+    source_count=1,
+    min_price=None,
+    max_price=None,
+):
+    db.add(
+        RegularCompetitorPricePercentile(
+            competitor_identity=identity,
+            competitor_name=competitor,
+            product_id=product.id,
+            percentile=percentile,
+            value=value,
+            sample_count=sample_count,
+            source_count=source_count,
+            min_price=min_price,
+            max_price=max_price,
         )
     )
     db.flush()
@@ -144,6 +193,26 @@ def _assign_emit_percentile_config(db, pf, *, source_key, region, competitor, pe
             product_id=None,
             source_name=source_name,
             supplier=f"{region} — {competitor} — P{percentile}",
+            coefficient=coefficient,
+        )
+    )
+    db.flush()
+    return source_name
+
+
+def _assign_regular_percentile_config(db, pf, *, identity, competitor, percentile, coefficient=1):
+    source_name = _regular_percentile_column_key(
+        pf,
+        identity=identity,
+        competitor=competitor,
+        percentile=percentile,
+    )
+    db.add(
+        CompetitorPrice(
+            price_format_id=pf.id,
+            product_id=None,
+            source_name=source_name,
+            supplier=f"{competitor} - P{percentile}",
             coefficient=coefficient,
         )
     )
@@ -320,6 +389,92 @@ def test_export_lookup_leaves_missing_percentile_cell_empty():
     assert values.get(product.id, {}).get(column_key) is None
 
 
+def test_export_lookup_populates_regular_percentile_column_with_exact_key_and_metadata():
+    db = _session()
+    pf = _format(db)
+    product = _product(db, code="REG-PCT", cost=100)
+    column_key = _assign_regular_percentile_config(
+        db,
+        pf,
+        identity="медсервис",
+        competitor="Медсервис",
+        percentile=30,
+        coefficient=Decimal("1.05"),
+    )
+    _stored_regular_percentile(
+        db,
+        product,
+        identity="медсервис",
+        competitor="Медсервис Алматы",
+        percentile=30,
+        value=Decimal("1595.17"),
+        sample_count=7,
+        source_count=2,
+        min_price=Decimal("1500"),
+        max_price=Decimal("1700"),
+    )
+
+    values = _competitor_prices_by_product(
+        db,
+        pf=pf,
+        product_ids=[product.id],
+        columns=[{"key": column_key, "title": "Медсервис - P30", "coefficient": 1.05}],
+    )
+
+    cell = values[product.id][column_key]
+    assert cell["price"] == pytest.approx(1674.9285)
+    assert cell["sourcePrice"] == pytest.approx(1595.17)
+    assert cell["sourceType"] == "percentile"
+    assert cell["percentileSourceType"] == "regular_competitor"
+    assert cell["canonicalIdentity"] == "медсервис"
+    assert cell["percentile"] == 30
+    assert cell["sampleCount"] == 7
+    assert cell["sourceName"] == "Медсервис - P30"
+    assert cell["matchedBy"] == "regular_competitor_price_percentiles"
+
+
+def test_export_lookup_keeps_regular_percentiles_physical_columns_and_missing_cells_separate():
+    db = _session()
+    pf = _format(db)
+    product_with_values = _product(db, code="REG-PCT-HIT", cost=100)
+    product_missing = _product(db, code="REG-PCT-MISS", cost=100)
+    physical_source = "provisor:account:12:plk:1392"
+    _competitor(db, pf, product_with_values, physical_source, Decimal("1400"))
+    medservice_key = _assign_regular_percentile_config(
+        db,
+        pf,
+        identity="медсервис",
+        competitor="Медсервис",
+        percentile=30,
+    )
+    atamiras_key = _assign_regular_percentile_config(
+        db,
+        pf,
+        identity="атамирас",
+        competitor="Атамирас",
+        percentile=20,
+    )
+    _stored_regular_percentile(db, product_with_values, identity="медсервис", competitor="Медсервис", percentile=30, value=Decimal("1595.17"))
+    _stored_regular_percentile(db, product_with_values, identity="атамирас", competitor="Атамирас", percentile=20, value=Decimal("1234.50"))
+
+    values = _competitor_prices_by_product(
+        db,
+        pf=pf,
+        product_ids=[product_with_values.id, product_missing.id],
+        columns=[
+            {"key": physical_source, "coefficient": 1},
+            {"key": medservice_key, "title": "Медсервис - P30", "coefficient": 1},
+            {"key": atamiras_key, "title": "Атамирас - P20", "coefficient": 1},
+        ],
+    )
+
+    assert values[product_with_values.id][physical_source]["price"] == pytest.approx(1400)
+    assert values[product_with_values.id][medservice_key]["price"] == pytest.approx(1595.17)
+    assert values[product_with_values.id][atamiras_key]["price"] == pytest.approx(1234.50)
+    assert values.get(product_missing.id, {}).get(medservice_key) is None
+    assert values.get(product_missing.id, {}).get(atamiras_key) is None
+
+
 def test_export_lookup_keeps_ordinary_competitor_columns_unchanged():
     db = _session()
     pf = _format(db)
@@ -379,6 +534,60 @@ def test_export_lookup_batches_percentile_rows_in_one_query():
 
     assert query_count == 1
     assert [values[product.id][column_key]["price"] for product in products] == pytest.approx([100, 101, 102])
+
+
+def _pricing_generation_select_count(product_count: int) -> int:
+    db = _session()
+    pf = _format(db)
+    pf.branch = "1"
+    db.add_all(
+        [
+            CompetitorPrice(price_format_id=pf.id, product_id=None, source_name="manual:a", supplier="Source A", coefficient=1),
+            CompetitorPrice(price_format_id=pf.id, product_id=None, source_name="manual:b", supplier="Source B", coefficient=1),
+        ]
+    )
+    products = []
+    for idx in range(product_count):
+        product = _product(db, code=f"BATCH-PRICE-{idx:03d}", cost=100 + idx)
+        products.append(product)
+        db.add(ProductExtra(product_id=product.id, manufacturer=f"Maker {idx % 3}"))
+        db.add(ProductRating(branch_id="", product_id=product.id, sku=product.code, rating_type="global", rating=idx % 5))
+        db.add(ProductRating(branch_id="1", product_id=product.id, sku=product.code, rating_type="local", rating=idx % 7))
+        db.add(CompetitorPrice(price_format_id=pf.id, product_id=product.id, source_name="manual:a", supplier="Source A", source_price=150 + idx, coefficient=1))
+        db.add(CompetitorPrice(price_format_id=pf.id, product_id=product.id, source_name="manual:b", supplier="Source B", source_price=140 + idx, coefficient=1))
+    _activate_all_products_for_generation(db)
+    db.commit()
+
+    select_count = 0
+
+    def _count_select(_conn, _cursor, statement, _parameters, _context, _executemany):
+        nonlocal select_count
+        if str(statement).lstrip().upper().startswith("SELECT"):
+            select_count += 1
+
+    engine = db.get_bind()
+    event.listen(engine, "before_cursor_execute", _count_select)
+    try:
+        calculate_prices(
+            db=db,
+            price_format_code=pf.code,
+            price_list_number=f"BATCH-QUERY-{product_count}",
+            as_of=date.today(),
+            activation_date=None,
+            user="test",
+            force_new_price_list=True,
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", _count_select)
+    return select_count
+
+
+def test_pricing_generation_batches_read_queries_for_product_set():
+    five_products = _pricing_generation_select_count(5)
+    twenty_five_products = _pricing_generation_select_count(25)
+
+    assert five_products <= 40
+    assert twenty_five_products <= five_products + 20
 
 
 def _activate_all_products_for_generation(db, *, branch_id="1"):

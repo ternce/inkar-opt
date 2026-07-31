@@ -68,9 +68,11 @@ def init_db() -> None:
     _ensure_nullable_percentile_values()
     _ensure_percentile_source_identity()
     _backfill_percentile_source_identity()
+    _backfill_account_scoped_provisor_source_keys()
     _ensure_compatible_indexes()
     _backfill_competitor_assignments()
     _backfill_competitor_price_coefficients()
+    _backfill_percentile_preparations()
 
 
 def _ensure_compatible_columns() -> None:
@@ -84,6 +86,9 @@ def _ensure_compatible_columns() -> None:
             ("percentile_number", "INTEGER DEFAULT 10"),
             ("pricing_rule_id", "INTEGER"),
             ("rounding_rule_id", "INTEGER"),
+            ("applied_markup_template_id", "INTEGER"),
+            ("applied_bend_template_id", "INTEGER"),
+            ("applied_no_competitor_template_id", "INTEGER"),
             ("pricing_rule_applied_at", "DATETIME"),
             ("pricing_rule_applied_tables_json", "TEXT DEFAULT '[]'"),
         ],
@@ -193,6 +198,20 @@ def _ensure_compatible_columns() -> None:
             ("lease_until", "DATETIME"),
             ("metadata_json", "TEXT DEFAULT '{}'"),
         ],
+        "price_format_percentile_preparations": [
+            ("price_format_id", "INTEGER"),
+            ("status", "VARCHAR(32) DEFAULT 'not_configured'"),
+            ("started_at", "DATETIME"),
+            ("completed_at", "DATETIME"),
+            ("failed_at", "DATETIME"),
+            ("last_error", "TEXT DEFAULT ''"),
+            ("source_refresh_id", "TEXT DEFAULT ''"),
+            ("source_refreshed_at", "DATETIME"),
+            ("configuration_fingerprint", "TEXT DEFAULT ''"),
+            ("job_id", "VARCHAR(64) DEFAULT ''"),
+            ("rows_count", "INTEGER DEFAULT 0"),
+            ("updated_at", "DATETIME"),
+        ],
         "product_substitute_matches": [
             ("product_id", "INTEGER"),
             ("source_type", "VARCHAR(64) DEFAULT 'provisor'"),
@@ -261,6 +280,13 @@ def _ensure_compatible_columns() -> None:
             ("mdc_markup_percent", "NUMERIC(18, 6)"),
             ("mdc_price", "NUMERIC(18, 4)"),
             ("competitor_candidate_price", "NUMERIC(18, 4)"),
+            ("memorandum_max_price", "NUMERIC(18, 4)"),
+            ("price_before_memorandum", "NUMERIC(18, 4)"),
+            ("memorandum_applied", "BOOLEAN DEFAULT FALSE"),
+            ("memorandum_below_mdc", "BOOLEAN DEFAULT FALSE"),
+            ("memorandum_list_id", "INTEGER"),
+            ("memorandum_list_name", "TEXT DEFAULT ''"),
+            ("memorandum_diagnostic_code", "VARCHAR(64) DEFAULT ''"),
             ("applied_source_name", "TEXT DEFAULT ''"),
             ("applied_source_type", "VARCHAR(64) DEFAULT ''"),
             ("applied_rule_name", "TEXT DEFAULT ''"),
@@ -329,6 +355,72 @@ def _ensure_compatible_columns() -> None:
                         conn.execute(text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {ddl_for_dialect}"))
                     else:
                         conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+    _ensure_regular_competitor_percentile_table()
+
+
+def _ensure_regular_competitor_percentile_table() -> None:
+    inspector = inspect(engine)
+    if inspector.has_table("regular_competitor_price_percentiles"):
+        return
+    with engine.begin() as conn:
+        if engine.dialect.name == "postgresql":
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS regular_competitor_price_percentiles (
+                        id SERIAL PRIMARY KEY,
+                        competitor_identity TEXT NOT NULL,
+                        competitor_name TEXT DEFAULT '',
+                        product_id INTEGER NOT NULL REFERENCES products(id),
+                        percentile INTEGER NOT NULL,
+                        value NUMERIC(18, 4),
+                        sample_count INTEGER DEFAULT 0,
+                        source_count INTEGER DEFAULT 0,
+                        min_price NUMERIC(18, 4),
+                        max_price NUMERIC(18, 4),
+                        algorithm_version VARCHAR(32) DEFAULT 'percentile_inc_v1',
+                        calculated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        CONSTRAINT uq_regular_comp_percentile_identity_product
+                            UNIQUE (competitor_identity, product_id, percentile)
+                    )
+                    """
+                )
+            )
+        else:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS regular_competitor_price_percentiles (
+                        id INTEGER PRIMARY KEY,
+                        competitor_identity TEXT NOT NULL,
+                        competitor_name TEXT DEFAULT '',
+                        product_id INTEGER NOT NULL REFERENCES products(id),
+                        percentile INTEGER NOT NULL,
+                        value NUMERIC(18, 4),
+                        sample_count INTEGER DEFAULT 0,
+                        source_count INTEGER DEFAULT 0,
+                        min_price NUMERIC(18, 4),
+                        max_price NUMERIC(18, 4),
+                        algorithm_version VARCHAR(32) DEFAULT 'percentile_inc_v1',
+                        calculated_at DATETIME,
+                        CONSTRAINT uq_regular_comp_percentile_identity_product
+                            UNIQUE (competitor_identity, product_id, percentile)
+                    )
+                    """
+                )
+            )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_regular_comp_percentile_lookup "
+                "ON regular_competitor_price_percentiles (competitor_identity, product_id, percentile)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_regular_comp_percentile_product "
+                "ON regular_competitor_price_percentiles (product_id)"
+            )
+        )
 
 
 def _ensure_compatible_column_types() -> None:
@@ -807,6 +899,11 @@ def _backfill_percentile_source_identity() -> None:
 def _ensure_compatible_indexes() -> None:
     indexes = [
         (
+            "ix_competitor_price_lists_provisor_account_external",
+            "competitor_price_lists",
+            ("source_type", "account_id", "external_price_list_id"),
+        ),
+        (
             "ix_competitor_price_list_items_pl_product",
             "competitor_price_list_items",
             ("price_list_id", "product_id"),
@@ -1055,3 +1152,202 @@ def _backfill_competitor_price_coefficients() -> None:
                         """
                     )
                 )
+
+
+def _account_scoped_provisor_source_key(account_id: object, external_price_list_id: object) -> str:
+    account = str(account_id or "").strip()
+    external = str(external_price_list_id or "").strip()
+    if account and external:
+        return f"account:{account}:plk:{external}"
+    return ""
+
+
+def _backfill_account_scoped_provisor_source_keys() -> None:
+    inspector = inspect(engine)
+    if not inspector.has_table("competitor_price_lists"):
+        return
+    columns = {col["name"] for col in inspector.get_columns("competitor_price_lists")}
+    required = {"id", "price_format_id", "source_type", "source_key", "account_id", "external_price_list_id"}
+    if not required.issubset(columns):
+        return
+
+    with engine.begin() as conn:
+        rows = (
+            conn.execute(
+                text(
+                    """
+                    SELECT id, price_format_id, source_key, account_id, external_price_list_id
+                    FROM competitor_price_lists
+                    WHERE source_type = 'provisor'
+                      AND COALESCE(account_id, '') <> ''
+                      AND COALESCE(external_price_list_id, '') <> ''
+                    """
+                )
+            )
+            .mappings()
+            .all()
+        )
+        for row in rows:
+            row_id = int(row["id"])
+            price_format_id = int(row["price_format_id"])
+            old_key = str(row["source_key"] or "").strip()
+            new_key = _account_scoped_provisor_source_key(row["account_id"], row["external_price_list_id"])
+            if not new_key or old_key == new_key:
+                continue
+
+            target_id = conn.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM competitor_price_lists
+                    WHERE price_format_id = :price_format_id
+                      AND source_type = 'provisor'
+                      AND source_key = :new_key
+                      AND id <> :row_id
+                    ORDER BY id
+                    LIMIT 1
+                    """
+                ),
+                {"price_format_id": price_format_id, "new_key": new_key, "row_id": row_id},
+            ).scalar()
+
+            if target_id is not None and inspector.has_table("price_format_competitor_assignments"):
+                assignments = (
+                    conn.execute(
+                        text(
+                            """
+                            SELECT id, price_format_id
+                            FROM price_format_competitor_assignments
+                            WHERE competitor_price_list_id = :row_id
+                            """
+                        ),
+                        {"row_id": row_id},
+                    )
+                    .mappings()
+                    .all()
+                )
+                for assignment in assignments:
+                    existing_assignment = conn.execute(
+                        text(
+                            """
+                            SELECT id
+                            FROM price_format_competitor_assignments
+                            WHERE price_format_id = :price_format_id
+                              AND competitor_price_list_id = :target_id
+                            LIMIT 1
+                            """
+                        ),
+                        {"price_format_id": int(assignment["price_format_id"]), "target_id": int(target_id)},
+                    ).scalar()
+                    if existing_assignment is None:
+                        conn.execute(
+                            text(
+                                """
+                                UPDATE price_format_competitor_assignments
+                                SET competitor_price_list_id = :target_id
+                                WHERE id = :assignment_id
+                                """
+                            ),
+                            {"target_id": int(target_id), "assignment_id": int(assignment["id"])},
+                        )
+                    else:
+                        conn.execute(
+                            text("DELETE FROM price_format_competitor_assignments WHERE id = :assignment_id"),
+                            {"assignment_id": int(assignment["id"])},
+                        )
+                continue
+
+            if target_id is not None:
+                logger.warning(
+                    "Skipping Provisor source_key migration because target exists: row_id=%s old_key=%s new_key=%s target_id=%s",
+                    row_id,
+                    old_key,
+                    new_key,
+                    target_id,
+                )
+                continue
+
+            conn.execute(
+                text("UPDATE competitor_price_lists SET source_key = :new_key WHERE id = :row_id"),
+                {"new_key": new_key, "row_id": row_id},
+            )
+            if inspector.has_table("competitors_prices") and old_key:
+                conn.execute(
+                    text(
+                        """
+                        UPDATE competitors_prices
+                        SET source_name = :new_source_name
+                        WHERE source_name = :old_source_name
+                        """
+                    ),
+                    {
+                        "new_source_name": f"provisor:{new_key}",
+                        "old_source_name": f"provisor:{old_key}",
+                    },
+                )
+
+
+def _backfill_percentile_preparations() -> None:
+    inspector = inspect(engine)
+    required_tables = {
+        "price_format_percentile_preparations",
+        "price_formats",
+        "competitor_price_percentiles",
+        "price_format_competitor_assignments",
+        "competitor_price_lists",
+    }
+    if any(not inspector.has_table(table) for table in required_tables):
+        return
+    with engine.begin() as conn:
+        bool_true = "TRUE" if engine.dialect.name == "postgresql" else "1"
+        conn.execute(
+            text(
+                f"""
+                INSERT INTO price_format_percentile_preparations (
+                    price_format_id,
+                    status,
+                    rows_count,
+                    completed_at,
+                    updated_at
+                )
+                SELECT
+                    pf.id,
+                    CASE
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM competitor_price_percentiles cpp
+                            WHERE cpp.price_format_id = pf.id
+                        ) THEN 'ready'
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM price_format_competitor_assignments a
+                            JOIN competitor_price_lists c ON c.id = a.competitor_price_list_id
+                            WHERE a.price_format_id = pf.id
+                              AND a.is_active = {bool_true}
+                              AND (a.percentile_mode = 'multi_price_per_sku' OR c.source_type = 'emit')
+                        ) THEN 'pending'
+                        ELSE 'not_configured'
+                    END,
+                    (
+                        SELECT count(*)
+                        FROM competitor_price_percentiles cpp
+                        WHERE cpp.price_format_id = pf.id
+                    ),
+                    CASE
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM competitor_price_percentiles cpp
+                            WHERE cpp.price_format_id = pf.id
+                        ) THEN CURRENT_TIMESTAMP
+                        ELSE NULL
+                    END,
+                    CURRENT_TIMESTAMP
+                FROM price_formats pf
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM price_format_percentile_preparations prep
+                    WHERE prep.price_format_id = pf.id
+                )
+                """
+            )
+        )

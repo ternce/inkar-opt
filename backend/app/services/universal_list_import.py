@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -20,7 +21,7 @@ from .sku import normalize_external_sku, normalize_sku_variants
 
 SUPPORTED_LIST_TYPES = {"critical", "markup", "exclusion"}
 UNIVERSAL_MARKUP_TYPES = {"critical_markup", "min_markup", "max_markup", "fixed_markup", "markup", "percentile_override"}
-UNIVERSAL_FIXED_PRICE_TYPES = {"fixed_price", "min_price", "max_price"}
+UNIVERSAL_FIXED_PRICE_TYPES = {"fixed_price", "min_price", "max_price", "memorandum"}
 UNIVERSAL_EXCLUSION_TYPES = {"exclusion", "exclude_from_pricing", "no_bend"}
 CRITICAL_MARKUP_NO_OVERRIDE = "-"
 UNIVERSAL_TYPE_LABELS = {
@@ -46,8 +47,19 @@ IDENTIFIER_ALIASES: dict[str, tuple[str, ...]] = {
     "material": ("material", "sku", "материал"),
     "article": ("article", "артикул"),
     "product_code": ("product code", "product_code", "productcode", "код товара", "код"),
+    "registry_id": ("id", "ид", "id товара", "product id", "productid"),
 }
 IDENTIFIER_PRIORITY = ("material", "article", "product_code")
+IDENTIFIER_ALIASES["material"] = (*IDENTIFIER_ALIASES["material"], "Материал", "Код", "GoodsID")
+IDENTIFIER_PRIORITY_MEMORANDUM = ("registry_id", "material", "product_code")
+PRODUCT_NAME_ALIASES = (
+    "Артикул",
+    "Наименование",
+    "Название",
+    "Name",
+    "Product Name",
+    "Наименование товара",
+)
 
 VALUE_ALIASES = (
     "value",
@@ -87,6 +99,85 @@ PRICE_TYPE_VALUE_COLUMN_ERRORS: dict[str, str] = {
     "min_price": "Для списка типа Минимальная цена нужна колонка значения:\nМин цена / Минимальная цена / Цена",
     "fixed_price": "Для списка типа Фиксированная цена нужна колонка значения:\nФикс цена / Фиксированная цена / Цена",
 }
+UNIVERSAL_TYPE_LABELS.update({"меморандум": "memorandum", "Меморандум": "memorandum", "РњРµРјРѕСЂР°РЅРґСѓРј": "memorandum"})
+PRICE_TYPE_VALUE_ALIASES["memorandum"] = ("максимальная цена по меморандуму", "меморандум", "меморандум цена", "макс цена", "цена")
+PRICE_TYPE_VALUE_ALIASES["memorandum"] = (
+    *PRICE_TYPE_VALUE_ALIASES["memorandum"],
+    "Меморандум",
+    "Максимальная цена",
+    "Цена меморандума",
+    "Максимальная цена по меморандуму",
+    "Предельная цена",
+    "Предельная цена для оптовой реализации",
+    "Предельная цена для розничной реализации",
+    "Предельная оптовая цена",
+    "Предельная розничная цена",
+    "Максимальная оптовая цена",
+    "Максимальная розничная цена",
+    "Цена для оптовой реализации",
+    "Цена для розничной реализации",
+    "Регулируемая цена",
+    "Государственная предельная цена",
+    "Цена по госреестру",
+    "Предельная стоимость",
+)
+PRICE_TYPE_VALUE_COLUMN_ERRORS["memorandum"] = "Для списка типа Меморандум нужна колонка значения:\nМаксимальная цена по меморандуму / Меморандум / Цена"
+MEMORANDUM_PRICE_COLUMN_PRIORITY = tuple(
+    normalize.casefold()
+    for normalize in (
+        "Предельная цена для оптовой реализации",
+        "Предельная оптовая цена",
+        "Максимальная оптовая цена",
+        "Цена для оптовой реализации",
+        "Меморандум",
+        "Максимальная цена по меморандуму",
+        "Цена меморандума",
+        "Предельная цена",
+        "Максимальная цена",
+        "Предельная цена для розничной реализации",
+        "Предельная розничная цена",
+        "Максимальная розничная цена",
+        "Цена для розничной реализации",
+        "Регулируемая цена",
+        "Государственная предельная цена",
+        "Цена по госреестру",
+        "Предельная стоимость",
+    )
+)
+
+
+class ImportHeaderError(ValueError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        detected_headers: list[str],
+        missing_fields: list[str],
+        supported_aliases: dict[str, list[str]],
+        status_code: int = 422,
+        extra: dict[str, Any] | None = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.detail = {
+            "detail": message,
+            "detectedHeaders": detected_headers,
+            "missingFields": missing_fields,
+            "supportedAliases": supported_aliases,
+        }
+        if extra:
+            self.detail.update(extra)
+
+
+class ImportRowLimitError(ValueError):
+    def __init__(self, *, limit: int, meaningful_rows_detected: int):
+        super().__init__(f"Количество заполненных строк превышает допустимый лимит {limit}")
+        self.status_code = 400
+        self.detail = {
+            "detail": f"Количество заполненных строк превышает допустимый лимит {limit}",
+            "limit": limit,
+            "meaningfulRowsDetected": meaningful_rows_detected,
+        }
 
 
 def _missing_value_column_error(list_type: str, headers: list[str]) -> str:
@@ -124,7 +215,9 @@ class ImportIssue:
     code: str
     message: str
     identifier: str = ""
+    name: str = ""
     field: str = ""
+    column: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -132,7 +225,9 @@ class ImportIssue:
             "code": self.code,
             "message": self.message,
             "identifier": self.identifier,
+            "name": self.name,
             "field": self.field,
+            "column": self.column or self.field,
         }
 
 
@@ -158,7 +253,9 @@ class ParsedUniversalListItem:
 
 
 def normalize_header(value: object) -> str:
-    text = str(value or "").strip().casefold()
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = text.replace("\u00a0", " ").replace("ё", "е").replace("Ё", "Е")
+    text = text.strip().casefold()
     text = re.sub(r"[_\-]+", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text
@@ -169,11 +266,78 @@ def _cell_text(value: object) -> str:
         return ""
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
+    if isinstance(value, Decimal):
+        if value == value.to_integral_value():
+            return str(int(value))
+        return format(value, "f")
     return str(value).strip()
+
+
+def _identifier_text(value: object) -> str:
+    text = _cell_text(value).strip()
+    if not text:
+        return ""
+    normalized = text.replace("\u00a0", "").replace(" ", "").replace(",", ".")
+    try:
+        number = Decimal(normalized)
+    except (InvalidOperation, ValueError):
+        return text
+    if number == number.to_integral_value():
+        return str(int(number))
+    return text
 
 
 def _is_empty_row(row: tuple[Any, ...]) -> bool:
     return all(_cell_text(value) == "" for value in row)
+
+
+def _cell_at(row: tuple[Any, ...], idx: int | None) -> object:
+    if idx is None or idx < 0 or idx >= len(row):
+        return None
+    return row[idx]
+
+
+def _is_meaningful_import_row(row: tuple[Any, ...], relevant_indexes: set[int]) -> bool:
+    if not relevant_indexes:
+        return not _is_empty_row(row)
+    for idx in relevant_indexes:
+        if _cell_text(_cell_at(row, idx)):
+            return True
+    return False
+
+
+def _supported_identifier_aliases(list_type: str) -> dict[str, list[str]]:
+    normalized = str(list_type or "").strip().casefold()
+    normalized = UNIVERSAL_TYPE_LABELS.get(normalized, normalized)
+    aliases: dict[str, list[str]] = {
+        "product_code": ["Материал", "SKU", "Код", "GoodsID"],
+    }
+    if normalized == "memorandum":
+        aliases["registry_id"] = ["ID", "ИД", "ID товара", "Product ID", "ProductID"]
+        aliases["product_code"].append("Код товара")
+    return aliases
+
+
+def _supported_price_aliases(list_type: str) -> list[str]:
+    normalized = str(list_type or "").strip().casefold()
+    normalized = UNIVERSAL_TYPE_LABELS.get(normalized, normalized)
+    if normalized == "memorandum":
+        return list(PRICE_TYPE_VALUE_ALIASES["memorandum"])
+    return list(VALUE_ALIASES)
+
+
+def _find_alias_indexes(headers: list[str], aliases: tuple[str, ...]) -> list[int]:
+    alias_set = {normalize_header(alias) for alias in aliases}
+    return [idx for idx, header in enumerate(headers) if header in alias_set]
+
+
+def _find_memorandum_price_column(headers: list[str]) -> tuple[int | None, list[int]]:
+    recognized = _find_alias_indexes(headers, PRICE_TYPE_VALUE_ALIASES["memorandum"])
+    if not recognized:
+        return None, []
+    if len(recognized) == 1:
+        return recognized[0], recognized
+    return None, recognized
 
 
 def _find_header_indexes(
@@ -210,7 +374,26 @@ def _identifier_for_row(row: tuple[Any, ...], identifier_indexes: dict[str, int]
         idx = identifier_indexes.get(identifier_type)
         if idx is None or idx >= len(row):
             continue
-        value = _cell_text(row[idx])
+        value = _identifier_text(row[idx])
+        if value:
+            return identifier_type, value
+    return "", ""
+
+
+def _identifier_for_universal_row(
+    row: tuple[Any, ...],
+    identifier_indexes: dict[str, int],
+    *,
+    list_type: str,
+) -> tuple[str, str]:
+    normalized = str(list_type or "").strip().casefold()
+    normalized = UNIVERSAL_TYPE_LABELS.get(normalized, normalized)
+    priority = IDENTIFIER_PRIORITY_MEMORANDUM if normalized == "memorandum" else IDENTIFIER_PRIORITY
+    for identifier_type in priority:
+        idx = identifier_indexes.get(identifier_type)
+        if idx is None or idx >= len(row):
+            continue
+        value = _identifier_text(row[idx])
         if value:
             return identifier_type, value
     return "", ""
@@ -230,6 +413,13 @@ def find_product_by_identifier(db: Session, identifier: object) -> Product | Non
     if not keys:
         return None
     return db.execute(select(Product).where(Product.code.in_(keys)).limit(1)).scalars().first()
+
+
+def find_product_by_identifier_type(db: Session, identifier: object, identifier_type: str) -> tuple[Product | None, str]:
+    product = find_product_by_identifier(db, identifier)
+    if product is not None:
+        return product, "Product.code"
+    return None, "Product.code"
 
 
 def _parse_bool(value: object) -> bool | None:
@@ -258,7 +448,7 @@ def _parse_markup_percent(value: object) -> Decimal | None:
 
 
 def _parse_decimal_value(value: object) -> Decimal | None:
-    text = _cell_text(value).replace(" ", "").replace(",", ".")
+    text = _cell_text(value).replace("\u00a0", "").replace(" ", "").replace(",", ".")
     if not text:
         return None
     try:
@@ -318,6 +508,8 @@ def is_exclude_from_pricing_type(list_type: str) -> bool:
 
 
 def _normalize_universal_value(list_type: str, raw_value: object) -> tuple[Decimal | None, str | None]:
+    normalized = str(list_type or "").strip().casefold()
+    normalized = UNIVERSAL_TYPE_LABELS.get(normalized, normalized)
     behavior = _universal_import_behavior(list_type)
     if behavior == "markup":
         value = _parse_markup_percent(raw_value)
@@ -333,7 +525,9 @@ def _normalize_universal_value(list_type: str, raw_value: object) -> tuple[Decim
         return Decimal("1") if parsed else Decimal("0"), None
     value = _parse_decimal_value(raw_value)
     if value is None:
-        return None, "invalid numeric value"
+        return None, "Цена обязательна" if normalized == "memorandum" else "invalid numeric value"
+    if normalized == "memorandum" and value <= 0:
+        return None, "Цена должна быть больше нуля"
     return value, None
 
 
@@ -536,30 +730,108 @@ def import_universal_list_excel(
         headers,
         additional_value_aliases=PRICE_TYPE_VALUE_ALIASES.get(normalized_list_type, ()),
     )
+    detected_headers = [_cell_text(value) for value in header_row if _cell_text(value)]
+    detected_price_indexes: list[int] = []
+    if normalized_list_type == "memorandum":
+        value_idx, detected_price_indexes = _find_memorandum_price_column(headers)
+    detected_price_columns = [
+        _cell_text(header_row[idx])
+        for idx in detected_price_indexes
+        if idx < len(header_row)
+    ]
+    if normalized_list_type == "memorandum" and len(detected_price_columns) > 1:
+        raise ImportHeaderError(
+            "Найдено несколько колонок предельной цены",
+            detected_headers=detected_headers,
+            missing_fields=[],
+            supported_aliases={
+                "price": _supported_price_aliases(normalized_list_type),
+            },
+            extra={
+                "detectedPriceColumns": detected_price_columns,
+            },
+        )
     if not identifier_indexes:
-        raise ValueError("missing product identifier column")
+        if normalized_list_type != "memorandum":
+            raise ValueError("missing product identifier column")
+        raise ImportHeaderError(
+            "Не найдена колонка идентификатора товара",
+            detected_headers=detected_headers,
+            missing_fields=["product_identifier"],
+            supported_aliases=_supported_identifier_aliases(normalized_list_type),
+        )
     exclusion_by_presence = is_exclude_from_pricing_type(str(universal_list.type or ""))
     if value_idx is None and not exclusion_by_presence:
-        raise ValueError(_missing_value_column_error(normalized_list_type, headers))
+        if normalized_list_type != "memorandum":
+            raise ValueError(_missing_value_column_error(normalized_list_type, headers))
+        raise ImportHeaderError(
+            "Не найдена колонка предельной цены",
+            detected_headers=detected_headers,
+            missing_fields=["memorandum_price"],
+            supported_aliases={
+                "price": _supported_price_aliases(normalized_list_type),
+            },
+        )
+    value_column = header_row[value_idx] if value_idx is not None and value_idx < len(header_row) else "value"
+    product_name_indexes = _find_alias_indexes(headers, PRODUCT_NAME_ALIASES) if normalized_list_type == "memorandum" else []
+    product_name_column = _cell_text(header_row[product_name_indexes[0]]) if product_name_indexes else ""
+    relevant_row_indexes = {idx for idx in identifier_indexes.values() if idx is not None}
+    if value_idx is not None:
+        relevant_row_indexes.add(value_idx)
+    relevant_row_indexes.update(product_name_indexes)
+    identifier_priority = IDENTIFIER_PRIORITY_MEMORANDUM if normalized_list_type == "memorandum" else IDENTIFIER_PRIORITY
+    selected_identifier_type = next((key for key in identifier_priority if key in identifier_indexes), "")
+    selected_identifier_idx = identifier_indexes.get(selected_identifier_type)
+    selected_identifier_column = (
+        _cell_text(header_row[selected_identifier_idx])
+        if selected_identifier_idx is not None and selected_identifier_idx < len(header_row)
+        else ""
+    )
 
     summary = _summary()
+    summary.update(
+        {
+            "imported": 0,
+            "updated": 0,
+            "skipped": 0,
+            "failed": 0,
+            "selectedPriceColumn": _cell_text(value_column),
+            "detectedPriceColumns": detected_price_columns,
+            "productNameColumn": product_name_column,
+            "selectedIdentifierColumn": selected_identifier_column,
+            "resolvedIdentifierFields": [],
+            "physicalRowsVisited": 0,
+            "meaningfulDataRows": 0,
+            "emptyRowsIgnored": 0,
+        }
+    )
     issues: list[ImportIssue] = []
+    warnings: list[dict[str, Any]] = []
+    resolved_identifier_fields: set[str] = set()
     items_by_product: dict[int, ParsedUniversalListItem] = {}
-
     row_limit = max_rows()
     for excel_row_number, row in enumerate(rows_iter, start=2):
-        summary["total_rows"] += 1
-        if summary["total_rows"] > row_limit:
-            raise ValueError(f"row count exceeds LIST_IMPORT_MAX_ROWS={row_limit}")
-        if _is_empty_row(row):
+        summary["physicalRowsVisited"] += 1
+        if not _is_meaningful_import_row(row, relevant_row_indexes):
             summary["empty_rows"] += 1
+            summary["emptyRowsIgnored"] += 1
             continue
+        summary["total_rows"] += 1
+        summary["meaningfulDataRows"] = summary["total_rows"]
+        if summary["total_rows"] > row_limit:
+            raise ImportRowLimitError(limit=row_limit, meaningful_rows_detected=summary["total_rows"])
 
-        identifier_type, identifier = _identifier_for_row(row, identifier_indexes)
+        identifier_type, identifier = _identifier_for_universal_row(row, identifier_indexes, list_type=normalized_list_type)
+        row_product_name = (
+            _cell_text(row[product_name_indexes[0]])
+            if product_name_indexes and product_name_indexes[0] < len(row)
+            else ""
+        )
         if not identifier:
             summary["invalid_rows"] += 1
             summary["errors"] += 1
-            issues.append(ImportIssue(excel_row_number, "missing_required_field", "missing product identifier", field="identifier"))
+            summary["failed"] += 1
+            issues.append(ImportIssue(excel_row_number, "missing_required_field", "Идентификатор товара обязателен", name=row_product_name, field="identifier", column="identifier"))
             continue
 
         raw_value = row[value_idx] if value_idx is not None and value_idx < len(row) else None
@@ -569,25 +841,57 @@ def import_universal_list_excel(
         if error or value is None:
             summary["invalid_rows"] += 1
             summary["errors"] += 1
-            issues.append(ImportIssue(excel_row_number, "invalid_value", error or "invalid value", identifier=identifier, field="value"))
-            continue
-
-        product = find_product_by_identifier(db, identifier)
-        if product is None:
-            summary["not_found"] += 1
+            summary["failed"] += 1
             issues.append(
                 ImportIssue(
                     excel_row_number,
-                    "product_not_found",
-                    f"product not found by {identifier_type}",
+                    "invalid_value",
+                    error or "invalid value",
                     identifier=identifier,
-                    field=identifier_type,
+                    name=row_product_name,
+                    field="value",
+                    column=str(value_column or "value"),
                 )
             )
             continue
 
+        product, resolved_identifier_field = find_product_by_identifier_type(db, identifier, identifier_type)
+        if product is None:
+            summary["not_found"] += 1
+            summary["failed"] += 1
+            missing_label = "ID" if identifier_type == "registry_id" else "SKU"
+            missing_message = (
+                "Товар с указанным ID отсутствует в локальном справочнике"
+                if normalized_list_type == "memorandum" and identifier_type == "registry_id"
+                else f"Товар с указанным {missing_label} не найден"
+                if normalized_list_type == "memorandum"
+                else f"product not found by {identifier_type}"
+            )
+            issues.append(
+                ImportIssue(
+                    excel_row_number,
+                    "product_not_found",
+                    missing_message,
+                    identifier=identifier,
+                    name=row_product_name,
+                    field=identifier_type,
+                    column=identifier_type,
+                )
+            )
+            continue
+        resolved_identifier_fields.add(resolved_identifier_field)
+
         if product.id in items_by_product:
             summary["duplicates"] += 1
+            warning = {
+                "row": excel_row_number,
+                "code": "duplicate_row",
+                "message": "Найден дубль ID; использована последняя строка" if identifier_type == "registry_id" else "Найден дубль SKU; использована последняя строка",
+                "identifier": identifier,
+                "name": row_product_name,
+                "resolvedIdentifierField": resolved_identifier_field,
+            }
+            warnings.append(warning)
             issues.append(ImportIssue(excel_row_number, "duplicate_row", "duplicate product row; last row wins", identifier=identifier))
 
         items_by_product[product.id] = ParsedUniversalListItem(
@@ -599,7 +903,7 @@ def import_universal_list_excel(
         )
 
     invalid_value_issues = [issue for issue in issues if issue.code == "invalid_value"]
-    if invalid_value_issues:
+    if invalid_value_issues and normalized_list_type != "memorandum":
         first = invalid_value_issues[0]
         raise ValueError(
             f"Некорректное значение в строке {first.row}: {first.message}. "
@@ -618,6 +922,7 @@ def import_universal_list_excel(
             if existing:
                 existing.value = item.value
                 existing.special_value = item.special_value
+                summary["updated"] += 1
             else:
                 db.add(
                     ListItem(
@@ -627,6 +932,7 @@ def import_universal_list_excel(
                         special_value=item.special_value,
                     )
                 )
+                summary["imported"] += 1
         db.commit()
     except SQLAlchemyError:
         db.rollback()
@@ -638,14 +944,35 @@ def import_universal_list_excel(
     item_count = db.scalar(select(func.count(ListItem.id)).where(ListItem.universal_list_id == universal_list.id))
     if item_count is None:
         item_count = 0
+    summary["skipped"] = summary["not_found"] + summary["invalid_rows"] + summary["empty_rows"]
+    summary["matched"] = len(items_by_product)
+    summary["resolvedIdentifierFields"] = sorted(resolved_identifier_fields)
+    success = summary["failed"] == 0
+    row_errors = [issue.to_dict() for issue in issues]
     return {
+        "success": success,
         "status": "ok",
         "list_id": universal_list.id,
         "list_type": str(universal_list.type or ""),
         "filename": filename,
         "item_count": int(item_count),
+        "totalRows": summary["total_rows"],
+        "matchedRows": summary["matched"],
+        "importedRows": summary["imported"],
+        "updatedRows": summary["updated"],
+        "unmatchedRows": summary["not_found"],
+        "invalidRows": summary["invalid_rows"],
+        "duplicateRows": summary["duplicates"],
+        "skippedRows": summary["skipped"],
+        "failedRows": summary["failed"],
+        "selectedIdentifierColumn": selected_identifier_column,
+        "selectedPriceColumn": summary["selectedPriceColumn"],
+        "detectedPriceColumns": detected_price_columns,
+        "productNameColumn": product_name_column,
+        "warnings": warnings,
+        "rowErrors": row_errors,
         "summary": summary,
-        "errors": [issue.to_dict() for issue in issues],
+        "errors": row_errors,
     }
 
 

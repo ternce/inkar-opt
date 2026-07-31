@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from .. import data
 from ..models import CompetitorPrice, PriceFormat, Product
 from .competitor_assignments import propagate_emit_assignments_to_new_price_format
+from .competitor_source_config import canonical_provisor_source_key
 from .sku import normalize_external_sku, normalize_sku, normalize_sku_variants
 
 
@@ -244,12 +245,14 @@ def persist_provisor_prices(
     price_format_code: str,
     filial_id: int,
     items: list[dict[str, Any]],
+    account_id: object = "",
     as_of: date | None = None,
 ) -> PersistStats:
     pf = _ensure_price_format(db, price_format_code)
     today = as_of or date.today()
 
-    src = f"provisor:{filial_id}"
+    source_key = canonical_provisor_source_key(account_id, filial_id)
+    src = f"provisor:{source_key or filial_id}"
 
     cfg = (
         db.execute(

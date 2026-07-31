@@ -7,6 +7,8 @@ if sys.platform.startswith("win"):
 import logging
 import json
 import time
+import gc
+import tracemalloc
 import difflib
 import re
 import unicodedata
@@ -23,7 +25,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 import httpx
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 import io
 import csv
 from pathlib import Path
@@ -125,7 +127,7 @@ from .services.competitor_assignments import (
     upsert_assignment,
 )
 from .services.competitor_coefficients import effective_price_coefficient, validate_price_coefficient
-from .services.percentile_export import load_percentile_export_prices
+from .services.percentile_export import load_percentile_export_price_cells
 from .services.manual_price_list_import import (
     deactivate_manual_price_list,
     delete_manual_price_list,
@@ -179,6 +181,8 @@ from .services.pricing_rules.templates import (
 from .services.products_excel_import import import_products_excel
 from .services.products_view import get_products_with_competitor_top5
 from .services.universal_list_import import (
+    ImportHeaderError,
+    ImportRowLimitError,
     business_list_item_to_dict,
     business_list_to_dict,
     import_business_list_excel,
@@ -202,10 +206,20 @@ from .services.competitor_matching import (
     rebuild_competitor_prices_for_selected,
 )
 from .services.competitor_percentiles import (
-    recalculate_competitor_percentiles_if_needed,
     recalculate_percentiles_for_price_lists,
 )
-from .services.competitor_source_config import canonical_competitor_source_key, ensure_canonical_source_key
+from .services.percentile_preparation import (
+    enqueue_percentile_preparation,
+    ensure_percentile_ready_for_generation,
+    percentile_preparation_to_dict,
+    resume_pending_percentile_preparations,
+    retry_waiting_percentile_preparations,
+)
+from .services.competitor_source_config import (
+    canonical_competitor_source_key,
+    canonical_provisor_source_key,
+    ensure_canonical_source_key,
+)
 from .services.sku import normalize_external_sku, normalize_sku, normalize_sku_variants
 from .services.competitors.management import list_competitor_sources
 from .services.competitors.mappings.read_models import (
@@ -437,29 +451,84 @@ def _identity_map_size(db: Session | None) -> int | None:
         return None
 
 
+def _session_size(db: Session | None, name: str) -> int | None:
+    if db is None:
+        return None
+    try:
+        return len(getattr(db, name))
+    except Exception:
+        return None
+
+
+def _python_memory_snapshot() -> tuple[float | None, float | None]:
+    try:
+        if not tracemalloc.is_tracing():
+            tracemalloc.start()
+        current, peak = tracemalloc.get_traced_memory()
+        return round(current / (1024 * 1024), 2), round(peak / (1024 * 1024), 2)
+    except Exception:
+        return None, None
+
+
+def _alive_async_tasks() -> int | None:
+    try:
+        return sum(1 for task in asyncio.all_tasks() if not task.done())
+    except Exception:
+        return None
+
+
 def _record_provisor_plk_memory(
     benchmark: dict[str, object] | None,
     *,
     stage: str,
     db: Session | None = None,
     rows: int | None = None,
+    decoded_rows: int | None = None,
+    normalized_rows: int | None = None,
+    mapping_rows: int | None = None,
+    results_entries: int | None = None,
+    status_results_entries: int | None = None,
+    manufacturer_cache_size: int | None = None,
+    product_cache_size: int | None = None,
+    match_cache_size: int | None = None,
 ) -> dict[str, object]:
+    started_at = time.perf_counter()
     memory = process_memory_snapshot()
     rss_mb = memory.get("rss_mb")
+    python_current_mb, python_peak_mb = _python_memory_snapshot()
     identity_map_size = _identity_map_size(db)
     if benchmark is not None:
         benchmark[f"rss_{stage}_mb"] = rss_mb
         benchmark[f"identity_map_{stage}"] = identity_map_size
+        benchmark[f"python_current_{stage}_mb"] = python_current_mb
+        benchmark[f"python_peak_{stage}_mb"] = python_peak_mb
     payload = {
         "account_id": benchmark.get("account_id") if benchmark else None,
+        "external_price_list_id": str((benchmark or {}).get("filial_id") or (benchmark or {}).get("price_list_id") or ""),
         "filial_id": str((benchmark or {}).get("filial_id") or (benchmark or {}).get("price_list_id") or ""),
-        "price_list_id": str((benchmark or {}).get("price_list_id") or (benchmark or {}).get("filial_id") or ""),
         "stage": stage,
         "rows": rows,
         "rss_mb": rss_mb,
+        "python_current_mb": python_current_mb,
+        "python_peak_mb": python_peak_mb,
         "identity_map_size": identity_map_size,
+        "session_new": _session_size(db, "new"),
+        "session_dirty": _session_size(db, "dirty"),
+        "session_deleted": _session_size(db, "deleted"),
+        "decoded_rows": decoded_rows,
+        "normalized_rows": normalized_rows if normalized_rows is not None else rows,
+        "mapping_rows": mapping_rows,
+        "results_entries": results_entries,
+        "status_results_entries": status_results_entries,
+        "manufacturer_cache_size": manufacturer_cache_size,
+        "product_cache_size": product_cache_size,
+        "match_cache_size": match_cache_size,
+        "alive_async_tasks": _alive_async_tasks(),
+        "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
     }
-    logger.info("[PROVISOR_PLK_MEMORY] %s", json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    logger.info("[PROVISOR_MEMORY] %s", serialized)
+    logger.info("[PROVISOR_PLK_MEMORY] %s", serialized)
     return payload
 
 
@@ -471,10 +540,47 @@ def _release_provisor_result_payload(
 ) -> None:
     items = result.get("items")
     rows = len(items) if isinstance(items, list) else 0
+    price_list = result.get("priceList")
+    if price_list is not None:
+        result["priceListId"] = str(getattr(price_list, "price_list_id", "") or "")
+    result["itemsCount"] = rows
+    result["rows"] = rows
     if isinstance(items, list):
         items.clear()
     result["items"] = []
+    result.pop("priceList", None)
     _record_provisor_plk_memory(benchmark, stage="after_cleanup", db=db, rows=rows)
+
+
+def _provisor_result_summary(result: dict, *, account_id: int, source_type: str) -> dict[str, object]:
+    price_list = result.get("priceList")
+    items = result.get("items")
+    items_count = int(result.get("itemsCount") or 0)
+    if not items_count and isinstance(items, list):
+        items_count = len(items)
+    price_list_id = str(getattr(price_list, "price_list_id", "") or result.get("priceListId") or "")
+    return {
+        "ok": bool(result.get("ok")),
+        "sourceType": source_type,
+        "accountId": account_id,
+        "priceListId": price_list_id,
+        "external_price_list_id": price_list_id,
+        "rows": items_count,
+        "itemsCount": items_count,
+        "elapsed_ms": float(result.get("elapsed_ms") or 0),
+        "status": "ok" if result.get("ok") else (
+            "timeout" if result.get("timeout") else "skipped" if result.get("skipped") else "error"
+        ),
+        "http_status": result.get("http_status"),
+        "timeout": bool(result.get("timeout")),
+        "skipped": bool(result.get("skipped")),
+        "skipped_unchanged": bool(result.get("skipped_unchanged")),
+        "skipped_heavy": bool(result.get("skipped_heavy")),
+        "duplicate": bool(result.get("duplicate")),
+        "error": str(result.get("error") or ""),
+        "localItemsCount": int(result.get("localItemsCount") or 0),
+        "skippedInfo": result.get("skippedInfo") or None,
+    }
 
 
 def _log_provisor_plk_benchmark(benchmark: dict[str, object] | None) -> dict[str, object]:
@@ -520,9 +626,26 @@ def _log_provisor_plk_benchmark(benchmark: dict[str, object] | None) -> dict[str
         "identity_map_after_flush": data.get("identity_map_after_flush"),
         "identity_map_after_commit": data.get("identity_map_after_commit"),
         "identity_map_after_cleanup": data.get("identity_map_after_cleanup"),
+        "max_insert_batch_size": int(data.get("max_insert_batch_size") or 0),
     }
     logger.info("[PROVISOR_PLK_BENCHMARK] %s", json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return payload
+
+
+def _is_price_source_auth_failure(exc: BaseException) -> bool:
+    message = str(exc or "").strip().lower()
+    return any(
+        marker in message
+        for marker in (
+            "http 401",
+            "http 403",
+            "token/createall failed",
+            "token/update failed",
+            "empty tokens",
+            "login",
+            "password",
+        )
+    )
 
 
 def _aggregate_provisor_benchmarks(
@@ -665,6 +788,8 @@ async def _startup() -> None:
         _seed_price_formats_if_missing()
         with SessionLocal() as db:
             mark_stale_emit_jobs(db, config=EmitConfig.from_settings(settings))
+            resume_pending_percentile_preparations(db=db, start_worker=True)
+            retry_waiting_percentile_preparations(db=db, start_worker=True)
         _start_provisor_auto_refresh_scheduler()
         _start_emit_refresh_scheduler()
     except Exception:
@@ -1427,7 +1552,16 @@ def get_price_formats(db: Session = Depends(get_db), current_user: AppUser = Dep
     rows = _filter_price_formats_for_user(rows, current_user)
     if not rows:
         return []
-    return [{"id": x.id, "name": x.name, "code": x.code, "branch": x.branch} for x in rows]
+    return [
+        {
+            "id": x.id,
+            "name": x.name,
+            "code": x.code,
+            "branch": x.branch,
+            "percentilePreparation": percentile_preparation_to_dict(db, int(x.id)),
+        }
+        for x in rows
+    ]
 
 
 @app.post("/api/price-formats")
@@ -1465,7 +1599,29 @@ def create_price_format(
     propagate_emit_assignments_to_new_price_format(db=db, price_format_id=int(row.id))
     db.commit()
     db.refresh(row)
-    return {"id": row.id, "name": row.name, "code": row.code, "branch": row.branch}
+    percentile_status = enqueue_percentile_preparation(db=db, price_format_id=int(row.id), reason="price_format_created")
+    return {"id": row.id, "name": row.name, "code": row.code, "branch": row.branch, "percentilePreparation": percentile_status}
+
+
+@app.get("/api/price-formats/{price_format_id}/percentile-preparation-status")
+def get_percentile_preparation_status(price_format_id: int, db: Session = Depends(get_db), current_user: AppUser = Depends(get_current_user)):
+    pf = db.get(PriceFormat, price_format_id)
+    if pf is None:
+        raise HTTPException(status_code=404, detail="price format not found")
+    _ensure_price_format_access(pf, current_user)
+    return percentile_preparation_to_dict(db, price_format_id)
+
+
+@app.post("/api/price-formats/{price_format_id}/percentile-preparation/retry")
+def retry_percentile_preparation(price_format_id: int, db: Session = Depends(get_db), current_user: AppUser = Depends(require_write_access)):
+    pf = db.get(PriceFormat, price_format_id)
+    if pf is None:
+        raise HTTPException(status_code=404, detail="price format not found")
+    _ensure_price_format_access(pf, current_user)
+    try:
+        return enqueue_percentile_preparation(db=db, price_format_id=price_format_id, reason="manual_retry")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/api/pricing-workflow/contexts")
@@ -1602,6 +1758,10 @@ def _branch_format_row(db: Session, pf: PriceFormat) -> dict:
         "branch": pf.branch,
         "pricingRule": pf.pricing_rule or "",
         "pricingRuleId": int(pf.pricing_rule_id) if pf.pricing_rule_id is not None else None,
+        "appliedMarkupTemplateId": int(pf.applied_markup_template_id) if getattr(pf, "applied_markup_template_id", None) is not None else None,
+        "appliedBendTemplateId": int(pf.applied_bend_template_id) if getattr(pf, "applied_bend_template_id", None) is not None else None,
+        "appliedNoCompetitorTemplateId": int(pf.applied_no_competitor_template_id) if getattr(pf, "applied_no_competitor_template_id", None) is not None else None,
+        "appliedRoundingRuleId": int(pf.rounding_rule_id) if pf.rounding_rule_id is not None else None,
         "roundingRuleId": int(pf.rounding_rule_id) if pf.rounding_rule_id is not None else None,
         "appliedRule": pricing_rule_application_status(db=db, pf=pf),
         "assignedPlkCount": len(assignments),
@@ -1662,15 +1822,17 @@ def _format_readiness(db: Session, pf: PriceFormat, branch_id: str) -> dict:
         ).scalar()
         or 0
     )
-    percentile_row_count = int(
-        db.execute(
-            select(func.count(CompetitorPricePercentile.id))
-            .where(CompetitorPricePercentile.price_format_id == pf.id)
-            .where(CompetitorPricePercentile.value.is_not(None))
-        ).scalar()
-        or 0
+    percentile_prep = percentile_preparation_to_dict(db, int(pf.id))
+    percentile_row_count = int(percentile_prep.get("rowsCount") or 0)
+    percentile_sources_ready = percentile_cfg_count > 0 and str(percentile_prep.get("status") or "") == "ready" and percentile_row_count > 0
+    percentile_prep_status = str(percentile_prep.get("status") or "")
+    percentile_prep_ready_status = (
+        "ok"
+        if mode == "regular" or percentile_prep_status == "ready"
+        else "warning"
+        if percentile_prep_status in {"not_configured", "pending", "processing"}
+        else "error"
     )
-    percentile_sources_ready = percentile_cfg_count > 0 and percentile_row_count > 0
     stale_sources = [row for row in active_assignments if (_date_days_old(row.price_date) or 999) > 2]
     missing_dates = [row for row in active_assignments if row.price_date is None]
     markup_count = int(db.execute(select(func.count(MarkupRange.id)).where(MarkupRange.price_format_id == pf.id)).scalar() or 0)
@@ -1695,6 +1857,12 @@ def _format_readiness(db: Session, pf: PriceFormat, branch_id: str) -> dict:
             "Назначенные персентили",
             "ok" if percentile_sources_ready else ("warning" if mode == "mixed" else "error" if mode == "percentile" else "ok"),
             f"Источников: {percentile_cfg_count}, строк: {percentile_row_count}",
+        ),
+        _readiness_item(
+            "percentile_preparation",
+            "Подготовка персентилей",
+            percentile_prep_ready_status,
+            str(percentile_prep.get("message") or ""),
         ),
         _readiness_item(
             "competitor_freshness",
@@ -1725,6 +1893,7 @@ def _format_readiness(db: Session, pf: PriceFormat, branch_id: str) -> dict:
         "warnings": warnings,
         "physicalSourcesReady": physical_sources_ready,
         "percentileSourcesReady": percentile_sources_ready,
+        "percentilePreparation": percentile_prep,
     }
 
 
@@ -2217,6 +2386,16 @@ def _pricing_log(db: Session, cp: CalculatedPrice, product: Product, source: Com
         {"label": "Percentile", "value": "сработал" if source and str(source.source_name or "").startswith("percentile:") else "не сработал", "description": _source_label(source.source_name) if source else ""},
         {"label": "Финальная причина", "value": cp.applied_reason or "", "description": "Человекочитаемый лог, сохранённый pricing engine."},
     ]
+    memorandum = _memorandum_summary(cp)
+    if memorandum["memorandumMaxPrice"] is not None:
+        log.insert(
+            -1,
+            {
+                "label": "Меморандум",
+                "value": memorandum["memorandumMaxPrice"],
+                "description": memorandum["memorandumReason"] or "Позиция покрыта меморандумом.",
+            },
+        )
     return log
 
 
@@ -2249,6 +2428,7 @@ def _generated_item_dict(
         else None,
         final_price=final,
     )
+    memorandum = _memorandum_summary(cp)
     ratings = ratings if ratings is not None else _product_ratings_by_id(db, [int(product.id)], str(pf.branch or "")).get(int(product.id), {})
     global_rating = ratings.get("global")
     local_rating = ratings.get("local")
@@ -2280,6 +2460,16 @@ def _generated_item_dict(
         "mdcPrice": float(cp.mdc_price) if getattr(cp, "mdc_price", None) is not None else None,
         "competitorCandidatePrice": float(cp.competitor_candidate_price) if getattr(cp, "competitor_candidate_price", None) is not None else None,
         "finalPrice": final,
+        "memorandumMaxPrice": memorandum["memorandumMaxPrice"],
+        "priceBeforeMemorandum": memorandum["priceBeforeMemorandum"],
+        "priceAfterMemorandum": memorandum["priceAfterMemorandum"],
+        "memorandumApplied": memorandum["memorandumApplied"],
+        "memorandumBelowMdc": memorandum["memorandumBelowMdc"],
+        "memorandumListId": memorandum["memorandumListId"],
+        "memorandumListName": memorandum["memorandumListName"],
+        "memorandumDiagnosticCode": memorandum["memorandumDiagnosticCode"],
+        "memorandumReason": memorandum["memorandumReason"],
+        "memorandum": memorandum,
         "markupPercent": float(cp.markup_percent_used) if cp.markup_percent_used is not None else actual_margin_percent,
         "actualMarginPercent": actual_margin_percent,
         "zone": _calculated_zone(cp, db, pf.id, product.id),
@@ -2484,6 +2674,7 @@ def _competitor_prices_by_product(
     percentile_source_names = {source_name for source_name in source_names if source_name.startswith("percentile:")}
     physical_source_names = [source_name for source_name in source_names if not source_name.startswith("percentile:")]
     coefficient_by_source = {str(column.get("key") or ""): float(column.get("priceCoefficient") or column.get("coefficient") or 1) for column in columns}
+    column_by_source = {str(column.get("key") or ""): column for column in columns if column.get("key")}
     rows = []
     if physical_source_names:
         rows = (
@@ -2498,7 +2689,7 @@ def _competitor_prices_by_product(
             .scalars()
             .all()
         )
-    percentile_prices = load_percentile_export_prices(
+    percentile_prices = load_percentile_export_price_cells(
         db=db,
         price_format_id=int(pf.id),
         product_ids=product_ids,
@@ -2530,10 +2721,15 @@ def _competitor_prices_by_product(
             "isSubstitute": match_type == "provisor_manual_substitute",
         }
     for product_id, values_by_source in percentile_prices.items():
-        for source_name, value in values_by_source.items():
+        for source_name, cell in values_by_source.items():
+            value = cell.get("value")
+            if value is None:
+                continue
             raw_price = float(value)
             coefficient = coefficient_by_source.get(source_name, 1.0)
             price = raw_price * coefficient
+            column = column_by_source.get(source_name) or {}
+            percentile_source_type = str(cell.get("percentileSourceType") or "")
             out.setdefault(product_id, {})[source_name] = {
                 "price": price,
                 "adjustedPrice": price,
@@ -2541,11 +2737,22 @@ def _competitor_prices_by_product(
                 "originalPrice": raw_price,
                 "coefficient": coefficient,
                 "priceCoefficient": coefficient,
-                "sourceName": source_name,
-                "matchedBy": "competitor_price_percentiles",
+                "sourceName": column.get("title") or source_name,
+                "matchedBy": "regular_competitor_price_percentiles"
+                if percentile_source_type == "regular_competitor"
+                else "competitor_price_percentiles",
                 "isManualMapping": False,
                 "isSubstitute": False,
                 "isPercentile": True,
+                "sourceType": "percentile",
+                "percentileSourceType": percentile_source_type or None,
+                "canonicalIdentity": cell.get("canonicalIdentity"),
+                "percentile": cell.get("percentile"),
+                "sampleCount": cell.get("sampleCount"),
+                "sourceCount": cell.get("sourceCount"),
+                "priceCount": cell.get("priceCount"),
+                "minPrice": float(cell["minPrice"]) if cell.get("minPrice") is not None else None,
+                "maxPrice": float(cell["maxPrice"]) if cell.get("maxPrice") is not None else None,
             }
     return out
 
@@ -2669,6 +2876,12 @@ def export_generated_price_list(
         ("bendPercentUsed", "Прогиб %"),
         ("markupPercentUsed", "Наценка правила %"),
         ("finalPrice", "Финальная цена"),
+        ("memorandumMaxPrice", "Максимальная цена по меморандуму"),
+        ("priceBeforeMemorandum", "Цена до меморандума"),
+        ("memorandumApplied", "Меморандум применён"),
+        ("memorandumBelowMdc", "Меморандум ниже МДЦ"),
+        ("memorandumListName", "Список меморандума"),
+        ("memorandumReason", "Причина ограничения"),
         ("markupPercent", "Наценка %"),
         ("actualMarginPercent", "Фактическая маржа %"),
         ("zone", "Зона"),
@@ -2715,6 +2928,13 @@ def export_generated_price_list(
                 if changed is False:
                     return "нет"
                 return ""
+        if key in {"memorandumApplied", "memorandumBelowMdc"}:
+            value = row.get(key)
+            if value is True:
+                return "да"
+            if value is False:
+                return "нет"
+            return ""
         value = row.get(key, "")
         mojibake_dash_values = {"\u0432\u0402\u201d", "\u0420\u0406\u0420\u201a\u0432\u0402\u045c"}
         competitor_price_keys = {"bestCompetitorPrice", "lowestCompetitorPrice", "chosenCompetitorPrice"}
@@ -2820,9 +3040,10 @@ LIST_TYPE_LABELS = {
 }
 
 LIST_TYPE_LABELS.setdefault("fixed_markup", "Фиксированная наценка")
+LIST_TYPE_LABELS.setdefault("memorandum", "Меморандум")
 LIST_TYPE_CODES = {v: k for k, v in LIST_TYPE_LABELS.items()}
 PERCENT_LIST_TYPES = {"fixed_markup", "critical_markup", "min_markup", "max_markup", "percentile_override", "markup"}
-PRICE_LIST_TYPES = {"fixed_price", "min_price", "max_price"}
+PRICE_LIST_TYPES = {"fixed_price", "min_price", "max_price", "memorandum"}
 BOOLEAN_LIST_TYPES = {"exclude_from_pricing", "no_bend", "exclusion"}
 
 
@@ -3208,6 +3429,8 @@ def upsert_lists_management_item(list_id: int, payload: dict = Body(...), db: Se
         value, special_value, value_error = parse_list_decimal(raw_value), "", None
     if value is None:
         raise HTTPException(status_code=400, detail=value_error or "invalid numeric value")
+    if _list_type_code(ul.type) == "memorandum" and value <= 0:
+        raise HTTPException(status_code=400, detail="Максимальная цена по меморандуму должна быть больше нуля")
     item = db.execute(
         select(ListItem).where(ListItem.universal_list_id == ul.id).where(ListItem.product_id == product.id)
     ).scalars().first()
@@ -3257,6 +3480,8 @@ async def import_lists_management_items(list_id: int, file: UploadFile = File(..
             value, special_value = parse_list_decimal(raw_value), ""
         if value is None:
             continue
+        if _list_type_code(ul.type) == "memorandum" and value <= 0:
+            continue
         item = db.execute(
             select(ListItem).where(ListItem.universal_list_id == ul.id).where(ListItem.product_id == product.id)
         ).scalars().first()
@@ -3290,11 +3515,29 @@ async def import_lists_management_excel(list_id: int, file: UploadFile = File(..
             content=content,
             filename=file.filename or "upload.xlsx",
         )
+    except (ImportHeaderError, ImportRowLimitError) as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except SQLAlchemyError as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail="database error during list import") from exc
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Unexpected list Excel import failure: list_id=%s filename=%s", list_id, file.filename)
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "errors": [
+                    {
+                        "row": None,
+                        "column": "",
+                        "message": "Не удалось обработать файл импорта. Проверьте формат и заголовки.",
+                    }
+                ],
+            },
+        ) from exc
 
 
 @app.get("/api/lists-management/{list_id}/export.{fmt}")
@@ -3923,8 +4166,8 @@ def debug_matching(
     rebuild_summary = None
     if rebuild and pf is not None:
         rebuild_summary = rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id)
-        recalculate_competitor_percentiles_if_needed(db=db, price_format_id=pf.id)
         db.commit()
+        enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="debug_matching_rebuild")
 
     list_stmt = select(CompetitorPriceList)
     lists = db.execute(list_stmt).scalars().all()
@@ -4747,8 +4990,8 @@ def get_provisor_diagnostics(
 @app.get("/api/competitors/percentiles")
 def get_competitor_percentile_sources(
     format_code: str | None = Query(None),
-    percentile_source: str = Query("emit"),
-    visibility: str = Query("eligible"),
+    percentile_source: str = Query("competitor"),
+    visibility: str = Query("all"),
     db: Session = Depends(get_db),
 ):
     include_ineligible = str(visibility or "").strip().casefold() in {"assignment", "all", "stored"}
@@ -4766,7 +5009,9 @@ def get_competitor_percentile_rows(
     region: str = Query(""),
     competitor: str = Query(""),
     source_key: str = Query(""),
-    percentile_source: str = Query("emit"),
+    api_identity: str = Query(""),
+    group_id: str = Query(""),
+    percentile_source: str = Query("competitor"),
     q: str = Query(""),
     percentile_filter: str = Query("all"),
     competitor_filter: str = Query("all"),
@@ -4782,6 +5027,8 @@ def get_competitor_percentile_rows(
         region=region,
         competitor=competitor,
         source_key=source_key,
+        api_identity=api_identity,
+        group_id=group_id,
         percentile_source=percentile_source,
         q=q,
         percentile_filter=percentile_filter,
@@ -4799,7 +5046,7 @@ def get_competitor_percentile_trace(
     region: str = Query(...),
     competitor: str = Query(...),
     source_key: str = Query(""),
-    percentile_source: str = Query("emit"),
+    percentile_source: str = Query("competitor"),
     sku: str = Query(...),
     db: Session = Depends(get_db),
 ):
@@ -4820,7 +5067,7 @@ def get_competitor_percentile_coverage_audit(
     region: str = Query(...),
     competitor: str = Query(...),
     source_key: str = Query(""),
-    percentile_source: str = Query("emit"),
+    percentile_source: str = Query("competitor"),
     db: Session = Depends(get_db),
 ):
     return percentile_coverage_audit(
@@ -4840,7 +5087,9 @@ def export_competitor_percentile_rows_endpoint(
     region: str = Query(""),
     competitor: str = Query(""),
     source_key: str = Query(""),
-    percentile_source: str = Query("emit"),
+    api_identity: str = Query(""),
+    group_id: str = Query(""),
+    percentile_source: str = Query("competitor"),
     q: str = Query(""),
     percentile_filter: str = Query("all"),
     competitor_filter: str = Query("all"),
@@ -4857,6 +5106,8 @@ def export_competitor_percentile_rows_endpoint(
         region=region,
         competitor=competitor,
         source_key=source_key,
+        api_identity=api_identity,
+        group_id=group_id,
         percentile_source=percentile_source,
         q=q,
         percentile_filter=percentile_filter,
@@ -4941,6 +5192,24 @@ def _assignment_row_from_percentile(source: dict, cfg: CompetitorPrice | None = 
         "isPercentile": True,
         "eligibleForPricing": source.get("eligibleForPricing") is not False,
         "pricingEligibilityReason": source.get("pricingEligibilityReason") or "",
+    }
+
+
+def _memorandum_summary(cp: CalculatedPrice) -> dict:
+    max_price = getattr(cp, "memorandum_max_price", None)
+    before = getattr(cp, "price_before_memorandum", None)
+    applied = bool(getattr(cp, "memorandum_applied", False))
+    below_mdc = bool(getattr(cp, "memorandum_below_mdc", False))
+    return {
+        "memorandumApplied": applied,
+        "memorandumListId": int(cp.memorandum_list_id) if getattr(cp, "memorandum_list_id", None) is not None else None,
+        "memorandumListName": getattr(cp, "memorandum_list_name", "") or "",
+        "memorandumMaxPrice": float(max_price) if max_price is not None else None,
+        "priceBeforeMemorandum": float(before) if before is not None else None,
+        "priceAfterMemorandum": float(cp.final_price) if applied else None,
+        "memorandumBelowMdc": below_mdc,
+        "memorandumDiagnosticCode": getattr(cp, "memorandum_diagnostic_code", "") or "",
+        "memorandumReason": "Цена по меморандуму ниже МДЦ" if below_mdc else "Цена ограничена меморандумом" if applied else "",
     }
 
 
@@ -5046,7 +5315,8 @@ def post_competitor_assignment(format_code: str, payload: dict = Body(...), db: 
         )
         db.add(cfg)
         db.commit()
-        return {"status": "ok"}
+        percentile_status = enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="percentile_assignment_added")
+        return {"status": "ok", "percentilePreparation": percentile_status}
 
     try:
         source_id_int = int(source_id)
@@ -5068,7 +5338,8 @@ def post_competitor_assignment(format_code: str, payload: dict = Body(...), db: 
     upsert_assignment(db=db, price_format_id=int(pf.id), competitor_price_list_id=source_id_int, coefficient=coefficient, is_active=True)
     sync_selected_competitor_configs(db=db, price_format_id=pf.id)
     db.commit()
-    return {"status": "ok"}
+    percentile_status = enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="competitor_assignment_added")
+    return {"status": "ok", "percentilePreparation": percentile_status}
 
 
 @app.patch("/api/price-formats/{format_code}/competitor-assignments/{assignment_id}")
@@ -5102,7 +5373,8 @@ def patch_competitor_assignment(format_code: str, assignment_id: str, payload: d
         else:
             cfg.coefficient = coefficient
         db.commit()
-        return {"status": "ok"}
+        percentile_status = enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="percentile_assignment_changed")
+        return {"status": "ok", "percentilePreparation": percentile_status}
 
     try:
         source_id_int = int(assignment_id)
@@ -5124,7 +5396,8 @@ def patch_competitor_assignment(format_code: str, assignment_id: str, payload: d
     assignment.updated_at = now_kz_naive()
     sync_selected_competitor_configs(db=db, price_format_id=pf.id)
     db.commit()
-    return {"status": "ok"}
+    percentile_status = enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="competitor_assignment_changed")
+    return {"status": "ok", "percentilePreparation": percentile_status}
 
 
 @app.delete("/api/price-formats/{format_code}/competitor-assignments/{assignment_id}")
@@ -5148,7 +5421,8 @@ def delete_competitor_assignment(format_code: str, assignment_id: str, db: Sessi
         if cfg is not None:
             db.delete(cfg)
             db.commit()
-        return {"status": "ok"}
+        percentile_status = enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="percentile_assignment_deleted")
+        return {"status": "ok", "percentilePreparation": percentile_status}
     try:
         source_id_int = int(assignment_id)
     except Exception:
@@ -5161,7 +5435,8 @@ def delete_competitor_assignment(format_code: str, assignment_id: str, db: Sessi
     assignment.updated_at = now_kz_naive()
     sync_selected_competitor_configs(db=db, price_format_id=pf.id)
     db.commit()
-    return {"status": "ok"}
+    percentile_status = enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="competitor_assignment_deleted")
+    return {"status": "ok", "percentilePreparation": percentile_status}
 
 
 @app.get("/api/competitors/mappings")
@@ -5507,6 +5782,9 @@ def get_pricing_rules(db: Session = Depends(get_db)):
 @app.post("/api/pricing-rules")
 def create_pricing_rule(payload: dict = Body(...), db: Session = Depends(get_db), current_user: AppUser = Depends(require_write_access)):
     try:
+        copy_from_rule_id = payload.get("copyFromRuleId") or payload.get("copy_from_rule_id")
+        if copy_from_rule_id not in (None, "", "none"):
+            return pricing_rule_to_dict(copy_pricing_rule(db=db, rule_id=int(copy_from_rule_id), payload=payload))
         return pricing_rule_to_dict(upsert_pricing_rule(db=db, payload=payload))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -5538,11 +5816,12 @@ def delete_pricing_rule_endpoint(rule_id: int, db: Session = Depends(get_db), cu
 
 
 @app.post("/api/pricing-rules/{rule_id}/copy")
-def copy_pricing_rule_endpoint(rule_id: int, db: Session = Depends(get_db), current_user: AppUser = Depends(require_write_access)):
+def copy_pricing_rule_endpoint(rule_id: int, payload: dict = Body(default={}), db: Session = Depends(get_db), current_user: AppUser = Depends(require_write_access)):
     try:
-        return pricing_rule_to_dict(copy_pricing_rule(db=db, rule_id=rule_id))
+        return pricing_rule_to_dict(copy_pricing_rule(db=db, rule_id=rule_id, payload=payload))
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        detail = str(e)
+        raise HTTPException(status_code=404 if "not found" in detail else 400, detail=detail)
 
 
 @app.post("/api/price-formats/{format_code}/pricing-rule")
@@ -6520,6 +6799,14 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
         "accounts_processed": [],
         "accounts_skipped": [],
     }
+    if refresh_source in {"all", "provisor"}:
+        _record_provisor_plk_memory(
+            {"account_id": None, "filial_id": ""},
+            stage="refresh_start",
+            db=db,
+            results_entries=0,
+            status_results_entries=0,
+        )
 
     accounts = (
         db.execute(select(PriceSourceAccount).where(PriceSourceAccount.is_active.is_(True)))
@@ -6849,12 +7136,24 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                 local_price_list_state: dict[str, tuple[str, int, datetime | None]] = {}
                 if pf_for_refresh is not None and price_lists:
                     if account.source_type == "provisor":
-                        source_keys = [f"plk:{getattr(row, 'price_list_id', '')}" for row in price_lists]
+                        source_keys = []
+                        for row in price_lists:
+                            external_id = str(getattr(row, "price_list_id", "") or "").strip()
+                            if not external_id:
+                                continue
+                            source_keys.extend(
+                                [
+                                    canonical_provisor_source_key(account.id, external_id),
+                                    f"plk:{external_id}",
+                                    f"{account.id}:{external_id}",
+                                ]
+                            )
                         existing_rows = (
                             db.execute(
                                 select(CompetitorPriceList)
                                 .where(CompetitorPriceList.price_format_id == pf_for_refresh.id)
                                 .where(CompetitorPriceList.source_type == account.source_type)
+                                .where(CompetitorPriceList.account_id == str(account.id))
                                 .where(CompetitorPriceList.source_key.in_(source_keys))
                             )
                             .scalars()
@@ -6886,11 +7185,18 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                         else {}
                     )
                     for row in existing_rows:
-                        local_price_list_state[str(row.source_key or "")] = (
+                        state = (
                             str(row.source_updated_at or ""),
                             int(item_counts.get(row.id, 0)),
                             row.updated_at,
                         )
+                        local_price_list_state[str(row.source_key or "")] = state
+                        if account.source_type == "provisor":
+                            external_id = str(row.external_price_list_id or "").strip()
+                            if external_id:
+                                local_price_list_state[canonical_provisor_source_key(row.account_id, external_id)] = state
+                                local_price_list_state[f"plk:{external_id}"] = state
+                                local_price_list_state[f"{row.account_id}:{external_id}"] = state
                 if account.source_type == "vidman":
                     for row in price_lists:
                         price_id = str(getattr(row, "price_list_id", "") or "")
@@ -6936,7 +7242,11 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                             if account.source_type == "provisor"
                             else PRICE_LIST_FETCH_TIMEOUT_SECONDS
                         )
-                        canonical_plk_key = f"provisor:plk:{price_list_id}" if account.source_type == "provisor" else ""
+                        canonical_plk_key = (
+                            f"provisor:{canonical_provisor_source_key(account.id, price_list_id)}"
+                            if account.source_type == "provisor"
+                            else ""
+                        )
                         plk_benchmark: dict[str, object] = {}
                         if account.source_type == "provisor":
                             plk_benchmark = {
@@ -7056,7 +7366,11 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                         )
                         try:
                             source_updated_at = str(getattr(price_list, "source_updated_at", "") or "").strip()
-                            local_key = f"plk:{price_list_id}" if account.source_type == "provisor" else f"{account.id}:{price_list_id}"
+                            local_key = (
+                                canonical_provisor_source_key(account.id, price_list_id)
+                                if account.source_type == "provisor"
+                                else f"{account.id}:{price_list_id}"
+                            )
                             local_updated_at, local_items_count, local_row_updated_at = local_price_list_state.get(local_key, ("", 0, None))
                             price_list_name = str(getattr(price_list, "price_list_name", "") or getattr(price_list, "distributor_name", "") or price_list_id)
                             logger.info(
@@ -7553,6 +7867,28 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                 "priceList": price_list,
                                 "error": "Неверный логин или пароль",
                             }
+                        except ProvisorAuthError as e:
+                            elapsed_ms = round((time.perf_counter() - fetch_items_started_at) * 1000, 2)
+                            if _is_price_source_auth_failure(e):
+                                logger.warning(
+                                    "[REFRESH] SKIP price_list=%s reason=auth_error elapsed_ms=%s",
+                                    price_list_id,
+                                    elapsed_ms,
+                                )
+                                return finish_result(
+                                    {
+                                        "ok": False,
+                                        "auth_error": True,
+                                        "priceList": price_list,
+                                        "items": [],
+                                        "elapsed_ms": elapsed_ms,
+                                        "timeout_limit_seconds": price_list_timeout,
+                                        "error": str(e),
+                                    },
+                                    outcome="failed",
+                                    skip_reason="auth_error",
+                                )
+                            raise
                         except Exception as e:
                             elapsed_ms = round((time.perf_counter() - fetch_items_started_at) * 1000, 2)
                             logger.warning(
@@ -7693,7 +8029,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                 if any(isinstance(result, dict) and result.get("auth_error") for result in results):
                     status.update(
                         {
-                            "source": "vidman",
+                            "source": account.source_type,
                             "status": "auth_error",
                             "ok": False,
                             "priceListsCount": 0,
@@ -7780,6 +8116,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
             return status
 
     fetched_statuses = await asyncio.gather(*(fetch_account(account) for account in accounts), return_exceptions=True)
+    SaveSession = sessionmaker(bind=db.get_bind())
 
     source_slowest_price_lists: dict[str, list[dict[str, object]]] = {}
     for account, status in zip(accounts, fetched_statuses):
@@ -7837,7 +8174,9 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
         )
         total_to_save = sum(1 for x in result_rows if x.get("ok") and x.get("priceList") is not None)
         saving_index = 0
+        summarized_results: list[dict[str, object]] = []
         for result in result_rows:
+            summary_appended = False
             price_list = result.get("priceList")
             benchmark = dict(result.get("benchmark") or {})
             if price_list is not None and result.get("skipped_unchanged"):
@@ -7859,6 +8198,8 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                 if benchmark:
                     logged = _log_provisor_plk_benchmark(benchmark)
                     provisor_plk_benchmarks.append(logged)
+                summarized_results.append(_provisor_result_summary(result, account_id=account_id, source_type=account_source_type))
+                summary_appended = True
             elif price_list is not None and result.get("timeout"):
                 try:
                     mark_unified_price_list_checked(
@@ -7878,6 +8219,8 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                 if benchmark:
                     logged = _log_provisor_plk_benchmark(benchmark)
                     provisor_plk_benchmarks.append(logged)
+                summarized_results.append(_provisor_result_summary(result, account_id=account_id, source_type=account_source_type))
+                summary_appended = True
             if result.get("ok") and price_list is not None:
                 saving_index += 1
                 price_list_id = str(getattr(price_list, "price_list_id", "") or "")
@@ -7907,6 +8250,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                     items = result.get("items") or []
                     if account_source_type == "provisor":
                         _record_provisor_plk_memory(benchmark, stage="before_db_replacement", db=db, rows=len(items))
+                        _record_provisor_plk_memory(benchmark, stage="before_db", db=db, rows=len(items))
                     if not items and int(result.get("localItemsCount") or 0) > 0:
                         if account_source_type == "provisor":
                             inventory["preserved_previous_snapshots"] = int(inventory.get("preserved_previous_snapshots") or 0) + 1
@@ -7933,7 +8277,9 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                         refreshed.append(
                             {
                                 "sourceType": account_source_type,
-                                "sourceKey": f"{account_id}:{price_list_id}",
+                                "sourceKey": canonical_provisor_source_key(account_id, price_list_id)
+                                if account_source_type == "provisor"
+                                else f"{account_id}:{price_list_id}",
                                 "accountId": account_id,
                                 "name": price_list_name,
                                 "itemsCount": 0,
@@ -7950,17 +8296,38 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                 _release_provisor_result_payload(result, benchmark, db=db)
                             logged = _log_provisor_plk_benchmark(benchmark)
                             provisor_plk_benchmarks.append(logged)
+                        summarized_results.append(_provisor_result_summary(result, account_id=account_id, source_type=account_source_type))
+                        summary_appended = True
                         continue
-                    saved = upsert_unified_price_list(
-                        db=db,
-                        price_format_code=format_code,
-                        price_list=price_list,
-                        items=items,
-                        status="updated",
-                        run_matching=False,
-                    )
+                    save_db = db
+                    close_save_db = False
+                    if account_source_type == "provisor":
+                        save_db = SaveSession()
+                        close_save_db = True
+                    try:
+                        saved = upsert_unified_price_list(
+                            db=save_db,
+                            price_format_code=format_code,
+                            price_list=price_list,
+                            items=items,
+                            status="updated",
+                            run_matching=False,
+                        )
+                        saved_id = int(saved.id)
+                        saved_source_type = str(saved.source_type or "")
+                        saved_source_key = str(saved.source_key or "")
+                        saved_display_name = str(saved.display_name or price_list_name)
+                        db_benchmark = dict(getattr(saved, "_benchmark", {}) or {})
+                    finally:
+                        if close_save_db:
+                            save_db.close()
+                            _record_provisor_plk_memory(
+                                benchmark,
+                                stage="after_session_close",
+                                db=save_db,
+                                rows=len(items),
+                            )
                     db_replace_elapsed_ms = round((time.perf_counter() - save_started_at) * 1000, 2)
-                    db_benchmark = dict(getattr(saved, "_benchmark", {}) or {})
                     if benchmark and db_benchmark:
                         benchmark.update(
                             {
@@ -8016,10 +8383,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                             download_elapsed_sec=round(float(result.get("elapsed_ms") or 0) / 1000, 3),
                             db_elapsed_sec=round(db_replace_elapsed_ms / 1000, 3),
                         )
-                    saved_source_type = str(saved.source_type or "")
-                    saved_source_key = str(saved.source_key or "")
-                    saved_display_name = str(saved.display_name or price_list_name)
-                    refreshed_price_list_ids.append(int(saved.id))
+                    refreshed_price_list_ids.append(saved_id)
                     if account_source_type == "vidman":
                         logger.info(
                             "[VW_PRICE_LIST_SAVED] account_id=%s price_id=%s price_name=%s old_date=%s new_date=%s items_count=%s",
@@ -8066,6 +8430,8 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                             _release_provisor_result_payload(result, benchmark, db=db)
                         logged = _log_provisor_plk_benchmark(benchmark)
                         provisor_plk_benchmarks.append(logged)
+                    summarized_results.append(_provisor_result_summary(result, account_id=account_id, source_type=account_source_type))
+                    summary_appended = True
                 except Exception as e:
                     elapsed_ms = round((time.perf_counter() - save_started_at) * 1000, 2)
                     db.rollback()
@@ -8119,14 +8485,27 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                             _release_provisor_result_payload(result, benchmark, db=db)
                         logged = _log_provisor_plk_benchmark(benchmark)
                         provisor_plk_benchmarks.append(logged)
+                    summarized_results.append(_provisor_result_summary(result, account_id=account_id, source_type=account_source_type))
+                    summary_appended = True
             elif result.get("error"):
                 errors.append(f"{account_source_type} / {account_login}: {result.get('error')}")
                 if benchmark:
                     logged = _log_provisor_plk_benchmark(benchmark)
                     provisor_plk_benchmarks.append(logged)
+                summarized_results.append(_provisor_result_summary(result, account_id=account_id, source_type=account_source_type))
+                summary_appended = True
             elif benchmark and not result.get("skipped_unchanged") and not result.get("timeout"):
                 logged = _log_provisor_plk_benchmark(benchmark)
                 provisor_plk_benchmarks.append(logged)
+                summarized_results.append(_provisor_result_summary(result, account_id=account_id, source_type=account_source_type))
+                summary_appended = True
+            elif not (result.get("ok") and price_list is not None) and not summary_appended:
+                summarized_results.append(_provisor_result_summary(result, account_id=account_id, source_type=account_source_type))
+                summary_appended = True
+            if account_source_type == "provisor":
+                result.clear()
+                gc.collect()
+        status["results"] = summarized_results
 
         account_row = db.get(PriceSourceAccount, account_id)
         if account_row is not None:
@@ -8136,7 +8515,17 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                 + int(status.get("skipped_heavy_count") or 0)
                 + int(status.get("success_zero_items") or 0)
             )
-            account_row.status = "connected" if available_count > 0 else "auth_error"
+            has_auth_error = (
+                str(status.get("status") or "").strip().lower() == "auth_error"
+                or bool(status.get("auth_error"))
+                or int(status.get("skipped_auth_error_count") or 0) > 0
+            )
+            if has_auth_error:
+                account_row.status = "auth_error"
+            elif account_source_type == "provisor" or available_count > 0:
+                account_row.status = "connected"
+            else:
+                account_row.status = "auth_error"
             account_row.status_message = str(status.get("message") or "")[:512]
             if available_count > 0:
                 account_row.last_success_at = now_kz_naive()
@@ -8155,7 +8544,6 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
             + int(status.get("success_zero_items") or 0)
         ) > 0
         status["priceListsCount"] = saved_count + int(status.get("skipped_unchanged") or 0) + int(status.get("success_zero_items") or 0)
-        status.pop("results", None)
         account_statuses.append(status)
         if status.get("skipped_price_lists"):
             errors.extend(
@@ -8237,8 +8625,8 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
         rebuild_started_at = time.perf_counter()
         sync_selected_competitor_configs(db=db, price_format_id=pf_for_refresh.id)
         rebuild_summary = rebuild_competitor_prices_for_selected(db=db, price_format_id=pf_for_refresh.id, commit_between_lists=True)
-        recalculate_competitor_percentiles_if_needed(db=db, price_format_id=pf_for_refresh.id)
         db.commit()
+        enqueue_percentile_preparation(db=db, price_format_id=int(pf_for_refresh.id), reason="source_refresh_completed")
         _timing(operation, "rebuild_selected_competitor_prices", rebuild_started_at)
     else:
         logger.info(
@@ -8263,6 +8651,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                     competitor_price_list_ids=refreshed_price_list_ids,
                 )
                 db.commit()
+                retry_waiting_percentile_preparations(db=db, start_worker=True)
                 if job is not None:
                     update_job(
                         db,
@@ -8313,6 +8702,14 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
     )
     progress["provisor_benchmark"] = provisor_benchmark_summary
     logger.info("[PROVISOR_REFRESH_BENCHMARK] %s", json.dumps(provisor_benchmark_summary, ensure_ascii=False, sort_keys=True))
+    if refresh_source in {"all", "provisor"}:
+        _record_provisor_plk_memory(
+            {"account_id": None, "filial_id": ""},
+            stage="refresh_finish",
+            db=db,
+            results_entries=len(refreshed),
+            status_results_entries=sum(len(status.get("results") or []) for status in account_statuses if isinstance(status, dict)),
+        )
     logger.info(
         "[PROVISOR_REFRESH_INVENTORY] refresh_id=%s requested_by=%s mode=%s raw_candidates=%s unique_plk=%s duplicates=%s queued=%s started=%s succeeded=%s failed=%s timed_out=%s skipped=%s persisted_snapshots=%s preserved_previous_snapshots=%s duration_seconds=%s",
         inventory.get("refresh_id") or "",
@@ -8422,13 +8819,13 @@ def _run_generate_price_job_sync(db: Session, job: Job, *, price_format_id: int,
         mode = "regular"
     percentile_mode = mode in {"percentile", "mixed"}
     physical_mode = mode in {"regular", "mixed"}
+    if percentile_mode and pf_for_generation is not None:
+        ensure_percentile_ready_for_generation(db, pf_for_generation)
     if percentile_mode and not physical_mode:
         summary = {"percentile_mode": {"skippedRawCompetitorPriceRebuild": True}}
     else:
         summary = rebuild_competitor_prices_for_selected(db=db, price_format_id=price_format_id, commit_between_lists=True)
     update_job(db, job, status="running", progress=70, message="Пересборка competitor_prices завершена", result={"summary": summary}, log_level="info")
-    if physical_mode:
-        recalculate_competitor_percentiles_if_needed(db=db, price_format_id=price_format_id)
     db.commit()
     competitor_prices_loaded = int(
         db.execute(
@@ -8530,6 +8927,10 @@ def get_settings_for_format(
         "branch": pf.branch,
         "pricingRule": pf.pricing_rule or "",
         "pricingRuleId": int(pf.pricing_rule_id) if pf.pricing_rule_id is not None else None,
+        "appliedMarkupTemplateId": int(pf.applied_markup_template_id) if getattr(pf, "applied_markup_template_id", None) is not None else None,
+        "appliedBendTemplateId": int(pf.applied_bend_template_id) if getattr(pf, "applied_bend_template_id", None) is not None else None,
+        "appliedNoCompetitorTemplateId": int(pf.applied_no_competitor_template_id) if getattr(pf, "applied_no_competitor_template_id", None) is not None else None,
+        "appliedRoundingRuleId": int(pf.rounding_rule_id) if pf.rounding_rule_id is not None else None,
         "roundingRuleId": int(pf.rounding_rule_id) if pf.rounding_rule_id is not None else None,
         "appliedRule": pricing_rule_application_status(db=db, pf=pf),
         "competitorPriceMode": pf.competitor_price_mode or "regular",
@@ -8564,6 +8965,7 @@ def get_settings_for_format(
             }
             for idx, r in enumerate(no_competitor_rows)
         ],
+        "percentilePreparation": percentile_preparation_to_dict(db, int(pf.id)),
     }
 
 
@@ -8582,6 +8984,9 @@ def put_settings_for_format(
         db.add(pf)
         db.flush()
         propagate_emit_assignments_to_new_price_format(db=db, price_format_id=int(pf.id))
+        percentile_relevant_change = True
+    else:
+        percentile_relevant_change = False
 
     if isinstance(payload.get("branch"), str):
         pf.branch = payload["branch"]
@@ -8602,6 +9007,7 @@ def put_settings_for_format(
             db.rollback()
             raise
     if payload.get("competitorPriceMode") in {"regular", "percentile", "mixed"}:
+        percentile_relevant_change = percentile_relevant_change or str(pf.competitor_price_mode or "regular") != str(payload["competitorPriceMode"])
         pf.competitor_price_mode = payload["competitorPriceMode"]
     if payload.get("percentileNumber") is not None:
         try:
@@ -8621,6 +9027,7 @@ def put_settings_for_format(
     # Replace markup ranges
     rec = payload.get("recommendedMarkups")
     if isinstance(rec, list):
+        pf.applied_markup_template_id = None
         db.execute(delete(MarkupRange).where(MarkupRange.price_format_id == pf.id))
         for row in rec:
             if not isinstance(row, dict):
@@ -8647,6 +9054,7 @@ def put_settings_for_format(
     # Replace bend ranges (step table by competitor price)
     bends = payload.get("bendRanges")
     if isinstance(bends, list):
+        pf.applied_bend_template_id = None
         db.execute(delete(BendRange).where(BendRange.price_format_id == pf.id))
         for row in bends:
             if not isinstance(row, dict):
@@ -8669,6 +9077,7 @@ def put_settings_for_format(
 
     no_comp = payload.get("noCompetitorMarkups")
     if isinstance(no_comp, list):
+        pf.applied_no_competitor_template_id = None
         db.execute(delete(NoCompetitorMarkupRange).where(NoCompetitorMarkupRange.price_format_id == pf.id))
         for row in no_comp:
             if not isinstance(row, dict):
@@ -8693,6 +9102,8 @@ def put_settings_for_format(
             )
 
     db.commit()
+    if percentile_relevant_change:
+        enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="price_format_settings_changed")
     return get_settings_for_format(format_code=format_code, db=db, current_user=current_user)
 
 
@@ -9209,6 +9620,9 @@ def generate_price_list(payload: dict = Body(...), db: Session = Depends(get_db)
                 status_code=400,
                 detail="Выберите хотя бы один прайс-лист конкурента перед формированием прайса.",
             )
+
+        if mode in {"percentile", "mixed"}:
+            ensure_percentile_ready_for_generation(db, pf_for_selection)
 
         calculated_count = calculate_prices(
             db=db,

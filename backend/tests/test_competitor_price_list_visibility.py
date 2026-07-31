@@ -122,6 +122,23 @@ def test_global_pool_returns_usable_provisor_rows_outside_format_branch_with_met
     assert zero.id not in by_id
 
 
+def test_global_pool_hides_listed_placeholders_but_shows_attempted_zero_rows():
+    db = _session()
+    pf = _format(db, branch="РђР»РјР°С‚С‹")
+    placeholder = _price_list(db, pf, source_key="account:3:159", branch_name="Listed", account_id="3", external_price_list_id=159)
+    empty_success = _price_list(db, pf, source_key="account:4:159", branch_name="Empty", account_id="4", external_price_list_id=159)
+    placeholder.last_refresh_status = "listed"
+    empty_success.last_refresh_status = "updated"
+    db.flush()
+
+    rows = list_competitor_price_lists(db=db, price_format_code=pf.code)
+    by_id = {row["id"]: row for row in rows}
+
+    assert placeholder.id not in by_id
+    assert by_id[empty_success.id]["itemsCount"] == 0
+    assert by_id[empty_success.id]["sourceVisibilityState"] == "empty_success"
+
+
 def test_list_competitor_price_lists_reuses_visibility_item_counts():
     db = _session()
     pf = _format(db, branch="Алматы")

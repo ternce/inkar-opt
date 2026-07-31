@@ -112,6 +112,7 @@ type PriceListItem = {
 
 type PercentileSource = {
   id: string;
+  apiIdentity?: string;
   percentileSource?: PercentileSourceMode;
   sourceKey?: string;
   name: string;
@@ -141,6 +142,7 @@ type PercentileBrowserRow = {
 
 type PercentileGroup = {
   id: string;
+  apiIdentity?: string;
   sourceKey?: string;
   region: string;
   competitor: string;
@@ -174,6 +176,7 @@ type PercentilePayload = {
   selectedRegion: string;
   selectedCompetitor: string;
   selectedSourceKey?: string;
+  selectedApiIdentity?: string;
   percentileSource?: PercentileSourceMode;
   percentileSourceLabel?: string;
   requiresCompetitor?: boolean;
@@ -390,6 +393,7 @@ function PercentileBrowser({
   selectedRegion,
   selectedCompetitor,
   selectedSourceKey,
+  selectedApiIdentity,
   priceColumns,
   percentileNumbers,
   search,
@@ -419,6 +423,7 @@ function PercentileBrowser({
   selectedRegion: string;
   selectedCompetitor: string;
   selectedSourceKey?: string;
+  selectedApiIdentity?: string;
   priceColumns: PercentilePriceColumn[];
   percentileNumbers: number[];
   search: string;
@@ -447,11 +452,13 @@ function PercentileBrowser({
     ['Покрытие', `${fmtNumber(summary.coveragePercent)}%`],
   ];
   const groupOptions = groups.filter((group) => group.scope !== 'kazakhstan');
-  const selectedGroupId = selectedSourceKey || groupOptions.find((group) => group.region === selectedRegion && group.competitor === selectedCompetitor)?.sourceKey || '__none__';
+  const isCompetitorSource = percentileSource === 'competitor';
+  const selectedGroupId = isCompetitorSource
+    ? selectedApiIdentity || groupOptions.find((group) => group.sourceKey === selectedSourceKey)?.apiIdentity || '__none__'
+    : selectedSourceKey || groupOptions.find((group) => group.region === selectedRegion && group.competitor === selectedCompetitor)?.sourceKey || '__none__';
   const competitors = Array.from(
     new Set(groups.filter((group) => !selectedRegion || group.region === selectedRegion).map((group) => group.competitor).filter(Boolean))
   );
-  const isCompetitorSource = percentileSource === 'competitor';
 
   return (
     <div className="space-y-4">
@@ -470,7 +477,7 @@ function PercentileBrowser({
             <SelectTrigger><SelectValue placeholder="Percentile Source" /></SelectTrigger>
             <SelectContent>
               <SelectItem value="emit">Emit</SelectItem>
-              <SelectItem value="competitor">Other Competitors</SelectItem>
+              <SelectItem value="competitor">Regular competitors</SelectItem>
             </SelectContent>
           </Select>
           {!isCompetitorSource ? (
@@ -546,12 +553,18 @@ function PercentileBrowser({
       </div>
 
       <div className="text-sm text-gray-600">
-        Percentile Source: <span className="font-medium text-gray-900">{isCompetitorSource ? 'Other Competitors' : 'Emit'}</span>
+        Percentile Source: <span className="font-medium text-gray-900">{isCompetitorSource ? 'Regular competitors' : 'Emit'}</span>
         {' · '}
         Scope: <span className="font-medium text-gray-900">{isCompetitorSource ? 'Global' : (selectedRegion || '—')}</span>
         {' · '}
         Competitor: <span className="font-medium text-gray-900">{selectedCompetitor || '—'}</span>
       </div>
+
+      {import.meta.env.DEV && isCompetitorSource ? (
+        <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          [REGULAR_PERCENTILE_SELECTION] displayedGroup={selectedCompetitor || '—'} apiIdentity={selectedApiIdentity || '—'} requestSourceKey=— requestCompetitor=— page={page}
+        </div>
+      ) : null}
 
       <div className="admin-table-card">
         <div className="flex items-center justify-between border-b border-gray-100 px-4 py-3 text-sm text-gray-600">
@@ -640,10 +653,11 @@ export function CompetitorsTab({ formatCode }: Props) {
   const [percentilePage, setPercentilePage] = useState(1);
   const [percentilePageCount, setPercentilePageCount] = useState(0);
   const [percentileGroups, setPercentileGroups] = useState<PercentileGroup[]>([]);
-  const [percentileSource, setPercentileSource] = useState<PercentileSourceMode>('emit');
+  const [percentileSource, setPercentileSource] = useState<PercentileSourceMode>('competitor');
   const [percentileRegion, setPercentileRegion] = useState('');
   const [percentileCompetitor, setPercentileCompetitor] = useState('');
   const [percentileSourceKey, setPercentileSourceKey] = useState('');
+  const [percentileApiIdentity, setPercentileApiIdentity] = useState('');
   const [percentilePriceColumns, setPercentilePriceColumns] = useState<PercentilePriceColumn[]>([]);
   const [percentileNumbers, setPercentileNumbers] = useState<number[]>([10, 20, 30, 40, 60]);
   const [percentileSearch, setPercentileSearch] = useState('');
@@ -688,7 +702,7 @@ export function CompetitorsTab({ formatCode }: Props) {
   };
 
   const loadPercentiles = async () => {
-    const res = await fetch(`/api/competitors/percentiles?format_code=${encodeURIComponent(formatCode)}&percentile_source=${encodeURIComponent(percentileSource)}`);
+    const res = await fetch(`/api/competitors/percentiles?format_code=${encodeURIComponent(formatCode)}&percentile_source=${encodeURIComponent(percentileSource)}&visibility=all`);
     const text = await res.text();
     const data = parseJsonOrNull(text);
     if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить персентили');
@@ -700,8 +714,9 @@ export function CompetitorsTab({ formatCode }: Props) {
       format_code: formatCode,
       percentile_source: percentileSource,
       region: percentileSource === 'emit' ? percentileRegion : '',
-      competitor: percentileCompetitor,
-      source_key: percentileSourceKey,
+      competitor: percentileSource === 'emit' ? percentileCompetitor : '',
+      source_key: percentileSource === 'emit' ? percentileSourceKey : '',
+      api_identity: percentileSource === 'competitor' ? percentileApiIdentity : '',
       q: appliedPercentileSearch,
       percentile_filter: percentileFilter,
       competitor_filter: percentileCompetitorFilter,
@@ -731,6 +746,7 @@ export function CompetitorsTab({ formatCode }: Props) {
     if (data && 'selectedRegion' in data && data.selectedRegion !== percentileRegion) setPercentileRegion(data.selectedRegion || '');
     if (data && 'selectedCompetitor' in data && data.selectedCompetitor !== percentileCompetitor) setPercentileCompetitor(data.selectedCompetitor || '');
     if (data && 'selectedSourceKey' in data && (data.selectedSourceKey || '') !== percentileSourceKey) setPercentileSourceKey(data.selectedSourceKey || '');
+    if (data && 'selectedApiIdentity' in data && (data.selectedApiIdentity || '') !== percentileApiIdentity) setPercentileApiIdentity(data.selectedApiIdentity || '');
     if (data?.page && data.page !== percentilePage) setPercentilePage(data.page);
   };
 
@@ -806,6 +822,7 @@ export function CompetitorsTab({ formatCode }: Props) {
     setPercentileRegion('');
     setPercentileCompetitor('');
     setPercentileSourceKey('');
+    setPercentileApiIdentity('');
     setPercentilePage(1);
     setPercentileRows([]);
     setPercentilePriceColumns([]);
@@ -832,7 +849,7 @@ export function CompetitorsTab({ formatCode }: Props) {
       .catch((e: any) => setError(e?.message || 'Не удалось загрузить персентили'))
       .finally(() => setIsLoading(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, formatCode, percentileSource, percentileRegion, percentileCompetitor, percentileSourceKey, appliedPercentileSearch, percentileFilter, percentileCompetitorFilter, percentileSort, percentileDirection, percentilePage]);
+  }, [activeTab, formatCode, percentileSource, percentileRegion, percentileCompetitor, percentileSourceKey, percentileApiIdentity, appliedPercentileSearch, percentileFilter, percentileCompetitorFilter, percentileSort, percentileDirection, percentilePage]);
 
   useEffect(() => {
     if (activeTab !== 'mappings') return;
@@ -870,8 +887,9 @@ export function CompetitorsTab({ formatCode }: Props) {
       format_code: formatCode,
       percentile_source: percentileSource,
       region: percentileSource === 'emit' ? percentileRegion : '',
-      competitor: percentileCompetitor,
-      source_key: percentileSourceKey,
+      competitor: percentileSource === 'emit' ? percentileCompetitor : '',
+      source_key: percentileSource === 'emit' ? percentileSourceKey : '',
+      api_identity: percentileSource === 'competitor' ? percentileApiIdentity : '',
       q: appliedPercentileSearch,
       percentile_filter: percentileFilter,
       competitor_filter: percentileCompetitorFilter,
@@ -1989,6 +2007,7 @@ export function CompetitorsTab({ formatCode }: Props) {
               selectedRegion={percentileRegion}
               selectedCompetitor={percentileCompetitor}
               selectedSourceKey={percentileSourceKey}
+              selectedApiIdentity={percentileApiIdentity}
               priceColumns={percentilePriceColumns}
               percentileNumbers={percentileNumbers}
               search={percentileSearch}
@@ -2004,15 +2023,33 @@ export function CompetitorsTab({ formatCode }: Props) {
                 setPercentileRegion('');
                 setPercentileCompetitor('');
                 setPercentileSourceKey('');
+                setPercentileApiIdentity('');
                 setPercentilePage(1);
               }}
               onSort={(value) => { setPercentileSort(value); setPercentilePage(1); }}
               onDirection={(value) => { setPercentileDirection(value); setPercentilePage(1); }}
-              onRegion={(value) => { setPercentileRegion(value); setPercentileCompetitor(''); setPercentilePage(1); }}
-              onCompetitor={(value) => { setPercentileCompetitor(value); setPercentilePage(1); }}
+              onRegion={(value) => { setPercentileRegion(value); setPercentileCompetitor(''); setPercentileSourceKey(''); setPercentileApiIdentity(''); setPercentilePage(1); }}
+              onCompetitor={(value) => {
+                if (percentileSource === 'competitor') {
+                  const group = percentileGroups.find((item) => item.competitor === value);
+                  setPercentileApiIdentity(group?.apiIdentity || '');
+                  setPercentileSourceKey(group?.sourceKey || '');
+                  setPercentileRegion('');
+                  setPercentileCompetitor(group?.competitor || value);
+                } else {
+                  setPercentileCompetitor(value);
+                }
+                setPercentilePage(1);
+              }}
               onSourceKey={(value) => {
-                const group = percentileGroups.find((item) => (item.sourceKey || item.id) === value);
-                setPercentileSourceKey(value);
+                const group = percentileGroups.find((item) => (item.apiIdentity || item.sourceKey || item.id) === value);
+                if (percentileSource === 'competitor') {
+                  setPercentileApiIdentity(group?.apiIdentity || value);
+                  setPercentileSourceKey(group?.sourceKey || '');
+                } else {
+                  setPercentileSourceKey(value);
+                  setPercentileApiIdentity('');
+                }
                 setPercentileRegion(group?.region || '');
                 setPercentileCompetitor(group?.competitor || '');
                 setPercentilePage(1);

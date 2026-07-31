@@ -18,10 +18,22 @@ from ..models import (
     PriceFormat,
     PriceFormatCompetitorAssignment,
     Product,
+    RegularCompetitorPricePercentile,
 )
 from ..timezone import now_kz_naive
 from .competitor_assignments import get_assigned_competitor_price_lists
-from .competitor_source_config import MULTI_PRICE_PERCENTILE_MODE, canonical_competitor_source_key, effective_percentile_mode
+from .competitor_source_config import (
+    MULTI_PRICE_PERCENTILE_MODE,
+    canonical_competitor_source_key,
+    default_percentile_mode_for_source,
+    effective_percentile_mode,
+)
+from .competitors.identity import (
+    canonical_regular_competitor_identity,
+    normalize_regular_competitor_text,
+    regular_competitor_alias_obsolete_identities,
+    regular_competitor_display_name,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -31,11 +43,14 @@ PERCENTILES = (10, 20, 30, 40, 60)
 DEFAULT_BRANCH = "Без филиала"
 REGIONAL_SCOPE = "regional"
 KAZAKHSTAN_SCOPE = "kazakhstan"
+REGULAR_COMPETITOR_SCOPE = "regular_competitor"
 KAZAKHSTAN_REGION = "Kazakhstan"
 STATUS_CALCULATED = "Calculated"
 STATUS_ONE_PRICE = "Calculated from one price"
 STATUS_NO_DATA = "No data"
 DEFAULT_TRACE_SKU = "163571"
+REGULAR_PERCENTILE_ALGORITHM_VERSION = "percentile_inc_v1"
+INACTIVE_REFRESH_STATUSES = {"failed", "error", "stale"}
 
 
 def _as_decimal(value: object) -> Decimal | None:
@@ -90,6 +105,40 @@ def _competitor_name(price_list: CompetitorPriceList) -> str:
     return competitor.strip()
 
 
+def regular_competitor_identity(price_list: CompetitorPriceList) -> str:
+    return canonical_regular_competitor_identity(
+        price_list.competitor_name,
+        supplier_name=price_list.supplier,
+        display_name=price_list.display_name,
+    )
+
+
+def _stored_regular_competitor_identity(price_list: CompetitorPriceList) -> str:
+    return normalize_regular_competitor_text(_competitor_name(price_list))
+
+
+def _legacy_regular_competitor_identity(price_list: CompetitorPriceList) -> str:
+    return " ".join(_competitor_name(price_list).strip().casefold().split())
+
+
+def _is_emit_price_list(price_list: CompetitorPriceList) -> bool:
+    source_key = _source_key(price_list)
+    if source_key.startswith("emit:"):
+        return True
+    if str(price_list.source_type or "").strip().casefold() == "emit":
+        return True
+    return default_percentile_mode_for_source(price_list) == MULTI_PRICE_PERCENTILE_MODE
+
+
+def _regular_price_list_is_usable(price_list: CompetitorPriceList) -> bool:
+    if _is_emit_price_list(price_list):
+        return False
+    if not regular_competitor_identity(price_list):
+        return False
+    status = str(price_list.last_refresh_status or "").strip().casefold()
+    return status not in INACTIVE_REFRESH_STATUSES
+
+
 def _status_for_values(values: list[Decimal]) -> str:
     if len(values) == 1:
         return STATUS_ONE_PRICE
@@ -131,7 +180,11 @@ def eligible_percentile_assignments(*, db: Session, price_format_id: int, requir
 
 
 def emit_percentile_assignments(*, db: Session, price_format_id: int):
-    return eligible_percentile_assignments(db=db, price_format_id=price_format_id, require_matched_prices=False)
+    return [
+        item
+        for item in eligible_percentile_assignments(db=db, price_format_id=price_format_id, require_matched_prices=False)
+        if _is_emit_price_list(item.price_list)
+    ]
 
 
 def _source_key(price_list: CompetitorPriceList) -> str:
@@ -1601,6 +1654,543 @@ def recalculate_competitor_percentiles_if_needed(*, db: Session, price_format_id
     return recalculate_competitor_percentiles(db=db, price_format_id=price_format_id)
 
 
+def _regular_competitor_identities_for_price_lists(*, db: Session, price_list_ids: list[int]) -> set[str]:
+    if not price_list_ids:
+        return set()
+    rows = db.execute(select(CompetitorPriceList).where(CompetitorPriceList.id.in_(price_list_ids))).scalars().all()
+    return {
+        identity
+        for row in rows
+        for identity in (regular_competitor_identity(row),)
+        if identity and not _is_emit_price_list(row)
+    }
+
+
+def _regular_delete_identities(competitor_identities: set[str]) -> set[str]:
+    out = {str(item or "").strip().casefold() for item in competitor_identities if str(item or "").strip()}
+    for identity in list(out):
+        out.update(regular_competitor_alias_obsolete_identities(identity))
+    return out
+
+
+def recalculate_regular_competitor_percentiles(
+    *,
+    db: Session,
+    competitor_identities: set[str] | None = None,
+) -> dict[str, Any]:
+    identities = {str(item or "").strip().casefold() for item in (competitor_identities or set()) if str(item or "").strip()}
+    if (db.get_bind().dialect.name or "").lower() == "postgresql":
+        return _recalculate_regular_competitor_percentiles_postgresql(db=db, competitor_identities=identities)
+    return _recalculate_regular_competitor_percentiles_python(db=db, competitor_identities=identities)
+
+
+def _recalculate_regular_competitor_percentiles_python(
+    *,
+    db: Session,
+    competitor_identities: set[str],
+) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    product_rows = db.execute(select(Product.id, Product.code, Product.provisor_goods_id)).all()
+    product_id_by_goods_id: dict[int, int] = {}
+    product_id_by_code: dict[str, int] = {}
+    for product_id, code, goods_id in sorted(product_rows, key=lambda row: int(row[0])):
+        if goods_id is not None:
+            product_id_by_goods_id.setdefault(int(goods_id), int(product_id))
+        product_code = str(code or "").strip()
+        if product_code:
+            product_id_by_code.setdefault(product_code, int(product_id))
+
+    rows = (
+        db.execute(
+            select(CompetitorPriceList, CompetitorPriceListItem)
+            .join(CompetitorPriceListItem, CompetitorPriceListItem.price_list_id == CompetitorPriceList.id)
+            .where(CompetitorPriceListItem.distributor_price.is_not(None))
+            .order_by(CompetitorPriceList.id.asc(), CompetitorPriceListItem.id.asc())
+        )
+        .all()
+    )
+    grouped: dict[tuple[str, int], list[Decimal]] = defaultdict(list)
+    source_counts: dict[tuple[str, int], set[int]] = defaultdict(set)
+    display_names: dict[str, str] = {}
+    alias_identities_by_canonical: dict[str, set[str]] = defaultdict(set)
+    source_rows = 0
+    for price_list, item in rows:
+        if not _regular_price_list_is_usable(price_list):
+            continue
+        identity = regular_competitor_identity(price_list)
+        if competitor_identities and identity not in competitor_identities:
+            continue
+        for old_identity in {_stored_regular_competitor_identity(price_list), _legacy_regular_competitor_identity(price_list)}:
+            if old_identity and old_identity != identity:
+                alias_identities_by_canonical[identity].add(old_identity)
+        product_id = int(item.product_id or 0)
+        if not product_id and item.provisor_goods_id is not None:
+            product_id = int(product_id_by_goods_id.get(int(item.provisor_goods_id)) or 0)
+        if not product_id:
+            matched_sku = str(item.matched_sku or "").strip()
+            distributor_goods_id = str(item.distributor_goods_id or "").strip()
+            product_id = int(product_id_by_code.get(matched_sku) or product_id_by_code.get(distributor_goods_id) or 0)
+        price = _as_decimal(item.distributor_price)
+        if not identity or not product_id or price is None:
+            continue
+        source_rows += 1
+        display_names.setdefault(identity, _competitor_name(price_list))
+        grouped[(identity, product_id)].append(price)
+        source_counts[(identity, product_id)].add(int(price_list.id))
+
+    if not competitor_identities:
+        competitor_identities = {identity for identity, _product_id in grouped}
+    canonical_rows_deleted = 0
+    if competitor_identities:
+        canonical_rows_deleted = int(
+            db.execute(
+                delete(RegularCompetitorPricePercentile).where(
+                    RegularCompetitorPricePercentile.competitor_identity.in_(sorted(competitor_identities))
+                )
+            ).rowcount
+            or 0
+        )
+
+    now = now_kz_naive()
+    mappings: list[dict[str, Any]] = []
+    for (identity, product_id), values in sorted(grouped.items()):
+        if competitor_identities and identity not in competitor_identities:
+            continue
+        sample_count = len(values)
+        source_count = len(source_counts.get((identity, product_id), set()))
+        min_price = min(values)
+        max_price = max(values)
+        for pct in PERCENTILES:
+            mappings.append(
+                {
+                    "competitor_identity": identity,
+                    "competitor_name": regular_competitor_display_name(identity, display_names.get(identity, identity)),
+                    "product_id": product_id,
+                    "percentile": pct,
+                    "value": float(_percentile(values, pct)),
+                    "sample_count": sample_count,
+                    "source_count": source_count,
+                    "min_price": float(min_price),
+                    "max_price": float(max_price),
+                    "algorithm_version": REGULAR_PERCENTILE_ALGORITHM_VERSION,
+                    "calculated_at": now,
+                }
+            )
+    if mappings:
+        db.bulk_insert_mappings(RegularCompetitorPricePercentile, mappings)
+    rows_written_by_identity = defaultdict(int)
+    for row in mappings:
+        rows_written_by_identity[str(row["competitor_identity"])] += 1
+    alias_rows_deleted_by_identity: dict[str, int] = {}
+    for identity, alias_identities in sorted(alias_identities_by_canonical.items()):
+        if not rows_written_by_identity.get(identity):
+            continue
+        if not alias_identities:
+            continue
+        alias_rows_deleted_by_identity[identity] = int(
+            db.execute(
+                delete(RegularCompetitorPricePercentile).where(
+                    RegularCompetitorPricePercentile.competitor_identity.in_(sorted(alias_identities))
+                )
+            ).rowcount
+            or 0
+        )
+    total_alias_rows_deleted = sum(alias_rows_deleted_by_identity.values())
+    summary = {
+        "regularCompetitorsProcessed": len({row["competitor_identity"] for row in mappings}),
+        "regularSourceRowsSelected": source_rows,
+        "regularMatchedRows": source_rows,
+        "regularProductsGrouped": len(grouped),
+        "regularPercentileRowsDeleted": canonical_rows_deleted + total_alias_rows_deleted,
+        "regularPercentileRowsWritten": len(mappings),
+        "regularPercentileElapsedSec": round(time.perf_counter() - started_at, 3),
+        "regularEngine": "python",
+        "totalAliasIdentitiesDeleted": sum(1 for aliases in alias_identities_by_canonical.values() for _alias in aliases),
+        "totalAliasRowsDeleted": total_alias_rows_deleted,
+    }
+    for identity in sorted({row["competitor_identity"] for row in mappings} | competitor_identities):
+        physical_price_lists = sorted(
+            {
+                price_list_id
+                for grouped_identity, _product_id in grouped
+                if grouped_identity == identity
+                for price_list_id in source_counts.get((grouped_identity, _product_id), set())
+            }
+        )
+        logger.info(
+            "[REGULAR_PERCENTILE_CANONICAL_REBUILD] canonical_identity=%s canonical_rows_written=%s "
+            "alias_identities_found=%s alias_rows_deleted_for_this_identity=%s elapsed_sec=%s "
+            "physical_price_lists=%s source_rows=%s matched_rows=%s products_grouped=%s",
+            identity,
+            rows_written_by_identity.get(identity, 0),
+            sorted(alias_identities_by_canonical.get(identity, set())),
+            alias_rows_deleted_by_identity.get(identity, 0),
+            summary["regularPercentileElapsedSec"],
+            len(physical_price_lists),
+            source_rows,
+            source_rows,
+            len({product_id for grouped_identity, product_id in grouped if grouped_identity == identity}),
+        )
+    logger.info(
+        "[REGULAR_PERCENTILE_CANONICAL_REBUILD] total_alias_identities_deleted=%s total_alias_rows_deleted=%s",
+        summary["totalAliasIdentitiesDeleted"],
+        summary["totalAliasRowsDeleted"],
+    )
+    logger.info("[REGULAR_PERCENTILE_REBUILD] completed summary=%s", json.dumps(summary, ensure_ascii=False))
+    return summary
+
+
+def _recalculate_regular_competitor_percentiles_postgresql(
+    *,
+    db: Session,
+    competitor_identities: set[str],
+) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    requested_identities = {str(item or "").strip().casefold() for item in competitor_identities if str(item or "").strip()}
+    db.execute(text("DROP TABLE IF EXISTS tmp_regular_percentile_identities"))
+    db.execute(text("CREATE TEMP TABLE tmp_regular_percentile_identities (identity TEXT PRIMARY KEY) ON COMMIT DROP"))
+    if requested_identities:
+        db.execute(
+            text("INSERT INTO tmp_regular_percentile_identities (identity) VALUES (:identity)"),
+            [{"identity": item} for item in sorted(requested_identities)],
+        )
+    db.execute(text("DROP TABLE IF EXISTS tmp_regular_percentile_sources"))
+    db.execute(
+        text(
+            """
+            CREATE TEMP TABLE tmp_regular_percentile_sources (
+                price_list_id BIGINT PRIMARY KEY,
+                competitor_identity TEXT NOT NULL,
+                competitor_name TEXT NOT NULL
+            ) ON COMMIT DROP
+            """
+        )
+    )
+    candidate_price_lists = db.execute(select(CompetitorPriceList).order_by(CompetitorPriceList.id.asc())).scalars().all()
+    source_mappings = []
+    alias_mappings: list[dict[str, str]] = []
+    for price_list in candidate_price_lists:
+        if not _regular_price_list_is_usable(price_list):
+            continue
+        identity = regular_competitor_identity(price_list)
+        if not identity or (requested_identities and identity not in requested_identities):
+            continue
+        for old_identity in {_stored_regular_competitor_identity(price_list), _legacy_regular_competitor_identity(price_list)}:
+            if old_identity and old_identity != identity:
+                alias_mappings.append({"canonical_identity": identity, "alias_identity": old_identity})
+        source_mappings.append(
+            {
+                "price_list_id": int(price_list.id),
+                "competitor_identity": identity,
+                "competitor_name": regular_competitor_display_name(identity, _competitor_name(price_list)),
+            }
+        )
+    if source_mappings:
+        db.execute(
+            text(
+                """
+                INSERT INTO tmp_regular_percentile_sources (
+                    price_list_id,
+                    competitor_identity,
+                    competitor_name
+                )
+                VALUES (
+                    :price_list_id,
+                    :competitor_identity,
+                    :competitor_name
+                )
+                """
+            ),
+            source_mappings,
+        )
+    db.execute(text("DROP TABLE IF EXISTS tmp_regular_percentile_alias_identities"))
+    db.execute(
+        text(
+            """
+            CREATE TEMP TABLE tmp_regular_percentile_alias_identities (
+                canonical_identity TEXT NOT NULL,
+                alias_identity TEXT NOT NULL,
+                PRIMARY KEY (canonical_identity, alias_identity)
+            ) ON COMMIT DROP
+            """
+        )
+    )
+    if alias_mappings:
+        db.execute(
+            text(
+                """
+                INSERT INTO tmp_regular_percentile_alias_identities (
+                    canonical_identity,
+                    alias_identity
+                )
+                VALUES (
+                    :canonical_identity,
+                    :alias_identity
+                )
+                ON CONFLICT DO NOTHING
+                """
+            ),
+            alias_mappings,
+        )
+    selected_identities = {str(row["competitor_identity"]) for row in source_mappings}
+    canonical_rows_deleted = int(
+        db.execute(
+            text(
+                """
+                DELETE FROM regular_competitor_price_percentiles
+                WHERE (SELECT count(*) FROM tmp_regular_percentile_identities) = 0
+                   OR competitor_identity IN (SELECT identity FROM tmp_regular_percentile_identities)
+                """
+            )
+        ).rowcount
+        or 0
+    )
+    result = db.execute(
+        text(
+            f"""
+            WITH matched_prices AS (
+                SELECT
+                    src.competitor_identity AS competitor_identity,
+                    min(src.competitor_name) AS competitor_name,
+                    coalesce(i.product_id, p_goods.id, p_sku.id, p_distributor.id) AS product_id,
+                    i.price_list_id,
+                    i.distributor_price::numeric AS distributor_price
+                FROM competitor_price_lists cpl
+                JOIN tmp_regular_percentile_sources src ON src.price_list_id = cpl.id
+                JOIN competitor_price_list_items i ON i.price_list_id = cpl.id
+                LEFT JOIN LATERAL (
+                    SELECT p.id
+                    FROM products p
+                    WHERE i.product_id IS NULL
+                      AND i.provisor_goods_id IS NOT NULL
+                      AND p.provisor_goods_id = i.provisor_goods_id
+                    ORDER BY p.id
+                    LIMIT 1
+                ) p_goods ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT p.id
+                    FROM products p
+                    WHERE i.product_id IS NULL
+                      AND p_goods.id IS NULL
+                      AND nullif(i.matched_sku, '') IS NOT NULL
+                      AND p.code = nullif(i.matched_sku, '')
+                    ORDER BY p.id
+                    LIMIT 1
+                ) p_sku ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT p.id
+                    FROM products p
+                    WHERE i.product_id IS NULL
+                      AND p_goods.id IS NULL
+                      AND p_sku.id IS NULL
+                      AND nullif(i.distributor_goods_id, '') IS NOT NULL
+                      AND p.code = nullif(i.distributor_goods_id, '')
+                    ORDER BY p.id
+                    LIMIT 1
+                ) p_distributor ON TRUE
+                WHERE i.distributor_price IS NOT NULL
+                  AND i.distributor_price > 0
+                  AND coalesce(i.product_id, p_goods.id, p_sku.id, p_distributor.id) IS NOT NULL
+                GROUP BY src.competitor_identity, coalesce(i.product_id, p_goods.id, p_sku.id, p_distributor.id), i.id, i.price_list_id, i.distributor_price
+            ),
+            calculated_arrays AS (
+                SELECT
+                    competitor_identity,
+                    min(competitor_name) AS competitor_name,
+                    product_id,
+                    count(*)::integer AS sample_count,
+                    count(DISTINCT price_list_id)::integer AS source_count,
+                    min(distributor_price) AS min_price,
+                    max(distributor_price) AS max_price,
+                    percentile_cont(ARRAY[0.10, 0.20, 0.30, 0.40, 0.60])
+                        WITHIN GROUP (ORDER BY distributor_price) AS percentile_values
+                FROM matched_prices
+                GROUP BY competitor_identity, product_id
+            )
+            INSERT INTO regular_competitor_price_percentiles (
+                competitor_identity,
+                competitor_name,
+                product_id,
+                percentile,
+                value,
+                sample_count,
+                source_count,
+                min_price,
+                max_price,
+                algorithm_version,
+                calculated_at
+            )
+            SELECT
+                ca.competitor_identity,
+                ca.competitor_name,
+                ca.product_id,
+                u.percentile,
+                u.value,
+                ca.sample_count,
+                ca.source_count,
+                ca.min_price,
+                ca.max_price,
+                :algorithm_version,
+                :calculated_at
+            FROM calculated_arrays ca
+            CROSS JOIN LATERAL unnest(
+                ARRAY[10, 20, 30, 40, 60]::integer[],
+                ca.percentile_values
+            ) AS u(percentile, value)
+            """
+        ),
+        {
+            "algorithm_version": REGULAR_PERCENTILE_ALGORITHM_VERSION,
+            "calculated_at": now_kz_naive(),
+        },
+    )
+    written = int(result.rowcount or 0)
+    alias_delete_counts = db.execute(
+        text(
+            """
+            WITH canonical_written AS (
+                SELECT competitor_identity
+                FROM regular_competitor_price_percentiles
+                WHERE competitor_identity IN (
+                    SELECT canonical_identity
+                    FROM tmp_regular_percentile_alias_identities
+                )
+                GROUP BY competitor_identity
+            )
+            SELECT a.canonical_identity, count(r.id) AS rows_to_delete
+            FROM tmp_regular_percentile_alias_identities a
+            JOIN canonical_written cw ON cw.competitor_identity = a.canonical_identity
+            JOIN regular_competitor_price_percentiles r ON r.competitor_identity = a.alias_identity
+            GROUP BY a.canonical_identity
+            """
+        )
+    ).all()
+    db.execute(
+        text(
+            """
+            WITH canonical_written AS (
+                SELECT competitor_identity
+                FROM regular_competitor_price_percentiles
+                WHERE competitor_identity IN (
+                    SELECT canonical_identity
+                    FROM tmp_regular_percentile_alias_identities
+                )
+                GROUP BY competitor_identity
+            )
+            DELETE FROM regular_competitor_price_percentiles r
+            USING tmp_regular_percentile_alias_identities a
+            JOIN canonical_written cw ON cw.competitor_identity = a.canonical_identity
+            WHERE r.competitor_identity = a.alias_identity
+            """
+        )
+    )
+    alias_rows_deleted_by_identity: dict[str, int] = defaultdict(int)
+    alias_identities_found_by_identity: dict[str, set[str]] = defaultdict(set)
+    for canonical_identity, alias_identity in db.execute(
+        text("SELECT canonical_identity, alias_identity FROM tmp_regular_percentile_alias_identities")
+    ).all():
+        alias_identities_found_by_identity[str(canonical_identity)].add(str(alias_identity))
+    for canonical_identity, deleted_rows in alias_delete_counts:
+        alias_rows_deleted_by_identity[str(canonical_identity)] += int(deleted_rows or 0)
+    total_alias_rows_deleted = sum(alias_rows_deleted_by_identity.values())
+    stat_rows = db.execute(
+        text(
+            """
+            SELECT
+                src.competitor_identity,
+                count(DISTINCT src.price_list_id) AS physical_price_lists,
+                count(i.id) AS source_rows,
+                count(i.id) FILTER (
+                    WHERE i.distributor_price IS NOT NULL
+                      AND i.distributor_price > 0
+                      AND coalesce(i.product_id, p_goods.id, p_sku.id, p_distributor.id) IS NOT NULL
+                ) AS matched_rows,
+                count(DISTINCT coalesce(i.product_id, p_goods.id, p_sku.id, p_distributor.id)) FILTER (
+                    WHERE i.distributor_price IS NOT NULL
+                      AND i.distributor_price > 0
+                      AND coalesce(i.product_id, p_goods.id, p_sku.id, p_distributor.id) IS NOT NULL
+                ) AS products_grouped
+            FROM tmp_regular_percentile_sources src
+            JOIN competitor_price_list_items i ON i.price_list_id = src.price_list_id
+            LEFT JOIN LATERAL (
+                SELECT p.id
+                FROM products p
+                WHERE i.product_id IS NULL
+                  AND i.provisor_goods_id IS NOT NULL
+                  AND p.provisor_goods_id = i.provisor_goods_id
+                ORDER BY p.id
+                LIMIT 1
+            ) p_goods ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT p.id
+                FROM products p
+                WHERE i.product_id IS NULL
+                  AND p_goods.id IS NULL
+                  AND nullif(i.matched_sku, '') IS NOT NULL
+                  AND p.code = nullif(i.matched_sku, '')
+                ORDER BY p.id
+                LIMIT 1
+            ) p_sku ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT p.id
+                FROM products p
+                WHERE i.product_id IS NULL
+                  AND p_goods.id IS NULL
+                  AND p_sku.id IS NULL
+                  AND nullif(i.distributor_goods_id, '') IS NOT NULL
+                  AND p.code = nullif(i.distributor_goods_id, '')
+                ORDER BY p.id
+                LIMIT 1
+            ) p_distributor ON TRUE
+            GROUP BY src.competitor_identity
+            """
+        )
+    ).all()
+    rows_written_by_identity = dict(
+        db.execute(
+            text(
+                """
+                SELECT competitor_identity, count(*) AS rows_written
+                FROM regular_competitor_price_percentiles
+                WHERE competitor_identity IN (SELECT competitor_identity FROM tmp_regular_percentile_sources)
+                GROUP BY competitor_identity
+                """
+            )
+        ).all()
+    )
+    summary = {
+        "regularCompetitorsProcessed": len(selected_identities),
+        "regularPercentileRowsDeleted": canonical_rows_deleted + total_alias_rows_deleted,
+        "regularPercentileRowsWritten": written,
+        "regularPercentileElapsedSec": round(time.perf_counter() - started_at, 3),
+        "regularEngine": "postgresql",
+        "totalAliasIdentitiesDeleted": sum(len(items) for items in alias_identities_found_by_identity.values()),
+        "totalAliasRowsDeleted": total_alias_rows_deleted,
+    }
+    for row in stat_rows:
+        logger.info(
+            "[REGULAR_PERCENTILE_CANONICAL_REBUILD] canonical_identity=%s canonical_rows_written=%s "
+            "alias_identities_found=%s alias_rows_deleted_for_this_identity=%s elapsed_sec=%s "
+            "physical_price_lists=%s source_rows=%s matched_rows=%s products_grouped=%s",
+            row.competitor_identity,
+            int(rows_written_by_identity.get(row.competitor_identity, 0) or 0),
+            sorted(alias_identities_found_by_identity.get(str(row.competitor_identity), set())),
+            alias_rows_deleted_by_identity.get(str(row.competitor_identity), 0),
+            summary["regularPercentileElapsedSec"],
+            int(row.physical_price_lists or 0),
+            int(row.source_rows or 0),
+            int(row.matched_rows or 0),
+            int(row.products_grouped or 0),
+        )
+    logger.info(
+        "[REGULAR_PERCENTILE_CANONICAL_REBUILD] total_alias_identities_deleted=%s total_alias_rows_deleted=%s",
+        summary["totalAliasIdentitiesDeleted"],
+        summary["totalAliasRowsDeleted"],
+    )
+    logger.info("[REGULAR_PERCENTILE_REBUILD] completed summary=%s", json.dumps(summary, ensure_ascii=False))
+    return summary
+
+
 def recalculate_percentiles_for_price_lists(
     *,
     db: Session,
@@ -1625,6 +2215,19 @@ def recalculate_percentiles_for_price_lists(
             "warnings": [],
         }
 
+    regular_identities = _regular_competitor_identities_for_price_lists(db=db, price_list_ids=ids)
+    regular_summary = (
+        recalculate_regular_competitor_percentiles(db=db, competitor_identities=regular_identities)
+        if regular_identities
+        else {
+            "regularCompetitorsProcessed": 0,
+            "regularSourceRowsSelected": 0,
+            "regularProductsGrouped": 0,
+            "regularPercentileRowsDeleted": 0,
+            "regularPercentileRowsWritten": 0,
+        }
+    )
+
     rows = db.execute(
         select(PriceFormatCompetitorAssignment, CompetitorPriceList, PriceFormat)
         .join(CompetitorPriceList, CompetitorPriceList.id == PriceFormatCompetitorAssignment.competitor_price_list_id)
@@ -1635,6 +2238,8 @@ def recalculate_percentiles_for_price_lists(
     by_format: dict[int, list[int]] = {}
     warnings: list[dict[str, Any]] = []
     for assignment, price_list, pf in rows:
+        if not _is_emit_price_list(price_list):
+            continue
         mode = effective_percentile_mode(price_list, assignment.percentile_mode)
         source_key = canonical_competitor_source_key(price_list)
         if mode != MULTI_PRICE_PERCENTILE_MODE:
@@ -1690,6 +2295,7 @@ def recalculate_percentiles_for_price_lists(
         "skipped_reason": "" if by_format else "no_eligible_multi_price_per_sku_assignments",
         "summaries": summaries,
         "warnings": warnings,
+        "regularPercentiles": regular_summary,
     }
 
 

@@ -54,6 +54,9 @@ class PriceFormat(Base):
     pricing_rule: Mapped[str] = mapped_column(Text, default="")
     pricing_rule_id: Mapped[int | None] = mapped_column(ForeignKey("pricing_rules.id"), nullable=True, index=True)
     rounding_rule_id: Mapped[int | None] = mapped_column(ForeignKey("rounding_rules.id"), nullable=True, index=True)
+    applied_markup_template_id: Mapped[int | None] = mapped_column(ForeignKey("markup_templates.id"), nullable=True, index=True)
+    applied_bend_template_id: Mapped[int | None] = mapped_column(ForeignKey("bend_templates.id"), nullable=True, index=True)
+    applied_no_competitor_template_id: Mapped[int | None] = mapped_column(ForeignKey("no_competitor_markup_templates.id"), nullable=True, index=True)
     pricing_rule_applied_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     pricing_rule_applied_tables_json: Mapped[str] = mapped_column(Text, default="[]")
     competitor_price_mode: Mapped[str] = mapped_column(String(32), default="regular")
@@ -248,6 +251,12 @@ class CompetitorPriceList(Base):
     __table_args__ = (
         UniqueConstraint("price_format_id", "source_type", "source_key", name="uq_competitor_price_list_source"),
         Index("ix_competitor_price_lists_pf_selected", "price_format_id", "is_selected"),
+        Index(
+            "ix_competitor_price_lists_provisor_account_external",
+            "source_type",
+            "account_id",
+            "external_price_list_id",
+        ),
     )
 
 
@@ -419,6 +428,38 @@ class CompetitorPricePercentile(Base):
     )
 
 
+class RegularCompetitorPricePercentile(Base):
+    __tablename__ = "regular_competitor_price_percentiles"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    competitor_identity: Mapped[str] = mapped_column(Text, index=True)
+    competitor_name: Mapped[str] = mapped_column(Text, default="", index=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
+    percentile: Mapped[int] = mapped_column(Integer, index=True)
+    value: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    sample_count: Mapped[int] = mapped_column(Integer, default=0)
+    source_count: Mapped[int] = mapped_column(Integer, default=0)
+    min_price: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    max_price: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    algorithm_version: Mapped[str] = mapped_column(String(32), default="percentile_inc_v1")
+    calculated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "competitor_identity",
+            "product_id",
+            "percentile",
+            name="uq_regular_comp_percentile_identity_product",
+        ),
+        Index(
+            "ix_regular_comp_percentile_lookup",
+            "competitor_identity",
+            "product_id",
+            "percentile",
+        ),
+    )
+
+
 class PriceSourceAccount(Base):
     __tablename__ = "price_source_accounts"
 
@@ -464,6 +505,27 @@ class Job(Base):
 
     __table_args__ = (
         Index("ix_jobs_type_format_status", "type", "format_code", "status"),
+    )
+
+
+class PriceFormatPercentilePreparation(Base):
+    __tablename__ = "price_format_percentile_preparations"
+
+    price_format_id: Mapped[int] = mapped_column(ForeignKey("price_formats.id"), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), default="not_configured", index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    source_refresh_id: Mapped[str] = mapped_column(Text, default="")
+    source_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    configuration_fingerprint: Mapped[str] = mapped_column(Text, default="")
+    job_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    rows_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    __table_args__ = (
+        Index("ix_pf_percentile_prep_status", "status", "updated_at"),
     )
 
 
@@ -743,6 +805,13 @@ class CalculatedPrice(Base):
     competitor_candidate_price: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
 
     final_price: Mapped[float] = mapped_column(Numeric(18, 4))
+    memorandum_max_price: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    price_before_memorandum: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    memorandum_applied: Mapped[bool] = mapped_column(Boolean, default=False)
+    memorandum_below_mdc: Mapped[bool] = mapped_column(Boolean, default=False)
+    memorandum_list_id: Mapped[int | None] = mapped_column(ForeignKey("universal_lists.id"), nullable=True, index=True)
+    memorandum_list_name: Mapped[str] = mapped_column(Text, default="")
+    memorandum_diagnostic_code: Mapped[str] = mapped_column(String(64), default="")
     applied_reason: Mapped[str] = mapped_column(Text, default="")
     applied_source_name: Mapped[str] = mapped_column(Text, default="")
     applied_source_type: Mapped[str] = mapped_column(String(64), default="")

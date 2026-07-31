@@ -44,6 +44,16 @@ def effective_percentile_mode(row: CompetitorPriceList, configured_mode: object 
     return mode or default_percentile_mode_for_source(row)
 
 
+def canonical_provisor_source_key(account_id: object, external_price_list_id: object) -> str:
+    account = str(account_id or "").strip()
+    external = str(external_price_list_id or "").strip()
+    if account and external:
+        return f"account:{account}:plk:{external}"
+    if external:
+        return f"plk:{external}"
+    return ""
+
+
 def canonical_competitor_source_key(row: CompetitorPriceList) -> str:
     """Return the stable business identity used for assignment/percentile joins."""
 
@@ -61,7 +71,7 @@ def canonical_competitor_source_key(row: CompetitorPriceList) -> str:
     if default_percentile_mode_for_source(row) == MULTI_PRICE_PERCENTILE_MODE and external_id:
         return f"emit:{external_id}"
     if source_type == "provisor" and account_id and external_id:
-        return f"{account_id}:{external_id}"
+        return canonical_provisor_source_key(account_id, external_id)
     if source_type == "provisor" and external_id:
         return f"plk:{external_id}"
     if source_type == "vidman" and account_id and external_id:

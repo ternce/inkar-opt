@@ -5,6 +5,8 @@ import logging
 import os
 import re
 import time
+import asyncio
+import tracemalloc
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Protocol
@@ -36,6 +38,66 @@ def _provisor_item_timeout_seconds() -> float:
     total_timeout = _env_float("PROVISOR_PRICE_TOTAL_TIMEOUT_SECONDS", 120.0)
     read_timeout = _env_float("PROVISOR_PRICE_READ_TIMEOUT_SECONDS", total_timeout)
     return max(read_timeout, total_timeout)
+
+
+def _python_memory_snapshot() -> tuple[float | None, float | None]:
+    try:
+        if not tracemalloc.is_tracing():
+            tracemalloc.start()
+        current, peak = tracemalloc.get_traced_memory()
+        return round(current / (1024 * 1024), 2), round(peak / (1024 * 1024), 2)
+    except Exception:
+        return None, None
+
+
+def _alive_async_tasks() -> int | None:
+    try:
+        return sum(1 for task in asyncio.all_tasks() if not task.done())
+    except Exception:
+        return None
+
+
+def _log_provisor_memory(
+    *,
+    account_id: object,
+    external_price_list_id: object,
+    stage: str,
+    decoded_rows: int | None = None,
+    normalized_rows: int | None = None,
+    manufacturer_cache_size: int | None = None,
+    elapsed_ms: float | None = None,
+) -> None:
+    rss = process_memory_snapshot().get("rss_mb")
+    current, peak = _python_memory_snapshot()
+    logger.info(
+        "[PROVISOR_MEMORY] %s",
+        json.dumps(
+            {
+                "account_id": account_id,
+                "external_price_list_id": str(external_price_list_id or ""),
+                "stage": stage,
+                "rss_mb": rss,
+                "python_current_mb": current,
+                "python_peak_mb": peak,
+                "identity_map_size": None,
+                "session_new": None,
+                "session_dirty": None,
+                "session_deleted": None,
+                "decoded_rows": decoded_rows,
+                "normalized_rows": normalized_rows,
+                "mapping_rows": None,
+                "results_entries": None,
+                "status_results_entries": None,
+                "manufacturer_cache_size": manufacturer_cache_size,
+                "product_cache_size": None,
+                "match_cache_size": None,
+                "alive_async_tasks": _alive_async_tasks(),
+                "elapsed_ms": elapsed_ms,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -264,6 +326,20 @@ class ProvisorPriceService:
         )
         http_benchmark = dict(getattr(raw_items, "benchmark", {}) or {})
         fetch_elapsed_ms = round((time.perf_counter() - fetch_started_at) * 1000, 2)
+        _log_provisor_memory(
+            account_id=account.id,
+            external_price_list_id=filial_id,
+            stage="after_http",
+            decoded_rows=int(http_benchmark.get("rows_received") or len(raw_items)),
+            elapsed_ms=fetch_elapsed_ms,
+        )
+        _log_provisor_memory(
+            account_id=account.id,
+            external_price_list_id=filial_id,
+            stage="after_json_decode",
+            decoded_rows=len(raw_items),
+            elapsed_ms=round(float(http_benchmark.get("json_decode_sec") or 0) * 1000, 2),
+        )
         normalize_started_at = time.perf_counter()
         first = next((x for x in raw_items if isinstance(x, dict)), {})
         filial = first.get("filial") if isinstance(first.get("filial"), dict) else {}
@@ -366,6 +442,19 @@ class ProvisorPriceService:
             len(manufacturer_cache),
             memory_after_normalization.get("rss_mb"),
         )
+        _log_provisor_memory(
+            account_id=account.id,
+            external_price_list_id=filial_id,
+            stage="after_normalize",
+            decoded_rows=len(raw_items),
+            normalized_rows=len(out),
+            manufacturer_cache_size=len(manufacturer_cache),
+            elapsed_ms=normalize_elapsed_ms,
+        )
+        try:
+            raw_items.clear()
+        except Exception:
+            pass
         return out
 
 

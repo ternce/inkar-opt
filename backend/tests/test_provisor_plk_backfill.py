@@ -49,8 +49,9 @@ def test_provisor_plk_backfill_dry_run_does_not_mutate():
 
     report = normalize_provisor_plk_rows(db=db, apply=False)
 
-    assert report["groups_changed"] == 1
-    assert report["rows_merged"] == 1
+    assert report["groups_changed"] == 2
+    assert report["rows_merged"] == 0
+    assert report["rows_normalized"] == 2
     assert sorted(db.execute(select(CompetitorPriceList.source_key)).scalars().all()) == ["3:128", "4:128"]
 
 
@@ -73,9 +74,9 @@ def test_provisor_plk_backfill_merges_duplicates_and_is_idempotent():
     latest = CompetitorPriceList(
         price_format_id=pf.id,
         source_type="provisor",
-        source_key="4:128",
+        source_key="legacy:3:128:latest",
         external_price_list_id="128",
-        account_id="4",
+        account_id="3",
         account_login="B",
         display_name="Amanat",
         last_success_at=datetime.utcnow(),
@@ -111,7 +112,10 @@ def test_provisor_plk_backfill_merges_duplicates_and_is_idempotent():
     assert report["assignments_merged"] == 1
     assert report["items_deleted_from_noncanonical_snapshots"] == 1
     rows = db.execute(select(CompetitorPriceList).order_by(CompetitorPriceList.external_price_list_id.asc())).scalars().all()
-    assert [(row.external_price_list_id, row.source_key) for row in rows] == [("128", "plk:128"), ("129", "plk:129")]
+    assert [(row.external_price_list_id, row.source_key) for row in rows] == [
+        ("128", "account:3:plk:128"),
+        ("129", "account:3:plk:129"),
+    ]
     canonical = rows[0]
     assert canonical.id == latest.id
     assert "aliasesJson" in canonical.region
@@ -120,7 +124,7 @@ def test_provisor_plk_backfill_merges_duplicates_and_is_idempotent():
     assert assignment.competitor_price_list_id == canonical.id
     assert assignment.is_active is True
     assert float(assignment.coefficient) == 1.2
-    assert db.execute(select(CompetitorPrice.source_name)).scalar_one() == "provisor:plk:128"
+    assert db.execute(select(CompetitorPrice.source_name)).scalar_one() == "provisor:account:3:plk:128"
 
     second_report = normalize_provisor_plk_rows(db=db, apply=True)
 

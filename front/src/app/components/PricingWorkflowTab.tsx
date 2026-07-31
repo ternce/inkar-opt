@@ -6,6 +6,7 @@ import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { formatDateTimeKz } from '../timezone';
+import { shouldPollPercentilePreparation, type PercentilePreparation } from '../percentilePreparationStatus';
 
 type PriceFormat = {
   id?: string | number;
@@ -44,6 +45,7 @@ type FormatReadiness = {
   items: ReadinessItem[];
   errors: ReadinessItem[];
   warnings: ReadinessItem[];
+  percentilePreparation?: PercentilePreparation;
 };
 
 type GeneratedPriceList = {
@@ -239,6 +241,16 @@ export function PricingWorkflowTab({
     setReadiness(items);
     return items as FormatReadiness[];
   };
+
+  useEffect(() => {
+    if (!readiness.some((row) => shouldPollPercentilePreparation(row.percentilePreparation?.status))) return;
+    const timer = window.setTimeout(() => {
+      void loadReadiness(formats.map((format) => format.code), selectedBranch).catch((e: any) => {
+        setError(e?.message || 'Не удалось обновить готовность данных');
+      });
+    }, 2500);
+    return () => window.clearTimeout(timer);
+  }, [readiness, formats, selectedBranch]);
 
   const loadData = async (nextBranch = selectedBranch) => {
     setIsLoading(true);

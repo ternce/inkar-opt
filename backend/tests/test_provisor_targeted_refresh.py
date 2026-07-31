@@ -6,11 +6,18 @@ import logging
 from decimal import Decimal
 from types import SimpleNamespace
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
 from backend.app.db import Base
-from backend.app.models import CompetitorPriceList, CompetitorPriceListItem, PriceFormat, PriceSourceAccount
+from backend.app.models import (
+    CompetitorPriceList,
+    CompetitorPriceListItem,
+    PriceFormat,
+    PriceFormatCompetitorAssignment,
+    PriceSourceAccount,
+)
+from backend.app.services.provisor import ProvisorAuthError
 from backend.app.services.price_sources import UnifiedPriceItem, UnifiedPriceList
 
 
@@ -26,6 +33,7 @@ class _FakeProvisorAdapter:
 
     def __init__(self):
         self.fetched_item_ids: list[str] = []
+        self.fetched_account_item_ids: list[str] = []
 
     async def fetch_price_lists(self, account):
         return [
@@ -46,6 +54,7 @@ class _FakeProvisorAdapter:
 
     async def fetch_price_list_items(self, account, price_list):
         self.fetched_item_ids.append(str(price_list.price_list_id))
+        self.fetched_account_item_ids.append(f"{account.id}:{price_list.price_list_id}")
         if str(price_list.price_list_id) == "1397":
             return []
         return [
@@ -94,6 +103,7 @@ class _ManyPlkProvisorAdapter(_FakeProvisorAdapter):
 
     async def fetch_price_list_items(self, account, price_list):
         self.fetched_item_ids.append(str(price_list.price_list_id))
+        self.fetched_account_item_ids.append(f"{account.id}:{price_list.price_list_id}")
         if str(price_list.price_list_id) == "104":
             raise RuntimeError("one PLK failed")
         return [
@@ -117,6 +127,55 @@ class _ManyPlkProvisorAdapter(_FakeProvisorAdapter):
         ]
 
 
+class _AccountScopedPlkAdapter(_FakeProvisorAdapter):
+    def __init__(self, ids_by_account: dict[int, list[int]]):
+        super().__init__()
+        self.ids_by_account = ids_by_account
+
+    async def fetch_price_lists(self, account):
+        return [
+            UnifiedPriceList(
+                source="provisor",
+                account_id=str(account.id),
+                account_login=account.login,
+                price_list_id=str(fid),
+                price_list_name=f"Filial {fid}",
+                distributor_name=f"Filial {fid}",
+                branch_id=str(fid),
+                branch_code=str(fid),
+                branch_name=f"Filial {fid}",
+                competitor_name=f"Filial {fid}",
+            )
+            for fid in self.ids_by_account.get(int(account.id), [])
+        ]
+
+    async def fetch_price_list_items(self, account, price_list):
+        self.fetched_item_ids.append(str(price_list.price_list_id))
+        self.fetched_account_item_ids.append(f"{account.id}:{price_list.price_list_id}")
+        return [
+            UnifiedPriceItem(
+                source="provisor",
+                account_id=str(account.id),
+                price_list_id=str(price_list.price_list_id),
+                price_list_name=price_list.price_list_name,
+                distributor_name=price_list.distributor_name,
+                product_name=f"Item account {account.id}",
+                manufacturer="",
+                registration_number="",
+                distributor_product_name=f"Item account {account.id}",
+                distributor_product_id=f"SKU-{account.id}-{price_list.price_list_id}",
+                distributor_price=Decimal(str(10 + int(account.id))),
+                stock=Decimal("1"),
+                pack_quantity=None,
+                expiry_date=None,
+                raw={"id": int(f"{account.id}{price_list.price_list_id}"), "goodsId": int(price_list.price_list_id) * 10 + int(account.id)},
+            )
+        ]
+
+    async def test_connection(self, account):
+        return True, "ok"
+
+
 class _TimeoutProvisorAdapter(_FakeProvisorAdapter):
     async def fetch_price_lists(self, account):
         return [
@@ -132,8 +191,16 @@ class _TimeoutProvisorAdapter(_FakeProvisorAdapter):
 
     async def fetch_price_list_items(self, account, price_list):
         self.fetched_item_ids.append(str(price_list.price_list_id))
+        self.fetched_account_item_ids.append(f"{account.id}:{price_list.price_list_id}")
         await asyncio.sleep(0.05)
         return []
+
+
+class _AuthErrorProvisorAdapter(_ManyPlkProvisorAdapter):
+    async def fetch_price_list_items(self, account, price_list):
+        self.fetched_item_ids.append(str(price_list.price_list_id))
+        self.fetched_account_item_ids.append(f"{account.id}:{price_list.price_list_id}")
+        raise ProvisorAuthError("Price/GetByFilialId failed: HTTP 401: unauthorized")
 
 
 class _ContextManagedProvisorAdapter(_FakeProvisorAdapter):
@@ -188,13 +255,25 @@ def _benchmark_payloads(caplog):
 
 def _memory_payloads(caplog):
     out = []
-    for record in caplog.records:
-        message = record.getMessage()
-        if "[PROVISOR_PLK_MEMORY]" not in message:
+    messages = [record.getMessage() for record in caplog.records]
+    messages.extend(caplog.text.splitlines())
+    seen: set[str] = set()
+    for message in messages:
+        if "[PROVISOR_MEMORY]" not in message and "[PROVISOR_PLK_MEMORY]" not in message:
             continue
-        raw = message.split("[PROVISOR_PLK_MEMORY]", 1)[1].strip()
-        if raw.startswith("{"):
-            out.append(json.loads(raw))
+        marker = "[PROVISOR_MEMORY]" if "[PROVISOR_MEMORY]" in message else "[PROVISOR_PLK_MEMORY]"
+        raw = message.split(marker, 1)[1].strip()
+        brace = raw.find("{")
+        if brace >= 0:
+            raw = raw[brace:]
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                continue
+            key = json.dumps(parsed, ensure_ascii=False, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                out.append(parsed)
     return out
 
 
@@ -360,6 +439,56 @@ def test_provisor_benchmark_skipped_plk_has_skip_reason(monkeypatch, caplog):
     assert payloads
     assert payloads[0]["outcome"] == "skipped"
     assert payloads[0]["skip_reason"] == "excluded_emit_or_heavy_filial"
+    account = db.get(PriceSourceAccount, 3)
+    assert account is not None
+    assert account.status == "connected"
+
+
+def test_provisor_successful_auth_with_all_skipped_is_not_auth_error(monkeypatch):
+    import backend.app.main as main
+
+    db = _session()
+    _seed(db)
+    adapter = _ManyPlkProvisorAdapter([1052])
+    monkeypatch.setattr(main, "adapter_for_source", lambda source: adapter)
+    monkeypatch.setattr(main, "credentials_from_row", _fake_credentials)
+
+    result = asyncio.run(
+        main._run_refresh_price_lists_logic(
+            format_code="FMT",
+            payload={"source": "provisor", "accountId": 3, "forceRefresh": True},
+            db=db,
+        )
+    )
+
+    assert result["progress"]["skipped_heavy"] == 1
+    account = db.get(PriceSourceAccount, 3)
+    assert account is not None
+    assert account.status == "connected"
+
+
+def test_provisor_actual_401_sets_auth_error(monkeypatch):
+    import backend.app.main as main
+
+    db = _session()
+    _seed(db)
+    adapter = _AuthErrorProvisorAdapter([128])
+    monkeypatch.setattr(main, "adapter_for_source", lambda source: adapter)
+    monkeypatch.setattr(main, "credentials_from_row", _fake_credentials)
+
+    result = asyncio.run(
+        main._run_refresh_price_lists_logic(
+            format_code="FMT",
+            payload={"source": "provisor", "accountId": 3, "forceRefresh": True},
+            db=db,
+        )
+    )
+
+    assert adapter.fetched_account_item_ids == ["3:128"]
+    assert result["progress"]["skipped_auth_error_count"] == 1
+    account = db.get(PriceSourceAccount, 3)
+    assert account is not None
+    assert account.status == "auth_error"
 
 
 def test_provisor_benchmark_failed_plk_has_failed_outcome(monkeypatch, caplog):
@@ -414,7 +543,7 @@ def test_one_provisor_plk_failure_does_not_cancel_remaining(monkeypatch):
     assert saved == ["100", "105"]
 
 
-def test_duplicate_provisor_plk_external_id_refreshed_once_with_aliases(monkeypatch):
+def test_same_provisor_plk_external_id_is_account_scoped(monkeypatch):
     import backend.app.main as main
 
     db = _session()
@@ -432,16 +561,70 @@ def test_duplicate_provisor_plk_external_id_refreshed_once_with_aliases(monkeypa
         )
     )
 
-    assert adapter.fetched_item_ids == ["128"]
+    assert sorted(adapter.fetched_account_item_ids) == ["3:128", "4:128"]
+    assert result["inventory"]["raw_plk_candidates"] == 2
+    assert result["inventory"]["unique_plk"] == 2
+    assert result["inventory"]["duplicates"] == 0
+    assert result["provisorAudit"]["skipped"] == 0
+    rows = db.execute(select(CompetitorPriceList).order_by(CompetitorPriceList.account_id.asc())).scalars().all()
+    assert len(rows) == 2
+    assert [(row.account_id, row.external_price_list_id, row.source_key) for row in rows] == [
+        ("3", "128", "account:3:plk:128"),
+        ("4", "128", "account:4:plk:128"),
+    ]
+
+
+def test_duplicate_provisor_plk_external_id_within_same_account_is_deduplicated(monkeypatch):
+    import backend.app.main as main
+
+    db = _session()
+    _seed(db)
+    adapter = _ManyPlkProvisorAdapter([128, 128])
+    monkeypatch.setattr(main, "adapter_for_source", lambda source: adapter)
+    monkeypatch.setattr(main, "credentials_from_row", _fake_credentials)
+
+    result = asyncio.run(
+        main._run_refresh_price_lists_logic(
+            format_code="FMT",
+            payload={"source": "provisor", "accountId": 3, "forceRefresh": True},
+            db=db,
+        )
+    )
+
+    assert adapter.fetched_account_item_ids == ["3:128"]
     assert result["inventory"]["raw_plk_candidates"] == 2
     assert result["inventory"]["unique_plk"] == 1
     assert result["inventory"]["duplicates"] == 1
-    assert result["provisorAudit"]["skipped"] == 1
     assert result["provisorAudit"]["failure_skip_reasons"]["duplicate_external_plk_id"] == 1
-    rows = db.execute(select(CompetitorPriceList)).scalars().all()
-    assert len(rows) == 1
-    assert rows[0].source_key == "plk:128"
-    assert "aliasesJson" in rows[0].region
+    row = db.execute(select(CompetitorPriceList)).scalar_one()
+    assert row.source_key == "account:3:plk:128"
+
+
+def test_zhasulan_farm_regression_all_discovered_plks_are_attempted(monkeypatch):
+    import backend.app.main as main
+
+    db = _session()
+    pf = PriceFormat(code="FMT", name="Format")
+    account = PriceSourceAccount(id=1, source_type="provisor", login="Жасулан-Фарм", encrypted_password="x")
+    db.add_all([pf, account])
+    db.commit()
+    adapter = _ManyPlkProvisorAdapter(list(range(1000, 1044)))
+    monkeypatch.setattr(main, "adapter_for_source", lambda source: adapter)
+    monkeypatch.setattr(main, "credentials_from_row", _fake_credentials)
+
+    result = asyncio.run(
+        main._run_refresh_price_lists_logic(
+            format_code="FMT",
+            payload={"source": "provisor", "accountId": 1, "forceRefresh": True, "maxParallelPlk": 4},
+            db=db,
+        )
+    )
+
+    assert result["inventory"]["raw_plk_candidates"] == 44
+    assert result["inventory"]["unique_plk"] == 44
+    assert result["inventory"]["duplicates"] == 0
+    assert len(adapter.fetched_account_item_ids) == 44
+    assert all(item.startswith("1:") for item in adapter.fetched_account_item_ids)
 
 
 def test_provisor_refresh_reuses_legacy_account_scoped_row(monkeypatch):
@@ -476,7 +659,7 @@ def test_provisor_refresh_reuses_legacy_account_scoped_row(monkeypatch):
     rows = db.execute(select(CompetitorPriceList)).scalars().all()
     assert len(rows) == 1
     assert rows[0].id == legacy_id
-    assert rows[0].source_key == "plk:128"
+    assert rows[0].source_key == "account:3:plk:128"
     assert result["inventory"]["persisted_snapshots"] == 1
 
 
@@ -499,7 +682,10 @@ def test_same_name_different_provisor_plk_not_merged(monkeypatch):
 
     assert result["inventory"]["unique_plk"] == 2
     assert result["inventory"]["duplicates"] == 0
-    assert sorted(db.execute(select(CompetitorPriceList.source_key)).scalars().all()) == ["plk:128", "plk:129"]
+    assert sorted(db.execute(select(CompetitorPriceList.source_key)).scalars().all()) == [
+        "account:3:plk:128",
+        "account:3:plk:129",
+    ]
 
 
 def test_targeted_provisor_refresh_only_processes_requested_account(monkeypatch):
@@ -545,8 +731,12 @@ def test_targeted_provisor_refresh_processes_multiple_requested_accounts(monkeyp
     )
 
     assert result["accounts_processed"] == [3, 4]
-    assert db.execute(select(CompetitorPriceList)).scalar_one().source_key == "plk:128"
-    assert result["inventory"]["duplicates"] == 1
+    rows = db.execute(select(CompetitorPriceList).order_by(CompetitorPriceList.account_id.asc())).scalars().all()
+    assert [(row.account_id, row.source_key) for row in rows] == [
+        ("3", "account:3:plk:128"),
+        ("4", "account:4:plk:128"),
+    ]
+    assert result["inventory"]["duplicates"] == 0
 
 
 def test_provisor_refresh_without_account_ids_keeps_refresh_all_behavior(monkeypatch):
@@ -569,8 +759,264 @@ def test_provisor_refresh_without_account_ids_keeps_refresh_all_behavior(monkeyp
 
     assert result["accounts_requested"] == []
     assert result["accounts_processed"] == [3, 4]
-    assert db.execute(select(CompetitorPriceList)).scalar_one().source_key == "plk:128"
-    assert result["inventory"]["duplicates"] == 1
+    rows = db.execute(select(CompetitorPriceList).order_by(CompetitorPriceList.account_id.asc())).scalars().all()
+    assert [(row.account_id, row.source_key) for row in rows] == [
+        ("3", "account:3:plk:128"),
+        ("4", "account:4:plk:128"),
+    ]
+    assert result["inventory"]["duplicates"] == 0
+
+
+def test_sequential_selected_provisor_refresh_preserves_unselected_account_rows_and_assignments(monkeypatch):
+    import backend.app.main as main
+    from backend.app.services.competitor_price_lists import list_competitor_price_lists
+
+    db = _session()
+    pf = PriceFormat(code="0001", name="Format 0001")
+    db.add(pf)
+    db.add_all(
+        [
+            PriceSourceAccount(id=1, source_type="provisor", login="Жасулан-Фарм", encrypted_password="x"),
+            PriceSourceAccount(id=12, source_type="provisor", login="arai2/3", encrypted_password="x"),
+            PriceSourceAccount(id=15, source_type="provisor", login="Есмамбетова", encrypted_password="x"),
+        ]
+    )
+    db.commit()
+
+    adapter = _AccountScopedPlkAdapter({1: [159], 12: [159], 15: [159]})
+    monkeypatch.setattr(main, "adapter_for_source", lambda source: adapter)
+    monkeypatch.setattr(main, "credentials_from_row", _fake_credentials)
+
+    first = asyncio.run(
+        main._run_refresh_price_lists_logic(
+            format_code="0001",
+            payload={"source": "provisor", "accountIds": [12, 15], "forceRefresh": True, "maxParallelAccounts": 2},
+            db=db,
+        )
+    )
+    assert sorted(adapter.fetched_account_item_ids) == ["12:159", "15:159"]
+    assert first["accounts_processed"] == [12, 15]
+
+    first_rows = db.execute(select(CompetitorPriceList).order_by(CompetitorPriceList.account_id.asc())).scalars().all()
+    assert [(row.account_id, row.external_price_list_id, row.source_key) for row in first_rows] == [
+        ("12", "159", "account:12:plk:159"),
+        ("15", "159", "account:15:plk:159"),
+    ]
+    db.add_all(
+        [
+            PriceFormatCompetitorAssignment(price_format_id=pf.id, competitor_price_list_id=row.id, is_active=True)
+            for row in first_rows
+        ]
+    )
+    db.commit()
+
+    adapter.fetched_account_item_ids.clear()
+    second = asyncio.run(
+        main._run_refresh_price_lists_logic(
+            format_code="0001",
+            payload={
+                "source": "provisor",
+                "accountIds": [1],
+                "forceRefresh": True,
+                "runRebuildAfterRefresh": True,
+            },
+            db=db,
+        )
+    )
+
+    assert adapter.fetched_account_item_ids == ["1:159"]
+    assert second["accounts_processed"] == [1]
+    rows = db.execute(select(CompetitorPriceList).order_by(CompetitorPriceList.account_id.asc())).scalars().all()
+    assert [(row.account_id, row.external_price_list_id, row.source_key) for row in rows] == [
+        ("1", "159", "account:1:plk:159"),
+        ("12", "159", "account:12:plk:159"),
+        ("15", "159", "account:15:plk:159"),
+    ]
+    item_counts = dict(
+        db.execute(
+            select(CompetitorPriceList.account_id, func.count(CompetitorPriceListItem.id))
+            .join(CompetitorPriceListItem, CompetitorPriceListItem.price_list_id == CompetitorPriceList.id)
+            .group_by(CompetitorPriceList.account_id)
+        ).all()
+    )
+    assert item_counts == {"1": 1, "12": 1, "15": 1}
+    saved_items = {
+        row.account_id: item.distributor_goods_id
+        for row, item in db.execute(
+            select(CompetitorPriceList, CompetitorPriceListItem)
+            .join(CompetitorPriceListItem, CompetitorPriceListItem.price_list_id == CompetitorPriceList.id)
+        ).all()
+    }
+    assert saved_items == {
+        "1": "SKU-1-159",
+        "12": "SKU-12-159",
+        "15": "SKU-15-159",
+    }
+    active_assignments = {
+        row.account_id
+        for row in (
+            db.execute(
+                select(CompetitorPriceList)
+                .join(PriceFormatCompetitorAssignment, PriceFormatCompetitorAssignment.competitor_price_list_id == CompetitorPriceList.id)
+                .where(PriceFormatCompetitorAssignment.price_format_id == pf.id)
+                .where(PriceFormatCompetitorAssignment.is_active.is_(True))
+            )
+            .scalars()
+            .all()
+        )
+    }
+    assert active_assignments == {"12", "15"}
+    visible = list_competitor_price_lists(db=db, price_format_code="0001")
+    assert sorted((str(row["accountId"]), str(row["filialId"])) for row in visible) == [
+        ("1", "159"),
+        ("12", "159"),
+        ("15", "159"),
+    ]
+    result_summaries = second["accounts"][0]["results"]
+    assert result_summaries == [
+        {
+            "ok": True,
+            "sourceType": "provisor",
+            "accountId": 1,
+            "priceListId": "159",
+            "external_price_list_id": "159",
+            "rows": 1,
+            "itemsCount": 1,
+            "elapsed_ms": result_summaries[0]["elapsed_ms"],
+            "status": "ok",
+            "http_status": None,
+            "timeout": False,
+            "skipped": False,
+            "skipped_unchanged": False,
+            "skipped_heavy": False,
+            "duplicate": False,
+            "error": "",
+            "localItemsCount": 0,
+            "skippedInfo": None,
+        }
+    ]
+    assert "items" not in result_summaries[0]
+    assert "priceList" not in result_summaries[0]
+
+
+def test_provisor_memory_logs_include_session_close_and_summary_payloads(monkeypatch, caplog):
+    import backend.app.main as main
+
+    db = _session()
+    pf = PriceFormat(code="0001", name="Format 0001")
+    account = PriceSourceAccount(id=1, source_type="provisor", login="Жасулан-Фарм", encrypted_password="x")
+    db.add_all([pf, account])
+    db.commit()
+    adapter = _AccountScopedPlkAdapter({1: [159]})
+    monkeypatch.setattr(main, "adapter_for_source", lambda source: adapter)
+    monkeypatch.setattr(main, "credentials_from_row", _fake_credentials)
+    captured_memory = []
+    original_record_memory = main._record_provisor_plk_memory
+
+    def record_memory_wrapper(*args, **kwargs):
+        payload = original_record_memory(*args, **kwargs)
+        captured_memory.append(payload)
+        return payload
+
+    monkeypatch.setattr(main, "_record_provisor_plk_memory", record_memory_wrapper)
+
+    with caplog.at_level(logging.INFO):
+        result = asyncio.run(
+            main._run_refresh_price_lists_logic(
+                format_code="0001",
+                payload={"source": "provisor", "accountId": 1, "forceRefresh": True},
+                db=db,
+            )
+        )
+
+    memory = captured_memory + _memory_payloads(caplog)
+    stages = {row.get("stage") for row in memory}
+    assert {"before_fetch", "before_db_replacement", "after_session_close", "after_cleanup"}.issubset(stages)
+    after_close = [row for row in memory if row.get("stage") == "after_session_close"]
+    assert after_close
+    assert all(row.get("identity_map_size") == 0 for row in after_close)
+    assert "items" not in result["accounts"][0]["results"][0]
+    assert "priceList" not in result["accounts"][0]["results"][0]
+
+
+def test_provisor_connection_listing_does_not_wipe_populated_snapshot(monkeypatch):
+    from backend.app.services.competitor_price_lists import upsert_unified_price_list
+    import backend.app.services.price_source_accounts as account_service
+
+    db = _session()
+    pf = PriceFormat(code="0001", name="Format 0001")
+    account = PriceSourceAccount(id=12, source_type="provisor", login="arai2/3", encrypted_password="x")
+    db.add_all([pf, account])
+    db.commit()
+    adapter = _AccountScopedPlkAdapter({12: [159]})
+    price_list = asyncio.run(adapter.fetch_price_lists(account))[0]
+    upsert_unified_price_list(
+        db=db,
+        price_format_code="0001",
+        price_list=price_list,
+        items=asyncio.run(adapter.fetch_price_list_items(account, price_list)),
+        status="updated",
+        run_matching=False,
+    )
+    before_items = db.execute(select(CompetitorPriceListItem.distributor_goods_id)).scalars().all()
+    assert before_items == ["SKU-12-159"]
+
+    monkeypatch.setattr(account_service, "adapter_for_source", lambda source: adapter)
+    monkeypatch.setattr(account_service, "credentials_from_row", _fake_credentials)
+
+    result_account = asyncio.run(account_service.test_account_connection(db=db, account_id=12, price_format_code="0001"))
+
+    row = db.execute(select(CompetitorPriceList).where(CompetitorPriceList.account_id == "12")).scalar_one()
+    after_items = db.execute(select(CompetitorPriceListItem.distributor_goods_id)).scalars().all()
+    assert result_account.status == "connected"
+    assert row.source_key == "account:12:plk:159"
+    assert row.last_refresh_status == "updated"
+    assert after_items == before_items
+
+
+def test_full_provisor_refresh_keeps_same_external_plk_populated_for_all_accounts(monkeypatch):
+    import backend.app.main as main
+    from backend.app.services.competitor_price_lists import list_competitor_price_lists
+
+    db = _session()
+    pf = PriceFormat(code="0001", name="Format 0001")
+    db.add(pf)
+    db.add_all(
+        [
+            PriceSourceAccount(id=1, source_type="provisor", login="Жасулан-Фарм", encrypted_password="x"),
+            PriceSourceAccount(id=12, source_type="provisor", login="arai2/3", encrypted_password="x"),
+            PriceSourceAccount(id=15, source_type="provisor", login="Есмамбетова", encrypted_password="x"),
+        ]
+    )
+    db.commit()
+    adapter = _AccountScopedPlkAdapter({1: [159], 12: [159], 15: [159]})
+    monkeypatch.setattr(main, "adapter_for_source", lambda source: adapter)
+    monkeypatch.setattr(main, "credentials_from_row", _fake_credentials)
+
+    result = asyncio.run(
+        main._run_refresh_price_lists_logic(
+            format_code="0001",
+            payload={"source": "provisor", "forceRefresh": True, "maxParallelAccounts": 3},
+            db=db,
+        )
+    )
+
+    assert sorted(adapter.fetched_account_item_ids) == ["12:159", "15:159", "1:159"]
+    assert result["inventory"]["unique_plk"] == 3
+    item_counts = dict(
+        db.execute(
+            select(CompetitorPriceList.account_id, func.count(CompetitorPriceListItem.id))
+            .join(CompetitorPriceListItem, CompetitorPriceListItem.price_list_id == CompetitorPriceList.id)
+            .group_by(CompetitorPriceList.account_id)
+        ).all()
+    )
+    assert item_counts == {"1": 1, "12": 1, "15": 1}
+    visible = list_competitor_price_lists(db=db, price_format_code="0001")
+    assert sorted((str(row["accountId"]), str(row["filialId"]), row["itemsCount"]) for row in visible) == [
+        ("1", "159", 1),
+        ("12", "159", 1),
+        ("15", "159", 1),
+    ]
 
 
 def test_provisor_unchanged_updates_checked_status_and_preserves_items(monkeypatch):
@@ -581,7 +1027,7 @@ def test_provisor_unchanged_updates_checked_status_and_preserves_items(monkeypat
     existing = CompetitorPriceList(
         price_format_id=pf.id,
         source_type="provisor",
-        source_key="plk:128",
+        source_key="account:3:plk:128",
         display_name="Existing",
         account_id="3",
         account_login="Aksai4/83",
@@ -603,6 +1049,7 @@ def test_provisor_unchanged_updates_checked_status_and_preserves_items(monkeypat
     adapter = _FakeProvisorAdapter()
     async def _unchanged_items(account, price_list):
         adapter.fetched_item_ids.append(str(price_list.price_list_id))
+        adapter.fetched_account_item_ids.append(f"{account.id}:{price_list.price_list_id}")
         return [
             UnifiedPriceItem(
                 source="provisor",
@@ -635,7 +1082,7 @@ def test_provisor_unchanged_updates_checked_status_and_preserves_items(monkeypat
         )
     )
 
-    row = db.execute(select(CompetitorPriceList).where(CompetitorPriceList.source_key == "plk:128")).scalar_one()
+    row = db.execute(select(CompetitorPriceList).where(CompetitorPriceList.source_key == "account:3:plk:128")).scalar_one()
     items = db.execute(select(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == row.id)).scalars().all()
     assert result["skipped_unchanged"] == 1
     assert row.last_refresh_status == "checked_unchanged"
@@ -652,7 +1099,7 @@ def test_provisor_timeout_does_not_wipe_existing_items(monkeypatch):
     existing = CompetitorPriceList(
         price_format_id=pf.id,
         source_type="provisor",
-        source_key="plk:128",
+        source_key="account:3:plk:128",
         display_name="Existing",
         account_id="3",
         external_price_list_id="128",
@@ -697,7 +1144,7 @@ def test_provisor_zero_response_does_not_wipe_existing_items(monkeypatch, caplog
     existing = CompetitorPriceList(
         price_format_id=pf.id,
         source_type="provisor",
-        source_key="plk:1397",
+        source_key="account:3:plk:1397",
         display_name="Existing",
         account_id="3",
         external_price_list_id="1397",
@@ -727,7 +1174,7 @@ def test_provisor_zero_response_does_not_wipe_existing_items(monkeypatch, caplog
             )
         )
 
-    row = db.execute(select(CompetitorPriceList).where(CompetitorPriceList.source_key == "plk:1397")).scalar_one()
+    row = db.execute(select(CompetitorPriceList).where(CompetitorPriceList.source_key == "account:3:plk:1397")).scalar_one()
     items = db.execute(select(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == row.id)).scalars().all()
     payloads = _benchmark_payloads(caplog)
     assert result["progress"]["success_zero_items"] == 1

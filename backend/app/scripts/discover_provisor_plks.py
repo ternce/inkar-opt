@@ -16,6 +16,7 @@ from app.db import SessionLocal
 from app.models import PriceSourceAccount
 from app.services.price_source_accounts import credentials_from_row
 from app.services.price_sources import PriceSourceAccountCredentials
+from app.services.competitor_source_config import canonical_provisor_source_key
 from app.services.provisor import get_filials_by_context
 
 
@@ -149,7 +150,7 @@ def _normalize_plk(row: dict[str, Any], account: PriceSourceAccountCredentials) 
 
     return PlkDiscoveryRow(
         external_price_list_id=external_id,
-        source_key=f"plk:{external_id}",
+        source_key=canonical_provisor_source_key(account.id, external_id),
         plk_name=plk_name,
         competitor_name=competitor,
         filial_name=filial_name,

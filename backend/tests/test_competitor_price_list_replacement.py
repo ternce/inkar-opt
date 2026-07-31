@@ -254,6 +254,48 @@ def test_replacement_row_count_matches_input_count():
     assert row._benchmark["inserted_rows_count"] == len(inputs)
 
 
+def test_chunked_provisor_persistence_preserves_all_rows(monkeypatch):
+    import backend.app.services.competitor_price_lists as service
+
+    db = _session()
+    _seed(db)
+    monkeypatch.setattr(service, "PROVISOR_INSERT_BATCH_SIZE", 2)
+    inputs = [
+        _item(goods_id=1000 + index, distributor_goods_id=f"DG-{index}")
+        for index in range(5)
+    ]
+
+    row = upsert_unified_price_list(
+        db=db,
+        price_format_code="FMT",
+        price_list=_price_list(),
+        items=inputs,
+        run_matching=False,
+    )
+
+    assert len(_items(db)) == 5
+    assert row._benchmark["inserted_rows_count"] == 5
+    assert row._benchmark["max_insert_batch_size"] == 2
+
+
+def test_provisor_raw_json_can_be_disabled(monkeypatch):
+    import backend.app.services.competitor_price_lists as service
+
+    db = _session()
+    _seed(db)
+    monkeypatch.setattr(service, "STORE_PROVISOR_RAW_JSON", False)
+
+    upsert_unified_price_list(
+        db=db,
+        price_format_code="FMT",
+        price_list=_price_list(),
+        items=[_item(goods_id=1001, distributor_goods_id="DG-1", raw_extra={"large": "payload"})],
+        run_matching=False,
+    )
+
+    assert _items(db)[0].raw_json == ""
+
+
 def test_replacement_memory_metrics_do_not_change_saved_rows(monkeypatch):
     import backend.app.services.competitor_price_lists as service
 
