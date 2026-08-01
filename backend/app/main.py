@@ -1964,7 +1964,6 @@ def post_pricing_workflow_generate_batch(
                     "pricing_context_id": context.id,
                     "price_format_id": pf.id,
                     "competitor_sources": competitor_sources,
-                    "percentile_sources": [],
                     "activation_date": activation_date,
                     "user": current_user.username,
                     "comment": comment,
@@ -4479,7 +4478,10 @@ def set_competitors_assigned(format_code: str, payload: dict, db: Session = Depe
     ).scalars().all()
 
     for row in existing_cfg:
-        if (row.source_name or "") not in selected_source_names:
+        source_name = row.source_name or ""
+        if source_name.startswith("percentile:"):
+            continue
+        if source_name not in selected_source_names:
             db.delete(row)
 
     # Upsert selected configs

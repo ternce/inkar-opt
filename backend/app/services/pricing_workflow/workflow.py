@@ -150,8 +150,13 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
 
     competitor_sources = payload.get("competitor_sources") or payload.get("competitorSources") or []
     has_percentile_payload = "percentile_sources" in payload or "percentileSources" in payload
-    percentile_sources = payload.get("percentile_sources") if "percentile_sources" in payload else payload.get("percentileSources")
-    percentile_sources = percentile_sources or []
+    percentile_sources = (
+        payload.get("percentile_sources")
+        if "percentile_sources" in payload
+        else payload.get("percentileSources")
+        if "percentileSources" in payload
+        else []
+    )
     if not isinstance(competitor_sources, list):
         raise ValueError("competitor_sources must be list")
     if not isinstance(percentile_sources, list):
@@ -176,6 +181,17 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
         for item in percentile_sources
         if isinstance(item, dict) and item.get("enabled") is not False and str(item.get("id") or item.get("sourceId") or "").strip()
     )
+    if not has_percentile_payload:
+        selected_percentile_count = int(
+            db.execute(
+                select(CompetitorPrice.id)
+                .where(CompetitorPrice.price_format_id == pf.id)
+                .where(CompetitorPrice.product_id.is_(None))
+                .where(CompetitorPrice.source_name.like("percentile:%"))
+                .limit(1)
+            ).scalar()
+            is not None
+        )
     mode = _price_mode(pf)
     if mode == "regular" and not selected_ids:
         raise ValueError("select at least one competitor source")
@@ -205,11 +221,20 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
             selected_ids=selected_ids,
             coefficients=coefficients,
         )
-        if mode in {"percentile", "mixed"} or has_percentile_payload:
+        if has_percentile_payload:
             selected_percentile_count = _save_selected_percentile_configs(db=db, pf=pf, percentile_sources=percentile_sources)
             enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="workflow_percentile_selection_changed")
         else:
-            selected_percentile_count = 0
+            selected_percentile_count = int(
+                db.execute(
+                    select(CompetitorPrice.id)
+                    .where(CompetitorPrice.price_format_id == pf.id)
+                    .where(CompetitorPrice.product_id.is_(None))
+                    .where(CompetitorPrice.source_name.like("percentile:%"))
+                    .limit(1)
+                ).scalar()
+                is not None
+            )
         selected_count = len(get_assigned_competitor_price_lists(db=db, price_format_id=int(pf.id)))
         if mode == "regular" and selected_count <= 0:
             raise ValueError("selected competitor sources are not available for calculation")

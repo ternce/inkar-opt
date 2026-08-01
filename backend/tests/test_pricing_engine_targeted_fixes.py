@@ -13,6 +13,7 @@ from sqlalchemy.pool import StaticPool
 
 from backend.app.db import Base
 from backend.app.deps import get_db
+from backend.app import data as app_data
 from backend.app.models import (
     BendRange,
     BranchCost,
@@ -2418,6 +2419,69 @@ def test_workflow_regular_mode_persists_submitted_regular_percentile_and_generat
     assert float(cp.lowest_competitor_price) == pytest.approx(1299.20)
 
 
+def test_workflow_absent_percentile_payload_preserves_existing_emit_and_regular_percentile_configs():
+    db = _session()
+    pf = _format(db)
+    pf.competitor_price_mode = "regular"
+    pf.percentile_number = 10
+    product = _product(db, code="WF-PCT-ABSENT-PRESERVE", cost=100)
+    context = _workflow_context(db)
+    source = _workflow_price_list_source(db, pf, product=product, price=Decimal("1904.80"))
+    emit_source_name = _emit_percentile_column_key(
+        pf,
+        source_key="emit:1106",
+        region="Kazakhstan",
+        competitor="Emit International 1106",
+        percentile=10,
+    )
+    amanat_source_name = _regular_percentile_column_key(pf, identity="Р°РјР°РЅР°С‚", competitor="РђРјР°РЅР°С‚", percentile=10)
+    db.add(
+        CompetitorPrice(
+            price_format_id=pf.id,
+            product_id=None,
+            source_name=emit_source_name,
+            supplier="Emit P10",
+            coefficient=1,
+        )
+    )
+    db.add(
+        CompetitorPrice(
+            price_format_id=pf.id,
+            product_id=None,
+            source_name=amanat_source_name,
+            supplier="РђРјР°РЅР°С‚ P10",
+            coefficient=1,
+        )
+    )
+    _stored_percentile(db, pf, product, source_key="emit:1106", region="Kazakhstan", competitor="Emit International 1106", percentile=10, value=Decimal("1299.20"))
+    _stored_regular_percentile(db, product, identity="Р°РјР°РЅР°С‚", competitor="РђРјР°РЅР°С‚", percentile=10, value=Decimal("1299.20"))
+    _activate_all_products_for_generation(db)
+
+    payload = _workflow_payload(
+        context,
+        pf,
+        source,
+        percentile_sources=[],
+        price_list_number="WF-PCT-ABSENT-PRESERVE-PL",
+    )
+    payload.pop("percentileSources")
+    run = create_workflow_run(db=db, payload=payload)
+
+    assert run.status == "success", run.error
+    source_names = {
+        row.source_name
+        for row in db.query(CompetitorPrice).filter(CompetitorPrice.product_id.is_(None), CompetitorPrice.source_name.in_([emit_source_name, amanat_source_name])).all()
+    }
+    assert source_names == {emit_source_name, amanat_source_name}
+    snapshot = json.loads(run.run_sources_json or "{}")
+    selected_percentile_ids = {f"percentile:{row['id']}" for row in snapshot.get("selectedPercentileSources", [])}
+    assert {emit_source_name, amanat_source_name} <= selected_percentile_ids
+    cp = db.query(CalculatedPrice).filter(CalculatedPrice.price_list_id == run.price_list_id).one()
+    assert cp.used_percentile is True
+    assert cp.applied_source_name == emit_source_name
+    assert float(cp.lowest_competitor_price) == pytest.approx(1299.20)
+
+
 def test_workflow_does_not_persist_or_use_available_percentile_when_not_submitted():
     db = _session()
     pf = _format(db)
@@ -2488,6 +2552,110 @@ def test_workflow_deselecting_existing_percentile_config_removes_it_from_generat
     assert cp.used_percentile is False
     assert cp.applied_source_name != amanat_source_name
     assert cp.lowest_competitor_price is None or float(cp.lowest_competitor_price) != pytest.approx(1299.20)
+
+
+def test_workflow_snake_case_empty_percentile_payload_removes_existing_percentile_config():
+    db = _session()
+    pf = _format(db)
+    pf.competitor_price_mode = "regular"
+    product = _product(db, code="WF-PCT-SNAKE-EMPTY", cost=100)
+    context = _workflow_context(db)
+    source = _workflow_price_list_source(db, pf, product=product, price=Decimal("1904.80"))
+    emit_source_name = _emit_percentile_column_key(
+        pf,
+        source_key="emit:1106",
+        region="Kazakhstan",
+        competitor="Emit International 1106",
+        percentile=10,
+    )
+    db.add(
+        CompetitorPrice(
+            price_format_id=pf.id,
+            product_id=None,
+            source_name=emit_source_name,
+            supplier="Emit P10",
+            coefficient=1,
+        )
+    )
+    _stored_percentile(db, pf, product, source_key="emit:1106", region="Kazakhstan", competitor="Emit International 1106", percentile=10, value=Decimal("1299.20"))
+    _activate_all_products_for_generation(db)
+
+    payload = {
+        "pricing_context_id": context.id,
+        "price_format_id": pf.id,
+        "competitor_sources": [{"id": source.id, "enabled": True, "coefficient": 1}],
+        "percentile_sources": [],
+        "price_list_number": "WF-PCT-SNAKE-EMPTY-PL",
+        "user": "test",
+    }
+    run = create_workflow_run(db=db, payload=payload)
+
+    assert run.status == "success", run.error
+    assert db.query(CompetitorPrice).filter(CompetitorPrice.product_id.is_(None), CompetitorPrice.source_name == emit_source_name).one_or_none() is None
+
+
+def test_legacy_physical_competitor_replacement_preserves_percentile_configs():
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+
+    def override_db():
+        with Session() as db:
+            yield db
+
+    original_available = list(app_data.COMPETITORS_AVAILABLE)
+    original_assigned = dict(app_data.COMPETITORS_ASSIGNED_BY_FORMAT)
+    app.dependency_overrides[get_db] = override_db
+    try:
+        app_data.COMPETITORS_AVAILABLE = [
+            {"id": 101, "name": "physical:A", "supplier": "Physical A", "coefficient": 1.0},
+            {"id": 202, "name": "physical:B", "supplier": "Physical B", "coefficient": 1.25},
+        ]
+        app_data.COMPETITORS_ASSIGNED_BY_FORMAT = {}
+        with Session() as db:
+            pf = _format(db)
+            pf.code = "LEGACY-PHYSICAL-REPLACE"
+            emit_source_name = _emit_percentile_column_key(
+                pf,
+                source_key="emit:1106",
+                region="Kazakhstan",
+                competitor="Emit International 1106",
+                percentile=10,
+            )
+            amanat_source_name = _regular_percentile_column_key(pf, identity="Р°РјР°РЅР°С‚", competitor="РђРјР°РЅР°С‚", percentile=10)
+            db.add_all(
+                [
+                    CompetitorPrice(price_format_id=pf.id, product_id=None, source_name="physical:A", supplier="Physical A", coefficient=1),
+                    CompetitorPrice(price_format_id=pf.id, product_id=None, source_name=emit_source_name, supplier="Emit P10", coefficient=1),
+                    CompetitorPrice(price_format_id=pf.id, product_id=None, source_name=amanat_source_name, supplier="РђРјР°РЅР°С‚ P10", coefficient=1),
+                ]
+            )
+            db.commit()
+
+        client = TestClient(app)
+        response = client.post("/api/price-formats/LEGACY-PHYSICAL-REPLACE/competitors", json={"assignedIds": [202]})
+        assert response.status_code == 200
+        assert response.json() == {"format": "LEGACY-PHYSICAL-REPLACE", "assignedIds": [202]}
+
+        with Session() as db:
+            rows = (
+                db.query(CompetitorPrice)
+                .filter(CompetitorPrice.product_id.is_(None))
+                .order_by(CompetitorPrice.source_name.asc(), CompetitorPrice.id.asc())
+                .all()
+            )
+            source_names = [row.source_name for row in rows]
+            assert "physical:A" not in source_names
+            assert source_names.count("physical:B") == 1
+            assert source_names.count(emit_source_name) == 1
+            assert source_names.count(amanat_source_name) == 1
+            physical_b = next(row for row in rows if row.source_name == "physical:B")
+            assert physical_b.supplier == "Physical B"
+            assert float(physical_b.coefficient) == pytest.approx(1.25)
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        app_data.COMPETITORS_AVAILABLE = original_available
+        app_data.COMPETITORS_ASSIGNED_BY_FORMAT = original_assigned
 
 
 def test_rebuild_competitor_prices_skips_multi_price_emit_raw_items():
