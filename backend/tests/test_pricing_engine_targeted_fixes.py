@@ -25,6 +25,7 @@ from backend.app.models import (
     ListItem,
     MarkupRange,
     NoCompetitorMarkupRange,
+    PricingContext,
     PriceFormatCompetitorAssignment,
     PriceFormat,
     PriceList,
@@ -60,10 +61,13 @@ from backend.app.services.pricing import (
     calculate_price_for_product,
     calculate_price_zone,
     calculate_prices,
+    load_percentile_price_cache,
+    resolve_all_competitor_prices,
 )
 from backend.app.services.references.imports import import_reference_excel
 from backend.app.services.pricing_workflow.analytics import build_workflow_analytics
 from backend.app.services.pricing_workflow.exports import _export_zone
+from backend.app.services.pricing_workflow.workflow import create_workflow_run
 
 
 def _session():
@@ -659,6 +663,52 @@ def _list_item(db, product, list_type, value, *, pf=None, status="active", start
     db.add(ListItem(universal_list_id=row.id, product_id=product.id, value=value))
     db.flush()
     return row
+
+
+def _workflow_context(db, *, branch_id="1"):
+    row = PricingContext(branch_id=str(branch_id), region="Almaty", sales_channel="retail", name=f"ctx-{branch_id}")
+    db.add(row)
+    db.flush()
+    return row
+
+
+def _workflow_price_list_source(db, pf, *, product=None, price=Decimal("1904.80"), source_key="medservice", competitor="Medservice"):
+    row = CompetitorPriceList(
+        price_format_id=pf.id,
+        source_type="provisor",
+        source_key=source_key,
+        display_name=competitor,
+        supplier=competitor,
+        branch_name="Almaty",
+        competitor_name=competitor,
+    )
+    db.add(row)
+    db.flush()
+    if product is not None:
+        db.add(
+            CompetitorPriceListItem(
+                price_list_id=row.id,
+                product_id=product.id,
+                matched_sku=product.code,
+                distributor_goods_id=product.code,
+                distributor_goods_name=product.name,
+                distributor_price=price,
+                match_type="matched",
+            )
+        )
+        db.flush()
+    return row
+
+
+def _workflow_payload(context, pf, source, *, percentile_sources, price_list_number):
+    return {
+        "pricingContextId": context.id,
+        "priceFormatId": pf.id,
+        "competitorSources": [{"id": source.id, "enabled": True, "coefficient": 1}],
+        "percentileSources": percentile_sources,
+        "priceListNumber": price_list_number,
+        "user": "test",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1366,6 +1416,112 @@ def test_fixed_markup_zone_uses_lowest_available_competitor_when_list_bypasses_s
     assert debug["zone"] == "left"
 
 
+def test_fixed_price_reference_includes_selected_emit_percentile_when_stored_mode_is_regular():
+    db = _session()
+    pf = _format(db)
+    pf.competitor_price_mode = "regular"
+    product = _product(db, code="FIXED-EMIT-REF", cost=100)
+    _list_item(db, product, "fixed_price", Decimal("1500.00"), pf=pf)
+    _competitor(db, pf, product, "provisor:medservice", Decimal("1904.80"))
+    _assign_emit_percentile_config(
+        db,
+        pf,
+        source_key="emit:1106",
+        region="Kazakhstan",
+        competitor="Emit International 1106",
+        percentile=10,
+    )
+    _stored_percentile(
+        db,
+        pf,
+        product,
+        source_key="emit:1106",
+        region="Kazakhstan",
+        competitor="Emit International 1106",
+        percentile=10,
+        value=Decimal("1299.20"),
+    )
+    _activate_all_products_for_generation(db)
+
+    calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="FIXED-EMIT-REF-PL",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        force_new_price_list=True,
+    )
+
+    cp = db.query(CalculatedPrice).one()
+    assert float(cp.final_price) == pytest.approx(1500.00)
+    assert cp.competitor_price is None
+    assert cp.used_percentile is False
+    assert float(cp.lowest_competitor_price) == pytest.approx(1299.20)
+    assert cp.zone == "right"
+
+
+def test_fixed_price_reference_includes_selected_regular_percentile_when_stored_mode_is_regular():
+    db = _session()
+    pf = _format(db)
+    pf.competitor_price_mode = "regular"
+    product = _product(db, code="FIXED-AMANAT-REF", cost=100)
+    _list_item(db, product, "fixed_price", Decimal("1500.00"), pf=pf)
+    _competitor(db, pf, product, "provisor:medservice", Decimal("1904.80"))
+    _assign_regular_percentile_config(db, pf, identity="аманат", competitor="Аманат", percentile=10)
+    _stored_regular_percentile(db, product, identity="аманат", competitor="Аманат", percentile=10, value=Decimal("1299.20"))
+    _activate_all_products_for_generation(db)
+
+    calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="FIXED-AMANAT-REF-PL",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        force_new_price_list=True,
+    )
+
+    cp = db.query(CalculatedPrice).one()
+    assert float(cp.final_price) == pytest.approx(1500.00)
+    assert cp.competitor_price is None
+    assert cp.used_percentile is False
+    assert float(cp.lowest_competitor_price) == pytest.approx(1299.20)
+    assert cp.zone == "right"
+
+
+def test_fixed_markup_reference_includes_selected_regular_percentile_when_stored_mode_is_regular():
+    db = _session()
+    rounding = RoundingRule(code="R-FM-PCT-REF", name="R-FM-PCT-REF", mode="math", precision=2, step=0.01)
+    db.add(rounding)
+    db.flush()
+    pf = _format(db, rounding=rounding)
+    pf.competitor_price_mode = "regular"
+    product = _product(db, code="FIXED-MARKUP-AMANAT-REF", cost=100)
+    _list_item(db, product, "fixed_markup", Decimal("10"), pf=pf)
+    _competitor(db, pf, product, "provisor:medservice", Decimal("1904.80"))
+    _assign_regular_percentile_config(db, pf, identity="аманат", competitor="Аманат", percentile=10)
+    _stored_regular_percentile(db, product, identity="аманат", competitor="Аманат", percentile=10, value=Decimal("1299.20"))
+    _activate_all_products_for_generation(db)
+
+    calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="FIXED-MARKUP-AMANAT-REF-PL",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        force_new_price_list=True,
+    )
+
+    cp = db.query(CalculatedPrice).one()
+    assert float(cp.final_price) == pytest.approx(111.11)
+    assert cp.competitor_price is None
+    assert cp.used_percentile is False
+    assert float(cp.lowest_competitor_price) == pytest.approx(1299.20)
+    assert cp.zone == "left"
+
+
 def test_fixed_markup_list_overrides_default_markup():
     db = _session()
     pf = _format(db)
@@ -1935,7 +2091,235 @@ def test_mixed_price_generation_keeps_p10_and_p30_separate_candidates():
     assert prices[product.id][p30]["price"] == pytest.approx(170)
 
 
-def test_regular_and_percentile_modes_remain_exclusive_with_mixed_available():
+def test_selected_emit_percentile_participates_when_stored_mode_is_regular():
+    db = _session()
+    pf = _format(db)
+    pf.competitor_price_mode = "regular"
+    product = _product(db, code="EMIT-P10-REGULAR-MODE", cost=100)
+    _competitor(db, pf, product, "provisor:medservice", Decimal("6836.26"))
+    percentile_source = _assign_emit_percentile_config(
+        db,
+        pf,
+        source_key="emit:1106",
+        region="Kazakhstan",
+        competitor="Emit International 1106",
+        percentile=10,
+    )
+    _stored_percentile(
+        db,
+        pf,
+        product,
+        source_key="emit:1106",
+        region="Kazakhstan",
+        competitor="Emit International 1106",
+        percentile=10,
+        value=Decimal("6597.37"),
+    )
+    _activate_all_products_for_generation(db)
+
+    calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="EMIT-P10-REGULAR-MODE-PL",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        force_new_price_list=True,
+    )
+
+    cp = db.query(CalculatedPrice).join(PriceList).filter(PriceList.number == "EMIT-P10-REGULAR-MODE-PL").one()
+    assert cp.used_percentile is True
+    assert cp.applied_source_name == percentile_source
+    assert float(cp.lowest_competitor_price) == pytest.approx(6597.37)
+    assert float(cp.competitor_price) == pytest.approx(6597.37)
+
+
+def test_selected_regular_percentile_participates_when_stored_mode_is_regular():
+    db = _session()
+    pf = _format(db)
+    pf.competitor_price_mode = "regular"
+    product = _product(db, code="AMANAT-P10-REGULAR-MODE", cost=100)
+    _competitor(db, pf, product, "provisor:medservice", Decimal("1904.80"))
+    percentile_source = _assign_regular_percentile_config(
+        db,
+        pf,
+        identity="аманат",
+        competitor="Аманат",
+        percentile=10,
+    )
+    _stored_regular_percentile(
+        db,
+        product,
+        identity="аманат",
+        competitor="Аманат",
+        percentile=10,
+        value=Decimal("1299.20"),
+    )
+    _activate_all_products_for_generation(db)
+
+    calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="AMANAT-P10-REGULAR-MODE-PL",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        force_new_price_list=True,
+    )
+
+    cp = db.query(CalculatedPrice).join(PriceList).filter(PriceList.number == "AMANAT-P10-REGULAR-MODE-PL").one()
+    assert cp.used_percentile is True
+    assert cp.applied_source_name == percentile_source
+    assert float(cp.lowest_competitor_price) == pytest.approx(1299.20)
+    assert float(cp.competitor_price) == pytest.approx(1299.20)
+
+
+def test_selected_emit_and_regular_percentiles_merge_with_physical_candidates():
+    db = _session()
+    pf = _format(db)
+    pf.competitor_price_mode = "regular"
+    product = _product(db, code="PCT-MERGED-CANDIDATES", cost=100)
+    _competitor(db, pf, product, "provisor:zerde", Decimal("2136.00"))
+    _competitor(db, pf, product, "provisor:medservice", Decimal("1904.80"))
+    emit_p10 = _assign_emit_percentile_config(
+        db,
+        pf,
+        source_key="emit:1106",
+        region="Kazakhstan",
+        competitor="Emit International 1106",
+        percentile=10,
+    )
+    amanat_p10 = _assign_regular_percentile_config(
+        db,
+        pf,
+        identity="аманат",
+        competitor="Аманат",
+        percentile=10,
+    )
+    _stored_percentile(db, pf, product, source_key="emit:1106", region="Kazakhstan", competitor="Emit International 1106", percentile=10, value=Decimal("1850.372"))
+    _stored_regular_percentile(db, product, identity="аманат", competitor="Аманат", percentile=10, value=Decimal("1299.20"))
+    _activate_all_products_for_generation(db)
+
+    calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="PCT-MERGED-CANDIDATES-PL",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        force_new_price_list=True,
+    )
+
+    cp = db.query(CalculatedPrice).join(PriceList).filter(PriceList.number == "PCT-MERGED-CANDIDATES-PL").one()
+    assert cp.used_percentile is True
+    assert cp.applied_source_name == amanat_p10
+    assert float(cp.lowest_competitor_price) == pytest.approx(1299.20)
+
+    cache = load_percentile_price_cache(db, pf.id)
+    resolved = resolve_all_competitor_prices(
+        db,
+        pf,
+        product.id,
+        percentile_price_cache=cache,
+        effective_competitor_price_mode="mixed",
+    )
+    assert [src for _price, src in resolved.prices] == [
+        amanat_p10,
+        emit_p10,
+        "provisor:medservice",
+        "provisor:zerde",
+    ]
+    assert [float(price) for price, _src in resolved.prices] == pytest.approx([1299.20, 1850.372, 1904.80, 2136.00])
+
+    pl = db.query(PriceList).filter(PriceList.number == "PCT-MERGED-CANDIDATES-PL").one()
+    columns = _competitor_columns_for_price_list(db, pl, pf)
+    prices = _competitor_prices_by_product(db, pf=pf, product_ids=[product.id], columns=columns)
+    assert prices[product.id][amanat_p10]["price"] == pytest.approx(1299.20)
+    assert prices[product.id][emit_p10]["price"] == pytest.approx(1850.372)
+
+
+def test_unselected_percentile_value_does_not_participate_in_generation():
+    db = _session()
+    pf = _format(db)
+    pf.competitor_price_mode = "regular"
+    product = _product(db, code="UNSELECTED-PCT", cost=100)
+    _competitor(db, pf, product, "provisor:medservice", Decimal("1904.80"))
+    _stored_regular_percentile(db, product, identity="аманат", competitor="Аманат", percentile=10, value=Decimal("1299.20"))
+    _activate_all_products_for_generation(db)
+
+    calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="UNSELECTED-PCT-PL",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        force_new_price_list=True,
+    )
+
+    cp = db.query(CalculatedPrice).join(PriceList).filter(PriceList.number == "UNSELECTED-PCT-PL").one()
+    assert cp.used_percentile is False
+    assert cp.applied_source_name == "provisor:medservice"
+    assert float(cp.lowest_competitor_price) == pytest.approx(1904.80)
+
+
+def test_selected_percentile_missing_product_value_is_ignored_safely():
+    db = _session()
+    pf = _format(db)
+    pf.competitor_price_mode = "regular"
+    product = _product(db, code="MISSING-PCT-VALUE", cost=100)
+    _competitor(db, pf, product, "provisor:medservice", Decimal("1904.80"))
+    _assign_regular_percentile_config(db, pf, identity="медсервис", competitor="Медсервис", percentile=30)
+    _activate_all_products_for_generation(db)
+
+    calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="MISSING-PCT-VALUE-PL",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        force_new_price_list=True,
+    )
+
+    cp = db.query(CalculatedPrice).join(PriceList).filter(PriceList.number == "MISSING-PCT-VALUE-PL").one()
+    assert cp.used_percentile is False
+    assert cp.applied_source_name == "provisor:medservice"
+    assert float(cp.lowest_competitor_price) == pytest.approx(1904.80)
+
+
+def test_physical_lower_than_selected_percentile_wins_and_percentile_cell_remains_visible():
+    db = _session()
+    pf = _format(db)
+    pf.competitor_price_mode = "regular"
+    product = _product(db, code="PHYSICAL-BEATS-PCT", cost=100)
+    _competitor(db, pf, product, "provisor:medservice", Decimal("1200.00"))
+    percentile_source = _assign_regular_percentile_config(db, pf, identity="аманат", competitor="Аманат", percentile=10)
+    _stored_regular_percentile(db, product, identity="аманат", competitor="Аманат", percentile=10, value=Decimal("1299.20"))
+    _activate_all_products_for_generation(db)
+
+    calculate_prices(
+        db=db,
+        price_format_code=pf.code,
+        price_list_number="PHYSICAL-BEATS-PCT-PL",
+        as_of=date.today(),
+        activation_date=None,
+        user="test",
+        force_new_price_list=True,
+    )
+
+    cp = db.query(CalculatedPrice).join(PriceList).filter(PriceList.number == "PHYSICAL-BEATS-PCT-PL").one()
+    assert cp.used_percentile is False
+    assert cp.applied_source_name == "provisor:medservice"
+    assert float(cp.lowest_competitor_price) == pytest.approx(1200.00)
+
+    pl = db.query(PriceList).filter(PriceList.number == "PHYSICAL-BEATS-PCT-PL").one()
+    columns = _competitor_columns_for_price_list(db, pl, pf)
+    prices = _competitor_prices_by_product(db, pf=pf, product_ids=[product.id], columns=columns)
+    assert prices[product.id][percentile_source]["price"] == pytest.approx(1299.20)
+
+
+def test_selected_percentile_configs_drive_effective_mode_without_updating_stored_mode():
     db = _session()
     pf = _format(db)
     product = _product(db, code="MODE-COMPAT", cost=100)
@@ -1951,17 +2335,159 @@ def test_regular_and_percentile_modes_remain_exclusive_with_mixed_available():
     _stored_percentile(db, pf, product, source_key="emit:1106", region="Kazakhstan", competitor="Emit International 1106", percentile=10, value=Decimal("150"))
     _activate_all_products_for_generation(db)
 
-    pf.competitor_price_mode = ""
+    pf.competitor_price_mode = "regular"
     calculate_prices(db=db, price_format_code=pf.code, price_list_number="MODE-REGULAR-PL", as_of=date.today(), activation_date=None, user="test", force_new_price_list=True)
     regular_cp = db.query(CalculatedPrice).join(PriceList).filter(PriceList.number == "MODE-REGULAR-PL").one()
-    assert regular_cp.used_percentile is False
-    assert regular_cp.applied_source_name == "provisor:arai"
+    assert pf.competitor_price_mode == "regular"
+    assert regular_cp.used_percentile is True
+    assert regular_cp.applied_source_name == percentile_source
 
     pf.competitor_price_mode = "percentile"
     calculate_prices(db=db, price_format_code=pf.code, price_list_number="MODE-PCT-PL", as_of=date.today(), activation_date=None, user="test", force_new_price_list=True)
     percentile_cp = db.query(CalculatedPrice).join(PriceList).filter(PriceList.number == "MODE-PCT-PL").one()
     assert percentile_cp.used_percentile is True
     assert percentile_cp.applied_source_name == percentile_source
+
+
+def test_workflow_regular_mode_persists_submitted_emit_percentile_and_generation_uses_it():
+    db = _session()
+    pf = _format(db)
+    pf.competitor_price_mode = "regular"
+    product = _product(db, code="WF-EMIT-PCT", cost=100)
+    context = _workflow_context(db)
+    source = _workflow_price_list_source(db, pf, product=product, price=Decimal("1904.80"))
+    emit_source_name = _emit_percentile_column_key(
+        pf,
+        source_key="emit:1106",
+        region="Kazakhstan",
+        competitor="Emit International 1106",
+        percentile=10,
+    )
+    _stored_percentile(db, pf, product, source_key="emit:1106", region="Kazakhstan", competitor="Emit International 1106", percentile=10, value=Decimal("1299.20"))
+    _activate_all_products_for_generation(db)
+
+    run = create_workflow_run(
+        db=db,
+        payload=_workflow_payload(
+            context,
+            pf,
+            source,
+            percentile_sources=[{"id": emit_source_name.removeprefix("percentile:"), "enabled": True, "sourceName": "Emit P10"}],
+            price_list_number="WF-EMIT-PCT-PL",
+        ),
+    )
+
+    assert run.status == "success", run.error
+    cfg = db.query(CompetitorPrice).filter(CompetitorPrice.product_id.is_(None), CompetitorPrice.source_name == emit_source_name).one()
+    assert cfg.source_name == emit_source_name
+    cp = db.query(CalculatedPrice).filter(CalculatedPrice.price_list_id == run.price_list_id).one()
+    assert cp.used_percentile is True
+    assert cp.applied_source_name == emit_source_name
+    assert float(cp.lowest_competitor_price) == pytest.approx(1299.20)
+    assert float(cp.competitor_price) == pytest.approx(1299.20)
+
+
+def test_workflow_regular_mode_persists_submitted_regular_percentile_and_generation_uses_it():
+    db = _session()
+    pf = _format(db)
+    pf.competitor_price_mode = "regular"
+    product = _product(db, code="WF-AMANAT-PCT", cost=100)
+    context = _workflow_context(db)
+    source = _workflow_price_list_source(db, pf, product=product, price=Decimal("1904.80"))
+    amanat_source_name = _regular_percentile_column_key(pf, identity="аманат", competitor="Аманат", percentile=10)
+    _stored_regular_percentile(db, product, identity="аманат", competitor="Аманат", percentile=10, value=Decimal("1299.20"))
+    _activate_all_products_for_generation(db)
+
+    run = create_workflow_run(
+        db=db,
+        payload=_workflow_payload(
+            context,
+            pf,
+            source,
+            percentile_sources=[{"id": amanat_source_name.removeprefix("percentile:"), "enabled": True, "sourceName": "Аманат P10"}],
+            price_list_number="WF-AMANAT-PCT-PL",
+        ),
+    )
+
+    assert run.status == "success", run.error
+    cfg = db.query(CompetitorPrice).filter(CompetitorPrice.product_id.is_(None), CompetitorPrice.source_name == amanat_source_name).one()
+    assert cfg.source_name == amanat_source_name
+    cp = db.query(CalculatedPrice).filter(CalculatedPrice.price_list_id == run.price_list_id).one()
+    assert cp.used_percentile is True
+    assert cp.applied_source_name == amanat_source_name
+    assert float(cp.lowest_competitor_price) == pytest.approx(1299.20)
+
+
+def test_workflow_does_not_persist_or_use_available_percentile_when_not_submitted():
+    db = _session()
+    pf = _format(db)
+    pf.competitor_price_mode = "regular"
+    product = _product(db, code="WF-PCT-NOT-SUBMITTED", cost=100)
+    context = _workflow_context(db)
+    source = _workflow_price_list_source(db, pf, product=product, price=Decimal("1904.80"))
+    amanat_source_name = _regular_percentile_column_key(pf, identity="аманат", competitor="Аманат", percentile=10)
+    _stored_regular_percentile(db, product, identity="аманат", competitor="Аманат", percentile=10, value=Decimal("1299.20"))
+    _activate_all_products_for_generation(db)
+
+    run = create_workflow_run(
+        db=db,
+        payload=_workflow_payload(
+            context,
+            pf,
+            source,
+            percentile_sources=[],
+            price_list_number="WF-PCT-NOT-SUBMITTED-PL",
+        ),
+    )
+
+    assert run.status == "success", run.error
+    assert db.query(CompetitorPrice).filter(CompetitorPrice.product_id.is_(None), CompetitorPrice.source_name == amanat_source_name).one_or_none() is None
+    cp = db.query(CalculatedPrice).filter(CalculatedPrice.price_list_id == run.price_list_id).one()
+    assert cp.used_percentile is False
+    assert cp.applied_source_name != amanat_source_name
+    assert cp.lowest_competitor_price is None or float(cp.lowest_competitor_price) != pytest.approx(1299.20)
+
+
+def test_workflow_deselecting_existing_percentile_config_removes_it_from_generation():
+    db = _session()
+    pf = _format(db)
+    pf.competitor_price_mode = "regular"
+    product = _product(db, code="WF-PCT-DESELECT", cost=100)
+    context = _workflow_context(db)
+    source = _workflow_price_list_source(db, pf, product=product, price=Decimal("1904.80"))
+    amanat_source_name = _regular_percentile_column_key(pf, identity="аманат", competitor="Аманат", percentile=10)
+    _stored_regular_percentile(db, product, identity="аманат", competitor="Аманат", percentile=10, value=Decimal("1299.20"))
+    _activate_all_products_for_generation(db)
+
+    first = create_workflow_run(
+        db=db,
+        payload=_workflow_payload(
+            context,
+            pf,
+            source,
+            percentile_sources=[{"id": amanat_source_name.removeprefix("percentile:"), "enabled": True, "sourceName": "Аманат P10"}],
+            price_list_number="WF-PCT-DESELECT-FIRST",
+        ),
+    )
+    assert first.status == "success", first.error
+
+    second = create_workflow_run(
+        db=db,
+        payload=_workflow_payload(
+            context,
+            pf,
+            source,
+            percentile_sources=[],
+            price_list_number="WF-PCT-DESELECT-SECOND",
+        ),
+    )
+
+    assert second.status == "success", second.error
+    assert db.query(CompetitorPrice).filter(CompetitorPrice.product_id.is_(None), CompetitorPrice.source_name == amanat_source_name).one_or_none() is None
+    cp = db.query(CalculatedPrice).filter(CalculatedPrice.price_list_id == second.price_list_id).one()
+    assert cp.used_percentile is False
+    assert cp.applied_source_name != amanat_source_name
+    assert cp.lowest_competitor_price is None or float(cp.lowest_competitor_price) != pytest.approx(1299.20)
 
 
 def test_rebuild_competitor_prices_skips_multi_price_emit_raw_items():

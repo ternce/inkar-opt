@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
@@ -430,8 +431,10 @@ def zone_reference_for_product(
     product_id: int,
     percentile_price_cache: PercentilePriceCache | None = None,
     pricing_preload: PricingPreload | None = None,
+    effective_competitor_price_mode: str | None = None,
 ) -> Decimal | None:
-    mode = _competitor_price_mode(price_format)
+    mode = effective_competitor_price_mode or _competitor_price_mode(price_format)
+    mode = mode if mode in COMPETITOR_PRICE_MODES else "regular"
     if mode == "mixed":
         resolved = resolve_all_competitor_prices(
             db,
@@ -439,6 +442,7 @@ def zone_reference_for_product(
             product_id,
             percentile_price_cache=percentile_price_cache,
             pricing_preload=pricing_preload,
+            effective_competitor_price_mode=mode,
         )
         return resolved.prices[0][0] if resolved.prices else None
     if mode == "percentile" and percentile_price_cache is not None:
@@ -455,6 +459,44 @@ def zone_reference_for_product(
 def _competitor_price_mode(price_format: PriceFormat) -> str:
     mode = str(price_format.competitor_price_mode or "regular").strip().lower()
     return mode if mode in COMPETITOR_PRICE_MODES else "regular"
+
+
+def _selected_percentile_configs_from_rows(rows: list[CompetitorPrice]) -> dict[str, CompetitorPrice]:
+    return {
+        str(row.source_name or ""): row
+        for row in rows
+        if row.product_id is None and str(row.source_name or "").strip().startswith("percentile:")
+    }
+
+
+def _has_physical_competitor_configs(rows: list[CompetitorPrice]) -> bool:
+    return any(
+        row.product_id is None
+        and bool(str(row.source_name or "").strip())
+        and not str(row.source_name or "").strip().startswith("percentile:")
+        for row in rows
+    )
+
+
+def _effective_competitor_price_mode(
+    configured_mode: str,
+    *,
+    has_physical_configs: bool,
+    has_percentile_configs: bool,
+) -> str:
+    mode = configured_mode if configured_mode in COMPETITOR_PRICE_MODES else "regular"
+    if has_percentile_configs:
+        return "mixed" if has_physical_configs else "percentile"
+    return mode
+
+
+def _has_emit_percentile_configs(selected_percentile_configs: dict[str, CompetitorPrice]) -> bool:
+    emit_prefix = "percentile:"
+    competitor_prefix = f"percentile:{PERCENTILE_SOURCE_COMPETITOR}:"
+    return any(
+        source_name.startswith(emit_prefix) and not source_name.startswith(competitor_prefix)
+        for source_name in selected_percentile_configs
+    )
 
 
 def calculate_price_zone(
@@ -1141,8 +1183,10 @@ def resolve_all_competitor_prices(
     percentile_price_cache: PercentilePriceCache | None = None,
     percentile_number: int | None = None,
     pricing_preload: PricingPreload | None = None,
+    effective_competitor_price_mode: str | None = None,
 ) -> CompetitorResolvedMany:
-    mode = _competitor_price_mode(price_format)
+    mode = effective_competitor_price_mode or _competitor_price_mode(price_format)
+    mode = mode if mode in COMPETITOR_PRICE_MODES else "regular"
     details: dict[str, dict[str, Decimal]] = {}
     prices: list[tuple[Decimal, str]] = []
 
@@ -1177,6 +1221,83 @@ def resolve_all_competitor_prices(
 
     prices.sort(key=lambda x: x[0])
     return CompetitorResolvedMany(prices, details)
+
+
+def _pricing_percentile_diagnostic_enabled(product: Product) -> bool:
+    flag = str(os.getenv("PRICING_PERCENTILE_CANDIDATE", "") or "").strip().lower()
+    if flag not in {"1", "true", "yes", "on"}:
+        return False
+    sku_filter = str(os.getenv("PRICING_PERCENTILE_CANDIDATE_SKU", "") or "").strip()
+    if sku_filter and sku_filter != str(product.code or ""):
+        return False
+    return True
+
+
+def _log_pricing_percentile_candidate_diagnostic(
+    *,
+    price_format: PriceFormat,
+    configured_mode: str,
+    effective_mode: str,
+    product: Product,
+    selected_percentile_configs: dict[str, CompetitorPrice],
+    percentile_price_cache: PercentilePriceCache | None,
+    resolved_many: CompetitorResolvedMany,
+    selected_source: str,
+) -> None:
+    if not _pricing_percentile_diagnostic_enabled(product):
+        return
+    buckets = (percentile_price_cache or {}).get(int(product.id), {})
+    details = resolved_many.details or {}
+    percentile_sources = {src for bucket in buckets.values() for _price, src, *_rest in bucket}
+    selected: list[dict[str, object]] = []
+    for source_name, cfg in sorted(selected_percentile_configs.items()):
+        entries = [
+            {
+                "percentile": pct,
+                "rawPercentileValue": str(original),
+                "adjustedValue": str(adjusted),
+                "cacheLookupKey": f"{int(product.id)}:{pct}:{source_name}",
+            }
+            for pct, bucket in sorted(buckets.items())
+            for adjusted, src, original, _coefficient, _entry_pct in bucket
+            if src == source_name
+        ]
+        candidate_added = bool(entries) or source_name in details
+        selected.append(
+            {
+                "configId": int(cfg.id or 0),
+                "sourceName": source_name,
+                "cacheHit": bool(entries) or source_name in percentile_sources,
+                "entries": entries,
+                "candidateAdded": candidate_added,
+                "rejectionReason": "" if candidate_added else "missing_positive_product_value_or_source_key_mismatch",
+            }
+        )
+    physical_count = sum(1 for _price, src in resolved_many.prices if not str(src).startswith("percentile:"))
+    percentile_count = sum(1 for _price, src in resolved_many.prices if str(src).startswith("percentile:"))
+    logger.info(
+        "[PRICING_PERCENTILE_CANDIDATE] %s",
+        json.dumps(
+            {
+                "priceFormatId": int(price_format.id),
+                "priceFormatCode": str(price_format.code or ""),
+                "competitorPriceMode": configured_mode,
+                "effectiveCompetitorPriceMode": effective_mode,
+                "productId": int(product.id),
+                "sku": str(product.code or ""),
+                "selectedPercentileConfigs": selected,
+                "physicalCandidateCount": physical_count,
+                "percentileCandidateCount": percentile_count,
+                "mergedCandidateOrdering": [
+                    {"price": str(price), "sourceName": src} for price, src in resolved_many.prices
+                ],
+                "lowestCompetitorPrice": str(resolved_many.prices[0][0]) if resolved_many.prices else None,
+                "selectedSource": selected_source,
+            },
+            ensure_ascii=False,
+            default=str,
+        ),
+    )
 
 
 def _active_lists_query(db: Session, price_format_id: int, as_of: date):
@@ -1781,6 +1902,7 @@ def calculate_price_for_product(
     region_id: int | None = None,
     active_lists: list[UniversalList] | None = None,
     percentile_price_cache: PercentilePriceCache | None = None,
+    effective_competitor_price_mode: str | None = None,
     cost_override: object = None,
     pricing_preload: PricingPreload | None = None,
 ) -> tuple[Decimal, dict]:
@@ -1906,6 +2028,7 @@ def calculate_price_for_product(
             product_id=product.id,
             percentile_price_cache=percentile_price_cache,
             pricing_preload=pricing_preload,
+            effective_competitor_price_mode=effective_competitor_price_mode,
         )
         zone, zone_reference, deviation_pct = calculate_price_zone(
             fixed_price,
@@ -1989,6 +2112,7 @@ def calculate_price_for_product(
             product_id=product.id,
             percentile_price_cache=percentile_price_cache,
             pricing_preload=pricing_preload,
+            effective_competitor_price_mode=effective_competitor_price_mode,
         )
         zone, zone_reference, deviation_pct = calculate_price_zone(
             fixed_markup_mdc,
@@ -2067,6 +2191,7 @@ def calculate_price_for_product(
         percentile_price_cache=percentile_price_cache,
         percentile_number=percentile_number,
         pricing_preload=pricing_preload,
+        effective_competitor_price_mode=effective_competitor_price_mode,
     )
 
     critical_markup_match = find_match(LIST_TYPE_CRITICAL_MARKUP)
@@ -2289,6 +2414,23 @@ def calculate_price_for_product(
     )
 
     applied_source = chosen_source or competitor_source_min
+    configured_competitor_price_mode = _competitor_price_mode(price_format)
+    resolved_effective_mode = effective_competitor_price_mode or configured_competitor_price_mode
+    selected_percentile_configs = (
+        _selected_percentile_configs_from_rows(pricing_preload.competitor_configs)
+        if pricing_preload is not None
+        else _assigned_percentile_configs(db=db, price_format_id=int(price_format.id))
+    )
+    _log_pricing_percentile_candidate_diagnostic(
+        price_format=price_format,
+        configured_mode=configured_competitor_price_mode,
+        effective_mode=resolved_effective_mode,
+        product=product,
+        selected_percentile_configs=selected_percentile_configs,
+        percentile_price_cache=percentile_price_cache,
+        resolved_many=resolved_many,
+        selected_source=applied_source,
+    )
     cached_match_type = _cached_source_match_type(pricing_preload, int(product.id), applied_source)
     source_match_type = cached_match_type if cached_match_type is not None else _source_match_type(db, price_format.id, product.id, applied_source)
     branch_id = str(region_id if region_id is not None else (price_format.branch or ""))
@@ -2615,10 +2757,27 @@ def calculate_prices(
     if not ranges:
         raise ValueError("Markup ranges are required")
 
-    competitor_price_mode = _competitor_price_mode(pf)
+    configured_competitor_price_mode = _competitor_price_mode(pf)
+    selected_source_configs = (
+        db.execute(
+            select(CompetitorPrice)
+            .where(CompetitorPrice.price_format_id == pf.id)
+            .where(CompetitorPrice.product_id.is_(None))
+        )
+        .scalars()
+        .all()
+    )
+    selected_percentile_configs = _selected_percentile_configs_from_rows(selected_source_configs)
+    has_physical_configs = _has_physical_competitor_configs(selected_source_configs)
+    competitor_price_mode = _effective_competitor_price_mode(
+        configured_competitor_price_mode,
+        has_physical_configs=has_physical_configs,
+        has_percentile_configs=bool(selected_percentile_configs),
+    )
     percentile_mode = competitor_price_mode in {"percentile", "mixed"}
     physical_mode = competitor_price_mode in {"regular", "mixed"}
-    if percentile_mode and not physical_mode:
+    has_emit_percentile_configs = _has_emit_percentile_configs(selected_percentile_configs)
+    if percentile_mode and not physical_mode and has_emit_percentile_configs:
         existing_percentile_rows = (
             db.execute(
                 select(CompetitorPricePercentile.id)
@@ -2787,6 +2946,7 @@ def calculate_prices(
             region_id=region_id,
             active_lists=active_lists,
             percentile_price_cache=percentile_price_cache,
+            effective_competitor_price_mode=competitor_price_mode,
             cost_override=stock_snapshot.cost_by_product_id.get(int(p.id), Decimal("0")),
             pricing_preload=pricing_preload,
         )

@@ -149,7 +149,9 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
         raise ValueError("price format not found")
 
     competitor_sources = payload.get("competitor_sources") or payload.get("competitorSources") or []
-    percentile_sources = payload.get("percentile_sources") or payload.get("percentileSources") or []
+    has_percentile_payload = "percentile_sources" in payload or "percentileSources" in payload
+    percentile_sources = payload.get("percentile_sources") if "percentile_sources" in payload else payload.get("percentileSources")
+    percentile_sources = percentile_sources or []
     if not isinstance(competitor_sources, list):
         raise ValueError("competitor_sources must be list")
     if not isinstance(percentile_sources, list):
@@ -203,7 +205,7 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
             selected_ids=selected_ids,
             coefficients=coefficients,
         )
-        if mode in {"percentile", "mixed"}:
+        if mode in {"percentile", "mixed"} or has_percentile_payload:
             selected_percentile_count = _save_selected_percentile_configs(db=db, pf=pf, percentile_sources=percentile_sources)
             enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="workflow_percentile_selection_changed")
         else:
@@ -216,7 +218,7 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
         if mode in {"regular", "mixed"}:
             rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id, commit_between_lists=True)
         db.commit()
-        if mode in {"percentile", "mixed"}:
+        if mode in {"percentile", "mixed"} or selected_percentile_count > 0:
             ensure_percentile_ready_for_generation(db, pf)
 
         activation_date = None
