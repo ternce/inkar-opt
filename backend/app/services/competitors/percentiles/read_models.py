@@ -199,6 +199,10 @@ def _list_competitor_percentile_sources(
             continue
         generated_at = row.generated_at.isoformat() if row.generated_at else ""
         source_meta = metadata.get(source_key, {})
+        # Regular competitor rows are global datasets stored in
+        # regular_competitor_price_percentiles. Availability must not depend on
+        # a physical regional PLK still being assigned to this price format.
+        eligible_for_pricing = True
         out.append(
             {
                 "apiIdentity": f"regular:{source_key}",
@@ -225,8 +229,8 @@ def _list_competitor_percentile_sources(
                 "generatedAt": generated_at,
                 "sourceType": "percentile",
                 "eligibleForPricing": eligible_for_pricing,
-                "pricingEligibilityReason": "" if eligible_for_pricing else "no_active_physical_percentile_assignment",
-                "assignedToPriceFormat": eligible_for_pricing,
+                "pricingEligibilityReason": "",
+                "assignedToPriceFormat": bool(source_meta.get("assignedToPriceFormat")),
                 "physicalPriceListCount": int(source_meta.get("physicalPriceListCount") or 0),
                 "regionsIncluded": source_meta.get("regionsIncluded") or [],
                 "accountsIncluded": source_meta.get("accountsIncluded") or [],

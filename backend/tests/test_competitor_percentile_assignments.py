@@ -813,3 +813,110 @@ def test_assignment_visibility_keeps_stored_emit_percentile_sources_after_physic
     assert len(percentile_rows) == 1
     assert percentile_rows[0]["sourceKey"].startswith(f"{pf_id}:regional:{source_key}:")
     assert percentile_rows[0]["eligibleForPricing"] is False
+
+
+def test_regular_percentile_assignment_availability_uses_canonical_dataset_without_physical_assignment():
+    db = _session()
+    pf = _format(db, code="REG-AVAILABLE")
+    product = _product(db)
+    db.add(
+        RegularCompetitorPricePercentile(
+            competitor_identity="медсервис",
+            competitor_name="Медсервис Алматы",
+            product_id=product.id,
+            percentile=30,
+            value=Decimal("1595.17"),
+            sample_count=5,
+            source_count=1,
+        )
+    )
+    db.commit()
+
+    sources = list_percentile_sources(
+        db=db,
+        price_format_code=pf.code,
+        percentile_source=PERCENTILE_SOURCE_COMPETITOR,
+        include_ineligible=True,
+    )
+
+    row = next(item for item in sources if item["sourceKey"] == "медсервис" and item["percentile"] == 30)
+    assert row["eligibleForPricing"] is True
+    assert row["pricingEligibilityReason"] == ""
+
+
+def test_regular_percentile_assignment_missing_dataset_is_unavailable():
+    import backend.app.main as main
+
+    Session = _session_factory_static()
+    with Session() as db:
+        pf = _format(db, code="REG-MISSING")
+        db.add(
+            CompetitorPrice(
+                price_format_id=pf.id,
+                product_id=None,
+                source_name=_regular_percentile_config_name(pf.id, "медсервис", "Медсервис", 30),
+                supplier="Медсервис - P30",
+                coefficient=1,
+            )
+        )
+        db.commit()
+
+    main.app.dependency_overrides[main.get_db] = lambda: Session()
+    try:
+        response = TestClient(main.app).get("/api/price-formats/REG-MISSING/competitor-assignments")
+    finally:
+        main.app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    percentile_rows = [row for row in response.json() if row["assignmentKind"] == "percentile_config"]
+    assert len(percentile_rows) == 1
+    assert percentile_rows[0]["sourceKey"].startswith("competitor:")
+    assert percentile_rows[0]["eligibleForPricing"] is False
+    assert percentile_rows[0]["pricingEligibilityReason"] == "regular_percentile_dataset_missing"
+
+
+def test_emit_assignment_availability_still_requires_active_emit_assignment():
+    db = _session()
+    pf = _format(db, code="EMIT-UNCHANGED")
+    product = _product(db)
+    source_key = "emit:302"
+    competitor = "Emiti"
+    price_list = _price_list(db, pf, source_key=source_key, competitor=competitor, external_price_list_id="302")
+    price_list.source_type = "emit"
+    assignment = _assign(db, pf, price_list, percentile_mode=MULTI_PRICE_PERCENTILE_MODE)
+    db.add(
+        CompetitorPricePercentile(
+            price_format_id=pf.id,
+            product_id=product.id,
+            competitor_price_list_id=price_list.id,
+            source_type="emit",
+            source_key=source_key,
+            branch_name=price_list.branch_name,
+            competitor_name=competitor,
+            percentile_scope="regional",
+            percentile=10,
+            value=Decimal("100.00"),
+            source_count=1,
+            price_count=1,
+            used_price_count=1,
+            status="Calculated",
+        )
+    )
+    db.commit()
+
+    visible = list_percentile_sources(db=db, price_format_code=pf.code, percentile_source=PERCENTILE_SOURCE_EMIT)
+    assert visible[0]["eligibleForPricing"] is True
+
+    assignment.is_active = False
+    db.commit()
+    hidden = list_percentile_sources(db=db, price_format_code=pf.code, percentile_source=PERCENTILE_SOURCE_EMIT)
+    inactive = list_percentile_sources(
+        db=db,
+        price_format_code=pf.code,
+        percentile_source=PERCENTILE_SOURCE_EMIT,
+        include_ineligible=True,
+    )
+
+    assert hidden == []
+    assert inactive[0]["eligibleForPricing"] is False
+    assert inactive[0]["pricingEligibilityReason"] == "no_active_physical_emit_assignment"

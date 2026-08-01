@@ -222,6 +222,7 @@ from .services.competitor_source_config import (
 )
 from .services.sku import normalize_external_sku, normalize_sku, normalize_sku_variants
 from .services.competitors.management import list_competitor_sources
+from .services.competitors.identity import canonical_regular_competitor_identity
 from .services.competitors.mappings.read_models import (
     delete_substitute_mapping,
     list_competitor_mappings,
@@ -5126,6 +5127,51 @@ def _assignment_percentile_source_name(source_id: object) -> str:
     return f"percentile:{str(source_id or '').strip()}"
 
 
+def _regular_assignment_source_from_config(cfg: CompetitorPrice, pf: PriceFormat) -> dict | None:
+    source_name = str(cfg.source_name or "").strip()
+    prefix = f"percentile:competitor:{int(pf.id)}:regular_competitor:"
+    if not source_name.startswith(prefix):
+        return None
+    source_id = source_name.removeprefix("percentile:")
+    rest = source_name.removeprefix(prefix)
+    if ":p" not in rest:
+        return None
+    before_percentile, percentile_text = rest.rsplit(":p", 1)
+    try:
+        percentile = int(percentile_text)
+    except Exception:
+        return None
+    source_key_raw, display_raw = (before_percentile.split("::", 1) + [""])[:2]
+    source_key = canonical_regular_competitor_identity(source_key_raw)
+    if not source_key:
+        return None
+    competitor = str(display_raw or cfg.supplier or source_key).strip()
+    name = str(cfg.supplier or competitor or source_name).strip()
+    if f"P{percentile}" not in name:
+        name = f"{name} - P{percentile}".strip()
+    return {
+        "apiIdentity": f"regular:{source_key}",
+        "id": source_id,
+        "percentileSource": "competitor",
+        "priceFormatId": int(pf.id),
+        "competitorPriceListId": None,
+        "sourceKey": source_key,
+        "percentileSourceType": "regular_competitor",
+        "region": "",
+        "competitor": competitor,
+        "scope": "regular_competitor",
+        "percentile": percentile,
+        "name": name,
+        "skuCount": 0,
+        "sourceCount": 0,
+        "generatedAt": "",
+        "sourceType": "percentile",
+        "eligibleForPricing": False,
+        "pricingEligibilityReason": "regular_percentile_dataset_missing",
+        "assignedToPriceFormat": True,
+    }
+
+
 def _selected_competitor_rows(db: Session, pf: PriceFormat) -> list[CompetitorPriceList]:
     return [item.price_list for item in get_assigned_competitor_price_lists(db=db, price_format_id=int(pf.id))]
 
@@ -5255,6 +5301,7 @@ def get_competitor_assignments(
         .all()
     )
     cfg_by_source_name = {cfg.source_name: cfg for cfg in percentile_cfgs}
+    appended_percentile_sources: set[str] = set()
     if cfg_by_source_name:
         for percentile_source in ("emit", "competitor"):
             for source in list_percentile_sources(
@@ -5264,9 +5311,17 @@ def get_competitor_assignments(
                 include_ineligible=True,
             ):
                 source_id = str(source.get("id") or "")
-                cfg = cfg_by_source_name.get(_assignment_percentile_source_name(source_id))
+                source_name = _assignment_percentile_source_name(source_id)
+                cfg = cfg_by_source_name.get(source_name)
                 if cfg is not None:
                     rows.append(_assignment_row_from_percentile(source, cfg))
+                    appended_percentile_sources.add(source_name)
+        for source_name, cfg in cfg_by_source_name.items():
+            if source_name in appended_percentile_sources:
+                continue
+            fallback_source = _regular_assignment_source_from_config(cfg, pf)
+            if fallback_source is not None:
+                rows.append(_assignment_row_from_percentile(fallback_source, cfg))
     summary = {
         "activePhysicalPlkCount": sum(1 for row in rows if row.get("assignmentKind") == "physical" and row.get("active") is not False),
         "inactivePhysicalPlkCount": sum(1 for row in rows if row.get("assignmentKind") == "physical" and row.get("active") is False),
