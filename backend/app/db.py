@@ -1307,6 +1307,9 @@ def _backfill_percentile_preparations() -> None:
                     price_format_id,
                     status,
                     last_error,
+                    source_refresh_id,
+                    configuration_fingerprint,
+                    job_id,
                     rows_count,
                     completed_at,
                     updated_at
@@ -1329,6 +1332,9 @@ def _backfill_percentile_preparations() -> None:
                         ) THEN 'pending'
                         ELSE 'not_configured'
                     END,
+                    '',
+                    '',
+                    '',
                     '',
                     (
                         SELECT count(*)
