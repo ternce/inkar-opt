@@ -1,99 +1,335 @@
 services:
+  # ============================================
+  # PostgreSQL Database
+  # ============================================
   postgres:
     image: postgres:16-alpine
-    container_name: apteka_postgres
+    container_name: movieplatform-postgres
     restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-apteka}
-      POSTGRES_USER: ${POSTGRES_USER:-apteka}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-apteka}
+
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "5432:5432"
+
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-movieplatform}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-movieplatform_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-movieplatform}
+
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-movieplatform} -d ${POSTGRES_DB:-movieplatform}"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+
+  # ============================================
+  # Redis
+  # ============================================
   redis:
     image: redis:7-alpine
-    container_name: apteka_redis
+    container_name: movieplatform-redis
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "6379:6379"
+
+    command:
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+
     volumes:
       - redis_data:/data
+
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-  backend:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: apteka_backend
+
+  # ============================================
+  # MinIO
+  # ============================================
+  minio:
+    image: minio/minio:latest
+    container_name: movieplatform-minio
     restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    environment:
-      ENVIRONMENT: ${ENVIRONMENT:-prod}
-      PORT: 8000
-      FRONTEND_DIST: /app/front/dist
-      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-apteka}:${POSTGRES_PASSWORD:-apteka}@postgres:5432/${POSTGRES_DB:-apteka}}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
-      PHCENTER_TOKEN: ${PHCENTER_TOKEN:-}
-      PHCENTER_BASE_URL: ${PHCENTER_BASE_URL:-https://ph.center}
-      PROVISOR_BASE_URL: ${PROVISOR_BASE_URL:-https://api.provisor.kz}
-      PROVISOR_LOGIN: ${PROVISOR_LOGIN:-}
-      PROVISOR_PASSWORD: ${PROVISOR_PASSWORD:-}
-      PROVISOR_EXCLUDED_FILIAL_IDS: ${PROVISOR_EXCLUDED_FILIAL_IDS:-1052,1076,1106,1107,1108,1111,1114,1149,1049}
-      PROVISOR_AUTO_REFRESH_ENABLED: ${PROVISOR_AUTO_REFRESH_ENABLED:-false}
-      PROVISOR_AUTO_REFRESH_CRON: "${PROVISOR_AUTO_REFRESH_CRON:-0 2 * * *}"
-      PROVISOR_AUTO_REFRESH_MODE: ${PROVISOR_AUTO_REFRESH_MODE:-selected}
-      PROVISOR_AUTO_REFRESH_MAX_PARALLEL_ACCOUNTS: ${PROVISOR_AUTO_REFRESH_MAX_PARALLEL_ACCOUNTS:-2}
-      PROVISOR_AUTO_REFRESH_MAX_PARALLEL_PLK: ${PROVISOR_AUTO_REFRESH_MAX_PARALLEL_PLK:-1}
-      PROVISOR_AUTO_REFRESH_KEEP_LAST_SUCCESS: ${PROVISOR_AUTO_REFRESH_KEEP_LAST_SUCCESS:-true}
-      PROVISOR_AUTO_REFRESH_TIMEZONE: ${PROVISOR_AUTO_REFRESH_TIMEZONE:-Asia/Qyzylorda}
-      EMIT_WORKER_ENABLED: ${EMIT_WORKER_ENABLED:-false}
-      EMIT_CRON: "${EMIT_CRON:-0 3 * * *}"
-      EMIT_TIMEZONE: ${EMIT_TIMEZONE:-Asia/Qyzylorda}
-      EMIT_FILIAL_IDS: ${EMIT_FILIAL_IDS:-1106,1107,1108,1111,1114,1149,8371}
-      EMIT_REFRESH_STALE_TIMEOUT_SECONDS: ${EMIT_REFRESH_STALE_TIMEOUT_SECONDS:-14400}
-      EMIT_DOWNLOAD_TIMEOUT_SECONDS: ${EMIT_DOWNLOAD_TIMEOUT_SECONDS:-7200}
-      EMIT_TEMP_DIR: ${EMIT_TEMP_DIR:-/tmp/emit}
-      EMIT_DELETE_TEMP_AFTER_SUCCESS: ${EMIT_DELETE_TEMP_AFTER_SUCCESS:-true}
-      EMIT_CLEANUP_TEMP_HOURS: ${EMIT_CLEANUP_TEMP_HOURS:-24}
-      EMIT_MIN_FREE_DISK_GB: ${EMIT_MIN_FREE_DISK_GB:-15}
-      EMIT_MAX_CONCURRENT_FILIALS: ${EMIT_MAX_CONCURRENT_FILIALS:-1}
-      EMIT_MIN_FINAL_ROWS: ${EMIT_MIN_FINAL_ROWS:-100}
-      EMIT_MIN_ROW_RATIO: ${EMIT_MIN_ROW_RATIO:-0.5}
-      VIDMAN_BASE_URL: ${VIDMAN_BASE_URL:-https://1.provizor.kz}
-      VIDMAN_LOGIN_PATH: ${VIDMAN_LOGIN_PATH:-/pages/login}
-      VIDMAN_PRICE_BASE_URL: ${VIDMAN_PRICE_BASE_URL:-https://prv.kz}
-      PRICE_SOURCE_SECRET: ${PRICE_SOURCE_SECRET:-}
-      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-}
+
     ports:
-      - "${APP_PORT:-8000}:8000"
+      - "9000:9000"
+      - "9001:9001"
+
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+
+    command: server /data --console-address ":9001"
+
+    volumes:
+      - minio_data:/data
+
     healthcheck:
       test:
         [
           "CMD",
-          "python",
-          "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()",
+          "curl",
+          "-f",
+          "http://localhost:9000/minio/health/live"
         ]
-      interval: 10s
-      timeout: 5s
-      retries: 12
+      interval: 30s
+      timeout: 20s
+      retries: 3
 
+
+  # ============================================
+  # MinIO Setup
+  # ============================================
+  minio-setup:
+    image: minio/mc:latest
+    container_name: movieplatform-minio-setup
+
+    depends_on:
+      minio:
+        condition: service_healthy
+
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000
+      $${MINIO_ROOT_USER:-minioadmin}
+      $${MINIO_ROOT_PASSWORD:-minioadmin123};
+
+      mc mb local/videos --ignore-existing;
+      mc mb local/thumbnails --ignore-existing;
+      mc mb local/documents --ignore-existing;
+      mc mb local/avatars --ignore-existing;
+
+      mc anonymous set download local/videos;
+      mc anonymous set download local/thumbnails;
+      mc anonymous set download local/avatars;
+
+      echo 'MinIO buckets created successfully';
+      exit 0;
+      "
+
+
+  # ============================================
+  # Mailhog
+  # ============================================
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: movieplatform-mailhog
+    restart: unless-stopped
+
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+    logging:
+      driver: none
+
+
+  # ============================================
+  # NestJS API
+  #
+  # Compiled production runtime
+  # WITHOUT dev/watch mode
+  # ============================================
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+
+    container_name: movieplatform-api
+    restart: unless-stopped
+
+    ports:
+      - "4000:4000"
+
+    volumes:
+      - api_video_uploads:/tmp/video-uploads
+      - api_uploads:/app/apps/api/uploads
+
+    environment:
+      NODE_ENV: production
+
+      # Local environment, but production Node runtime
+      APP_ENV: staging
+
+      ENABLE_TEST_PAYMENTS: "true"
+
+      DATABASE_URL: postgresql://${POSTGRES_USER:-movieplatform}:${POSTGRES_PASSWORD:-movieplatform_dev}@postgres:5432/${POSTGRES_DB:-movieplatform}?schema=public
+
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_URL: redis://redis:6379
+
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+
+      MINIO_BUCKET_VIDEOS: videos
+      MINIO_BUCKET_THUMBNAILS: thumbnails
+      MINIO_BUCKET_DOCUMENTS: documents
+      MINIO_BUCKET_AVATARS: avatars
+
+      UPLOAD_DIR: /app/apps/api/uploads
+
+      # Browser-accessible through Next proxy
+      MINIO_PUBLIC_ENDPOINT: http://localhost:3000/minio
+
+      VIDEO_PROCESSING_CONCURRENCY: 1
+
+      JWT_SECRET: ${JWT_SECRET:-dev-secret-key-change-in-production}
+      JWT_ACCESS_EXPIRATION: ${JWT_ACCESS_EXPIRATION:-15m}
+      JWT_REFRESH_EXPIRATION: ${JWT_REFRESH_EXPIRATION:-7d}
+
+      SMTP_HOST: mailhog
+      SMTP_PORT: 1025
+      SMTP_SECURE: "false"
+      SMTP_FROM_NAME: SESH
+      SMTP_FROM_EMAIL: noreply@movieplatform.local
+
+      LOG_LEVEL: info
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+      redis:
+        condition: service_healthy
+
+      minio:
+        condition: service_healthy
+
+
+  # ============================================
+  # Next.js Web
+  #
+  # Production standalone runtime
+  # WITHOUT next dev / Turbopack
+  # ============================================
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:4000/api/v1
+        NEXT_PUBLIC_APP_URL: http://localhost:3000
+
+    container_name: movieplatform-web
+    restart: unless-stopped
+
+    ports:
+      - "3000:3000"
+
+    environment:
+      NODE_ENV: production
+
+      # Server-side Next requests
+      API_INTERNAL_URL: http://api:4000/api/v1
+
+      # Browser-side requests
+      NEXT_PUBLIC_API_URL: http://localhost:4000/api/v1
+      NEXT_PUBLIC_APP_URL: http://localhost:3000
+
+      NEXT_PUBLIC_APP_ENV: staging
+      NEXT_PUBLIC_ENABLE_TEST_PAYMENTS: "true"
+
+      MINIO_INTERNAL_ENDPOINT: http://minio:9000
+      NEXT_PUBLIC_MINIO_URL: http://localhost:9000
+
+    depends_on:
+      - api
+
+
+  # ============================================
+  # Redis Commander - optional
+  # ============================================
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: movieplatform-redis-commander
+    restart: unless-stopped
+
+    ports:
+      - "8081:8081"
+
+    environment:
+      REDIS_HOSTS: local:redis:6379
+
+    depends_on:
+      - redis
+
+    profiles:
+      - tools
+
+
+  # ============================================
+  # pgAdmin - optional
+  # ============================================
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: movieplatform-pgadmin
+    restart: unless-stopped
+
+    ports:
+      - "5050:80"
+
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@movieplatform.local}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin123}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+    depends_on:
+      - postgres
+
+    profiles:
+      - tools
+
+
+# ============================================
+# Persistent volumes
+# ============================================
 volumes:
   postgres_data:
+    driver: local
+
   redis_data:
+    driver: local
+
+  minio_data:
+    driver: local
+
+  api_video_uploads:
+    driver: local
+
+  api_uploads:
+    driver: local
+
+  pgadmin_data:
+    driver: local
+
+
+# ============================================
+# Network
+# ============================================
+networks:
+  default:
+    name: movieplatform-network

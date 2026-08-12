@@ -10,6 +10,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from .db_time import db_now
 from ..models import (
     CompetitorPriceList,
     PriceFormat,
@@ -73,7 +74,7 @@ def _try_insert_lock(
     lease: timedelta,
     metadata: dict[str, Any] | None = None,
 ) -> bool:
-    now = datetime.utcnow()
+    now = db_now(db)
     row = RefreshLock(
         name=name,
         lock_type=lock_type,
@@ -110,7 +111,7 @@ def try_acquire_lock(
         metadata=metadata,
     ):
         return True
-    now = datetime.utcnow()
+    now = db_now(db)
     result = db.execute(
         update(RefreshLock)
         .where(RefreshLock.name == name)
@@ -129,7 +130,7 @@ def try_acquire_lock(
 
 
 def renew_lock(db: Session, *, name: str, owner_token: str, lease: timedelta) -> bool:
-    now = datetime.utcnow()
+    now = db_now(db)
     result = db.execute(
         update(RefreshLock)
         .where(RefreshLock.name == name)
@@ -276,7 +277,7 @@ def refresh_job_to_status(job: RefreshJob | None) -> dict[str, Any]:
 
 
 def mark_stale_running_jobs(db: Session, *, now: datetime | None = None) -> list[RefreshJob]:
-    now = now or datetime.utcnow()
+    now = now or db_now(db)
     stale_before = now - STALE_AFTER
     rows = (
         db.execute(
@@ -307,7 +308,7 @@ def latest_refresh_job(db: Session) -> RefreshJob | None:
         db.execute(
             select(RefreshJob)
             .where(RefreshJob.source_type == SOURCE_TYPE)
-            .where(RefreshJob.status.in_(("pending", "running", "stale")))
+            .where(RefreshJob.status.in_(("queued", "pending", "running", "stale")))
             .order_by(RefreshJob.started_at.desc().nullslast(), RefreshJob.id.desc())
         )
         .scalars()
@@ -332,7 +333,7 @@ def active_or_stale_refresh_job(db: Session) -> RefreshJob | None:
         db.execute(
             select(RefreshJob)
             .where(RefreshJob.source_type == SOURCE_TYPE)
-            .where(RefreshJob.status.in_(("pending", "running", "stale")))
+            .where(RefreshJob.status.in_(("queued", "pending", "running", "stale")))
             .order_by(RefreshJob.started_at.desc().nullslast(), RefreshJob.id.desc())
         )
         .scalars()
@@ -418,7 +419,7 @@ def heartbeat(db: Session, job: RefreshJob, *, message: str | None = None, owner
 
 def start_job(db: Session, job: RefreshJob, *, total_accounts: int, total_plk: int, metadata: dict[str, Any], owner_token: str | None = None) -> bool:
     token = owner_token or job_owner_token(job)
-    if not token or job.status != "pending" or job_owner_token(job) != token:
+    if not token or job.status not in {"queued", "pending", "running"} or job_owner_token(job) != token:
         return False
     now = datetime.utcnow()
     job.status = "running"

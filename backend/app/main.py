@@ -279,6 +279,7 @@ from .services.provisor_auto_refresh import (
     release_lock,
     release_scheduler_lock,
     renew_emit_scheduler_lock,
+    renew_global_refresh_lock,
     renew_scheduler_lock,
     refresh_job_to_status,
     release_global_refresh_lock,
@@ -303,6 +304,16 @@ from .services.emit_worker import (
     latest_emit_job,
     list_emit_jobs,
     mark_stale_emit_jobs,
+)
+from .services.refresh_queue import (
+    active_parser_refresh_job,
+    active_price_format_refresh_job,
+    claim_next_queued_refresh_job,
+    create_queued_emit_refresh_job,
+    create_queued_price_format_refresh_job,
+    create_queued_provisor_auto_refresh_job,
+    recover_expired_orphan_locks,
+    recover_stale_parser_jobs,
 )
 
 
@@ -335,6 +346,28 @@ PROVISOR_PRICE_UNHEALTHY_TIMEOUTS = 3
 PROVISOR_PRICE_UNHEALTHY_SKIP_FOR = timedelta(hours=6)
 DEFAULT_PROVISOR_EXCLUDED_FILIAL_IDS = "1052,1076,1106,1107,1108,1111,1114,1149,1049"
 _provisor_price_health: dict[tuple[str, str], dict[str, object]] = {}
+
+
+def _process_role() -> str:
+    return settings.process_role
+
+
+def _startup_runs_web_initialization() -> bool:
+    return _process_role() in {"all", "web"}
+
+
+def _startup_runs_parser_recovery() -> bool:
+    return _process_role() in {"all", "worker"}
+
+
+def _startup_runs_percentile_preparation_recovery() -> bool:
+    # Percentile preparation is pricing/database work, not parser temp-file work.
+    # Keep it with the HTTP/pricing side for Stage 1; ALL preserves legacy behavior.
+    return _process_role() in {"all", "web"}
+
+
+def _startup_runs_parser_schedulers() -> bool:
+    return _process_role() in {"all", "worker"}
 
 
 def _timing(operation: str, step: str, started_at: float) -> None:
@@ -784,15 +817,25 @@ def _seed_price_formats_if_missing() -> None:
 
 @app.on_event("startup")
 async def _startup() -> None:
+    if _process_role() == "worker":
+        raise RuntimeError("PROCESS_ROLE=worker must be started with: python -m app.worker")
+    logger.info("[PROCESS_ROLE] role=%s startup=fastapi", _process_role())
     try:
-        init_db()
-        _seed_price_formats_if_missing()
-        with SessionLocal() as db:
-            mark_stale_emit_jobs(db, config=EmitConfig.from_settings(settings))
-            resume_pending_percentile_preparations(db=db, start_worker=True)
-            retry_waiting_percentile_preparations(db=db, start_worker=True)
-        _start_provisor_auto_refresh_scheduler()
-        _start_emit_refresh_scheduler()
+        if _startup_runs_web_initialization():
+            init_db()
+            _seed_price_formats_if_missing()
+        if _startup_runs_parser_recovery():
+            with SessionLocal() as db:
+                mark_stale_emit_jobs(db, config=EmitConfig.from_settings(settings))
+        if _startup_runs_percentile_preparation_recovery():
+            with SessionLocal() as db:
+                resume_pending_percentile_preparations(db=db, start_worker=True)
+                retry_waiting_percentile_preparations(db=db, start_worker=True)
+        if _startup_runs_parser_schedulers():
+            _start_provisor_auto_refresh_scheduler()
+            _start_emit_refresh_scheduler()
+        else:
+            logger.info("[PROCESS_ROLE] role=%s parser schedulers disabled", _process_role())
     except Exception:
         # In production deployments (e.g., Railway) the database might be configured
         # after the first deploy or might be temporarily unavailable.
@@ -802,6 +845,33 @@ async def _startup() -> None:
         traceback.print_exc()
         if settings.environment != "prod":
             raise
+
+
+def _worker_startup() -> None:
+    if _process_role() != "worker":
+        raise RuntimeError("app.worker requires PROCESS_ROLE=worker")
+    logger.info("[PROCESS_ROLE] role=%s startup=worker", _process_role())
+    try:
+        with SessionLocal() as db:
+            recover_stale_parser_jobs(
+                db,
+                stale_heartbeat_seconds=settings.parser_worker_stale_heartbeat_seconds,
+                emit_config=EmitConfig.from_settings(settings),
+            )
+            recover_expired_orphan_locks(db)
+        _start_provisor_auto_refresh_scheduler()
+        _start_emit_refresh_scheduler()
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
+        if settings.environment != "prod":
+            raise
+
+
+def _worker_shutdown() -> None:
+    _shutdown_provisor_auto_refresh_scheduler()
+    _shutdown_emit_refresh_scheduler()
 
 
 def _start_provisor_auto_refresh_scheduler() -> None:
@@ -883,8 +953,9 @@ async def _renew_provisor_scheduler_ownership(owner_token: str) -> None:
 
 @app.on_event("shutdown")
 def _shutdown() -> None:
-    _shutdown_provisor_auto_refresh_scheduler()
-    _shutdown_emit_refresh_scheduler()
+    if _startup_runs_parser_schedulers():
+        _shutdown_provisor_auto_refresh_scheduler()
+        _shutdown_emit_refresh_scheduler()
 
 
 def _shutdown_provisor_auto_refresh_scheduler() -> None:
@@ -1133,6 +1204,187 @@ async def _start_emit_refresh_background(*, mode: str, requested_by: str, filial
         asyncio.create_task(coro)
 
 
+def _update_queued_price_format_progress(db: Session, job: RefreshJob, result: dict, *, owner_token: str) -> None:
+    progress = result.get("progress") if isinstance(result, dict) else {}
+    if not isinstance(progress, dict):
+        progress = {}
+    job.processed_plk = int(progress.get("processed") or 0)
+    job.total_plk = max(int(progress.get("total") or 0), int(job.processed_plk or 0))
+    job.success_count = int(progress.get("success") or 0)
+    job.failed_count = int(progress.get("errors") or 0)
+    job.skipped_count = int(progress.get("skipped") or 0)
+    metadata = json.loads(job.metadata_json or "{}") if job.metadata_json else {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    metadata.update({"result": result, "owner_token": owner_token, "current_stage": "completed"})
+    job.metadata_json = json.dumps(metadata, ensure_ascii=False, default=str)
+    job.heartbeat_at = now_kz_naive()
+    db.commit()
+
+
+def _heartbeat_queued_price_format_refresh_job(job_id: int, owner_token: str) -> bool:
+    with SessionLocal() as heartbeat_db:
+        job = heartbeat_db.get(RefreshJob, job_id)
+        if job is None or job.status != "running" or refresh_job_owner_token(job) != owner_token:
+            return False
+        if job.source_type != "provisor":
+            if not renew_global_refresh_lock(heartbeat_db, owner_token=owner_token):
+                return False
+            job.heartbeat_at = now_kz_naive()
+            job.message = "Refreshing competitor price lists..."
+            heartbeat_db.commit()
+            return True
+        if not refresh_job_heartbeat(heartbeat_db, job, message="Refreshing competitor price lists...", owner_token=owner_token):
+            return False
+        return True
+
+
+async def _run_queued_price_format_refresh_job(job_id: int, *, owner_token: str) -> None:
+    db = SessionLocal()
+    heartbeat_task = None
+    try:
+        job = db.get(RefreshJob, job_id)
+        if job is None:
+            logger.error("[REFRESH_QUEUE] price-format job not found: %s", job_id)
+            return
+        metadata = json.loads(job.metadata_json or "{}") if job.metadata_json else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        format_code = str(metadata.get("format_code") or "").strip()
+        payload = metadata.get("payload") if isinstance(metadata.get("payload"), dict) else {}
+        if not format_code:
+            raise ValueError("Queued price-format refresh job is missing format_code")
+
+        async def beat() -> None:
+            while True:
+                await asyncio.sleep(30)
+                if not _heartbeat_queued_price_format_refresh_job(job_id, owner_token):
+                    return
+
+        heartbeat_task = asyncio.create_task(beat())
+        job.message = "Refreshing competitor price lists..."
+        job.heartbeat_at = now_kz_naive()
+        db.commit()
+        result = await _run_refresh_price_lists_logic(format_code=format_code, payload=payload, db=db, job=None)
+        db.expire_all()
+        job = db.get(RefreshJob, job_id)
+        if job is not None:
+            _update_queued_price_format_progress(db, job, result, owner_token=owner_token)
+            errors = result.get("errors") if isinstance(result, dict) else []
+            status = "failed" if errors and not int(job.success_count or 0) else "success"
+            finish_refresh_job(
+                db,
+                job,
+                status=status,
+                message=job.message or "Competitor price-list refresh completed.",
+                error="; ".join(str(x) for x in (errors or [])[:5]) if isinstance(errors, list) else "",
+                owner_token=owner_token,
+                allowed_statuses={"running"},
+                release_refresh=job.source_type == "provisor",
+                release_global=True,
+            )
+    except Exception as exc:
+        db.rollback()
+        logger.exception("[REFRESH_QUEUE] price-format refresh failed job_id=%s", job_id)
+        job = db.get(RefreshJob, job_id)
+        if job is not None:
+            finish_refresh_job(
+                db,
+                job,
+                status="failed",
+                message="Competitor price-list refresh failed.",
+                error=str(exc),
+                owner_token=owner_token,
+                allowed_statuses={"running", "queued", "pending"},
+                release_refresh=job.source_type == "provisor",
+                release_global=True,
+            )
+    finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+        db.close()
+
+
+async def _execute_claimed_refresh_job(job_id: int, *, owner_token: str) -> None:
+    with SessionLocal() as db:
+        job = db.get(RefreshJob, job_id)
+        if job is None:
+            logger.error("[REFRESH_QUEUE] claimed job not found: %s", job_id)
+            return
+        metadata = json.loads(job.metadata_json or "{}") if job.metadata_json else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        queue_kind = str(metadata.get("queue_kind") or "")
+        source_type = str(job.source_type or "")
+        mode = str(job.mode or "selected")
+        requested_by = str(job.requested_by or metadata.get("requested_by") or "worker")
+
+    try:
+        if source_type == "emit":
+            await _emit_worker_instance().run_job(job_id, owner_token=owner_token)
+            return
+        if queue_kind == "price_format_refresh":
+            await _run_queued_price_format_refresh_job(job_id, owner_token=owner_token)
+            return
+        if source_type == "provisor":
+            await _run_provisor_refresh_job(job_id, mode=mode, requested_by=requested_by, owner_token=owner_token)
+            return
+    except asyncio.CancelledError:
+        logger.warning("[REFRESH_QUEUE] claimed job interrupted by worker shutdown job_id=%s", job_id)
+        with SessionLocal() as db:
+            job = db.get(RefreshJob, job_id)
+            if job is not None:
+                finish_refresh_job(
+                    db,
+                    job,
+                    status="interrupted",
+                    message="Refresh interrupted during worker shutdown.",
+                    error="worker_shutdown",
+                    metadata={"stale_reason": "worker_shutdown", "current_stage": "interrupted"},
+                    owner_token=owner_token,
+                    allowed_statuses={"running", "queued", "pending", "downloading", "parsing", "normalizing", "saving"},
+                    release_refresh=job.source_type == "provisor",
+                    release_global=True,
+                )
+                if job.source_type == "emit":
+                    release_lock(db, name=EMIT_REFRESH_LOCK_NAME, owner_token=owner_token)
+        raise
+    except Exception as exc:
+        logger.exception("[REFRESH_QUEUE] claimed job execution failed job_id=%s", job_id)
+        with SessionLocal() as db:
+            job = db.get(RefreshJob, job_id)
+            if job is not None:
+                finish_refresh_job(
+                    db,
+                    job,
+                    status="failed",
+                    message="Parser refresh job failed.",
+                    error=str(exc),
+                    owner_token=owner_token,
+                    allowed_statuses={"running", "queued", "pending", "downloading", "parsing", "normalizing", "saving"},
+                    release_refresh=job.source_type == "provisor",
+                    release_global=True,
+                )
+                if job.source_type == "emit":
+                    release_lock(db, name=EMIT_REFRESH_LOCK_NAME, owner_token=owner_token)
+        return
+
+    with SessionLocal() as db:
+        job = db.get(RefreshJob, job_id)
+        if job is not None:
+            finish_refresh_job(
+                db,
+                job,
+                status="failed",
+                message="Unknown parser refresh job type.",
+                error=f"Unsupported source_type={source_type} queue_kind={queue_kind}",
+                owner_token=owner_token,
+                allowed_statuses={"running"},
+                release_refresh=False,
+                release_global=True,
+            )
+
+
 def _fmt_dt(dt: datetime | None) -> str:
     return local_display(dt)
 
@@ -1310,12 +1562,65 @@ def health():
     return {"status": "ok"}
 
 
+def _refresh_job_to_legacy_job_dict(job: RefreshJob) -> dict:
+    status = str(job.status or "")
+    legacy_status = {
+        "queued": "queued",
+        "pending": "pending",
+        "running": "running",
+        "downloading": "running",
+        "parsing": "running",
+        "normalizing": "running",
+        "saving": "running",
+        "success": "success",
+        "partial_success": "success",
+        "failed": "error",
+        "error": "error",
+        "interrupted": "error",
+        "stale": "error",
+        "cancelled": "cancelled",
+    }.get(status, status or "pending")
+    total = int(job.total_plk or job.total_accounts or 0)
+    processed = int(job.processed_plk or job.processed_accounts or 0)
+    progress = 0
+    if legacy_status == "success":
+        progress = 100
+    elif total > 0:
+        progress = max(1, min(99, int((processed / total) * 100)))
+    elif legacy_status == "running":
+        progress = 1
+    metadata = json.loads(job.metadata_json or "{}") if job.metadata_json else {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return {
+        "id": str(job.id),
+        "type": f"refresh_jobs:{job.source_type}",
+        "status": legacy_status,
+        "format_code": str(metadata.get("format_code") or metadata.get("price_format_code") or ""),
+        "price_format_id": None,
+        "account_id": None,
+        "progress": progress,
+        "message": job.message or "",
+        "logs": [],
+        "result": metadata,
+        "error": job.error_message or None,
+        "created_at": local_iso(job.started_at) if job.started_at else "",
+        "started_at": local_iso(job.started_at) if job.started_at else "",
+        "updated_at": local_iso(job.heartbeat_at) if job.heartbeat_at else "",
+        "finished_at": local_iso(job.finished_at) if job.finished_at else "",
+    }
+
+
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str, db: Session = Depends(get_db)):
     job = db.get(Job, job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="job not found")
-    return job_to_dict(job)
+    if job is not None:
+        return job_to_dict(job)
+    if str(job_id).isdigit():
+        refresh_job = db.get(RefreshJob, int(job_id))
+        if refresh_job is not None:
+            return _refresh_job_to_legacy_job_dict(refresh_job)
+    raise HTTPException(status_code=404, detail="job not found")
 
 
 @app.get("/api/ph-center/prices-analysis")
@@ -6560,6 +6865,9 @@ async def run_provisor_auto_refresh_now(payload: dict = Body(default={}), db: Se
             emit_blocker.id,
         )
         raise HTTPException(status_code=409, detail="Emit refresh is currently running. Provisor refresh cannot start at the same time.")
+    if _process_role() == "web":
+        job = create_queued_provisor_auto_refresh_job(db, mode=mode, requested_by="manual")
+        return {"job_id": job.id, **refresh_job_to_status(job)}
     job, blocker, owner_token = try_create_refresh_job(db, mode=mode, requested_by="manual")
     if job is None:
         message = "Обновление Provisor уже выполняется."
@@ -6639,7 +6947,7 @@ def force_fail_emit_refresh_job(job_id: int, payload: dict = Body(default={}), d
     now = datetime.utcnow()
     heartbeat_at = job.heartbeat_at
     age_seconds = int((now - heartbeat_at).total_seconds()) if heartbeat_at else config.stale_timeout_seconds + 1
-    if job.status in ("pending", "downloading", "parsing", "normalizing", "saving", "running") and age_seconds <= config.stale_timeout_seconds and not force:
+    if job.status in ("queued", "pending", "downloading", "parsing", "normalizing", "saving", "running") and age_seconds <= config.stale_timeout_seconds and not force:
         raise HTTPException(status_code=409, detail="Emit job heartbeat is still healthy; pass force=true to override.")
     metadata = json.loads(job.metadata_json or "{}") if job.metadata_json else {}
     if not isinstance(metadata, dict):
@@ -6667,7 +6975,7 @@ def force_fail_emit_refresh_job(job_id: int, payload: dict = Body(default={}), d
         error="Emit refresh manually marked interrupted.",
         metadata=metadata,
         owner_token=token or None,
-        allowed_statuses={"pending", "downloading", "parsing", "normalizing", "saving", "running", "interrupted", "error"},
+        allowed_statuses={"queued", "pending", "downloading", "parsing", "normalizing", "saving", "running", "interrupted", "error"},
         release_refresh=False,
         release_global=False,
     )
@@ -6699,6 +7007,18 @@ async def run_emit_refresh_now(payload: dict = Body(default={}), db: Session = D
         pf = db.execute(select(PriceFormat).where(PriceFormat.code == price_format_code)).scalars().first()
         if pf is None:
             raise HTTPException(status_code=400, detail=f"Ценовой формат не найден: {price_format_code}")
+    if _process_role() == "web":
+        emit_blocker = active_emit_job(db, config=worker.config)
+        if emit_blocker is not None:
+            raise HTTPException(status_code=409, detail={"message": "Emit refresh is already running.", "job": emit_job_to_dict(emit_blocker)})
+        job = create_queued_emit_refresh_job(
+            db,
+            mode=mode,
+            filial_ids=target_ids,
+            requested_by="manual",
+            price_format_code=price_format_code,
+        )
+        return {"job_id": job.id, **emit_job_to_dict(job)}
     job, blocker, owner_token = worker.create_job(
         mode=mode,
         filial_ids=target_ids,
@@ -6771,6 +7091,32 @@ async def refresh_competitor_price_lists(format_code: str, payload: dict = Body(
     refresh_job_type = _refresh_job_type(refresh_source)
     job_key = _refresh_job_key(format_code, refresh_source)
     logger.info("[SOURCE_REFRESH_JOB] job_key=%s source=%s format_code=%s", job_key, refresh_source, format_code)
+    if _process_role() == "web":
+        existing_refresh = active_price_format_refresh_job(db, format_code=format_code, refresh_source=refresh_source)
+        if existing_refresh is not None:
+            return {"job_id": existing_refresh.id, "status": existing_refresh.status, "source": refresh_source, "message": "РўР°РєР°СЏ Р·Р°РґР°С‡Р° СѓР¶Рµ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ"}
+        if refresh_source in {"provisor", "all"}:
+            provisor_blocker = active_or_stale_refresh_job(db)
+            if provisor_blocker is not None:
+                raise HTTPException(status_code=409, detail="Provisor refresh is currently running.")
+            emit_blocker = active_emit_job(db, config=EmitConfig.from_settings(settings))
+            if emit_blocker is not None:
+                logger.warning(
+                    "[REFRESH_MUTEX] source=provisor action=skip reason=emit_refresh_active active_job_id=%s",
+                    emit_blocker.id,
+                )
+                raise HTTPException(status_code=409, detail="Emit refresh is currently running. Provisor refresh cannot start at the same time.")
+        parser_blocker = active_parser_refresh_job(db)
+        if parser_blocker is not None:
+            raise HTTPException(status_code=409, detail="Another competitor refresh is currently running or queued.")
+        job = create_queued_price_format_refresh_job(
+            db,
+            format_code=format_code,
+            refresh_source=refresh_source,
+            payload=payload or {},
+            requested_by="manual",
+        )
+        return {"job_id": job.id, "status": job.status, "source": refresh_source}
     global_owner_token: str | None = None
     if refresh_source in {"provisor", "all"}:
         provisor_blocker = active_or_stale_refresh_job(db)

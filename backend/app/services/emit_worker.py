@@ -27,10 +27,11 @@ from typing import Any, Iterable, Iterator
 import httpx
 from openpyxl import load_workbook
 from sqlalchemy import delete, func, select, update
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session, object_session, sessionmaker
 
 from ..config import Settings
 from ..models import CompetitorPriceList, CompetitorPriceListItem, PriceFormat, PriceFormatCompetitorAssignment, RefreshJob, RefreshLock
+from .db_time import db_now
 from .competitor_assignments import propagate_emit_assignments_to_price_formats, upsert_assignment
 from .competitor_percentiles import fanout_emit_percentiles_from_price_format, recalculate_competitor_percentiles
 from .competitor_source_config import canonical_competitor_source_key
@@ -57,7 +58,7 @@ logger = logging.getLogger(__name__)
 SOURCE_TYPE = "emit"
 COMPAT_SOURCE_TYPE = "provisor"
 LOCK_NAME = "emit_refresh"
-ACTIVE_STATUSES = ("pending", "downloading", "parsing", "normalizing", "saving", "running")
+ACTIVE_STATUSES = ("queued", "pending", "downloading", "parsing", "normalizing", "saving", "running")
 TERMINAL_STATUSES = ("success", "error", "interrupted", "stale", "skipped", "cancelled", "failed")
 DEFAULT_STALE_TIMEOUT_SECONDS = 14_400
 EMIT_NAME_MARKERS = (
@@ -2486,7 +2487,7 @@ def cleanup_stale_emit_temp_files(config: EmitConfig, metadata: dict[str, Any]) 
 
 
 def mark_stale_emit_jobs(db: Session, *, config: EmitConfig | None = None, now: datetime | None = None) -> list[RefreshJob]:
-    now = now or datetime.utcnow()
+    now = now or db_now(db)
     timeout_seconds = _emit_stale_timeout_seconds(config)
     stale_before = now - timedelta(seconds=timeout_seconds)
     rows = (
@@ -2649,7 +2650,10 @@ def emit_job_to_dict(job: RefreshJob | None, *, config: EmitConfig | None = None
         base["is_stale"] = False
         base["stale_timeout_seconds"] = _emit_stale_timeout_seconds(config)
         return base
-    now = datetime.utcnow()
+    try:
+        now = db_now(object_session(job)) if object_session(job) is not None else datetime.utcnow()
+    except Exception:
+        now = datetime.utcnow()
     timeout_seconds = _emit_stale_timeout_seconds(config)
     heartbeat = job.heartbeat_at
     stale_age = int((now - heartbeat).total_seconds()) if heartbeat else 0
@@ -3387,7 +3391,18 @@ class EmitWorker:
             with self.session_factory() as db:
                 job = db.get(RefreshJob, job_id)
                 if job is not None:
-                    update_emit_job(db, job, status="parsing", message=f"Parsing Emit filial {filial_id}", metadata={"temp_file_path": str(temp_path), "file_size_bytes": download_size_bytes})
+                    update_emit_job(
+                        db,
+                        job,
+                        status="parsing",
+                        message=f"Parsing Emit filial {filial_id}",
+                        metadata={
+                            "temp_file_path": str(temp_path),
+                            "staging_file_path": str(staging_path),
+                            "stage_db_path": str(staging_path),
+                            "file_size_bytes": download_size_bytes,
+                        },
+                    )
             parse_started = time.perf_counter()
             logger.info("[EMIT_STAGE] event=emit_parse_started job_id=%s filial_id=%s stage_db_path=%s", job_id, filial_id, staging_path)
             stats = parse_normalize_stage(source_path=temp_path, stage_db_path=staging_path, filial_id=filial_id, filial_name=filial_name, config=self.config)

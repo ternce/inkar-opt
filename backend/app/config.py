@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 class Settings(BaseModel):
+    process_role: str
     environment: str
     app_timezone: str
     cors_allow_origins: list[str]
@@ -43,6 +44,9 @@ class Settings(BaseModel):
     emit_max_memory_mb: int
     emit_cron: str
     emit_timezone: str
+    parser_worker_poll_interval_seconds: float
+    parser_worker_concurrency: int
+    parser_worker_stale_heartbeat_seconds: int
     vidman_base_url: str
     vidman_login_path: str
     vidman_price_base_url: str
@@ -55,6 +59,9 @@ def get_settings() -> Settings:
     root_env = Path(__file__).resolve().parents[2] / ".env"
     load_dotenv(dotenv_path=root_env if root_env.exists() else None)
     environment = os.getenv("ENVIRONMENT", "dev")
+    process_role = os.getenv("PROCESS_ROLE", "all").strip().lower() or "all"
+    if process_role not in {"all", "web", "worker"}:
+        raise ValueError("PROCESS_ROLE must be one of: all, web, worker")
 
     cors_allow_origins_raw = os.getenv("CORS_ALLOW_ORIGINS")
     cors_allow_origins = (
@@ -83,6 +90,7 @@ def get_settings() -> Settings:
         return list(dict.fromkeys(out))
 
     return Settings(
+        process_role=process_role,
         environment=environment,
         app_timezone=os.getenv("APP_TIMEZONE", os.getenv("TZ", "Asia/Qyzylorda")).strip() or "Asia/Qyzylorda",
         cors_allow_origins=cors_allow_origins,
@@ -124,6 +132,9 @@ def get_settings() -> Settings:
         emit_max_memory_mb=max(0, int(os.getenv("EMIT_MAX_MEMORY_MB", "0"))),
         emit_cron=os.getenv("EMIT_CRON", "0 3 * * *"),
         emit_timezone=os.getenv("EMIT_TIMEZONE", os.getenv("TZ", "Asia/Qyzylorda")).strip() or "Asia/Qyzylorda",
+        parser_worker_poll_interval_seconds=max(0.5, float(os.getenv("PARSER_WORKER_POLL_INTERVAL_SECONDS", "5"))),
+        parser_worker_concurrency=max(1, int(os.getenv("PARSER_WORKER_CONCURRENCY", "1"))),
+        parser_worker_stale_heartbeat_seconds=max(30, int(os.getenv("PARSER_WORKER_STALE_HEARTBEAT_SECONDS", "180"))),
         vidman_base_url=os.getenv("VIDMAN_BASE_URL", "https://1.provizor.kz"),
         vidman_login_path=os.getenv("VIDMAN_LOGIN_PATH", "/pages/login"),
         vidman_price_base_url=os.getenv("VIDMAN_PRICE_BASE_URL", "https://prv.kz"),
