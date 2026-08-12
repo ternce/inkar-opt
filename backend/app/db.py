@@ -1306,6 +1306,7 @@ def _backfill_percentile_preparations() -> None:
                 INSERT INTO price_format_percentile_preparations (
                     price_format_id,
                     status,
+                    last_error,
                     rows_count,
                     completed_at,
                     updated_at
@@ -1328,6 +1329,7 @@ def _backfill_percentile_preparations() -> None:
                         ) THEN 'pending'
                         ELSE 'not_configured'
                     END,
+                    '',
                     (
                         SELECT count(*)
                         FROM competitor_price_percentiles cpp
