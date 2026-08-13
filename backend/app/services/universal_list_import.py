@@ -23,6 +23,12 @@ SUPPORTED_LIST_TYPES = {"critical", "markup", "exclusion"}
 UNIVERSAL_MARKUP_TYPES = {"critical_markup", "min_markup", "max_markup", "fixed_markup", "markup", "percentile_override"}
 UNIVERSAL_FIXED_PRICE_TYPES = {"fixed_price", "min_price", "max_price", "memorandum"}
 UNIVERSAL_EXCLUSION_TYPES = {"exclusion", "exclude_from_pricing", "no_bend"}
+NON_NEGATIVE_PRICE_TYPES = {"fixed_price", "min_price", "max_price"}
+PRICE_TYPE_ERROR_LABELS = {
+    "fixed_price": "Фиксированная цена",
+    "min_price": "Минимальная цена",
+    "max_price": "Максимальная цена",
+}
 CRITICAL_MARKUP_NO_OVERRIDE = "-"
 UNIVERSAL_TYPE_LABELS = {
     "фиксированная цена": "fixed_price",
@@ -528,6 +534,9 @@ def _normalize_universal_value(list_type: str, raw_value: object) -> tuple[Decim
         return None, "Цена обязательна" if normalized == "memorandum" else "invalid numeric value"
     if normalized == "memorandum" and value <= 0:
         return None, "Цена должна быть больше нуля"
+    error = validate_universal_list_price_value(normalized, value)
+    if error:
+        return None, error
     return value, None
 
 
@@ -535,8 +544,19 @@ def normalize_universal_list_value(list_type: str, raw_value: object) -> tuple[D
     return _normalize_universal_value(list_type, raw_value)
 
 
+def validate_universal_list_price_value(list_type: str, value: Decimal | None, *, sku: object = None) -> str | None:
+    normalized = str(list_type or "").strip().casefold()
+    normalized = UNIVERSAL_TYPE_LABELS.get(normalized, normalized)
+    if normalized not in NON_NEGATIVE_PRICE_TYPES or value is None or value >= 0:
+        return None
+    label = PRICE_TYPE_ERROR_LABELS.get(normalized, "Цена")
+    sku_text = _cell_text(sku)
+    sku_part = f" SKU: {sku_text}," if sku_text else ""
+    return f"{label} не может быть отрицательной.{sku_part} значение: {value:g}"
+
+
 def normalize_universal_list_item_value(
-    list_type: str, raw_value: object
+    list_type: str, raw_value: object, *, sku: object = None
 ) -> tuple[Decimal | None, str, str | None]:
     normalized_type = str(list_type or "").strip().casefold()
     normalized_type = UNIVERSAL_TYPE_LABELS.get(normalized_type, normalized_type)
@@ -545,6 +565,8 @@ def normalize_universal_list_item_value(
         # special_value is the authoritative domain value.
         return Decimal("0"), CRITICAL_MARKUP_NO_OVERRIDE, None
     value, error = _normalize_universal_value(list_type, raw_value)
+    if error is None:
+        error = validate_universal_list_price_value(list_type, value, sku=sku)
     return value, "", error
 
 
@@ -836,7 +858,7 @@ def import_universal_list_excel(
 
         raw_value = row[value_idx] if value_idx is not None and value_idx < len(row) else None
         value, special_value, error = normalize_universal_list_item_value(
-            str(universal_list.type or ""), raw_value
+            str(universal_list.type or ""), raw_value, sku=identifier
         )
         if error or value is None:
             summary["invalid_rows"] += 1

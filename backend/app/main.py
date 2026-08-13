@@ -193,6 +193,7 @@ from .services.universal_list_import import (
     normalize_universal_list_value,
     normalize_universal_list_item_value,
     parse_list_decimal,
+    validate_universal_list_price_value,
 )
 from .timezone import local_display, local_iso, now_kz_naive
 from .services.ph_center_top import FarmcenterTopService
@@ -3737,6 +3738,9 @@ def upsert_lists_management_item(list_id: int, payload: dict = Body(...), db: Se
         raise HTTPException(status_code=400, detail=value_error or "invalid numeric value")
     if _list_type_code(ul.type) == "memorandum" and value <= 0:
         raise HTTPException(status_code=400, detail="Максимальная цена по меморандуму должна быть больше нуля")
+    price_value_error = validate_universal_list_price_value(str(ul.type or ""), value, sku=sku)
+    if price_value_error:
+        raise HTTPException(status_code=400, detail=price_value_error)
     item = db.execute(
         select(ListItem).where(ListItem.universal_list_id == ul.id).where(ListItem.product_id == product.id)
     ).scalars().first()
@@ -3768,7 +3772,7 @@ async def import_lists_management_items(list_id: int, file: UploadFile = File(..
     sku_idx = headers.index("sku") if "sku" in headers else 0
     exclusion_by_presence = is_exclude_from_pricing_type(str(ul.type or ""))
     value_idx = headers.index("value") if "value" in headers else (None if exclusion_by_presence else 1)
-    imported = 0
+    pending_items: list[tuple[Product, Decimal, str]] = []
     for row in ws.iter_rows(min_row=2, values_only=True):
         sku = str(row[sku_idx] or "").strip()
         if not sku:
@@ -3788,6 +3792,12 @@ async def import_lists_management_items(list_id: int, file: UploadFile = File(..
             continue
         if _list_type_code(ul.type) == "memorandum" and value <= 0:
             continue
+        price_value_error = validate_universal_list_price_value(str(ul.type or ""), value, sku=sku)
+        if price_value_error:
+            raise HTTPException(status_code=400, detail=price_value_error)
+        pending_items.append((product, value, special_value))
+    imported = 0
+    for product, value, special_value in pending_items:
         item = db.execute(
             select(ListItem).where(ListItem.universal_list_id == ul.id).where(ListItem.product_id == product.id)
         ).scalars().first()

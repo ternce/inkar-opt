@@ -4,7 +4,7 @@ import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from './ui/dialog';
-import { listTypeLabel, listTypeOptions } from './listTypeLabels';
+import { isFixedPriceType, listTypeCode, listTypeHelper, listTypeLabel, listTypeOptions, listTypeUnit } from './listTypeLabels';
 
 type PriceFormat = {
   code: string;
@@ -39,6 +39,7 @@ type ListCard = ListRow & {
     name: string;
     manufacturer: string;
     value: number | '-' | null;
+    valueDisplay?: string;
     comment: string;
   }>;
 };
@@ -132,6 +133,9 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
   const [isImporting, setIsImporting] = useState(false);
 
   const selectedCodes = useMemo(() => new Set(form.formatCodes), [form.formatCodes]);
+  const formTypeHelper = listTypeHelper(form.type);
+  const openedValueUnit = listTypeUnit(opened?.type);
+  const typeChangedWithItems = Boolean(editing && editing.itemsCount > 0 && listTypeCode(editing.type) !== listTypeCode(form.type));
   const memorandumRows = useMemo(() => rows.filter((row) => row.type === 'memorandum' || listTypeLabel(row.type, row.typeLabel) === 'Меморандум'), [rows]);
 
   const loadRows = async () => {
@@ -263,6 +267,12 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
     if (!isExcelFile(importFile)) {
       setImportStatus('Поддерживаются только файлы .xlsx и .xls');
       return;
+    }
+    if (isFixedPriceType(opened.type)) {
+      const confirmed = window.confirm(
+        'Вы импортируете фиксированные конечные цены в тенге. Значение 5000 станет итоговой ценой 5000 ₸, а отрицательные значения будут отклонены.'
+      );
+      if (!confirmed) return;
     }
     const fd = new FormData();
     fd.append('file', importFile);
@@ -524,7 +534,17 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
               )}
               <div className="import-row">
                 <Input placeholder="SKU" value={newItem.sku} onChange={(e) => setNewItem((prev) => ({ ...prev, sku: e.target.value }))} />
-                <Input placeholder="Значение правила" value={newItem.value} onChange={(e) => setNewItem((prev) => ({ ...prev, value: e.target.value }))} />
+                <div className="relative">
+                  <Input
+                    className={openedValueUnit ? 'pr-10' : ''}
+                    placeholder={openedValueUnit ? `Значение, ${openedValueUnit}` : 'Значение правила'}
+                    value={newItem.value}
+                    onChange={(e) => setNewItem((prev) => ({ ...prev, value: e.target.value }))}
+                  />
+                  {openedValueUnit ? (
+                    <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-gray-500">{openedValueUnit}</span>
+                  ) : null}
+                </div>
                 <Button variant="outline" onClick={() => void addItem()}>Добавить товар</Button>
               </div>
               <div className="table-scroll compact">
@@ -544,7 +564,7 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
                         <td>{item.sku}</td>
                         <td>{item.name}</td>
                         <td>{item.manufacturer || '—'}</td>
-                        <td>{item.value ?? '—'}</td>
+                        <td>{item.valueDisplay ?? item.value ?? '-'}</td>
                         <td>{item.comment || '—'}</td>
                       </tr>
                     ))}
@@ -571,6 +591,12 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>{listTypeOptions.map(([value, label]) => <SelectItem key={value} value={value}>{label}</SelectItem>)}</SelectContent>
               </Select>
+              {formTypeHelper ? <span className="business-alert warn whitespace-pre-line">{formTypeHelper}</span> : null}
+              {typeChangedWithItems ? (
+                <span className="business-alert warn">
+                  Изменение типа списка с уже загруженными товарами меняет единицы и смысл сохраненных значений. Проверьте позиции перед сохранением.
+                </span>
+              ) : null}
             </label>
             <label>Дата начала<Input type="date" value={form.startDate} onChange={(e) => setForm((prev) => ({ ...prev, startDate: e.target.value }))} /></label>
             <label>Дата окончания<Input type="date" value={form.endDate} onChange={(e) => setForm((prev) => ({ ...prev, endDate: e.target.value }))} /></label>

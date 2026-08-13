@@ -15,7 +15,7 @@ from sqlalchemy.pool import StaticPool
 
 from backend.app.db import Base
 from backend.app.deps import get_db
-from backend.app.main import _generated_price_export_rows, app
+from backend.app.main import LIST_TYPE_LABELS, _generated_price_export_rows, app
 from backend.app.models import (
     BusinessList,
     BusinessListItem,
@@ -1192,6 +1192,148 @@ def test_critical_markup_excel_import_accepts_dash():
         assert db.scalar(select(func.count(ListItem.id)).where(ListItem.universal_list_id == list_id)) == 2
     finally:
         db.close()
+
+
+def test_lists_management_type_codes_include_existing_universal_values():
+    assert {
+        "fixed_price",
+        "min_price",
+        "max_price",
+        "fixed_markup",
+        "critical_markup",
+        "min_markup",
+        "max_markup",
+        "no_bend",
+        "percentile_override",
+        "exclude_from_pricing",
+        "memorandum",
+    }.issubset(LIST_TYPE_LABELS)
+
+
+def test_fixed_price_manual_save_accepts_positive_and_zero_rejects_negative():
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = client.post(
+        "/api/lists-management",
+        json={"name": "Fixed price", "type": "fixed_price", "active": True},
+    ).json()["id"]
+
+    positive = client.post(f"/api/lists-management/{list_id}/items", json={"sku": "12345", "value": "5000"})
+    assert positive.status_code == 200
+    zero = client.post(f"/api/lists-management/{list_id}/items", json={"sku": "A-77", "value": "0"})
+    assert zero.status_code == 200
+
+    negative = client.post(f"/api/lists-management/{list_id}/items", json={"sku": "12345", "value": "-2"})
+    assert negative.status_code == 400
+    assert "SKU: 12345" in negative.json()["detail"]
+    assert "-2" in negative.json()["detail"]
+
+    values = {item["sku"]: item["value"] for item in client.get(f"/api/lists-management/{list_id}").json()["items"]}
+    assert values == {"12345": 5000.0, "A-77": 0.0}
+
+
+@pytest.mark.parametrize("list_type", ["fixed_price", "min_price", "max_price"])
+def test_price_lists_manual_save_reject_negative_values(list_type):
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = client.post(
+        "/api/lists-management",
+        json={"name": list_type, "type": list_type, "active": True},
+    ).json()["id"]
+
+    response = client.post(f"/api/lists-management/{list_id}/items", json={"sku": "12345", "value": "-2"})
+
+    assert response.status_code == 400
+    assert "-2" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("list_type", ["fixed_markup", "critical_markup", "min_markup", "max_markup"])
+def test_markup_lists_manual_save_accept_negative_values(list_type):
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = client.post(
+        "/api/lists-management",
+        json={"name": list_type, "type": list_type, "active": True},
+    ).json()["id"]
+
+    response = client.post(f"/api/lists-management/{list_id}/items", json={"sku": "12345", "value": "-2"})
+
+    assert response.status_code == 200
+    card = client.get(f"/api/lists-management/{list_id}").json()
+    assert card["items"][0]["value"] == -2.0
+
+
+def test_fixed_price_excel_import_rejects_negative_without_partial_save():
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = client.post(
+        "/api/lists-management",
+        json={"name": "Fixed price", "type": "fixed_price", "active": True},
+    ).json()["id"]
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={"file": ("fixed.xlsx", _xlsx([["SKU", "Value"], ["12345", 5000], ["A-77", -2]]), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+
+    assert response.status_code == 400
+    assert "-2" in response.json()["detail"]
+    assert client.get(f"/api/lists-management/{list_id}").json()["items"] == []
+
+
+def test_critical_markup_excel_import_accepts_negative_value():
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = client.post(
+        "/api/lists-management",
+        json={"name": "Critical", "type": "critical_markup", "active": True},
+    ).json()["id"]
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={"file": ("critical.xlsx", _xlsx([["SKU", "Value"], ["12345", -2]]), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+
+    assert response.status_code == 200
+    card = client.get(f"/api/lists-management/{list_id}").json()
+    assert card["items"][0]["value"] == -2.0
+    assert card["items"][0]["valueDisplay"] == "-2%"
+
+
+def test_legacy_fixed_price_import_rejects_negative_without_partial_save():
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = client.post(
+        "/api/lists-management",
+        json={"name": "Fixed price", "type": "fixed_price", "active": True},
+    ).json()["id"]
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import",
+        files={"file": ("fixed.xlsx", _xlsx([["sku", "value"], ["12345", 5000], ["A-77", -2]]), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+
+    assert response.status_code == 400
+    assert "-2" in response.json()["detail"]
+    assert client.get(f"/api/lists-management/{list_id}").json()["items"] == []
+
+
+def test_legacy_critical_markup_import_accepts_negative_value():
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = client.post(
+        "/api/lists-management",
+        json={"name": "Critical", "type": "critical_markup", "active": True},
+    ).json()["id"]
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import",
+        files={"file": ("critical.xlsx", _xlsx([["sku", "value"], ["12345", -2]]), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+
+    assert response.status_code == 200
+    card = client.get(f"/api/lists-management/{list_id}").json()
+    assert card["items"][0]["value"] == -2.0
 
 
 @pytest.mark.parametrize(
