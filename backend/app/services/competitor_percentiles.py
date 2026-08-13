@@ -151,7 +151,7 @@ def _matched_positive_counts_by_price_list(*, db: Session, price_list_ids: list[
     if not price_list_ids:
         return {}
     rows = db.execute(
-        select(CompetitorPriceListItem.price_list_id, func.count(CompetitorPriceListItem.id))
+        select(CompetitorPriceListItem.price_list_id, func.count())
         .where(CompetitorPriceListItem.price_list_id.in_(price_list_ids))
         .where(CompetitorPriceListItem.distributor_price.is_not(None))
         .where(CompetitorPriceListItem.distributor_price > 0)

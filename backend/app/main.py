@@ -244,6 +244,7 @@ from .services.competitors.percentiles.read_models import (
     percentile_coverage_audit,
     percentile_trace,
 )
+from .services.competitors.percentiles.sources import PERCENTILE_SOURCE_COMPETITOR, PERCENTILE_SOURCE_EMIT
 from .services.jobs import create_job, get_active_job, job_to_dict, schedule_job, update_job
 from .services.references.batch import import_reference_batch
 from .services.references.imports import import_reference_excel
@@ -5187,7 +5188,7 @@ def get_provisor_diagnostics(
     item_counts = (
         dict(
             db.execute(
-                select(CompetitorPriceListItem.price_list_id, func.count(CompetitorPriceListItem.id))
+                select(CompetitorPriceListItem.price_list_id, func.count())
                 .where(CompetitorPriceListItem.price_list_id.in_(row_ids))
                 .group_by(CompetitorPriceListItem.price_list_id)
             ).all()
@@ -5434,6 +5435,13 @@ def _assignment_percentile_source_name(source_id: object) -> str:
     return f"percentile:{str(source_id or '').strip()}"
 
 
+def _assignment_percentile_source_family(source_id: object) -> str:
+    text = str(source_id or "").strip()
+    if text.startswith(f"{PERCENTILE_SOURCE_COMPETITOR}:"):
+        return PERCENTILE_SOURCE_COMPETITOR
+    return PERCENTILE_SOURCE_EMIT
+
+
 def _regular_assignment_source_from_config(cfg: CompetitorPrice, pf: PriceFormat) -> dict | None:
     source_name = str(cfg.source_name or "").strip()
     prefix = f"percentile:competitor:{int(pf.id)}:regular_competitor:"
@@ -5584,7 +5592,7 @@ def get_competitor_assignments(
     counts = (
         dict(
             db.execute(
-                select(CompetitorPriceListItem.price_list_id, func.count(CompetitorPriceListItem.id))
+                select(CompetitorPriceListItem.price_list_id, func.count())
                 .where(CompetitorPriceListItem.price_list_id.in_([item.price_list.id for item in selected]))
                 .group_by(CompetitorPriceListItem.price_list_id)
             ).all()
@@ -5610,12 +5618,24 @@ def get_competitor_assignments(
     cfg_by_source_name = {cfg.source_name: cfg for cfg in percentile_cfgs}
     appended_percentile_sources: set[str] = set()
     if cfg_by_source_name:
-        for percentile_source in ("emit", "competitor"):
+        configured_source_ids = {
+            source_name.removeprefix("percentile:")
+            for source_name in cfg_by_source_name
+            if str(source_name or "").startswith("percentile:")
+        }
+        configured_source_ids_by_family: dict[str, set[str]] = {PERCENTILE_SOURCE_EMIT: set(), PERCENTILE_SOURCE_COMPETITOR: set()}
+        for source_id in configured_source_ids:
+            configured_source_ids_by_family[_assignment_percentile_source_family(source_id)].add(source_id)
+        for percentile_source in (PERCENTILE_SOURCE_EMIT, PERCENTILE_SOURCE_COMPETITOR):
+            source_ids = configured_source_ids_by_family.get(percentile_source) or set()
+            if not source_ids:
+                continue
             for source in list_percentile_sources(
                 db=db,
                 price_format_code=format_code,
                 percentile_source=percentile_source,
                 include_ineligible=True,
+                source_ids=source_ids,
             ):
                 source_id = str(source.get("id") or "")
                 source_name = _assignment_percentile_source_name(source_id)

@@ -1585,7 +1585,7 @@ def set_selected_competitor_price_lists(
     _timing(operation, "load_selected_price_lists", started_at)
     counts = dict(
         db.execute(
-            select(CompetitorPriceListItem.price_list_id, func.count(CompetitorPriceListItem.id))
+            select(CompetitorPriceListItem.price_list_id, func.count())
             .where(CompetitorPriceListItem.price_list_id.in_([row.id for row in rows]))
             .group_by(CompetitorPriceListItem.price_list_id)
         ).all()
@@ -1621,7 +1621,7 @@ def save_selected_competitor_price_lists_only(
     rows = list_global_competitor_price_lists_for_format(db=db, price_format=pf)
     counts = dict(
         db.execute(
-            select(CompetitorPriceListItem.price_list_id, func.count(CompetitorPriceListItem.id))
+            select(CompetitorPriceListItem.price_list_id, func.count())
             .where(CompetitorPriceListItem.price_list_id.in_([row.id for row in rows]))
             .group_by(CompetitorPriceListItem.price_list_id)
         ).all()

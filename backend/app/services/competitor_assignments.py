@@ -6,7 +6,7 @@ from datetime import datetime
 import logging
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from ..models import (
     CompetitorPriceList,
@@ -34,6 +34,39 @@ ATTEMPTED_ZERO_REFRESH_STATUSES = {
     "failed",
     "error",
 }
+
+
+COMPETITOR_PRICE_LIST_READ_COLUMNS = (
+    CompetitorPriceList.id,
+    CompetitorPriceList.price_format_id,
+    CompetitorPriceList.source_type,
+    CompetitorPriceList.source_key,
+    CompetitorPriceList.display_name,
+    CompetitorPriceList.supplier,
+    CompetitorPriceList.region,
+    CompetitorPriceList.branch_id,
+    CompetitorPriceList.branch_code,
+    CompetitorPriceList.branch_name,
+    CompetitorPriceList.competitor_name,
+    CompetitorPriceList.account_id,
+    CompetitorPriceList.account_login,
+    CompetitorPriceList.external_price_list_id,
+    CompetitorPriceList.sync_batch_id,
+    CompetitorPriceList.source_updated_at,
+    CompetitorPriceList.last_checked_at,
+    CompetitorPriceList.last_success_at,
+    CompetitorPriceList.last_refresh_status,
+    CompetitorPriceList.last_refresh_message,
+    CompetitorPriceList.price_date,
+    CompetitorPriceList.coefficient,
+    CompetitorPriceList.price_coefficient,
+    CompetitorPriceList.is_selected,
+    CompetitorPriceList.updated_at,
+)
+
+
+def competitor_price_list_read_options():
+    return load_only(*COMPETITOR_PRICE_LIST_READ_COLUMNS)
 
 
 def source_name(row: CompetitorPriceList) -> str:
@@ -105,7 +138,7 @@ def visible_item_counts(db: Session, rows: list[CompetitorPriceList]) -> dict[in
         return {}
     return dict(
         db.execute(
-            select(CompetitorPriceListItem.price_list_id, func.count(CompetitorPriceListItem.id))
+            select(CompetitorPriceListItem.price_list_id, func.count())
             .where(CompetitorPriceListItem.price_list_id.in_(ids))
             .group_by(CompetitorPriceListItem.price_list_id)
         ).all()
@@ -139,7 +172,7 @@ def list_global_competitor_price_lists_for_format(
     region: str | None = None,
     branch_scoped: bool = False,
 ) -> list[CompetitorPriceList]:
-    stmt = select(CompetitorPriceList)
+    stmt = select(CompetitorPriceList).options(competitor_price_list_read_options())
     if account_id:
         stmt = stmt.where(CompetitorPriceList.account_id == str(account_id))
     rows = db.execute(stmt.order_by(CompetitorPriceList.updated_at.desc(), CompetitorPriceList.id.desc())).scalars().all()
@@ -231,6 +264,7 @@ def get_assigned_competitor_price_lists(
 ) -> list[AssignedCompetitorPriceList]:
     stmt = (
         select(CompetitorPriceList, PriceFormatCompetitorAssignment)
+        .options(competitor_price_list_read_options())
         .join(
             PriceFormatCompetitorAssignment,
             PriceFormatCompetitorAssignment.competitor_price_list_id == CompetitorPriceList.id,

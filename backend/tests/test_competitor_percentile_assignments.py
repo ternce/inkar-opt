@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -203,6 +203,127 @@ def test_assignment_summary_counts_only_active_physical_plk_rows():
     assert payload["summary"]["totalRowsCount"] == 9
     assert sum(1 for row in payload["items"] if row["assignmentKind"] == "physical") == 6
     assert sum(1 for row in payload["items"] if row["assignmentKind"] == "percentile_config") == 3
+
+
+def test_regular_percentile_sources_reuse_assigned_identity_lookup():
+    Session = _session_factory_static()
+    with Session() as db:
+        pf = _format(db, code="REG-QCOUNT")
+        product = _product(db)
+        price_list = _price_list(db, pf, source_key="7:401", competitor="Amanat")
+        _assign(db, pf, price_list)
+        identity = canonical_regular_competitor_identity("Amanat")
+        db.add(
+            RegularCompetitorPricePercentile(
+                competitor_identity=identity,
+                competitor_name="Amanat",
+                product_id=product.id,
+                percentile=10,
+                value=Decimal("100.00"),
+                source_count=1,
+                sample_count=1,
+            )
+        )
+        db.commit()
+
+        assignment_lookup_count = 0
+
+        def count_assignment_lookup(_conn, _cursor, statement, _parameters, _context, _executemany):
+            nonlocal assignment_lookup_count
+            normalized = " ".join(str(statement).lower().split())
+            if "from competitor_price_lists" in normalized and "price_format_competitor_assignments" in normalized:
+                assignment_lookup_count += 1
+
+        event.listen(db.bind, "before_cursor_execute", count_assignment_lookup)
+        try:
+            sources = list_percentile_sources(
+                db=db,
+                price_format_code=pf.code,
+                percentile_source=PERCENTILE_SOURCE_COMPETITOR,
+                include_ineligible=True,
+            )
+        finally:
+            event.remove(db.bind, "before_cursor_execute", count_assignment_lookup)
+
+    assert len(sources) == 1
+    assert assignment_lookup_count == 1
+
+
+def test_emit_only_assignment_does_not_load_regular_percentile_sources():
+    import backend.app.main as main
+
+    Session = _session_factory_static()
+    with Session() as db:
+        pf = _format(db, code="EMIT-ONLY")
+        product = _product(db)
+        price_list = CompetitorPriceList(
+            price_format_id=pf.id,
+            source_type="emit",
+            source_key="emit:branch-1",
+            display_name="Emit Aktau",
+            supplier="Emit",
+            branch_name="Aktau",
+            competitor_name="Emit",
+            external_price_list_id="branch-1",
+        )
+        db.add(price_list)
+        db.flush()
+        _assign(db, pf, price_list, percentile_mode=MULTI_PRICE_PERCENTILE_MODE)
+        source_id = percentile_source_id(
+            percentile_source=PERCENTILE_SOURCE_EMIT,
+            price_format_id=pf.id,
+            scope="regional",
+            source_key=price_list.source_key,
+            region="Aktau",
+            competitor="Emit",
+            percentile=10,
+        )
+        db.add(
+            CompetitorPricePercentile(
+                price_format_id=pf.id,
+                product_id=product.id,
+                competitor_price_list_id=price_list.id,
+                source_type="emit",
+                source_key=price_list.source_key,
+                branch_name="Aktau",
+                competitor_name="Emit",
+                percentile_scope="regional",
+                percentile=10,
+                value=Decimal("100.00"),
+                source_count=1,
+            )
+        )
+        db.add(
+            CompetitorPrice(
+                price_format_id=pf.id,
+                source_name=f"percentile:{source_id}",
+                supplier="Emit",
+                coefficient=1,
+            )
+        )
+        db.commit()
+
+    regular_query_count = 0
+
+    def count_regular_queries(_conn, _cursor, statement, _parameters, _context, _executemany):
+        nonlocal regular_query_count
+        if "regular_competitor_price_percentiles" in str(statement).lower():
+            regular_query_count += 1
+
+    engine = Session.kw["bind"]
+    event.listen(engine, "before_cursor_execute", count_regular_queries)
+    main.app.dependency_overrides[main.get_db] = lambda: Session()
+    try:
+        response = TestClient(main.app).get("/api/price-formats/EMIT-ONLY/competitor-assignments?include_summary=1")
+    finally:
+        main.app.dependency_overrides.clear()
+        event.remove(engine, "before_cursor_execute", count_regular_queries)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["summary"]["activePhysicalPlkCount"] == 1
+    assert payload["summary"]["percentileSourceCount"] == 1
+    assert regular_query_count == 0
 
 
 def test_ordinary_provisor_refresh_recalculates_global_regular_percentiles():

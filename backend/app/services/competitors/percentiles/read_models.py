@@ -31,6 +31,7 @@ from ...competitor_percentiles import (
     percentile_inc_linear,
     regular_competitor_identity,
 )
+from ...competitor_assignments import competitor_price_list_read_options
 from ...competitors.identity import canonical_regular_competitor_identity, regular_competitor_display_name
 from ...competitor_source_config import (
     MULTI_PRICE_PERCENTILE_MODE,
@@ -54,6 +55,8 @@ def list_percentile_sources(
     price_format_code: str | None = None,
     percentile_source: str = PERCENTILE_SOURCE_DEFAULT,
     include_ineligible: bool = False,
+    source_ids: set[str] | None = None,
+    assigned_regular_identities: set[str] | None = None,
 ) -> list[dict]:
     """Group stored percentile rows into source-like UI records.
 
@@ -67,6 +70,8 @@ def list_percentile_sources(
             db=db,
             price_format_code=price_format_code,
             include_ineligible=include_ineligible,
+            source_ids=source_ids,
+            assigned_regular_identities=assigned_regular_identities,
         )
 
     allowed_groups_by_format: dict[int, set[tuple[str, str, str]]] = {}
@@ -107,6 +112,7 @@ def list_percentile_sources(
         stmt = stmt.where(CompetitorPricePercentile.price_format_id == pf.id)
 
     rows = db.execute(stmt.order_by(CompetitorPricePercentile.branch_name.asc(), CompetitorPricePercentile.competitor_name.asc())).all()
+    requested_source_ids = {str(item or "").strip() for item in (source_ids or set()) if str(item or "").strip()}
     out: list[dict] = []
     for row in rows:
         allowed_groups = allowed_groups_by_format.get(int(row.price_format_id))
@@ -121,16 +127,19 @@ def list_percentile_sources(
         if not eligible_for_pricing and not include_ineligible:
             continue
         generated_at = row.generated_at.isoformat() if row.generated_at else ""
+        source_id = provider.source_id(
+            price_format_id=row.price_format_id,
+            scope=row.percentile_scope,
+            source_key=row.source_key,
+            region=row.branch_name,
+            competitor=row.competitor_name,
+            percentile=row.percentile,
+        )
+        if requested_source_ids and source_id not in requested_source_ids:
+            continue
         out.append(
             {
-                "id": provider.source_id(
-                    price_format_id=row.price_format_id,
-                    scope=row.percentile_scope,
-                    source_key=row.source_key,
-                    region=row.branch_name,
-                    competitor=row.competitor_name,
-                    percentile=row.percentile,
-                ),
+                "id": source_id,
                 "percentileSource": PERCENTILE_SOURCE_EMIT,
                 "priceFormatId": row.price_format_id,
                 "competitorPriceListId": row.competitor_price_list_id,
@@ -157,6 +166,8 @@ def _list_competitor_percentile_sources(
     db: Session,
     price_format_code: str | None = None,
     include_ineligible: bool = False,
+    source_ids: set[str] | None = None,
+    assigned_regular_identities: set[str] | None = None,
 ) -> list[dict]:
     provider = get_percentile_provider(PERCENTILE_SOURCE_COMPETITOR)
     pf: PriceFormat | None = None
@@ -165,8 +176,22 @@ def _list_competitor_percentile_sources(
         pf = db.execute(select(PriceFormat).where(PriceFormat.code == price_format_code.strip())).scalars().first()
         if pf is None:
             return []
-        allowed_identities = _assigned_regular_identities(db=db, price_format_id=int(pf.id))
-    metadata = _regular_source_metadata(db=db, price_format_id=int(pf.id) if pf is not None else None)
+        allowed_identities = (
+            assigned_regular_identities
+            if assigned_regular_identities is not None
+            else _assigned_regular_identities(db=db, price_format_id=int(pf.id))
+        )
+    requested_source_ids = {str(item or "").strip() for item in (source_ids or set()) if str(item or "").strip()}
+    requested_regular_identities = _regular_identities_from_source_ids(
+        requested_source_ids,
+        price_format_id=int(pf.id) if pf is not None else None,
+    )
+    metadata = _regular_source_metadata(
+        db=db,
+        price_format_id=int(pf.id) if pf is not None else None,
+        assigned_regular_identities=allowed_identities,
+        requested_identities=requested_regular_identities,
+    )
     stmt = (
         select(
             RegularCompetitorPricePercentile.competitor_identity,
@@ -181,6 +206,8 @@ def _list_competitor_percentile_sources(
             RegularCompetitorPricePercentile.percentile,
         )
     )
+    if requested_regular_identities:
+        stmt = stmt.where(RegularCompetitorPricePercentile.competitor_identity.in_(requested_regular_identities))
     rows = db.execute(stmt.order_by(func.min(RegularCompetitorPricePercentile.competitor_name).asc())).all()
     stored_identities = {str(row.competitor_identity or "").strip() for row in rows if str(row.competitor_identity or "").strip()}
     out: list[dict] = []
@@ -203,17 +230,20 @@ def _list_competitor_percentile_sources(
         # regular_competitor_price_percentiles. Availability must not depend on
         # a physical regional PLK still being assigned to this price format.
         eligible_for_pricing = True
+        source_id = provider.source_id(
+            price_format_id=price_format_id,
+            scope=REGULAR_COMPETITOR_SCOPE,
+            source_key=source_key,
+            region="",
+            competitor=competitor,
+            percentile=row.percentile,
+        )
+        if requested_source_ids and source_id not in requested_source_ids:
+            continue
         out.append(
             {
                 "apiIdentity": f"regular:{source_key}",
-                "id": provider.source_id(
-                    price_format_id=price_format_id,
-                    scope=REGULAR_COMPETITOR_SCOPE,
-                    source_key=source_key,
-                    region="",
-                    competitor=competitor,
-                    percentile=row.percentile,
-                ),
+                "id": source_id,
                 "percentileSource": PERCENTILE_SOURCE_COMPETITOR,
                 "priceFormatId": price_format_id,
                 "competitorPriceListId": None,
@@ -241,18 +271,60 @@ def _list_competitor_percentile_sources(
     return out
 
 
+def _regular_identities_from_source_ids(source_ids: set[str], price_format_id: int | None) -> set[str]:
+    if not source_ids or not price_format_id:
+        return set()
+    prefix = f"{PERCENTILE_SOURCE_COMPETITOR}:{price_format_id}:{REGULAR_COMPETITOR_SCOPE}:"
+    out: set[str] = set()
+    for source_id in source_ids:
+        text = str(source_id or "").strip()
+        if not text.startswith(prefix) or ":p" not in text:
+            continue
+        before_percentile = text.removeprefix(prefix).rsplit(":p", 1)[0]
+        source_key = before_percentile.split("::", 1)[0]
+        canonical = canonical_regular_competitor_identity(source_key)
+        if canonical:
+            out.add(canonical)
+    return out
+
+
 def _is_obsolete_regular_identity(stored_identity: object, stored_identities: set[str]) -> bool:
     identity = str(stored_identity or "").strip()
     canonical = canonical_regular_competitor_identity(identity)
     return bool(canonical and canonical != identity and canonical in stored_identities)
 
 
-def _regular_source_metadata(*, db: Session, price_format_id: int | None = None) -> dict[str, dict]:
-    rows = db.execute(select(CompetitorPriceList).order_by(CompetitorPriceList.id.asc())).scalars().all()
-    ids = [int(row.id) for row in rows]
+def _regular_source_metadata(
+    *,
+    db: Session,
+    price_format_id: int | None = None,
+    assigned_regular_identities: set[str] | None = None,
+    requested_identities: set[str] | None = None,
+) -> dict[str, dict]:
+    rows = (
+        db.execute(
+            select(CompetitorPriceList)
+            .options(competitor_price_list_read_options())
+            .order_by(CompetitorPriceList.id.asc())
+        )
+        .scalars()
+        .all()
+    )
+    metadata_rows: list[CompetitorPriceList] = []
+    for row in rows:
+        identity = regular_competitor_identity(row)
+        if (
+            not identity
+            or (requested_identities and identity not in requested_identities)
+            or canonical_competitor_source_key(row).startswith("emit:")
+            or default_percentile_mode_for_source(row) == MULTI_PRICE_PERCENTILE_MODE
+        ):
+            continue
+        metadata_rows.append(row)
+    ids = [int(row.id) for row in metadata_rows]
     item_counts = dict(
         db.execute(
-            select(CompetitorPriceListItem.price_list_id, func.count(CompetitorPriceListItem.id))
+            select(CompetitorPriceListItem.price_list_id, func.count())
             .where(CompetitorPriceListItem.price_list_id.in_(ids))
             .where(CompetitorPriceListItem.distributor_price.is_not(None))
             .where(CompetitorPriceListItem.distributor_price > 0)
@@ -265,16 +337,14 @@ def _regular_source_metadata(*, db: Session, price_format_id: int | None = None)
             .group_by(CompetitorPriceListItem.price_list_id)
         ).all()
     ) if ids else {}
-    assigned = _assigned_regular_identities(db=db, price_format_id=price_format_id) if price_format_id else set()
+    assigned = (
+        assigned_regular_identities
+        if assigned_regular_identities is not None
+        else (_assigned_regular_identities(db=db, price_format_id=price_format_id) if price_format_id else set())
+    )
     out: dict[str, dict] = {}
-    for row in rows:
+    for row in metadata_rows:
         identity = regular_competitor_identity(row)
-        if (
-            not identity
-            or canonical_competitor_source_key(row).startswith("emit:")
-            or default_percentile_mode_for_source(row) == MULTI_PRICE_PERCENTILE_MODE
-        ):
-            continue
         meta = out.setdefault(
             identity,
             {
@@ -311,6 +381,7 @@ def _assigned_regular_identities(*, db: Session, price_format_id: int | None) ->
     assigned = (
         db.execute(
             select(CompetitorPriceList, PriceFormatCompetitorAssignment)
+            .options(competitor_price_list_read_options())
             .join(
                 PriceFormatCompetitorAssignment,
                 PriceFormatCompetitorAssignment.competitor_price_list_id == CompetitorPriceList.id,
