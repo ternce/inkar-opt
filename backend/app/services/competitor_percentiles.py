@@ -22,6 +22,10 @@ from ..models import (
 )
 from ..timezone import now_kz_naive
 from .competitor_assignments import get_assigned_competitor_price_lists
+from .competitor_read_models import (
+    refresh_emit_percentile_source_summaries,
+    refresh_regular_percentile_source_summaries,
+)
 from .competitor_source_config import (
     MULTI_PRICE_PERCENTILE_MODE,
     canonical_competitor_source_key,
@@ -220,16 +224,19 @@ def recalculate_competitor_percentiles(
     source_price_list_ids: list[int] | None = None,
 ) -> dict[str, Any]:
     if (db.get_bind().dialect.name or "").lower() == "postgresql":
-        return _recalculate_competitor_percentiles_postgresql(
+        summary = _recalculate_competitor_percentiles_postgresql(
             db=db,
             price_format_id=price_format_id,
             source_price_list_ids=source_price_list_ids,
         )
-    return _recalculate_competitor_percentiles_python(
-        db=db,
-        price_format_id=price_format_id,
-        source_price_list_ids=source_price_list_ids,
-    )
+    else:
+        summary = _recalculate_competitor_percentiles_python(
+            db=db,
+            price_format_id=price_format_id,
+            source_price_list_ids=source_price_list_ids,
+        )
+    refresh_emit_percentile_source_summaries(db=db, price_format_id=price_format_id)
+    return summary
 
 
 def fanout_emit_percentiles_from_price_format(
@@ -1680,8 +1687,11 @@ def recalculate_regular_competitor_percentiles(
 ) -> dict[str, Any]:
     identities = {str(item or "").strip().casefold() for item in (competitor_identities or set()) if str(item or "").strip()}
     if (db.get_bind().dialect.name or "").lower() == "postgresql":
-        return _recalculate_regular_competitor_percentiles_postgresql(db=db, competitor_identities=identities)
-    return _recalculate_regular_competitor_percentiles_python(db=db, competitor_identities=identities)
+        summary = _recalculate_regular_competitor_percentiles_postgresql(db=db, competitor_identities=identities)
+    else:
+        summary = _recalculate_regular_competitor_percentiles_python(db=db, competitor_identities=identities)
+    refresh_regular_percentile_source_summaries(db=db, competitor_identities=identities)
+    return summary
 
 
 def _recalculate_regular_competitor_percentiles_python(

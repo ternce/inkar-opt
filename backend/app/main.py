@@ -5589,17 +5589,7 @@ def get_competitor_assignments(
     selected = get_assigned_competitor_price_lists(db=db, price_format_id=int(pf.id))
     for item in selected:
         ensure_canonical_source_key(item.price_list)
-    counts = (
-        dict(
-            db.execute(
-                select(CompetitorPriceListItem.price_list_id, func.count())
-                .where(CompetitorPriceListItem.price_list_id.in_([item.price_list.id for item in selected]))
-                .group_by(CompetitorPriceListItem.price_list_id)
-            ).all()
-        )
-        if selected
-        else {}
-    )
+    counts = {int(item.price_list.id): int(getattr(item.price_list, "items_count", 0) or 0) for item in selected}
     rows = [
         _assignment_row_from_price_list(item.price_list, int(counts.get(item.price_list.id, 0)), item.assignment)
         for item in selected

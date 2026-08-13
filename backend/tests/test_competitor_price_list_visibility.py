@@ -14,6 +14,7 @@ from backend.app.models import (
 from backend.app.services.competitor_assignments import get_assigned_competitor_price_lists
 from backend.app.services.competitor_price_lists import _visible_competitor_price_list_rows
 from backend.app.services.competitor_price_lists import list_competitor_price_lists
+from backend.app.services.competitor_read_models import refresh_price_list_item_counters
 from backend.app.services.competitors.management import list_competitor_sources
 
 
@@ -100,6 +101,7 @@ def _item(db, price_list, *, distributor_goods_id="SKU-1", goods_id=100):
         )
     )
     db.flush()
+    refresh_price_list_item_counters(db=db, price_list_ids=[int(price_list.id)])
 
 
 def test_global_pool_returns_usable_provisor_rows_outside_format_branch_with_metadata():
@@ -139,7 +141,7 @@ def test_global_pool_hides_listed_placeholders_but_shows_attempted_zero_rows():
     assert by_id[empty_success.id]["sourceVisibilityState"] == "empty_success"
 
 
-def test_list_competitor_price_lists_reuses_visibility_item_counts():
+def test_list_competitor_price_lists_uses_persisted_item_counts():
     db = _session()
     pf = _format(db, branch="Алматы")
     first = _price_list(db, pf, source_key="4:128", branch_name="Инкар (Алматы)", external_price_list_id=128)
@@ -165,7 +167,7 @@ def test_list_competitor_price_lists_reuses_visibility_item_counts():
         event.remove(db.bind, "before_cursor_execute", capture_count_query)
 
     assert {row["id"]: row["itemsCount"] for row in rows} == {first.id: 1, second.id: 1}
-    assert len(grouped_item_count_queries) == 1
+    assert len(grouped_item_count_queries) == 0
 
 
 def test_global_pool_dedupe_preserves_same_filial_from_different_accounts():

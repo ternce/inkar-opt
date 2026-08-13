@@ -14,10 +14,12 @@ from backend.app.models import (
     CompetitorPriceList,
     CompetitorPriceListItem,
     CompetitorPricePercentile,
+    CompetitorPricePercentileSourceSummary,
     PriceFormat,
     PriceFormatCompetitorAssignment,
     Product,
     RegularCompetitorPricePercentile,
+    RegularCompetitorPricePercentileSourceSummary,
 )
 from backend.app.services.competitor_percentiles import (
     MULTI_PRICE_PERCENTILE_MODE,
@@ -36,6 +38,14 @@ from backend.app.services.competitors.percentiles.sources import (
 )
 from backend.app.services.competitor_price_lists import sync_selected_competitor_configs
 from backend.app.services.competitors.identity import canonical_regular_competitor_identity
+from backend.app.services.competitor_read_models import (
+    live_emit_percentile_source_summary_rows,
+    live_price_list_item_counts,
+    live_regular_percentile_source_summary_rows,
+    refresh_emit_percentile_source_summaries,
+    refresh_price_list_item_counters,
+    refresh_regular_percentile_source_summaries,
+)
 
 
 def _session_factory_static():
@@ -179,6 +189,10 @@ def test_assignment_summary_counts_only_active_physical_plk_rows():
                     )
                 )
         db.flush()
+        refresh_regular_percentile_source_summaries(
+            db=db,
+            competitor_identities={source_key for source_key, _competitor, _price_list_id in percentile_sources},
+        )
         for source_key, competitor, _price_list_id in percentile_sources:
             db.add(
                 CompetitorPrice(
@@ -224,6 +238,7 @@ def test_regular_percentile_sources_reuse_assigned_identity_lookup():
                 sample_count=1,
             )
         )
+        refresh_regular_percentile_source_summaries(db=db, competitor_identities={identity})
         db.commit()
 
         assignment_lookup_count = 0
@@ -301,6 +316,7 @@ def test_emit_only_assignment_does_not_load_regular_percentile_sources():
                 coefficient=1,
             )
         )
+        refresh_emit_percentile_source_summaries(db=db, price_format_id=pf.id)
         db.commit()
 
     regular_query_count = 0
@@ -324,6 +340,198 @@ def test_emit_only_assignment_does_not_load_regular_percentile_sources():
     assert payload["summary"]["activePhysicalPlkCount"] == 1
     assert payload["summary"]["percentileSourceCount"] == 1
     assert regular_query_count == 0
+
+
+def test_price_list_counters_match_live_aggregate_semantics():
+    db = _session()
+    pf = _format(db, code="COUNT-LIVE")
+    product = _product(db)
+    price_list = _price_list(db, pf, source_key="7:501", competitor="Amanat")
+    rows = [
+        CompetitorPriceListItem(price_list_id=price_list.id, product_id=product.id, distributor_price=Decimal("10")),
+        CompetitorPriceListItem(price_list_id=price_list.id, provisor_goods_id=100, distributor_price=Decimal("20")),
+        CompetitorPriceListItem(price_list_id=price_list.id, matched_sku="SKU-1", distributor_price=Decimal("30")),
+        CompetitorPriceListItem(price_list_id=price_list.id, distributor_goods_id="D-1", distributor_price=Decimal("40")),
+        CompetitorPriceListItem(price_list_id=price_list.id, distributor_goods_id="D-2", distributor_price=Decimal("0")),
+        CompetitorPriceListItem(price_list_id=price_list.id, distributor_goods_id="D-3", distributor_price=Decimal("-1")),
+        CompetitorPriceListItem(price_list_id=price_list.id, distributor_goods_id="D-4", distributor_price=None),
+        CompetitorPriceListItem(price_list_id=price_list.id, distributor_price=Decimal("50")),
+    ]
+    db.add_all(rows)
+    db.flush()
+
+    live = live_price_list_item_counts(db=db, price_list_ids=[price_list.id])
+    refresh_price_list_item_counters(db=db, price_list_ids=[price_list.id])
+
+    assert live[int(price_list.id)] == (8, 4)
+    assert int(price_list.items_count) == 8
+    assert int(price_list.matched_positive_items_count) == 4
+
+
+def test_competitor_price_lists_endpoint_uses_persisted_item_counters():
+    import backend.app.main as main
+
+    Session = _session_factory_static()
+    with Session() as db:
+        pf = _format(db, code="PLK-QCOUNT")
+        price_list = _price_list(db, pf, source_key="7:601", competitor="Amanat")
+        price_list.items_count = 12
+        price_list.matched_positive_items_count = 9
+        db.commit()
+
+    item_table_reads = 0
+
+    def count_item_reads(_conn, _cursor, statement, _parameters, _context, _executemany):
+        nonlocal item_table_reads
+        normalized = " ".join(str(statement).lower().split())
+        if "from competitor_price_list_items" in normalized:
+            item_table_reads += 1
+
+    engine = Session.kw["bind"]
+    event.listen(engine, "before_cursor_execute", count_item_reads)
+    main.app.dependency_overrides[main.get_db] = lambda: Session()
+    try:
+        response = TestClient(main.app).get("/api/competitors/price-lists?format_code=PLK-QCOUNT")
+    finally:
+        main.app.dependency_overrides.clear()
+        event.remove(engine, "before_cursor_execute", count_item_reads)
+
+    assert response.status_code == 200
+    assert response.json()[0]["itemsCount"] == 12
+    assert item_table_reads == 0
+
+
+def test_percentile_sources_endpoint_uses_persisted_summaries():
+    import backend.app.main as main
+
+    Session = _session_factory_static()
+    with Session() as db:
+        pf = _format(db, code="PCT-QCOUNT")
+        product = _product(db)
+        emit_list = _price_list(db, pf, source_key="emit:701", branch="Aktau", competitor="Emit")
+        competitor_list = _price_list(db, pf, source_key="7:701", competitor="Amanat")
+        _assign(db, pf, emit_list, percentile_mode=MULTI_PRICE_PERCENTILE_MODE)
+        _assign(db, pf, competitor_list)
+        identity = canonical_regular_competitor_identity("Amanat")
+        db.add(
+            CompetitorPricePercentile(
+                price_format_id=pf.id,
+                product_id=product.id,
+                competitor_price_list_id=emit_list.id,
+                source_type="emit",
+                source_key=emit_list.source_key,
+                branch_name="Aktau",
+                competitor_name="Emit",
+                percentile_scope="regional",
+                percentile=10,
+                value=Decimal("100.00"),
+                source_count=1,
+            )
+        )
+        db.add(
+            RegularCompetitorPricePercentile(
+                competitor_identity=identity,
+                competitor_name="Amanat",
+                product_id=product.id,
+                percentile=10,
+                value=Decimal("100.00"),
+                source_count=1,
+                sample_count=1,
+            )
+        )
+        refresh_emit_percentile_source_summaries(db=db, price_format_id=pf.id)
+        refresh_regular_percentile_source_summaries(db=db, competitor_identities={identity})
+        db.commit()
+
+    live_percentile_reads = 0
+
+    def count_live_percentile_reads(_conn, _cursor, statement, _parameters, _context, _executemany):
+        nonlocal live_percentile_reads
+        normalized = f" {' '.join(str(statement).lower().split())} "
+        if " from competitor_price_percentiles " in normalized or " from regular_competitor_price_percentiles " in normalized:
+            live_percentile_reads += 1
+
+    engine = Session.kw["bind"]
+    event.listen(engine, "before_cursor_execute", count_live_percentile_reads)
+    main.app.dependency_overrides[main.get_db] = lambda: Session()
+    try:
+        emit_response = TestClient(main.app).get("/api/competitors/percentiles?format_code=PCT-QCOUNT&percentile_source=emit")
+        competitor_response = TestClient(main.app).get(
+            "/api/competitors/percentiles?format_code=PCT-QCOUNT&percentile_source=competitor"
+        )
+    finally:
+        main.app.dependency_overrides.clear()
+        event.remove(engine, "before_cursor_execute", count_live_percentile_reads)
+
+    assert emit_response.status_code == 200
+    assert competitor_response.status_code == 200
+    assert emit_response.json()[0]["skuCount"] == 1
+    assert competitor_response.json()[0]["skuCount"] == 1
+    assert live_percentile_reads == 0
+
+
+def test_emit_percentile_source_summaries_match_live_aggregate():
+    db = _session()
+    pf = _format(db, code="EMIT-SUMMARY")
+    product_a = _product(db, code="SKU-A", goods_id=101)
+    product_b = _product(db, code="SKU-B", goods_id=102)
+    source = _price_list(db, pf, source_key="emit:501", branch="Aktau", competitor="Emit", account_id="emit")
+    for product, value in [(product_a, Decimal("100")), (product_b, None)]:
+        db.add(
+            CompetitorPricePercentile(
+                price_format_id=pf.id,
+                product_id=product.id,
+                competitor_price_list_id=source.id,
+                source_type="emit",
+                source_key=source.source_key,
+                branch_name="Aktau",
+                competitor_name="Emit",
+                percentile_scope="regional",
+                percentile=10,
+                value=value,
+                source_count=2,
+            )
+        )
+    db.flush()
+
+    live = live_emit_percentile_source_summary_rows(db=db, price_format_id=pf.id)
+    written = refresh_emit_percentile_source_summaries(db=db, price_format_id=pf.id)
+    stored = db.execute(select(CompetitorPricePercentileSourceSummary)).scalars().all()
+
+    assert written == 1
+    assert len(live) == len(stored) == 1
+    assert stored[0].sku_count == live[0]["sku_count"] == 2
+    assert stored[0].source_count == live[0]["source_count"] == 4
+
+
+def test_regular_percentile_source_summaries_match_live_aggregate():
+    db = _session()
+    pf = _format(db, code="REG-SUMMARY")
+    product_a = _product(db, code="SKU-A", goods_id=101)
+    product_b = _product(db, code="SKU-B", goods_id=102)
+    identity = canonical_regular_competitor_identity("Amanat")
+    for product in (product_a, product_b):
+        db.add(
+            RegularCompetitorPricePercentile(
+                competitor_identity=identity,
+                competitor_name="Amanat",
+                product_id=product.id,
+                percentile=20,
+                value=Decimal("120.00"),
+                source_count=3,
+                sample_count=3,
+            )
+        )
+    db.flush()
+
+    live = live_regular_percentile_source_summary_rows(db=db, competitor_identities={identity})
+    written = refresh_regular_percentile_source_summaries(db=db, competitor_identities={identity})
+    stored = db.execute(select(RegularCompetitorPricePercentileSourceSummary)).scalars().all()
+
+    assert written == 1
+    assert len(live) == len(stored) == 1
+    assert stored[0].sku_count == live[0]["sku_count"] == 2
+    assert stored[0].source_count == live[0]["source_count"] == 6
 
 
 def test_ordinary_provisor_refresh_recalculates_global_regular_percentiles():
@@ -890,6 +1098,7 @@ def test_assignment_visibility_keeps_stored_emit_percentile_sources_after_physic
                 coefficient=1,
             )
         )
+        refresh_emit_percentile_source_summaries(db=db, price_format_id=pf.id)
         db.commit()
 
         visible_for_pricing = list_percentile_sources(
@@ -951,6 +1160,7 @@ def test_regular_percentile_assignment_availability_uses_canonical_dataset_witho
             source_count=1,
         )
     )
+    refresh_regular_percentile_source_summaries(db=db)
     db.commit()
 
     sources = list_percentile_sources(
@@ -1023,6 +1233,7 @@ def test_emit_assignment_availability_still_requires_active_emit_assignment():
             status="Calculated",
         )
     )
+    refresh_emit_percentile_source_summaries(db=db, price_format_id=pf.id)
     db.commit()
 
     visible = list_percentile_sources(db=db, price_format_code=pf.code, percentile_source=PERCENTILE_SOURCE_EMIT)

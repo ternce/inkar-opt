@@ -46,6 +46,7 @@ from .competitor_assignments import (
     list_global_competitor_price_lists_for_format,
     set_competitor_assignments,
 )
+from .competitor_read_models import refresh_price_list_item_counters
 from .competitor_coefficients import effective_price_coefficient, validate_price_coefficient
 from .competitor_percentiles import DEFAULT_BRANCH
 from .percentile_preparation import enqueue_percentile_preparation
@@ -771,10 +772,12 @@ def upsert_provisor_price_list(
         )
 
     db.flush()
+    refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
     if int(filial_id) in PROVISOR_REFERENCE_FILIAL_IDS:
         _sync_provisor_reference_mapping_from_items(db, account_id="")
     if run_matching:
         rematch_price_list_items_by_product(db=db, price_list=row)
+        refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
         _replace_legacy_price_rows_for_list(db=db, price_list=row)
         sync_selected_competitor_configs(db=db, price_format_id=pf.id)
         rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id)
@@ -1160,6 +1163,7 @@ def upsert_unified_price_list(
         _sync_provisor_reference_mapping_from_items(db, account_id=price_list.account_id)
     if run_matching:
         rematch_price_list_items_by_product(db=db, price_list=row)
+        refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
         _replace_legacy_price_rows_for_list(db=db, price_list=row)
         sync_selected_competitor_configs(db=db, price_format_id=pf.id)
         rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id)
@@ -1186,12 +1190,8 @@ def upsert_unified_price_list(
         manufacturer_cache_size=len(manufacturer_cache),
         match_cache_size=len(preserved_match_fields),
     )
-    final_items_count = int(
-        db.execute(
-            select(func.count(CompetitorPriceListItem.id)).where(CompetitorPriceListItem.price_list_id == row.id)
-        ).scalar_one()
-        or 0
-    )
+    refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
+    final_items_count = int(row.items_count or 0)
     logger.info(
         "[PROVISOR_ACCOUNT_PLK_ROUTE] account_id=%s external_price_list_id=%s source_key=%s "
         "competitor_price_list_id=%s download_rows=%s deleted_rows=%s inserted_rows=%s final_items_count=%s",
@@ -1300,12 +1300,8 @@ def upsert_unified_price_list_metadata(
         row.price_date = today
     row.updated_at = datetime.utcnow()
     db.flush()
-    final_items_count = int(
-        db.execute(
-            select(func.count(CompetitorPriceListItem.id)).where(CompetitorPriceListItem.price_list_id == row.id)
-        ).scalar_one()
-        or 0
-    )
+    refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
+    final_items_count = int(row.items_count or 0)
     logger.info(
         "[PROVISOR_ACCOUNT_PLK_ROUTE] account_id=%s external_price_list_id=%s source_key=%s "
         "competitor_price_list_id=%s download_rows=%s deleted_rows=%s inserted_rows=%s final_items_count=%s",
@@ -1583,13 +1579,7 @@ def set_selected_competitor_price_lists(
     pf = _ensure_price_format(db, price_format_code)
     rows = list_global_competitor_price_lists_for_format(db=db, price_format=pf)
     _timing(operation, "load_selected_price_lists", started_at)
-    counts = dict(
-        db.execute(
-            select(CompetitorPriceListItem.price_list_id, func.count())
-            .where(CompetitorPriceListItem.price_list_id.in_([row.id for row in rows]))
-            .group_by(CompetitorPriceListItem.price_list_id)
-        ).all()
-    )
+    counts = {int(row.id): int(getattr(row, "items_count", 0) or 0) for row in rows}
     selectable_ids = {int(row.id) for row in _visible_competitor_price_list_rows(rows, counts)}
     set_competitor_assignments(db=db, price_format=pf, selected_ids=[x for x in selected_ids if int(x) in selectable_ids], coefficients=coefficients)
     sync_selected_competitor_configs(db=db, price_format_id=pf.id)
@@ -1619,13 +1609,7 @@ def save_selected_competitor_price_lists_only(
 ) -> int:
     pf = _ensure_price_format(db, price_format_code)
     rows = list_global_competitor_price_lists_for_format(db=db, price_format=pf)
-    counts = dict(
-        db.execute(
-            select(CompetitorPriceListItem.price_list_id, func.count())
-            .where(CompetitorPriceListItem.price_list_id.in_([row.id for row in rows]))
-            .group_by(CompetitorPriceListItem.price_list_id)
-        ).all()
-    )
+    counts = {int(row.id): int(getattr(row, "items_count", 0) or 0) for row in rows}
     selectable_ids = {int(row.id) for row in _visible_competitor_price_list_rows(rows, counts)}
     set_competitor_assignments(db=db, price_format=pf, selected_ids=[x for x in selected_ids if int(x) in selectable_ids], coefficients=coefficients)
     sync_selected_competitor_configs(db=db, price_format_id=pf.id)
@@ -1766,6 +1750,7 @@ def import_manual_price_list_excel(
 
     db.flush()
     _replace_legacy_price_rows_for_list(db=db, price_list=row)
+    refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
     db.commit()
     enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="price_list_imported")
     return row

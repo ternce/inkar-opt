@@ -14,12 +14,14 @@ from ....models import (
     CompetitorPriceList,
     CompetitorPriceListItem,
     CompetitorPricePercentile,
+    CompetitorPricePercentileSourceSummary,
     PriceFormat,
     PriceFormatCompetitorAssignment,
     Product,
     ProductExtra,
     ProductRating,
     RegularCompetitorPricePercentile,
+    RegularCompetitorPricePercentileSourceSummary,
 )
 from ...competitor_percentiles import (
     KAZAKHSTAN_REGION,
@@ -75,32 +77,7 @@ def list_percentile_sources(
         )
 
     allowed_groups_by_format: dict[int, set[tuple[str, str, str]]] = {}
-    stmt = (
-        select(
-            CompetitorPricePercentile.price_format_id,
-            CompetitorPricePercentile.source_type,
-            CompetitorPricePercentile.source_key,
-            CompetitorPricePercentile.competitor_price_list_id,
-            CompetitorPricePercentile.branch_name,
-            CompetitorPricePercentile.competitor_name,
-            CompetitorPricePercentile.percentile_scope,
-            CompetitorPricePercentile.percentile,
-            func.count(func.distinct(CompetitorPricePercentile.product_id)).label("sku_count"),
-            func.sum(CompetitorPricePercentile.source_count).label("source_count"),
-            func.max(CompetitorPricePercentile.updated_at).label("generated_at"),
-        )
-        .where(provider.row_filter())
-        .group_by(
-            CompetitorPricePercentile.price_format_id,
-            CompetitorPricePercentile.source_type,
-            CompetitorPricePercentile.source_key,
-            CompetitorPricePercentile.competitor_price_list_id,
-            CompetitorPricePercentile.branch_name,
-            CompetitorPricePercentile.competitor_name,
-            CompetitorPricePercentile.percentile_scope,
-            CompetitorPricePercentile.percentile,
-        )
-    )
+    stmt = select(CompetitorPricePercentileSourceSummary)
     if price_format_code:
         pf = db.execute(select(PriceFormat).where(PriceFormat.code == price_format_code.strip())).scalars().first()
         if pf is None:
@@ -109,9 +86,14 @@ def list_percentile_sources(
         if not allowed_groups and not include_ineligible:
             return []
         allowed_groups_by_format[int(pf.id)] = allowed_groups
-        stmt = stmt.where(CompetitorPricePercentile.price_format_id == pf.id)
+        stmt = stmt.where(CompetitorPricePercentileSourceSummary.price_format_id == pf.id)
 
-    rows = db.execute(stmt.order_by(CompetitorPricePercentile.branch_name.asc(), CompetitorPricePercentile.competitor_name.asc())).all()
+    rows = db.execute(
+        stmt.order_by(
+            CompetitorPricePercentileSourceSummary.branch_name.asc(),
+            CompetitorPricePercentileSourceSummary.competitor_name.asc(),
+        )
+    ).scalars().all()
     requested_source_ids = {str(item or "").strip() for item in (source_ids or set()) if str(item or "").strip()}
     out: list[dict] = []
     for row in rows:
@@ -192,23 +174,12 @@ def _list_competitor_percentile_sources(
         assigned_regular_identities=allowed_identities,
         requested_identities=requested_regular_identities,
     )
-    stmt = (
-        select(
-            RegularCompetitorPricePercentile.competitor_identity,
-            func.min(RegularCompetitorPricePercentile.competitor_name).label("competitor_name"),
-            RegularCompetitorPricePercentile.percentile,
-            func.count(func.distinct(RegularCompetitorPricePercentile.product_id)).label("sku_count"),
-            func.sum(RegularCompetitorPricePercentile.source_count).label("source_count"),
-            func.max(RegularCompetitorPricePercentile.calculated_at).label("generated_at"),
-        )
-        .group_by(
-            RegularCompetitorPricePercentile.competitor_identity,
-            RegularCompetitorPricePercentile.percentile,
-        )
-    )
+    stmt = select(RegularCompetitorPricePercentileSourceSummary)
     if requested_regular_identities:
-        stmt = stmt.where(RegularCompetitorPricePercentile.competitor_identity.in_(requested_regular_identities))
-    rows = db.execute(stmt.order_by(func.min(RegularCompetitorPricePercentile.competitor_name).asc())).all()
+        stmt = stmt.where(RegularCompetitorPricePercentileSourceSummary.competitor_identity.in_(requested_regular_identities))
+    rows = db.execute(
+        stmt.order_by(RegularCompetitorPricePercentileSourceSummary.competitor_name.asc())
+    ).scalars().all()
     stored_identities = {str(row.competitor_identity or "").strip() for row in rows if str(row.competitor_identity or "").strip()}
     out: list[dict] = []
     for row in rows:
@@ -321,22 +292,6 @@ def _regular_source_metadata(
         ):
             continue
         metadata_rows.append(row)
-    ids = [int(row.id) for row in metadata_rows]
-    item_counts = dict(
-        db.execute(
-            select(CompetitorPriceListItem.price_list_id, func.count())
-            .where(CompetitorPriceListItem.price_list_id.in_(ids))
-            .where(CompetitorPriceListItem.distributor_price.is_not(None))
-            .where(CompetitorPriceListItem.distributor_price > 0)
-            .where(
-                (CompetitorPriceListItem.product_id.is_not(None))
-                | (CompetitorPriceListItem.provisor_goods_id.is_not(None))
-                | (CompetitorPriceListItem.matched_sku != "")
-                | (CompetitorPriceListItem.distributor_goods_id != "")
-            )
-            .group_by(CompetitorPriceListItem.price_list_id)
-        ).all()
-    ) if ids else {}
     assigned = (
         assigned_regular_identities
         if assigned_regular_identities is not None
@@ -362,7 +317,7 @@ def _regular_source_metadata(
         account = str(row.account_login or row.account_id or "").strip()
         if account:
             meta["accountsIncluded"].add(account)
-        meta["matchedRows"] += int(item_counts.get(int(row.id), 0) or 0)
+        meta["matchedRows"] += int(getattr(row, "matched_positive_items_count", 0) or 0)
     return {
         identity: {
             "physicalPriceListCount": len(meta["physicalPriceListIds"]),

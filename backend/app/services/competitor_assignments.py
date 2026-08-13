@@ -5,12 +5,11 @@ from datetime import datetime
 
 import logging
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session, load_only
 
 from ..models import (
     CompetitorPriceList,
-    CompetitorPriceListItem,
     PriceFormat,
     PriceFormatCompetitorAssignment,
 )
@@ -61,6 +60,8 @@ COMPETITOR_PRICE_LIST_READ_COLUMNS = (
     CompetitorPriceList.coefficient,
     CompetitorPriceList.price_coefficient,
     CompetitorPriceList.is_selected,
+    CompetitorPriceList.items_count,
+    CompetitorPriceList.matched_positive_items_count,
     CompetitorPriceList.updated_at,
 )
 
@@ -133,16 +134,7 @@ def branch_visibility_metadata(row: CompetitorPriceList, pf: PriceFormat, region
 
 
 def visible_item_counts(db: Session, rows: list[CompetitorPriceList]) -> dict[int, int]:
-    ids = [int(row.id) for row in rows]
-    if not ids:
-        return {}
-    return dict(
-        db.execute(
-            select(CompetitorPriceListItem.price_list_id, func.count())
-            .where(CompetitorPriceListItem.price_list_id.in_(ids))
-            .group_by(CompetitorPriceListItem.price_list_id)
-        ).all()
-    )
+    return {int(row.id): int(getattr(row, "items_count", 0) or 0) for row in rows}
 
 
 def source_visibility_state(row: CompetitorPriceList, item_count: int) -> str:

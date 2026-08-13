@@ -28,6 +28,7 @@ from ..models import (
 from .competitor_persist import _ensure_price_format
 from .competitor_matching import rebuild_competitor_prices_for_selected, rematch_price_list_items_by_product
 from .competitor_percentiles import DEFAULT_BRANCH
+from .competitor_read_models import refresh_price_list_item_counters
 from .percentile_preparation import enqueue_percentile_preparation
 from .sku import normalize_sku, normalize_sku_variants
 from ..timezone import now_kz_naive
@@ -559,6 +560,7 @@ def import_manual_price_list(
         db.flush()
 
         match_stats = rematch_price_list_items_by_product(db=db, price_list=row)
+        refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
         matched = int(match_stats.get("matched") or match_stats.get("supplier_items_matched") or 0)
         persisted = len(parsed.valid_rows)
         status = "partial_success" if parsed.errors else "success"

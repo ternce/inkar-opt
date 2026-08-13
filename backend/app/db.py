@@ -111,6 +111,8 @@ def _ensure_compatible_columns() -> None:
             ("last_refresh_status", "VARCHAR(64) DEFAULT ''"),
             ("last_refresh_message", "TEXT DEFAULT ''"),
             ("price_coefficient", "NUMERIC(18, 6) DEFAULT 1.0"),
+            ("items_count", "INTEGER DEFAULT 0"),
+            ("matched_positive_items_count", "INTEGER DEFAULT 0"),
         ],
         "competitor_price_list_items": [
             ("provisor_goods_id", "BIGINT"),

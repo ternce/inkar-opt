@@ -34,6 +34,7 @@ from ..models import CompetitorPriceList, CompetitorPriceListItem, PriceFormat, 
 from .db_time import db_now
 from .competitor_assignments import propagate_emit_assignments_to_price_formats, upsert_assignment
 from .competitor_percentiles import fanout_emit_percentiles_from_price_format, recalculate_competitor_percentiles
+from .competitor_read_models import refresh_price_list_item_counters
 from .competitor_source_config import canonical_competitor_source_key
 from .competitor_persist import _ensure_price_format
 from .manufacturers import _clean_text, _extract_manufacturer_cleaned, _normalize_manufacturer_cleaned, resolve_manufacturer
@@ -2328,6 +2329,7 @@ def replace_emit_price_list_from_staging(
     stats.db_replace_elapsed_sec = round(time.perf_counter() - started, 3)
     flush_started = time.perf_counter()
     db.flush()
+    refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
     _add_elapsed(stats, "flush_elapsed", flush_started)
     trace_goods_id = _trace_goods_id()
     if trace_goods_id is not None:

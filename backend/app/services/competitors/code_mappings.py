@@ -17,6 +17,7 @@ from ...models import (
     ProductExtra,
 )
 from ..competitor_assignments import get_assigned_competitor_price_lists
+from ..competitor_read_models import refresh_price_list_item_counters
 
 SUPPORTED_PLATFORMS = {"provisor", "vidman"}
 MANUAL_SUGGESTION_MIN_SCORE = 55.0
@@ -1028,6 +1029,7 @@ def apply_mapping_to_matching_items(
         .where(CompetitorPriceList.source_type == mapping.platform)
     )
     touched = 0
+    touched_price_list_ids: set[int] = set()
     for item in db.execute(stmt).scalars().all():
         if source_match_key_for_item(mapping.platform, item) != mapping.source_match_key:
             continue
@@ -1042,6 +1044,10 @@ def apply_mapping_to_matching_items(
             item.match_type = "manual_code_mapping"
             item.match_score = mapping.confidence or 100
         touched += 1
+        touched_price_list_ids.add(int(item.price_list_id))
+    if touched_price_list_ids:
+        db.flush()
+        refresh_price_list_item_counters(db=db, price_list_ids=touched_price_list_ids)
     return touched
 
 

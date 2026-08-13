@@ -240,6 +240,8 @@ class CompetitorPriceList(Base):
     coefficient: Mapped[float] = mapped_column(Numeric(18, 6), default=1.0)
     price_coefficient: Mapped[float] = mapped_column(Numeric(18, 6), default=1.0)
     is_selected: Mapped[bool] = mapped_column(Boolean, default=False)
+    items_count: Mapped[int] = mapped_column(Integer, default=0)
+    matched_positive_items_count: Mapped[int] = mapped_column(Integer, default=0)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
@@ -428,6 +430,47 @@ class CompetitorPricePercentile(Base):
     )
 
 
+class CompetitorPricePercentileSourceSummary(Base):
+    __tablename__ = "competitor_price_percentile_source_summaries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    price_format_id: Mapped[int] = mapped_column(ForeignKey("price_formats.id"), index=True)
+    source_type: Mapped[str] = mapped_column(String(32), default="", index=True)
+    source_key: Mapped[str] = mapped_column(Text, default="", index=True)
+    competitor_price_list_id: Mapped[int | None] = mapped_column(ForeignKey("competitor_price_lists.id"), nullable=True, index=True)
+    branch_name: Mapped[str] = mapped_column(Text, default="", index=True)
+    competitor_name: Mapped[str] = mapped_column(Text, default="", index=True)
+    percentile_scope: Mapped[str] = mapped_column(String(32), default="regional", index=True)
+    percentile: Mapped[int] = mapped_column(Integer, index=True)
+    sku_count: Mapped[int] = mapped_column(Integer, default=0)
+    source_count: Mapped[int] = mapped_column(Integer, default=0)
+    generated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "price_format_id",
+            "source_type",
+            "source_key",
+            "competitor_price_list_id",
+            "branch_name",
+            "competitor_name",
+            "percentile_scope",
+            "percentile",
+            name="uq_comp_pct_source_summary",
+        ),
+        Index(
+            "ix_comp_pct_source_summary_lookup",
+            "price_format_id",
+            "source_key",
+            "branch_name",
+            "competitor_name",
+            "percentile_scope",
+            "percentile",
+        ),
+    )
+
+
 class RegularCompetitorPricePercentile(Base):
     __tablename__ = "regular_competitor_price_percentiles"
 
@@ -455,6 +498,32 @@ class RegularCompetitorPricePercentile(Base):
             "ix_regular_comp_percentile_lookup",
             "competitor_identity",
             "product_id",
+            "percentile",
+        ),
+    )
+
+
+class RegularCompetitorPricePercentileSourceSummary(Base):
+    __tablename__ = "regular_competitor_price_percentile_source_summaries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    competitor_identity: Mapped[str] = mapped_column(Text, index=True)
+    competitor_name: Mapped[str] = mapped_column(Text, default="", index=True)
+    percentile: Mapped[int] = mapped_column(Integer, index=True)
+    sku_count: Mapped[int] = mapped_column(Integer, default=0)
+    source_count: Mapped[int] = mapped_column(Integer, default=0)
+    generated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "competitor_identity",
+            "percentile",
+            name="uq_regular_comp_pct_source_summary",
+        ),
+        Index(
+            "ix_regular_comp_pct_source_summary_lookup",
+            "competitor_identity",
             "percentile",
         ),
     )
