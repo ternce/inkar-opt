@@ -5,6 +5,7 @@ import { Download, FileText, Play, RefreshCw } from 'lucide-react';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
+import { StickyTableToolbar } from './StickyTableToolbar';
 import { formatDateTimeKz } from '../timezone';
 import { shouldPollPercentilePreparation, type PercentilePreparation } from '../percentilePreparationStatus';
 
@@ -472,6 +473,22 @@ export function PricingWorkflowTab({
             </Button>
           </div>
         </div>
+        <StickyTableToolbar summary={`Generate: ${generateCodes.length} / Export: ${exportCodes.length}`}>
+          <Button variant="outline" size="sm" onClick={() => toggleAllGenerate(!allGenerateSelected)} disabled={!generatableRows.length || isReadOnly}>
+            {allGenerateSelected ? 'Clear generate' : 'Select all generate'}
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => toggleAllExport(!allExportSelected)} disabled={!exportableRows.length}>
+            {allExportSelected ? 'Clear export' : 'Select all export'}
+          </Button>
+          <Button onClick={generateSelected} disabled={isReadOnly || !generateCodes.length || isGenerating || isLoading} className="bg-blue-600 hover:bg-blue-700" size="sm">
+            <Play className="mr-2 h-4 w-4" />
+            Generate
+          </Button>
+          <Button variant="outline" onClick={exportSelectedForSap} disabled={!exportCodes.length} size="sm">
+            <Download className="mr-2 h-4 w-4" />
+            Export
+          </Button>
+        </StickyTableToolbar>
         <CompactTable
           empty="Для выбранного филиала нет ценовых форматов"
           columns={[

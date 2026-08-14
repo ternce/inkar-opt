@@ -361,7 +361,7 @@ function TemplateEditor({
                 <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">От</th>
                 <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">До</th>
                 <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">{valueLabel}</th>
-                <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">Действия</th>
+                <th className="sticky-action-col px-4 py-3 text-right text-sm font-medium text-gray-700">Действия</th>
               </tr>
             </thead>
             <tbody>
@@ -370,7 +370,7 @@ function TemplateEditor({
                   <td className="px-4 py-3"><Input className="numeric-input" value={row.costFrom} onChange={(e) => updateRow(index, { costFrom: e.target.value })} disabled={selectedId === CURRENT_FORMAT_SETTINGS} /></td>
                   <td className="px-4 py-3"><Input className="numeric-input" value={row.costTo} onChange={(e) => updateRow(index, { costTo: e.target.value })} placeholder="∞" disabled={selectedId === CURRENT_FORMAT_SETTINGS} /></td>
                   <td className="px-4 py-3"><Input className="numeric-input" value={String(row[valueKey] || '')} onChange={(e) => updateRow(index, { [valueKey]: e.target.value })} disabled={selectedId === CURRENT_FORMAT_SETTINGS} /></td>
-                  <td className="px-4 py-3 text-right">
+                  <td className="sticky-action-col px-4 py-3 text-right">
                     <Button variant="ghost" size="sm" className="text-red-600 hover:text-red-700" onClick={() => removeRow(index)} disabled={selectedId === CURRENT_FORMAT_SETTINGS}>
                       <Trash2 className="mr-1 h-4 w-4" />Удалить
                     </Button>

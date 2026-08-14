@@ -455,7 +455,7 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
                     <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Успешно</th>
                     <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Ошибок</th>
                     <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Ошибка</th>
-                    <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">Действия</th>
+                    <th className="sticky-action-col px-4 py-3 text-right text-sm font-medium text-gray-700">Действия</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -471,7 +471,7 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
                       <td className="px-4 py-3 text-sm tabular-nums text-green-700">{job.rowsSuccess}</td>
                       <td className="px-4 py-3 text-sm tabular-nums text-red-700">{job.rowsFailed}</td>
                       <td className="min-w-56 px-4 py-3 text-sm text-red-700">{job.error || '-'}</td>
-                      <td className="px-4 py-3 text-right text-sm">
+                      <td className="sticky-action-col px-4 py-3 text-right text-sm">
                         <Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => setActiveJob(job)}>
                           Открыть лог
                         </Button>

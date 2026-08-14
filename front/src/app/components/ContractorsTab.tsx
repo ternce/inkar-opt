@@ -201,7 +201,7 @@ export function ContractorsTab({ branch = '', selectedFormatCode = '', priceForm
                   <th>ЦФ</th>
                   <th>Статус</th>
                   <th>Последнее обновление</th>
-                  <th>Действия</th>
+                  <th className="sticky-action-col">Действия</th>
                 </tr>
               </thead>
               <tbody>
@@ -218,7 +218,7 @@ export function ContractorsTab({ branch = '', selectedFormatCode = '', priceForm
                     </td>
                     <td><span className={`status-pill ${row.status === 'active' ? 'ok' : 'muted'}`}>{statusText(row.status)}</span></td>
                     <td>{row.updatedAt || '—'}</td>
-                    <td>
+                    <td className="sticky-action-col">
                       <div className="row-actions">
                         <Button variant="ghost" size="sm" onClick={() => void openCard(row.id)}>Открыть</Button>
                         <Button variant="ghost" size="sm" disabled><Pencil className="h-4 w-4" /></Button>

@@ -402,7 +402,6 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
               <thead>
                 <tr>
                   <th>Наименование</th>
-                  <th>Действия</th>
                   <th>Тип списка</th>
                   <th>Статус</th>
                   <th>Товаров</th>
@@ -411,6 +410,7 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
                   <th>Дата окончания</th>
                   <th>Последнее изменение</th>
                   <th>Комментарий</th>
+                  <th className="sticky-action-col">Действия</th>
                 </tr>
               </thead>
               <tbody>
@@ -420,15 +420,6 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
                       <button className="link-button" onClick={() => void openCard(row.id)}>{row.name}</button>
                       <div className="muted">{row.code}</div>
                       {opened?.id === row.id ? <span className="selected-list-badge">Выбран</span> : null}
-                    </td>
-                    <td>
-                      <div className="row-actions">
-                        <Button variant="ghost" size="sm" onClick={() => void openCard(row.id)}>Открыть</Button>
-                        <Button variant="ghost" size="sm" onClick={() => openEditor(row)}><Pencil className="h-4 w-4" /></Button>
-                        <Button variant="ghost" size="sm" onClick={() => void copyList(row)}><Copy className="h-4 w-4" /></Button>
-                        <Button variant="ghost" size="sm" onClick={() => void archiveList(row)}><Archive className="h-4 w-4" /></Button>
-                        <Button variant="ghost" size="sm" onClick={() => void deleteList(row)}><Trash2 className="h-4 w-4" /></Button>
-                      </div>
                     </td>
                     <td>{listTypeLabel(row.type, row.typeLabel)}</td>
                     <td>
@@ -443,6 +434,15 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
                     <td>{row.endDate || '—'}</td>
                     <td>{row.updatedAt || '—'}</td>
                     <td>{row.comment || '—'}</td>
+                    <td className="sticky-action-col">
+                      <div className="row-actions">
+                        <Button variant="ghost" size="sm" onClick={() => void openCard(row.id)}>Открыть</Button>
+                        <Button variant="ghost" size="sm" onClick={() => openEditor(row)}><Pencil className="h-4 w-4" /></Button>
+                        <Button variant="ghost" size="sm" onClick={() => void copyList(row)}><Copy className="h-4 w-4" /></Button>
+                        <Button variant="ghost" size="sm" onClick={() => void archiveList(row)}><Archive className="h-4 w-4" /></Button>
+                        <Button variant="ghost" size="sm" onClick={() => void deleteList(row)}><Trash2 className="h-4 w-4" /></Button>
+                      </div>
+                    </td>
                   </tr>
                 ))}
                 {!rows.length && (

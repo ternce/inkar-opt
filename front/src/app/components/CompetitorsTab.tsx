@@ -1862,7 +1862,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Последняя замена данных</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Время источника</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Ошибки / timeout</th>
-                      <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">Действия</th>
+                      <th className="sticky-action-col px-4 py-3 text-right text-sm font-medium text-gray-700">Действия</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1893,7 +1893,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                         <td className="px-4 py-3 text-sm text-gray-700 whitespace-nowrap">{formatLocalDateTime(competitorLastDataReplacement(row))}</td>
                         <td className="px-4 py-3 text-sm text-gray-700 whitespace-nowrap">{formatLocalDateTime(usefulSourceTimestamp(row))}</td>
                         <td className="px-4 py-3 text-sm text-gray-700">{row.errorSummary || row.refreshMessage || '—'}</td>
-                        <td className="px-4 py-3 text-sm">
+                        <td className="sticky-action-col px-4 py-3 text-sm">
                           <div className="flex items-center justify-end gap-2">
                             <Button variant="outline" size="sm" className="h-7 px-2" onClick={() => openPriceList(row.id)}>
                               <Eye className="mr-1 h-4 w-4" />
@@ -2215,7 +2215,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Наш товар</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Источник</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Тип сопоставления</th>
-                      <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">Действия</th>
+                      <th className="sticky-action-col px-4 py-3 text-right text-sm font-medium text-gray-700">Действия</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -2230,7 +2230,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                         <td className="px-4 py-3 text-sm text-gray-900 min-w-80">{row.ourName || '—'}</td>
                         <td className="px-4 py-3 text-sm text-gray-700">{row.priceListName || '—'}</td>
                         <td className="px-4 py-3 text-sm text-gray-700">{row.matchType || '—'}</td>
-                        <td className="px-4 py-3 text-right text-sm">
+                        <td className="sticky-action-col px-4 py-3 text-right text-sm">
                           <div className="flex items-center justify-end gap-2">
                             <Button variant="outline" size="sm" className="h-7 px-2" onClick={() => setSelectedRow(row)} disabled={row.status === 'rejected'}>
                               Выбрать

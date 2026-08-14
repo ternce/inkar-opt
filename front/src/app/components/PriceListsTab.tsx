@@ -382,6 +382,7 @@ export function PriceListsTab({ formatCode, initialPriceListNumber = '' }: Price
           <span className="muted-count">{lists.length} шт.</span>
         </div>
         <CompactTable
+          stickyLastColumn
           empty="Сформированных прайс-листов пока нет"
           columns={['Номер прайса', 'ЦФ', 'Филиал', 'Правило ЦО', 'Дата формирования', 'Дата активации', 'Пользователь', 'SKU', 'Статус', 'Revision', 'Комментарий', 'Действия']}
           rows={lists.map((row) => [
@@ -626,17 +627,17 @@ function ZoneBadge({ zone, showList = false }: { zone: string | null; showList?:
   );
 }
 
-function CompactTable({ columns, rows, empty }: { columns: string[]; rows: any[][]; empty: string }) {
+function CompactTable({ columns, rows, empty, stickyLastColumn = false }: { columns: string[]; rows: any[][]; empty: string; stickyLastColumn?: boolean }) {
   return (
     <div className="compact-table-wrap">
       <table className="compact-table">
         <thead>
-          <tr>{columns.map((column) => <th key={column}>{column}</th>)}</tr>
+          <tr>{columns.map((column, index) => <th key={column} className={stickyLastColumn && index === columns.length - 1 ? 'sticky-action-col' : undefined}>{column}</th>)}</tr>
         </thead>
         <tbody>
           {rows.length ? rows.map((row, idx) => (
             <tr key={idx}>
-              {row.map((cell, cellIdx) => <td key={cellIdx}>{cell}</td>)}
+              {row.map((cell, cellIdx) => <td key={cellIdx} className={stickyLastColumn && cellIdx === columns.length - 1 ? 'sticky-action-col' : undefined}>{cell}</td>)}
             </tr>
           )) : (
             <tr>

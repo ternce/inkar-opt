@@ -498,6 +498,7 @@
 }
 
 .compact-table-wrap {
+  max-height: min(640px, calc(100vh - 280px));
   overflow: auto;
   border: 1px solid #e2e8f0;
   border-radius: 8px;
@@ -607,6 +608,75 @@
 
 .row-checkbox-cell input:disabled + span {
   color: #94a3b8;
+}
+
+.sticky-table-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 12px 0 0;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.96);
+  padding: 10px 12px;
+  box-shadow: 0 -8px 24px rgba(15, 23, 42, 0.08);
+  backdrop-filter: blur(10px);
+}
+
+.sticky-table-toolbar__summary {
+  min-width: 0;
+  color: #334155;
+  font-size: 13px;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.sticky-table-toolbar__actions {
+  display: flex;
+  flex: 1;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.sticky-action-col {
+  position: sticky;
+  right: 0;
+  z-index: 2;
+  background: #ffffff;
+  border-left: 1px solid #e2e8f0;
+  box-shadow: -8px 0 14px rgba(15, 23, 42, 0.06);
+}
+
+th.sticky-action-col,
+.compact-table th.sticky-action-col,
+.business-table th.sticky-action-col,
+.admin-table th.sticky-action-col {
+  z-index: 4;
+  background: #f8fafc;
+}
+
+td.sticky-action-col,
+.compact-table td.sticky-action-col,
+.business-table td.sticky-action-col,
+.admin-table td.sticky-action-col {
+  white-space: nowrap;
+}
+
+@media (max-width: 720px) {
+  .sticky-table-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .sticky-table-toolbar__actions {
+    justify-content: flex-end;
+  }
 }
 
 .assignment-workspace {
@@ -1431,11 +1501,26 @@
 }
 
 .admin-table-card {
+  max-height: min(680px, calc(100vh - 280px));
   overflow: hidden;
   border: 1px solid rgba(226, 232, 240, 0.85);
   border-radius: 10px;
   background: #ffffff;
   box-shadow: 0 8px 18px rgba(15, 23, 42, 0.04);
+}
+
+.admin-table-card:has(> .admin-table) {
+  overflow: auto;
+}
+
+.admin-table-card:has(.thin-scrollbar) {
+  max-height: none;
+}
+
+.admin-table-card > .overflow-x-auto,
+.admin-table-card > .thin-scrollbar {
+  max-height: min(680px, calc(100vh - 280px));
+  overflow: auto;
 }
 
 .admin-table {
@@ -2023,13 +2108,14 @@
 }
 
 .table-scroll {
+  max-height: min(680px, calc(100vh - 280px));
   overflow: auto;
   border: 1px solid #e2e8f0;
   border-radius: 10px;
 }
 
 .table-scroll.compact {
-  max-height: 420px;
+  max-height: min(420px, calc(100vh - 280px));
 }
 
 .business-table {
