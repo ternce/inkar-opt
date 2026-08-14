@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { toast } from 'sonner';
 import { ExternalLink, Percent, PlusCircle, RefreshCw, Search, Trash2, Users, X } from 'lucide-react';
 import { Button } from './ui/button';
@@ -664,17 +664,20 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
   );
 }
 
-function CompactTable({ columns, rows, empty, stickyLastColumn = false }: { columns: string[]; rows: any[][]; empty: string; stickyLastColumn?: boolean }) {
+function CompactTable({ columns, rows, empty, stickyLastColumn = false }: { columns: string[]; rows: ReactNode[][]; empty: string; stickyLastColumn?: boolean }) {
+  if (stickyLastColumn) {
+    return <PlkActionRailTable columns={columns} rows={rows} empty={empty} />;
+  }
   return (
     <div className="compact-table-wrap">
       <table className="compact-table">
         <thead>
-          <tr>{columns.map((column, index) => <th key={column} className={stickyLastColumn && index === columns.length - 1 ? 'sticky-action-col' : undefined}>{column}</th>)}</tr>
+          <tr>{columns.map((column) => <th key={column}>{column}</th>)}</tr>
         </thead>
         <tbody>
           {rows.length ? rows.map((row, idx) => (
             <tr key={idx}>
-              {row.map((cell, cellIdx) => <td key={cellIdx} className={stickyLastColumn && cellIdx === columns.length - 1 ? 'sticky-action-col' : undefined}>{cell}</td>)}
+              {row.map((cell, cellIdx) => <td key={cellIdx}>{cell}</td>)}
             </tr>
           )) : (
             <tr>
@@ -685,4 +688,72 @@ function CompactTable({ columns, rows, empty, stickyLastColumn = false }: { colu
       </table>
     </div>
   );
+}
+
+function PlkActionRailTable({ columns, rows, empty }: { columns: string[]; rows: ReactNode[][]; empty: string }) {
+  const scrollRefs = useRef<(HTMLDivElement | null)[]>([]);
+  const isSyncingRef = useRef(false);
+  const dataColumns = columns.slice(0, -1);
+  const actionColumn = columns[columns.length - 1] || 'Действие';
+
+  const syncHorizontalScroll = (source: HTMLDivElement) => {
+    if (isSyncingRef.current) return;
+    isSyncingRef.current = true;
+    scrollRefs.current.forEach((node) => {
+      if (node && node !== source) node.scrollLeft = source.scrollLeft;
+    });
+    window.requestAnimationFrame(() => {
+      isSyncingRef.current = false;
+    });
+  };
+
+  if (!rows.length) {
+    return (
+      <div className="plk-viewport">
+        <div className="plk-empty">{empty}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="plk-viewport">
+      <div className="plk-table-layout">
+        <div className="plk-row plk-header-row">
+          <div
+            ref={(node) => { scrollRefs.current[0] = node; }}
+            className="plk-data-horizontal-scroll"
+            onScroll={(event) => syncHorizontalScroll(event.currentTarget)}
+          >
+            <div className="plk-data-grid" style={{ gridTemplateColumns: plkGridTemplate(dataColumns.length) }}>
+              {dataColumns.map((column) => <div key={column} className="plk-cell plk-header-cell">{column}</div>)}
+            </div>
+          </div>
+          <div className="plk-action-rail plk-action-header">{actionColumn}</div>
+        </div>
+        {rows.map((row, rowIndex) => (
+          <div key={rowIndex} className="plk-row">
+            <div
+              ref={(node) => { scrollRefs.current[rowIndex + 1] = node; }}
+              className="plk-data-horizontal-scroll"
+              onScroll={(event) => syncHorizontalScroll(event.currentTarget)}
+            >
+              <div className="plk-data-grid" style={{ gridTemplateColumns: plkGridTemplate(dataColumns.length) }}>
+                {row.slice(0, -1).map((cell, cellIndex) => <div key={cellIndex} className="plk-cell">{cell}</div>)}
+              </div>
+            </div>
+            <div className="plk-action-rail plk-action-cell">{row[row.length - 1]}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function plkGridTemplate(columnCount: number) {
+  return Array.from({ length: columnCount }, (_, index) => {
+    if (index === 0 || index === 2) return 'minmax(220px, 1.4fr)';
+    if (index >= 5 && index <= 7) return 'minmax(190px, 1fr)';
+    if (index === columnCount - 1) return 'minmax(150px, .8fr)';
+    return 'minmax(150px, 1fr)';
+  }).join(' ');
 }
