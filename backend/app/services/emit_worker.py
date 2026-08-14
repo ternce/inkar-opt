@@ -22,7 +22,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 import httpx
 from openpyxl import load_workbook
@@ -90,6 +90,7 @@ _PACK_PATTERNS = tuple(
         r"\b\d+(?:[,.]\d+)?\s*%\s*\d*(?:[,.]\d+)?\s*(?:\u0433|\u043c\u043b)?\b",
     )
 )
+PARSE_PROGRESS_INTERVAL_SECONDS = 30.0
 
 
 @dataclass
@@ -852,9 +853,8 @@ def _trace_goods_id() -> int | None:
         return None
 
 
-def _stage_storage_key(item: dict[str, Any]) -> tuple[str, ...]:
-    """Uniquely identify a staged Emit row while preserving all positive prices."""
-
+def _stage_logical_key(item: dict[str, Any]) -> tuple[str, ...]:
+    """Existing staged-row identity. Keep these fields/order stable for dedupe semantics."""
     return (
         *_dedupe_key(item),
         "row",
@@ -864,6 +864,15 @@ def _stage_storage_key(item: dict[str, Any]) -> tuple[str, ...]:
         str(item.get("source_timestamp") or ""),
         str(item.get("raw_json") or ""),
     )
+
+
+def _canonical_stage_logical_key(item: dict[str, Any]) -> str:
+    return json.dumps(list(_stage_logical_key(item)), ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _stage_storage_key(item: dict[str, Any]) -> str:
+    """Fixed-size SQLite storage key derived from the full logical staged-row identity."""
+    return hashlib.sha256(_canonical_stage_logical_key(item).encode("utf-8")).hexdigest()
 
 
 def _dedupe_score(item: dict[str, Any]) -> tuple[int, int, int, int, int, float, str]:
@@ -980,7 +989,7 @@ def open_stage_db(path: Path) -> sqlite3.Connection:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS stage_items (
-            dedupe_key TEXT PRIMARY KEY,
+            dedupe_hash TEXT PRIMARY KEY,
             key_type TEXT NOT NULL DEFAULT '',
             quality_json TEXT NOT NULL,
             provisor_id INTEGER,
@@ -1017,7 +1026,7 @@ def _stage_values(item: dict[str, Any]) -> tuple[Any, ...]:
     group_key = _dedupe_key(item)
     price = item.get("distributor_price")
     return (
-        json.dumps(key, ensure_ascii=False),
+        key,
         group_key[0],
         _quality_json(item),
         item.get("provisor_id"),
@@ -1051,7 +1060,7 @@ def _stage_upsert(conn: sqlite3.Connection, item: dict[str, Any], stats: EmitSta
     cursor = conn.execute(
         """
         INSERT OR IGNORE INTO stage_items (
-            dedupe_key, key_type, quality_json, provisor_id, provisor_goods_id, goods_id_text,
+            dedupe_hash, key_type, quality_json, provisor_id, provisor_goods_id, goods_id_text,
             variant_key, pack_signature, producer_key, rows_seen, names_sample_json,
             producers_sample_json, price_min, price_max, filial_id, name, reg_number,
             distributor_goods_name, distributor_goods_id, distributor_price, stock, package_count,
@@ -1064,7 +1073,7 @@ def _stage_upsert(conn: sqlite3.Connection, item: dict[str, Any], stats: EmitSta
     if cursor.rowcount:
         return
     conn.execute(
-        "UPDATE stage_items SET rows_seen = rows_seen + 1 WHERE dedupe_key = ?",
+        "UPDATE stage_items SET rows_seen = rows_seen + 1 WHERE dedupe_hash = ?",
         (values[0],),
     )
     stats.duplicate_rows_removed += 1
@@ -1126,7 +1135,7 @@ class _StageAuditAccumulator:
                     "goodsId": "",
                     "variants_count": 1,
                     "rows_seen": 1,
-                    "dedupe_key": list(_stage_storage_key(item)),
+                    "dedupe_hash": _stage_storage_key(item),
                     "names_sample": [item.get("name") or ""] if item.get("name") else [],
                     "producers_sample": [item.get("raw_manufacturer") or ""] if item.get("raw_manufacturer") else [],
                     "prices_min": item.get("distributor_price"),
@@ -1174,7 +1183,7 @@ def _stage_existing_keys(conn: sqlite3.Connection, keys: list[str]) -> set[str]:
         existing.update(
             str(row[0])
             for row in conn.execute(
-                f"SELECT dedupe_key FROM stage_items WHERE dedupe_key IN ({placeholders})",
+                f"SELECT dedupe_hash FROM stage_items WHERE dedupe_hash IN ({placeholders})",
                 chunk,
             ).fetchall()
         )
@@ -1183,7 +1192,7 @@ def _stage_existing_keys(conn: sqlite3.Connection, keys: list[str]) -> set[str]:
 
 _STAGE_INSERT_SQL = """
     INSERT OR IGNORE INTO stage_items (
-        dedupe_key, key_type, quality_json, provisor_id, provisor_goods_id, goods_id_text,
+        dedupe_hash, key_type, quality_json, provisor_id, provisor_goods_id, goods_id_text,
         variant_key, pack_signature, producer_key, rows_seen, names_sample_json,
         producers_sample_json, price_min, price_max, filial_id, name, reg_number,
         distributor_goods_name, distributor_goods_id, distributor_price, stock, package_count,
@@ -1207,6 +1216,55 @@ def _estimate_seen_key_memory_mb(seen_keys: set[bytes]) -> float:
     return round(total / (1024 * 1024), 3)
 
 
+def _stage_progress_payload(stats: EmitStats, stage_path: Path, started: float) -> dict[str, Any]:
+    elapsed = max(time.perf_counter() - started, 0.001)
+    stage_bytes = _stage_total_size_bytes(stage_path)
+    rss = current_rss_mb()
+    if rss is not None:
+        stats.max_rss_mb = max(float(stats.max_rss_mb or 0.0), rss)
+    return {
+        "current_stage": "parsing",
+        "parsed_rows": stats.input_rows,
+        "normalized_rows": stats.normalized_rows,
+        "positive_price_rows": stats.positive_price_rows,
+        "staged_rows_estimate": max(0, int(stats.positive_price_rows or 0) - int(stats.duplicate_rows_removed or 0)),
+        "final_rows_saved": stats.final_rows_saved,
+        "duplicate_rows_removed": stats.duplicate_rows_removed,
+        "zero_price_rows_skipped": stats.zero_price_rows_skipped,
+        "negative_price_rows_skipped": stats.negative_price_rows_skipped,
+        "parse_elapsed_sec": round(elapsed, 3),
+        "parse_rows_per_sec": round(float(stats.input_rows or 0) / elapsed, 3),
+        "stage_db_size_bytes": stage_bytes,
+        "stage_db_size_mb": round(stage_bytes / (1024 * 1024), 3),
+        "stage_db_size_gb": round(stage_bytes / (1024 ** 3), 4),
+        "rss_mb": rss,
+        "max_rss_mb": stats.max_rss_mb,
+        "batch_size": stats.max_batch_size,
+        "seen_key_count": stats.seen_key_count,
+        "seen_key_memory_estimate_mb": stats.seen_key_memory_estimate_mb,
+    }
+
+
+def _maybe_emit_parse_progress(
+    *,
+    stats: EmitStats,
+    stage_path: Path,
+    started: float,
+    last_progress_at: float | None,
+    progress_interval_seconds: float,
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+    force: bool = False,
+) -> float | None:
+    if progress_callback is None:
+        return last_progress_at
+    now = time.perf_counter()
+    interval = max(0.0, float(progress_interval_seconds))
+    if not force and last_progress_at is not None and now - last_progress_at < interval:
+        return last_progress_at
+    progress_callback(_stage_progress_payload(stats, stage_path, started))
+    return now
+
+
 def _stage_insert_many_dedupe(conn: sqlite3.Connection, values: list[tuple[Any, ...]], stats: EmitStats) -> None:
     key_counts = Counter(str(row[0]) for row in values)
     existing = _stage_existing_keys(conn, list(key_counts.keys()))
@@ -1218,7 +1276,7 @@ def _stage_insert_many_dedupe(conn: sqlite3.Connection, values: list[tuple[Any, 
     ]
     if duplicate_updates:
         conn.executemany(
-            "UPDATE stage_items SET rows_seen = rows_seen + ? WHERE dedupe_key = ?",
+            "UPDATE stage_items SET rows_seen = rows_seen + ? WHERE dedupe_hash = ?",
             duplicate_updates,
         )
         stats.duplicate_rows_removed += sum(int(count) for count, _key in duplicate_updates)
@@ -1397,7 +1455,7 @@ def collect_stage_audit(conn: sqlite3.Connection, *, limit: int = 20) -> tuple[d
     if remaining:
         for row in conn.execute(
             """
-            SELECT rows_seen, names_sample_json, producers_sample_json, price_min, price_max, dedupe_key
+            SELECT rows_seen, names_sample_json, producers_sample_json, price_min, price_max, dedupe_hash
             FROM stage_items
             WHERE key_type = 'fallback' AND variant_key = '' AND pack_signature = ''
             ORDER BY rows_seen DESC
@@ -1411,7 +1469,7 @@ def collect_stage_audit(conn: sqlite3.Connection, *, limit: int = 20) -> tuple[d
                     "goodsId": "",
                     "variants_count": 1,
                     "rows_seen": int(row[0] or 0),
-                    "dedupe_key": _json_loads(row[5], []),
+                    "dedupe_hash": str(row[5] or ""),
                     "names_sample": _json_loads(row[1], []),
                     "producers_sample": _json_loads(row[2], []),
                     "prices_min": row[3],
@@ -1641,6 +1699,8 @@ def parse_normalize_stage(
     filial_id: int,
     filial_name: str,
     config: EmitConfig | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    progress_interval_seconds: float = PARSE_PROGRESS_INTERVAL_SECONDS,
 ) -> EmitStats:
     started = time.perf_counter()
     cfg = config or EmitConfig(min_final_rows=MIN_FINAL_ROWS)
@@ -1668,6 +1728,7 @@ def parse_normalize_stage(
     audit_accumulator = _StageAuditAccumulator()
     fast_audit_valid = True
     seen_stage_compact_keys: set[bytes] = set()
+    last_progress_at: float | None = None
     try:
         source_iter = iter(iter_source_rows(source_path))
         while True:
@@ -1720,6 +1781,14 @@ def parse_normalize_stage(
                 _ensure_free_disk(Path(cfg.temp_dir), cfg.min_free_disk_gb)
                 _raise_if_memory_exceeded(cfg, stage="parse_normalize_stage", stats=stats)
                 _update_max_rss(stats)
+                last_progress_at = _maybe_emit_parse_progress(
+                    stats=stats,
+                    stage_path=stage_path,
+                    started=started,
+                    last_progress_at=last_progress_at,
+                    progress_interval_seconds=progress_interval_seconds,
+                    progress_callback=progress_callback,
+                )
         stage_commit_started = time.perf_counter()
         conn.commit()
         _add_elapsed(stats, "stage_commit_elapsed", stage_commit_started)
@@ -1749,6 +1818,15 @@ def parse_normalize_stage(
                 "item_prices_in_stage": stage_prices,
             }
         _add_elapsed(stats, "stage_audit_elapsed", stage_audit_started)
+        _maybe_emit_parse_progress(
+            stats=stats,
+            stage_path=stage_path,
+            started=started,
+            last_progress_at=last_progress_at,
+            progress_interval_seconds=progress_interval_seconds,
+            progress_callback=progress_callback,
+            force=True,
+        )
     finally:
         conn.close()
     stage_audit_started = time.perf_counter()
@@ -1791,6 +1869,7 @@ def parse_normalize_stage(
             "stage_upsert_elapsed_sec": stats.stage_upsert_elapsed,
             "stage_commit_elapsed_sec": stats.stage_commit_elapsed,
             "stage_audit_elapsed_sec": stats.stage_audit_elapsed,
+            "parse_dedupe_elapsed_sec": stats.parse_dedupe_elapsed_sec,
             "input_rows": stats.input_rows,
             "normalized_rows": stats.normalized_rows,
             "positive_price_rows": stats.positive_price_rows,
@@ -3407,7 +3486,42 @@ class EmitWorker:
                     )
             parse_started = time.perf_counter()
             logger.info("[EMIT_STAGE] event=emit_parse_started job_id=%s filial_id=%s stage_db_path=%s", job_id, filial_id, staging_path)
-            stats = parse_normalize_stage(source_path=temp_path, stage_db_path=staging_path, filial_id=filial_id, filial_name=filial_name, config=self.config)
+
+            def _parse_progress(progress: dict[str, Any]) -> None:
+                logger.info(
+                    "[EMIT_PARSE_PROGRESS] job_id=%s filial_id=%s parsed_rows=%s staged_rows_estimate=%s duplicates_removed=%s elapsed_sec=%s rows_per_sec=%s stage_db_mb=%s rss_mb=%s",
+                    job_id,
+                    filial_id,
+                    progress.get("parsed_rows"),
+                    progress.get("staged_rows_estimate"),
+                    progress.get("duplicate_rows_removed"),
+                    progress.get("parse_elapsed_sec"),
+                    progress.get("parse_rows_per_sec"),
+                    progress.get("stage_db_size_mb"),
+                    progress.get("rss_mb"),
+                )
+                try:
+                    with self.session_factory() as progress_db:
+                        progress_job = progress_db.get(RefreshJob, job_id)
+                        if progress_job is not None:
+                            update_emit_job(
+                                progress_db,
+                                progress_job,
+                                status="parsing",
+                                message=f"Parsing Emit filial {filial_id}: {progress.get('parsed_rows', 0)} rows",
+                                metadata=progress,
+                            )
+                except Exception:
+                    logger.exception("[EMIT_PARSE_PROGRESS_ERROR] job_id=%s filial_id=%s", job_id, filial_id)
+
+            stats = parse_normalize_stage(
+                source_path=temp_path,
+                stage_db_path=staging_path,
+                filial_id=filial_id,
+                filial_name=filial_name,
+                config=self.config,
+                progress_callback=_parse_progress,
+            )
             logger.info(
                 "[EMIT_STAGE] event=emit_parse_completed job_id=%s filial_id=%s elapsed_sec=%s input_rows=%s final_rows=%s duplicates_removed=%s",
                 job_id,

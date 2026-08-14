@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import inspect
 import io
 import json
@@ -46,11 +47,14 @@ from backend.app.services.emit_worker import (
     replace_emit_price_list_from_staging,
     stage_row_count,
     normalize_name_without_price_noise,
+    _canonical_stage_logical_key,
     _copy_value,
     _emit_heartbeat_once,
     _PRICE_NOISE_RE,
     _PRICE_TAIL_RE,
     _recalculate_percentiles_for_emit_rows,
+    _stage_logical_key,
+    _stage_storage_key,
 )
 from backend.app.services import emit_worker as emit_worker_module
 from backend.app.services.competitor_assignments import (
@@ -502,6 +506,70 @@ def test_sqlite_staging_removes_only_exact_duplicate_observations(tmp_path):
     assert [row["distributor_price"] for row in rows] == [8688.26, 8989.73]
 
 
+def test_stage_schema_uses_compact_hash_primary_key_and_keeps_raw_json(tmp_path):
+    stage = tmp_path / "stage.sqlite"
+    conn = open_stage_db(stage)
+    try:
+        columns = {row[1]: row for row in conn.execute("PRAGMA table_info(stage_items)").fetchall()}
+        indexes = conn.execute("PRAGMA index_list(stage_items)").fetchall()
+    finally:
+        conn.close()
+
+    assert "dedupe_hash" in columns
+    assert columns["dedupe_hash"][5] == 1
+    assert "dedupe_key" not in columns
+    assert "raw_json" in columns
+    assert any(row[2] == 1 for row in indexes)
+
+
+def test_stage_storage_key_is_sha256_of_existing_logical_identity_and_not_raw_payload(tmp_path):
+    item = {
+        "provisor_id": 1,
+        "provisor_goods_id": 10,
+        "name": "A",
+        "raw_manufacturer": "P",
+        "producer_key": "p",
+        "variant_key": "sku:a",
+        "pack_signature": "pack",
+        "distributor_price": 8688.26,
+        "stock": 3,
+        "source_timestamp": "2026-07-25T00:00:00",
+        "raw_json": '{"id":1,"goodsId":10,"goodsPrice":8688.26,"payload":"' + ("x" * 2000) + '"}',
+    }
+
+    assert _stage_logical_key(item) == (
+        "goodsId+variant",
+        "10",
+        "sku:a",
+        "row",
+        "1",
+        "8688.26",
+        "3",
+        "2026-07-25T00:00:00",
+        item["raw_json"],
+    )
+    expected = hashlib.sha256(_canonical_stage_logical_key(item).encode("utf-8")).hexdigest()
+    storage_key = _stage_storage_key(item)
+
+    assert storage_key == expected
+    assert len(storage_key) == 64
+    assert item["raw_json"] not in storage_key
+
+    stage = tmp_path / "stage.sqlite"
+    stats = EmitStats()
+    conn = open_stage_db(stage)
+    try:
+        from backend.app.services.emit_worker import _stage_upsert
+
+        _stage_upsert(conn, item, stats)
+        row = conn.execute("SELECT dedupe_hash, raw_json FROM stage_items").fetchone()
+    finally:
+        conn.close()
+
+    assert row[0] == storage_key
+    assert row[1] == item["raw_json"]
+
+
 def test_emit_stats_exposes_split_timing_fields(tmp_path):
     stats, rows = _parse_rows_to_stage(
         tmp_path,
@@ -530,7 +598,7 @@ def _stage_full_rows(stage_path):
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
-            SELECT dedupe_key, key_type, quality_json, provisor_id, provisor_goods_id,
+            SELECT dedupe_hash, key_type, quality_json, provisor_id, provisor_goods_id,
                    goods_id_text, variant_key, pack_signature, producer_key, rows_seen,
                    names_sample_json, producers_sample_json, price_min, price_max, filial_id,
                    name, reg_number, distributor_goods_name, distributor_goods_id,
@@ -592,6 +660,37 @@ def _parse_rows_with_batch(tmp_path, rows, *, batch_size, stage_name="stage.sqli
         config=EmitConfig(temp_dir=str(tmp_path), min_free_disk_gb=0, min_final_rows=1, batch_insert_size=batch_size),
     )
     return stats, stage, _stage_full_rows(stage)
+
+
+def test_parse_progress_callback_reports_throttled_metadata(tmp_path):
+    rows = [
+        {"id": 1, "goodsId": 10, "distributorGoodsId": "SKU-A", "distributorGoodsName": "A", "goodsPrice": 12},
+        {"id": 2, "goodsId": 11, "distributorGoodsId": "SKU-B", "distributorGoodsName": "B", "goodsPrice": 8},
+        {"id": 2, "goodsId": 11, "distributorGoodsId": "SKU-B", "distributorGoodsName": "B", "goodsPrice": 8},
+    ]
+    source = tmp_path / "emit.ndjson"
+    stage = tmp_path / "stage.sqlite"
+    source.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows), encoding="utf-8")
+    events = []
+
+    stats = parse_normalize_stage(
+        source_path=source,
+        stage_db_path=stage,
+        filial_id=1106,
+        filial_name="Emit",
+        config=EmitConfig(temp_dir=str(tmp_path), min_free_disk_gb=0, min_final_rows=1, batch_insert_size=1),
+        progress_callback=events.append,
+        progress_interval_seconds=0,
+    )
+
+    assert events
+    assert events[-1]["current_stage"] == "parsing"
+    assert events[-1]["parsed_rows"] == stats.input_rows
+    assert events[-1]["normalized_rows"] == stats.normalized_rows
+    assert events[-1]["final_rows_saved"] == stats.final_rows_saved
+    assert events[-1]["duplicate_rows_removed"] == stats.duplicate_rows_removed
+    assert events[-1]["stage_db_size_bytes"] > 0
+    assert events[-1]["parse_rows_per_sec"] > 0
 
 
 def _assert_parse_equivalent(reference_stats, reference_rows, optimized_stats, optimized_rows):
@@ -1185,6 +1284,9 @@ def test_emit_percentile_rebuild_uses_assigned_price_format_not_first_format(tmp
     rows = db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == selected_pf.id).all()
     by_percentile = {item.percentile: float(item.value) for item in rows if item.percentile_scope == "regional"}
     assert round(by_percentile[10], 3) == 8748.554
+    assert round(by_percentile[20], 3) == 8808.848
+    assert round(by_percentile[30], 3) == 8869.142
+    assert round(by_percentile[40], 3) == 8929.436
     assert round(by_percentile[60], 3) == 9063.476
 
 
