@@ -23,6 +23,7 @@ from backend.app.models import (
     CompetitorPriceList,
     CompetitorPriceListItem,
     CompetitorPricePercentile,
+    CompetitorPricePercentileSourceSummary,
     PriceFormat,
     PriceFormatCompetitorAssignment,
     PriceSourceAccount,
@@ -2011,6 +2012,113 @@ def test_new_price_format_gets_active_emit_assignments_for_scheduler():
         CompetitorPricePercentile.percentile == 10,
     ).all()
     assert {row.branch_name for row in rows} == {"Emit International 1107"}
+
+
+def test_emit_fanout_refreshes_percentile_source_summaries_for_all_formats():
+    db = _session()
+    formats = [
+        PriceFormat(code="003", name="003"),
+        PriceFormat(code="004", name="004"),
+        PriceFormat(code="005", name="005"),
+        PriceFormat(code="007", name="007"),
+        PriceFormat(code="IPL_012_001", name="IPL_012_001"),
+        PriceFormat(code="IPL_012_002", name="IPL_012_002"),
+    ]
+    products = [
+        Product(code="SKU-1", name="Product 1", cost=100, provisor_goods_id=101),
+        Product(code="SKU-2", name="Product 2", cost=100, provisor_goods_id=102),
+    ]
+    db.add_all([*formats, *products])
+    db.flush()
+    emit_1106 = CompetitorPriceList(
+        price_format_id=formats[0].id,
+        source_type="provisor",
+        source_key="emit:1106",
+        display_name="Emit International 1106",
+        supplier="Emit International 1106",
+        branch_id="1106",
+        branch_code="1106",
+        branch_name="Emit International 1106",
+        competitor_name="Emit International 1106",
+        external_price_list_id="1106",
+        account_login="emit",
+        last_refresh_status="success",
+    )
+    db.add(emit_1106)
+    db.flush()
+    db.add_all(
+        [
+            CompetitorPriceListItem(price_list_id=emit_1106.id, provisor_goods_id=101, filial_id=1106, name="A", distributor_price=100),
+            CompetitorPriceListItem(price_list_id=emit_1106.id, provisor_goods_id=101, filial_id=1106, name="A", distributor_price=120),
+            CompetitorPriceListItem(price_list_id=emit_1106.id, provisor_goods_id=102, filial_id=1106, name="B", distributor_price=200),
+            CompetitorPriceListItem(price_list_id=emit_1106.id, provisor_goods_id=102, filial_id=1106, name="B", distributor_price=240),
+        ]
+    )
+    for pf in formats:
+        db.add(
+            PriceFormatCompetitorAssignment(
+                price_format_id=pf.id,
+                competitor_price_list_id=emit_1106.id,
+                is_active=True,
+                percentile_mode="multi_price_per_sku",
+            )
+        )
+
+    stale_generated_at = datetime(2026, 8, 14, 10, 32, 5)
+    for pf in formats[1:]:
+        db.add(
+            CompetitorPricePercentileSourceSummary(
+                price_format_id=pf.id,
+                source_type="emit",
+                source_key="emit:1106",
+                competitor_price_list_id=emit_1106.id,
+                branch_name="Emit International 1106",
+                competitor_name="Emit International 1106",
+                percentile_scope="regional",
+                percentile=10,
+                sku_count=999,
+                source_count=1720,
+                generated_at=stale_generated_at,
+                updated_at=stale_generated_at,
+            )
+        )
+    db.commit()
+
+    result = _recalculate_percentiles_for_emit_rows(
+        db,
+        price_list_ids=[emit_1106.id],
+        scope_to_price_list_ids=True,
+    )
+
+    assert result["expensive_calculation_count"] == 1
+    assert result["shared_result_reuse_count"] == 5
+    assert result["assigned_price_format_ids"] == [1, 2, 3, 4, 5, 6]
+
+    rows = (
+        db.execute(
+            select(CompetitorPricePercentileSourceSummary)
+            .where(CompetitorPricePercentileSourceSummary.source_key == "emit:1106")
+            .where(CompetitorPricePercentileSourceSummary.percentile_scope == "regional")
+            .where(CompetitorPricePercentileSourceSummary.percentile == 10)
+            .order_by(CompetitorPricePercentileSourceSummary.price_format_id.asc())
+        )
+        .scalars()
+        .all()
+    )
+
+    assert [int(row.price_format_id) for row in rows] == [1, 2, 3, 4, 5, 6]
+    assert {row.generated_at for row in rows} == {rows[0].generated_at}
+    assert rows[0].generated_at is not None
+    assert rows[0].generated_at > stale_generated_at
+    assert {int(row.sku_count) for row in rows} == {2}
+    assert {int(row.source_count) for row in rows} == {2}
+    assert {int(row.competitor_price_list_id or 0) for row in rows} == {int(emit_1106.id)}
+    assert all(row.updated_at is not None and row.updated_at > stale_generated_at for row in rows)
+
+    row_007 = next(row for row in rows if int(row.price_format_id) == 4)
+    assert formats[3].code == "007"
+    assert row_007.source_key == "emit:1106"
+    assert int(row_007.source_count) == 2
 
 
 def test_top_level_object_with_data_items_parsed_streaming(tmp_path):

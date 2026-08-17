@@ -267,20 +267,23 @@ def fanout_emit_percentiles_from_price_format(
 
     dialect = (db.get_bind().dialect.name or "").lower()
     if dialect == "postgresql":
-        return _fanout_emit_percentiles_postgresql(
+        summary = _fanout_emit_percentiles_postgresql(
             db=db,
             source_price_format_id=source_price_format_id,
             target_price_format_id=target_price_format_id,
             selected_sources=selected_sources,
             started_at=started_at,
         )
-    return _fanout_emit_percentiles_python(
-        db=db,
-        source_price_format_id=source_price_format_id,
-        target_price_format_id=target_price_format_id,
-        selected_sources=selected_sources,
-        started_at=started_at,
-    )
+    else:
+        summary = _fanout_emit_percentiles_python(
+            db=db,
+            source_price_format_id=source_price_format_id,
+            target_price_format_id=target_price_format_id,
+            selected_sources=selected_sources,
+            started_at=started_at,
+        )
+    refresh_emit_percentile_source_summaries(db=db, price_format_id=target_price_format_id)
+    return summary
 
 
 def _selected_source_rows(
