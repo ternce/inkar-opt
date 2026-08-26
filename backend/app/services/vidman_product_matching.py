@@ -11,7 +11,7 @@ from typing import Iterable
 from sqlalchemy import delete, func, inspect, select
 from sqlalchemy.orm import Session
 
-from backend.app.models import (
+from ..models import (
     InternalProductNormalized,
     Product,
     ProductExtra,
@@ -19,8 +19,8 @@ from backend.app.models import (
     VidmanProductMatch,
     VidmanProductMatchCandidate,
 )
-from backend.app.services.vidman_normalization import ParsedVidmanItem, normalize_manufacturer, normalize_text, parse_vidman_product
-from backend.app.timezone import now_kz_naive
+from .vidman_normalization import ParsedVidmanItem, normalize_manufacturer, normalize_text, parse_vidman_product
+from ..timezone import now_kz_naive
 
 
 AUTO_MATCHED = "AUTO_MATCHED"

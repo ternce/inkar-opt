@@ -8,9 +8,9 @@ from decimal import Decimal
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from backend.app.models import InternalProductNormalized, Product, ProductExtra
-from backend.app.services.vidman_normalization import ParsedVidmanItem, parse_vidman_product
-from backend.app.timezone import now_kz_naive
+from ..models import InternalProductNormalized, Product, ProductExtra
+from .vidman_normalization import ParsedVidmanItem, parse_vidman_product
+from ..timezone import now_kz_naive
 
 
 DEFAULT_BATCH_SIZE = 500

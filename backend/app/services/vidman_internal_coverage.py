@@ -10,7 +10,7 @@ from difflib import SequenceMatcher
 from sqlalchemy import delete, func, inspect, select
 from sqlalchemy.orm import Session
 
-from backend.app.models import (
+from ..models import (
     InternalProductNormalized,
     Product,
     VidmanCanonicalProduct,
@@ -19,7 +19,7 @@ from backend.app.models import (
     VidmanInternalCoverageRejection,
     VidmanProductMatch,
 )
-from backend.app.services.vidman_product_matching import (
+from .vidman_product_matching import (
     AUTO_MATCHED,
     MANUALLY_APPROVED,
     ProductIdentity,
@@ -30,8 +30,8 @@ from backend.app.services.vidman_product_matching import (
     _structural_conflicts,
     _tokens,
 )
-from backend.app.services.vidman_review_triage import score_review_candidate
-from backend.app.timezone import now_kz_naive
+from .vidman_review_triage import score_review_candidate
+from ..timezone import now_kz_naive
 
 
 EXPECTED_UNCOVERED_INTERNAL_PRODUCTS = 2271
@@ -204,7 +204,7 @@ def assert_expected_uncovered_count(db: Session, *, expected: int = EXPECTED_UNC
 
 
 def _parsed_from_internal(row: InternalProductNormalized):
-    from backend.app.services.vidman_product_matching import _parsed_from_internal as parse_row
+    from .vidman_product_matching import _parsed_from_internal as parse_row
 
     return parse_row(row)
 

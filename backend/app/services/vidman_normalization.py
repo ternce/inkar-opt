@@ -11,13 +11,13 @@ from typing import Iterable
 from sqlalchemy import delete, distinct, func, select
 from sqlalchemy.orm import Session
 
-from backend.app.models import (
+from ..models import (
     VidmanCanonicalProduct,
     VidmanNormalizedItem,
     VidmanRawCanonicalLink,
     VidmanRawItem,
 )
-from backend.app.timezone import now_kz_naive
+from ..timezone import now_kz_naive
 
 
 DEFAULT_BATCH_SIZE = 1000

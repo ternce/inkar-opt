@@ -10,14 +10,14 @@ from difflib import SequenceMatcher
 from sqlalchemy import delete, func, inspect, select
 from sqlalchemy.orm import Session
 
-from backend.app.models import (
+from ..models import (
     Product,
     VidmanCanonicalProduct,
     VidmanProductMatch,
     VidmanRejectedCandidate,
     VidmanProductReviewQueue,
 )
-from backend.app.services.vidman_product_matching import (
+from .vidman_product_matching import (
     AUTO_MATCHED,
     MANUAL_UNMATCHED,
     MANUALLY_APPROVED,
@@ -34,7 +34,7 @@ from backend.app.services.vidman_product_matching import (
     build_product_indexes,
     decide_match,
 )
-from backend.app.timezone import now_kz_naive
+from ..timezone import now_kz_naive
 
 
 TIER_A_STRONG = "TIER_A_STRONG"

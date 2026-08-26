@@ -7,7 +7,7 @@ from typing import Any
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from backend.app.models import (
+from ..models import (
     InternalProductNormalized,
     Product,
     ProductExtra,
@@ -22,17 +22,17 @@ from backend.app.models import (
     VidmanRawCanonicalLink,
     VidmanRawItem,
 )
-from backend.app.services.vidman_internal_coverage import (
+from .vidman_internal_coverage import (
     MANUAL_NO_VIDMAN_MATCH,
     internal_coverage_counts,
 )
-from backend.app.services.vidman_product_matching import (
+from .vidman_product_matching import (
     AUTO_MATCHED,
     MANUALLY_APPROVED,
     REVIEW_REQUIRED,
     UNMATCHED,
 )
-from backend.app.timezone import now_kz_naive
+from ..timezone import now_kz_naive
 
 
 REVIEW_STATUSES = {"unreviewed", "reviewed", "all"}
