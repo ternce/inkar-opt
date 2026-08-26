@@ -10,7 +10,6 @@ from sqlalchemy.orm import Session
 
 from .. import data
 from ..models import CompetitorPrice, PriceFormat, Product
-from .competitor_assignments import propagate_emit_assignments_to_new_price_format
 from .competitor_source_config import canonical_provisor_source_key
 from .sku import normalize_external_sku, normalize_sku, normalize_sku_variants
 
@@ -73,7 +72,6 @@ def _ensure_price_format(db: Session, price_format_code: str) -> PriceFormat:
     )
     db.add(pf)
     db.flush()
-    propagate_emit_assignments_to_new_price_format(db=db, price_format_id=int(pf.id))
     return pf
 
 

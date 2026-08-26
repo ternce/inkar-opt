@@ -123,7 +123,6 @@ from .services.competitor_assignments import (
     get_assigned_competitor_price_lists,
     get_assignment,
     price_format_branch_matches,
-    propagate_emit_assignments_to_new_price_format,
     upsert_assignment,
 )
 from .services.competitor_coefficients import effective_price_coefficient, validate_price_coefficient
@@ -144,6 +143,7 @@ from .services.price_source_accounts import (
     test_account_connection,
     upsert_account,
 )
+from .services.vidman_orchestrator import refresh_vidman_account_stage43
 from .services.price_sources import VidmanPriceService
 from .services.provisor_refresh_audit import (
     AUTH_FAILED as PROVISOR_AUDIT_AUTH_FAILED,
@@ -238,6 +238,23 @@ from .services.competitors.code_mappings import (
     platform_from_value,
     upsert_code_mapping,
 )
+from .services.vidman_review_api import (
+    approve_review_match,
+    list_review_queue,
+    mark_review_unmatched,
+    reject_review_candidate,
+    review_counters,
+    review_detail,
+    search_internal_products as search_vidman_internal_products,
+)
+from .services.vidman_internal_coverage_api import (
+    approve_internal_coverage,
+    internal_coverage_counters,
+    internal_coverage_detail,
+    list_internal_coverage,
+    mark_internal_coverage_no_match,
+    reject_internal_coverage_candidate,
+)
 from .services.competitors.percentiles.read_models import (
     export_percentile_product_rows,
     list_percentile_product_rows,
@@ -245,7 +262,7 @@ from .services.competitors.percentiles.read_models import (
     percentile_coverage_audit,
     percentile_trace,
 )
-from .services.competitors.percentiles.sources import PERCENTILE_SOURCE_COMPETITOR, PERCENTILE_SOURCE_EMIT
+from .services.competitors.percentiles.sources import PERCENTILE_SOURCE_COMPETITOR, PERCENTILE_SOURCE_DEFAULT, PERCENTILE_SOURCE_EMIT
 from .services.jobs import create_job, get_active_job, job_to_dict, schedule_job, update_job
 from .services.references.batch import import_reference_batch
 from .services.references.imports import import_reference_excel
@@ -1904,7 +1921,6 @@ def create_price_format(
                 raise HTTPException(status_code=400, detail="pricing rule not found")
     db.add(row)
     db.flush()
-    propagate_emit_assignments_to_new_price_format(db=db, price_format_id=int(row.id))
     db.commit()
     db.refresh(row)
     percentile_status = enqueue_percentile_preparation(db=db, price_format_id=int(row.id), reason="price_format_created")
@@ -4015,7 +4031,6 @@ async def import_contractors(file: UploadFile = File(...), db: Session = Depends
             pf = PriceFormat(code=format_code, name=format_code, branch=str(row[branch_i] or "").strip())
             db.add(pf)
             db.flush()
-            propagate_emit_assignments_to_new_price_format(db=db, price_format_id=int(pf.id))
         holding_name = str(row[holding_i] or "").strip() or "Без холдинга"
         cp_name = str(row[cp_i] or "").strip() or "Не указан"
         point_name = str(row[pharmacy_i] or "").strip()
@@ -4781,7 +4796,6 @@ def set_competitors_assigned(format_code: str, payload: dict, db: Session = Depe
         pf = PriceFormat(code=format_code, name=format_code)
         db.add(pf)
         db.flush()
-        propagate_emit_assignments_to_new_price_format(db=db, price_format_id=int(pf.id))
 
     selected = [x for x in data.COMPETITORS_AVAILABLE if x.get("id") in ids]
     selected_source_names = {str(x.get("name") or "").strip() for x in selected if str(x.get("name") or "").strip()}
@@ -5309,7 +5323,7 @@ def get_provisor_diagnostics(
 @app.get("/api/competitors/percentiles")
 def get_competitor_percentile_sources(
     format_code: str | None = Query(None),
-    percentile_source: str = Query("competitor"),
+    percentile_source: str = Query(PERCENTILE_SOURCE_DEFAULT),
     visibility: str = Query("all"),
     db: Session = Depends(get_db),
 ):
@@ -5330,7 +5344,7 @@ def get_competitor_percentile_rows(
     source_key: str = Query(""),
     api_identity: str = Query(""),
     group_id: str = Query(""),
-    percentile_source: str = Query("competitor"),
+    percentile_source: str = Query(PERCENTILE_SOURCE_DEFAULT),
     q: str = Query(""),
     percentile_filter: str = Query("all"),
     competitor_filter: str = Query("all"),
@@ -5365,7 +5379,7 @@ def get_competitor_percentile_trace(
     region: str = Query(...),
     competitor: str = Query(...),
     source_key: str = Query(""),
-    percentile_source: str = Query("competitor"),
+    percentile_source: str = Query(PERCENTILE_SOURCE_DEFAULT),
     sku: str = Query(...),
     db: Session = Depends(get_db),
 ):
@@ -5386,7 +5400,7 @@ def get_competitor_percentile_coverage_audit(
     region: str = Query(...),
     competitor: str = Query(...),
     source_key: str = Query(""),
-    percentile_source: str = Query("competitor"),
+    percentile_source: str = Query(PERCENTILE_SOURCE_DEFAULT),
     db: Session = Depends(get_db),
 ):
     return percentile_coverage_audit(
@@ -5408,7 +5422,7 @@ def export_competitor_percentile_rows_endpoint(
     source_key: str = Query(""),
     api_identity: str = Query(""),
     group_id: str = Query(""),
-    percentile_source: str = Query("competitor"),
+    percentile_source: str = Query(PERCENTILE_SOURCE_DEFAULT),
     q: str = Query(""),
     percentile_filter: str = Query("all"),
     competitor_filter: str = Query("all"),
@@ -5927,6 +5941,246 @@ def search_products_for_mapping(
     db: Session = Depends(get_db),
 ):
     return find_products_for_mapping(db=db, q=q, limit=limit)
+
+
+@app.get("/api/vidman/review")
+def get_vidman_review_queue(
+    tier: str | None = Query(None),
+    status: str = Query("unreviewed"),
+    search: str = Query(""),
+    manufacturer: str = Query(""),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=200),
+    sort: str = Query("priority"),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    _ = current_user
+    return list_review_queue(
+        db,
+        tier=tier,
+        status=status,
+        search=search,
+        manufacturer=manufacturer,
+        page=page,
+        limit=limit,
+        sort=sort,
+    )
+
+
+@app.get("/api/vidman/review/counters")
+def get_vidman_review_counters(
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    _ = current_user
+    return review_counters(db)
+
+
+@app.get("/api/vidman/review/internal-products/search")
+def search_vidman_review_internal_products(
+    q: str = Query("", min_length=1),
+    limit: int = Query(20, ge=1, le=50),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    _ = current_user
+    return search_vidman_internal_products(db, q=q, limit=limit)
+
+
+@app.get("/api/vidman/internal-coverage")
+def get_vidman_internal_coverage(
+    tier: str | None = Query(None),
+    search: str = Query(""),
+    manufacturer: str = Query(""),
+    review_status: str = Query("unreviewed"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=200),
+    sort: str = Query("priority"),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    _ = current_user
+    return list_internal_coverage(
+        db,
+        tier=tier,
+        search=search,
+        manufacturer=manufacturer,
+        review_status=review_status,
+        page=page,
+        limit=limit,
+        sort=sort,
+    )
+
+
+@app.get("/api/vidman/internal-coverage/counters")
+def get_vidman_internal_coverage_counters(
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    _ = current_user
+    return internal_coverage_counters(db)
+
+
+@app.get("/api/vidman/internal-coverage/{product_id}")
+def get_vidman_internal_coverage_detail(
+    product_id: int,
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    _ = current_user
+    try:
+        return internal_coverage_detail(db, product_id=product_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/vidman/internal-coverage/{product_id}/approve")
+def post_vidman_internal_coverage_approve(
+    product_id: int,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+):
+    canonical_id = payload.get("canonical_product_id") or payload.get("canonicalProductId")
+    if not canonical_id:
+        raise HTTPException(status_code=400, detail="canonical_product_id is required")
+    try:
+        match = approve_internal_coverage(
+            db,
+            product_id=product_id,
+            canonical_product_id=int(canonical_id),
+            actor=current_user.username or "",
+        )
+        return {
+            "match": {
+                "canonicalProductId": match.canonical_product_id,
+                "productId": match.product_id,
+                "status": match.status,
+                "matchedBy": match.matched_by,
+            }
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/vidman/internal-coverage/{product_id}/reject-candidate")
+def post_vidman_internal_coverage_reject_candidate(
+    product_id: int,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+):
+    canonical_id = payload.get("canonical_product_id") or payload.get("canonicalProductId")
+    if not canonical_id:
+        raise HTTPException(status_code=400, detail="canonical_product_id is required")
+    try:
+        row = reject_internal_coverage_candidate(
+            db,
+            product_id=product_id,
+            canonical_product_id=int(canonical_id),
+            reason=str(payload.get("reason") or ""),
+            actor=current_user.username or "",
+        )
+        return {"rejectedCandidate": {"canonicalProductId": row.canonical_product_id, "reason": row.reason}}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/vidman/internal-coverage/{product_id}/mark-no-match")
+def post_vidman_internal_coverage_mark_no_match(
+    product_id: int,
+    payload: dict = Body(default={}),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+):
+    try:
+        decision = mark_internal_coverage_no_match(
+            db,
+            product_id=product_id,
+            reason=str(payload.get("reason") or ""),
+            actor=current_user.username or "",
+        )
+        return {"decision": {"productId": decision.product_id, "status": decision.status, "reason": decision.reason}}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/vidman/review/{canonical_id}")
+def get_vidman_review_detail(
+    canonical_id: int,
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    _ = current_user
+    try:
+        return review_detail(db, canonical_product_id=canonical_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/vidman/review/{canonical_id}/approve")
+def post_vidman_review_approve(
+    canonical_id: int,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+):
+    product_id = payload.get("product_id") or payload.get("productId")
+    if not product_id:
+        raise HTTPException(status_code=400, detail="product_id is required")
+    try:
+        match = approve_review_match(
+            db,
+            canonical_product_id=canonical_id,
+            product_id=int(product_id),
+            actor=current_user.username or "",
+        )
+        return {"match": {"status": match.status, "productId": match.product_id, "matchedBy": match.matched_by}}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/vidman/review/{canonical_id}/reject-candidate")
+def post_vidman_review_reject_candidate(
+    canonical_id: int,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+):
+    product_id = payload.get("product_id") or payload.get("productId")
+    if not product_id:
+        raise HTTPException(status_code=400, detail="product_id is required")
+    try:
+        row = reject_review_candidate(
+            db,
+            canonical_product_id=canonical_id,
+            product_id=int(product_id),
+            reason=str(payload.get("reason") or ""),
+            actor=current_user.username or "",
+        )
+        return {"rejectedCandidate": {"productId": row.product_id, "reason": row.reason}}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/vidman/review/{canonical_id}/mark-unmatched")
+def post_vidman_review_mark_unmatched(
+    canonical_id: int,
+    payload: dict = Body(default={}),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+):
+    try:
+        match = mark_review_unmatched(
+            db,
+            canonical_product_id=canonical_id,
+            reason=str(payload.get("reason") or ""),
+            actor=current_user.username or "",
+        )
+        return {"match": {"status": match.status, "productId": match.product_id, "matchedBy": match.matched_by}}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/competitor-items/search")
@@ -7103,6 +7357,75 @@ async def _start_provisor_refresh_background(*, mode: str, requested_by: str, ru
             asyncio.create_task(coro)
     finally:
         db.close()
+
+
+@app.post("/api/vidman/accounts/{account_id}/refresh")
+async def refresh_vidman_account(account_id: int, payload: dict = Body(default={}), db: Session = Depends(get_db)):
+    try:
+        result = await refresh_vidman_account_stage43(
+            db=db,
+            price_source_account_id=account_id,
+            price_format_code=str(payload.get("formatCode") or payload.get("format_code") or ""),
+            apply=not bool(payload.get("dryRun") or payload.get("dry_run") or payload.get("apply") is False),
+            max_plks=int(payload["maxPlks"]) if payload.get("maxPlks") is not None else None,
+            only_main_ids=sorted(int(x) for x in _payload_id_set(payload, "mainIds", "main_ids", "mainId", "main_id")),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return result.to_dict()
+
+
+@app.post("/api/price-formats/{format_code}/vidman/refresh")
+async def refresh_vidman_price_format(format_code: str, payload: dict = Body(default={}), db: Session = Depends(get_db)):
+    target_account_ids = _payload_id_set(payload or {}, "accountIds", "account_ids", "accountId", "account_id")
+    accounts = (
+        db.execute(
+            select(PriceSourceAccount)
+            .where(PriceSourceAccount.source_type == "vidman")
+            .where(PriceSourceAccount.is_active.is_(True))
+            .order_by(PriceSourceAccount.id.asc())
+        )
+        .scalars()
+        .all()
+    )
+    if target_account_ids:
+        accounts = [account for account in accounts if str(int(account.id)) in target_account_ids]
+    dry_run = bool((payload or {}).get("dryRun") or (payload or {}).get("dry_run"))
+    apply = not dry_run and (payload or {}).get("apply", True) is not False
+    max_accounts = (payload or {}).get("maxAccounts") or (payload or {}).get("max_accounts")
+    if max_accounts is not None:
+        accounts = accounts[: max(0, int(max_accounts))]
+    results = []
+    errors = []
+    for account in accounts:
+        try:
+            one = await refresh_vidman_account_stage43(
+                db=db,
+                price_source_account_id=int(account.id),
+                price_format_code=format_code,
+                apply=apply,
+                max_plks=int((payload or {})["maxPlks"]) if (payload or {}).get("maxPlks") is not None else None,
+                only_main_ids=sorted(int(x) for x in _payload_id_set(payload or {}, "mainIds", "main_ids", "mainId", "main_id")),
+            )
+            results.append(one.to_dict())
+        except Exception as exc:
+            db.rollback()
+            errors.append({"account_id": int(account.id), "error": str(exc)})
+    return {
+        "status": "success" if not errors else "partial",
+        "source": "vidman",
+        "formatCode": format_code,
+        "accountsRequested": sorted(int(x) for x in target_account_ids) if target_account_ids else [],
+        "accountsProcessed": [int(account.id) for account in accounts],
+        "accountsSkipped": [],
+        "dryRun": not apply,
+        "publishedPlks": sum(int(result.get("published_plks") or 0) for result in results),
+        "processedPlks": sum(int(result.get("processed_plks") or 0) for result in results),
+        "preservedPlks": sum(int(result.get("preserved_plks") or 0) for result in results),
+        "failedPlks": sum(int(result.get("failed_plks") or 0) for result in results),
+        "errors": errors,
+        "results": results,
+    }
 
 
 @app.post("/api/price-formats/{format_code}/competitor-price-lists/refresh")
@@ -9406,7 +9729,6 @@ def put_settings_for_format(
         pf = PriceFormat(code=format_code, name=payload.get("name") or format_code)
         db.add(pf)
         db.flush()
-        propagate_emit_assignments_to_new_price_format(db=db, price_format_id=int(pf.id))
         percentile_relevant_change = True
     else:
         percentile_relevant_change = False

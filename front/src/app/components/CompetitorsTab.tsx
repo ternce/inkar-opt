@@ -96,6 +96,23 @@ type ProvisorAccount = {
   last_success_at?: string | null;
 };
 
+type VidmanRefreshResult = {
+  status?: string;
+  processedPlks?: number;
+  publishedPlks?: number;
+  preservedPlks?: number;
+  failedPlks?: number;
+  results?: Array<{
+    main_id?: number;
+    name?: string;
+    status?: string;
+    rows_written?: number;
+    rows_to_publish?: number;
+    skipped_reason?: string;
+    error?: string;
+  }>;
+};
+
 type PriceListItem = {
   provisor_id: number | null;
   provisor_goods_id?: number | null;
@@ -671,6 +688,7 @@ export function CompetitorsTab({ formatCode }: Props) {
   const [selectedProvisorAccountIds, setSelectedProvisorAccountIds] = useState<number[]>([]);
   const [provisorAccountSearch, setProvisorAccountSearch] = useState('');
   const [provisorAccountSelectorOpen, setProvisorAccountSelectorOpen] = useState(false);
+  const [vidmanRefreshResult, setVidmanRefreshResult] = useState<VidmanRefreshResult | null>(null);
 
   const [mappingPlatform, setMappingPlatform] = useState<Platform>('provisor');
   const [mappingStatus, setMappingStatus] = useState<MappingStatus>('unmapped');
@@ -920,6 +938,23 @@ export function CompetitorsTab({ formatCode }: Props) {
     try {
       const accountIds = Array.from(new Set((options?.accountIds || []).map((id) => Number(id)).filter((id) => Number.isFinite(id))));
       const filialIds = Array.from(new Set((options?.filialIds || []).map((id) => Number(id)).filter((id) => Number.isFinite(id))));
+      if (source === 'vidman') {
+        setVidmanRefreshResult(null);
+        setActiveJob({ id: 'vidman-stage-43', status: 'running', progress: 20, message: 'Обновляем Vidman' });
+        const res = await fetch(`/api/price-formats/${encodeURIComponent(formatCode)}/vidman/refresh`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ accountIds }),
+        });
+        const text = await res.text();
+        const data = parseJsonOrNull(text);
+        if (!res.ok) throw new Error(data?.detail || text || 'Не удалось обновить Vidman');
+        setVidmanRefreshResult(data);
+        setActiveJob({ id: 'vidman-stage-43', status: data?.status || 'success', progress: 100, message: 'Vidman обновлен' });
+        await loadPriceListTab();
+        toast.success(`Vidman обновлен: опубликовано ${fmtNumber(data?.publishedPlks || 0)}`);
+        return;
+      }
       const res = await fetch(`/api/price-formats/${encodeURIComponent(formatCode)}/competitor-price-lists/refresh`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1697,6 +1732,30 @@ export function CompetitorsTab({ formatCode }: Props) {
                 </div>
               </div>
               {renderProvisorAccountSelector()}
+              {vidmanRefreshResult ? (
+                <div className="mt-3 rounded border border-blue-100 bg-blue-50 px-3 py-2 text-sm text-blue-900">
+                  <div className="flex flex-wrap gap-x-4 gap-y-1">
+                    <span><strong>Vidman:</strong> {vidmanRefreshResult.status || 'success'}</span>
+                    <span>PLK обработано: {fmtNumber(vidmanRefreshResult.processedPlks || 0)}</span>
+                    <span>Опубликовано: {fmtNumber(vidmanRefreshResult.publishedPlks || 0)}</span>
+                    <span>Сохранено прежних: {fmtNumber(vidmanRefreshResult.preservedPlks || 0)}</span>
+                    <span>Ошибок: {fmtNumber(vidmanRefreshResult.failedPlks || 0)}</span>
+                  </div>
+                  {vidmanRefreshResult.results?.length ? (
+                    <div className="mt-2 max-h-32 space-y-1 overflow-auto">
+                      {vidmanRefreshResult.results.slice(0, 8).map((row) => (
+                        <div key={`${row.main_id}-${row.name}`} className="flex flex-wrap gap-x-3 text-xs">
+                          <span className="font-medium">{row.name || row.main_id}</span>
+                          <span>{row.status || ''}</span>
+                          <span>строк: {fmtNumber(row.rows_written || row.rows_to_publish || 0)}</span>
+                          {row.skipped_reason ? <span>{row.skipped_reason}</span> : null}
+                          {row.error ? <span>{row.error}</span> : null}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
 
             {provisorDiagnostics ? (

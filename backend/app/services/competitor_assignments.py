@@ -153,7 +153,16 @@ def source_visibility_state(row: CompetitorPriceList, item_count: int) -> str:
 
 
 def is_visible_source_row(row: CompetitorPriceList, item_count: int) -> bool:
+    if is_legacy_untrusted_vidman_price_list(row):
+        return False
     return source_visibility_state(row, item_count) != "placeholder"
+
+
+def is_legacy_untrusted_vidman_price_list(row: CompetitorPriceList) -> bool:
+    if str(row.source_type or "").strip().lower() != "vidman":
+        return False
+    source_key = str(row.source_key or "").strip()
+    return not (source_key.startswith("account:") and ":main:" in source_key)
 
 
 def list_global_competitor_price_lists_for_format(
@@ -167,7 +176,13 @@ def list_global_competitor_price_lists_for_format(
     stmt = select(CompetitorPriceList).options(competitor_price_list_read_options())
     if account_id:
         stmt = stmt.where(CompetitorPriceList.account_id == str(account_id))
-    rows = db.execute(stmt.order_by(CompetitorPriceList.updated_at.desc(), CompetitorPriceList.id.desc())).scalars().all()
+    rows = (
+        db.execute(
+            stmt.order_by(CompetitorPriceList.updated_at.desc(), CompetitorPriceList.id.desc()).execution_options(populate_existing=True)
+        )
+        .scalars()
+        .all()
+    )
     for row in rows:
         meta = branch_visibility_metadata(row, price_format, region)
         setattr(row, "_visible_for_format_branch", bool(meta["visibleForFormatBranch"]))
@@ -266,6 +281,7 @@ def get_assigned_competitor_price_lists(
     if active_only:
         stmt = stmt.where(PriceFormatCompetitorAssignment.is_active.is_(True))
     rows = db.execute(stmt.order_by(CompetitorPriceList.updated_at.desc(), CompetitorPriceList.id.desc())).all()
+    rows = [(row, assignment) for row, assignment in rows if not is_legacy_untrusted_vidman_price_list(row)]
     return [AssignedCompetitorPriceList(price_list=row, assignment=assignment) for row, assignment in rows]
 
 
@@ -282,6 +298,7 @@ def get_all_assigned_competitor_price_lists(*, db: Session) -> list[AssignedComp
         )
         .all()
     )
+    rows = [(row, assignment) for row, assignment in rows if not is_legacy_untrusted_vidman_price_list(row)]
     return [AssignedCompetitorPriceList(price_list=row, assignment=assignment) for row, assignment in rows]
 
 
@@ -356,121 +373,18 @@ def propagate_emit_assignments_to_price_formats(
 ) -> EmitAssignmentPropagationResult:
     target_price_list_ids = {int(item) for item in (emit_price_list_ids or []) if int(item) > 0}
     pf_filter_ids = {int(item) for item in (price_format_ids or []) if int(item) > 0}
-
-    price_formats = _all_active_price_formats(db)
-    if pf_filter_ids:
-        price_formats = [pf for pf in price_formats if int(pf.id) in pf_filter_ids]
-    price_format_ids_ordered = [int(pf.id) for pf in price_formats]
-
-    stmt = select(CompetitorPriceList)
-    if target_price_list_ids:
-        stmt = stmt.where(CompetitorPriceList.id.in_(target_price_list_ids))
-    rows = db.execute(stmt.order_by(CompetitorPriceList.id.asc())).scalars().all()
-    emit_rows = [row for row in rows if _is_active_emit_price_list(row)]
-    emit_row_ids = [int(row.id) for row in emit_rows]
-    metadata_by_price_list_id: dict[int, PriceFormatCompetitorAssignment] = {}
-    if emit_row_ids:
-        metadata_rows = (
-            db.execute(
-                select(PriceFormatCompetitorAssignment)
-                .where(PriceFormatCompetitorAssignment.competitor_price_list_id.in_(emit_row_ids))
-                .where(PriceFormatCompetitorAssignment.is_active.is_(True))
-                .order_by(PriceFormatCompetitorAssignment.updated_at.desc(), PriceFormatCompetitorAssignment.id.desc())
-            )
-            .scalars()
-            .all()
-        )
-        for existing_assignment in metadata_rows:
-            mode = str(existing_assignment.percentile_mode or "").strip()
-            if mode and mode != MULTI_PRICE_PERCENTILE_MODE:
-                continue
-            metadata_by_price_list_id.setdefault(int(existing_assignment.competitor_price_list_id), existing_assignment)
-
-    created: list[int] = []
-    reused: list[int] = []
-    reactivated: list[int] = []
-    skipped: list[int] = []
-    affected: set[int] = set()
-    now = datetime.utcnow()
-
     logger.info(
-        "[EMIT_ASSIGNMENT_PROPAGATION] action=start price_format_ids=%s price_list_ids=%s",
-        price_format_ids_ordered,
-        [int(row.id) for row in emit_rows],
+        "[EMIT_ASSIGNMENT_PROPAGATION] action=disabled price_format_ids=%s price_list_ids=%s",
+        sorted(pf_filter_ids),
+        sorted(target_price_list_ids),
     )
-
-    for pf in price_formats:
-        for price_list in emit_rows:
-            assignment = get_assignment(
-                db=db,
-                price_format_id=int(pf.id),
-                competitor_price_list_id=int(price_list.id),
-            )
-            if assignment is None:
-                template = metadata_by_price_list_id.get(int(price_list.id))
-                assignment = PriceFormatCompetitorAssignment(
-                    price_format_id=int(pf.id),
-                    competitor_price_list_id=int(price_list.id),
-                    is_active=True,
-                    coefficient=float(template.coefficient) if template is not None else 1.0,
-                    percentile_mode=MULTI_PRICE_PERCENTILE_MODE,
-                    source_mode=str(template.source_mode or "").strip() if template is not None else "",
-                    created_at=now,
-                    updated_at=now,
-                )
-                db.add(assignment)
-                db.flush()
-                created.append(int(assignment.id))
-                affected.add(int(pf.id))
-                continue
-
-            mode = str(assignment.percentile_mode or "").strip()
-            if mode and mode != MULTI_PRICE_PERCENTILE_MODE:
-                skipped.append(int(assignment.id))
-                logger.warning(
-                    "[EMIT_ASSIGNMENT_PROPAGATION] action=skip reason=incompatible_percentile_mode "
-                    "price_format_id=%s price_list_id=%s assignment_id=%s percentile_mode=%s",
-                    int(pf.id),
-                    int(price_list.id),
-                    int(assignment.id),
-                    mode,
-                )
-                continue
-
-            if not assignment.is_active:
-                assignment.is_active = True
-                assignment.percentile_mode = MULTI_PRICE_PERCENTILE_MODE
-                assignment.updated_at = now
-                reactivated.append(int(assignment.id))
-                affected.add(int(pf.id))
-                continue
-
-            if not mode:
-                assignment.percentile_mode = MULTI_PRICE_PERCENTILE_MODE
-                assignment.updated_at = now
-                affected.add(int(pf.id))
-            reused.append(int(assignment.id))
-            affected.add(int(pf.id))
-
-    result = EmitAssignmentPropagationResult(
-        created_assignment_ids=created,
-        reused_assignment_ids=reused,
-        reactivated_assignment_ids=reactivated,
-        skipped_incompatible_assignment_ids=skipped,
-        affected_price_format_ids=sorted(affected),
+    return EmitAssignmentPropagationResult(
+        created_assignment_ids=[],
+        reused_assignment_ids=[],
+        reactivated_assignment_ids=[],
+        skipped_incompatible_assignment_ids=[],
+        affected_price_format_ids=[],
     )
-    logger.info(
-        "[EMIT_ASSIGNMENT_PROPAGATION] action=end price_format_ids=%s price_list_ids=%s created=%s reused=%s "
-        "reactivated=%s skipped_incompatible=%s affected_price_format_ids=%s",
-        price_format_ids_ordered,
-        [int(row.id) for row in emit_rows],
-        result.created_count,
-        result.reused_count,
-        result.reactivated_count,
-        result.skipped_incompatible_count,
-        result.affected_price_format_ids,
-    )
-    return result
 
 
 def propagate_emit_assignments_to_new_price_format(*, db: Session, price_format_id: int) -> int:

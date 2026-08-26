@@ -22,6 +22,7 @@ import {
   resolveInitialRoundingSelection,
   resolveInitialTemplateSelection,
 } from '../pricingTemplateSelection';
+import { parseOptionalDecimalInput, parseRequiredDecimalInput } from '../decimalInput';
 
 type RangeRow = {
   id?: number;
@@ -121,9 +122,9 @@ const emptyTemplate = (kind: 'markup' | 'bend' | 'noCompetitor'): Template => ({
 
 const toPayloadRows = (rows: RangeRow[], valueKey: 'markupPercent' | 'bendPercent') =>
   rows.map((row, index) => ({
-    costFrom: Number(row.costFrom),
-    costTo: row.costTo === '' ? null : Number(row.costTo),
-    [valueKey]: Number(row[valueKey] || 0),
+    costFrom: parseRequiredDecimalInput(row.costFrom, 'От'),
+    costTo: parseOptionalDecimalInput(row.costTo, 'До'),
+    [valueKey]: parseRequiredDecimalInput(row[valueKey] || 0, valueKey === 'markupPercent' ? 'Наценка (%)' : 'Прогиб (%)'),
     sortOrder: index,
   }));
 
@@ -367,9 +368,9 @@ function TemplateEditor({
             <tbody>
               {draft.rows.map((row, index) => (
                 <tr key={index}>
-                  <td className="px-4 py-3"><Input className="numeric-input" value={row.costFrom} onChange={(e) => updateRow(index, { costFrom: e.target.value })} disabled={selectedId === CURRENT_FORMAT_SETTINGS} /></td>
-                  <td className="px-4 py-3"><Input className="numeric-input" value={row.costTo} onChange={(e) => updateRow(index, { costTo: e.target.value })} placeholder="∞" disabled={selectedId === CURRENT_FORMAT_SETTINGS} /></td>
-                  <td className="px-4 py-3"><Input className="numeric-input" value={String(row[valueKey] || '')} onChange={(e) => updateRow(index, { [valueKey]: e.target.value })} disabled={selectedId === CURRENT_FORMAT_SETTINGS} /></td>
+                  <td className="px-4 py-3"><Input className="numeric-input" inputMode="decimal" value={row.costFrom} onChange={(e) => updateRow(index, { costFrom: e.target.value })} disabled={selectedId === CURRENT_FORMAT_SETTINGS} /></td>
+                  <td className="px-4 py-3"><Input className="numeric-input" inputMode="decimal" value={row.costTo} onChange={(e) => updateRow(index, { costTo: e.target.value })} placeholder="∞" disabled={selectedId === CURRENT_FORMAT_SETTINGS} /></td>
+                  <td className="px-4 py-3"><Input className="numeric-input" inputMode="decimal" value={String(row[valueKey] || '')} onChange={(e) => updateRow(index, { [valueKey]: e.target.value })} disabled={selectedId === CURRENT_FORMAT_SETTINGS} /></td>
                   <td className="sticky-action-col px-4 py-3 text-right">
                     <Button variant="ghost" size="sm" className="text-red-600 hover:text-red-700" onClick={() => removeRow(index)} disabled={selectedId === CURRENT_FORMAT_SETTINGS}>
                       <Trash2 className="mr-1 h-4 w-4" />Удалить
@@ -714,6 +715,7 @@ function normalizeRule(rule: PricingRule): PricingRule {
 function RoundingEditor({ items, appliedRoundingRuleId, onReload }: { items: RoundingRule[]; appliedRoundingRuleId: number | null; onReload: () => Promise<void> }) {
   const [selectedId, setSelectedId] = useState<string>(CURRENT_FORMAT_SETTINGS);
   const [draft, setDraft] = useState<RoundingRule>({ id: 0, code: '', name: '', mode: 'math', precision: 2, step: 0.01, isActive: true });
+  const [stepText, setStepText] = useState('0.01');
   const [error, setError] = useState<string | null>(null);
   const preserveSelectionRef = useRef<string | null>(null);
 
@@ -725,6 +727,7 @@ function RoundingEditor({ items, appliedRoundingRuleId, onReload }: { items: Rou
       if (row) {
         setSelectedId(preservedId);
         setDraft(row);
+        setStepText(row.step == null ? '' : String(row.step));
         return;
       }
     }
@@ -734,17 +737,20 @@ function RoundingEditor({ items, appliedRoundingRuleId, onReload }: { items: Rou
       if (row) {
         setSelectedId(String(row.id));
         setDraft(row);
+        setStepText(row.step == null ? '' : String(row.step));
         return;
       }
     }
     setSelectedId(CURRENT_FORMAT_SETTINGS);
     setDraft({ id: 0, code: '', name: appliedRoundingRuleId ? 'Текущее округление ЦФ (правило недоступно)' : 'Без шаблона', mode: 'math', precision: 2, step: 0.01, isActive: true });
+    setStepText('0.01');
   }, [items, appliedRoundingRuleId]);
 
   const select = (value: string) => {
     setSelectedId(value);
     if (value === CREATE_NEW_TEMPLATE) {
       setDraft({ id: 0, code: '', name: '', mode: 'math', precision: 2, step: 0.01, isActive: true });
+      setStepText('0.01');
       return;
     }
     if (value === CURRENT_FORMAT_SETTINGS) {
@@ -752,16 +758,26 @@ function RoundingEditor({ items, appliedRoundingRuleId, onReload }: { items: Rou
       return;
     }
     const row = items.find((item) => String(item.id) === value);
-    if (row) setDraft(row);
+    if (row) {
+      setDraft(row);
+      setStepText(row.step == null ? '' : String(row.step));
+    }
   };
 
   const save = async () => {
     setError(null);
     const isNew = selectedId === CREATE_NEW_TEMPLATE || !draft.id;
+    let payload: RoundingRule;
+    try {
+      payload = { ...draft, step: parseOptionalDecimalInput(stepText, 'Шаг') };
+    } catch (e: any) {
+      setError(e?.message || 'Некорректное число');
+      return;
+    }
     const res = await fetch(isNew ? '/api/pricing-rules/rounding-rules' : `/api/pricing-rules/rounding-rules/${draft.id}`, {
       method: isNew ? 'POST' : 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(draft),
+      body: JSON.stringify(payload),
     });
     const text = await res.text();
     const data = parseJsonOrNull(text);
@@ -771,6 +787,7 @@ function RoundingEditor({ items, appliedRoundingRuleId, onReload }: { items: Rou
     }
     setSelectedId(String(data.id));
     setDraft(data);
+    setStepText(data.step == null ? '' : String(data.step));
     preserveSelectionRef.current = String(data.id);
     await onReload();
   };
@@ -806,7 +823,7 @@ function RoundingEditor({ items, appliedRoundingRuleId, onReload }: { items: Rou
             </SelectContent>
           </Select>
           <Input value={String(draft.precision)} onChange={(e) => setDraft((prev) => ({ ...prev, precision: Number(e.target.value) }))} placeholder="Точность" disabled={selectedId === CURRENT_FORMAT_SETTINGS} />
-          <Input value={draft.step == null ? '' : String(draft.step)} onChange={(e) => setDraft((prev) => ({ ...prev, step: e.target.value === '' ? null : Number(e.target.value) }))} placeholder="Шаг" disabled={selectedId === CURRENT_FORMAT_SETTINGS} />
+          <Input value={stepText} inputMode="decimal" onChange={(e) => setStepText(e.target.value)} placeholder="Шаг" disabled={selectedId === CURRENT_FORMAT_SETTINGS} />
           <Button onClick={save} disabled={selectedId === CURRENT_FORMAT_SETTINGS} className="bg-blue-600 hover:bg-blue-700"><Save className="mr-2 h-4 w-4" />Сохранить</Button>
         </div>
       </div>

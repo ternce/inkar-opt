@@ -12,6 +12,7 @@ import {
   formatLocalDate,
   formatLocalDateTime,
 } from '../competitorTimestamps';
+import { parseRequiredDecimalInput } from '../decimalInput';
 
 type PriceFormat = {
   id?: string;
@@ -625,13 +626,21 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
                 <Input
                   key={`${row.id}-coef`}
                   className="numeric-input assignment-coef-input"
-                  type="number"
+                  inputMode="decimal"
                   min="0.01"
                   max="100"
                   step="0.001"
                   defaultValue={String(row.priceCoefficient ?? row.coefficient ?? 1)}
                   title="1.000 = no change; 0.975 = discount 2.5%; 1.025 = increase 2.5%"
-                  onBlur={(event) => saveAssignment(row, { priceCoefficient: Number(event.target.value) })}
+                  onBlur={(event) => {
+                    try {
+                      saveAssignment(row, {
+                        priceCoefficient: parseRequiredDecimalInput(event.target.value, 'priceCoefficient'),
+                      });
+                    } catch (e: any) {
+                      setError(e?.message || 'priceCoefficient must be between 0.01 and 100');
+                    }
+                  }}
                 />,
                 formatLocalDate(row.priceDate),
                 formatLocalDateTime(competitorLastSuccessfulCheck(row)),

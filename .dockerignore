@@ -13,6 +13,10 @@ front/.vite/
 
 # Local DB artifacts
 backend/app.db
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
 **/*.sqlite
 **/*.sqlite3
 
@@ -30,14 +34,36 @@ backend/app.db
 Thumbs.db
 
 *.log
-
+**/*.log
 
 # Chrome audit
 .tmp-chrome-assignment-audit/
+.tmp-chrome*/
 
 # Audit logs
 *.log
+**/*.log
 vite-audit.log
 preview-proxy*.log
 prod-proxy*.log
 local-audit-uvicorn.log
+
+# Local backend diagnostics / generated audit exports
+backend/diagnostics/
+backend/**/*.xlsx
+backend/**/*.log
+backend/tmp_vidman_rollout_audit*.json
+backend/suspicious_matches.xlsx
+
+# Local root-level audit/export outputs
+/*.xlsx
+/competitors-*.json
+/endpoint-sql-counts.json
+/request-audit*.json
+/deployment_data_export/
+/exports/
+/exports_*/
+/exports_single_goods/
+/exports_single_goods_debug/
+/exports_single_goods_json/
+/raw_json/

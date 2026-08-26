@@ -1167,6 +1167,8 @@ def upsert_unified_price_list(
         _replace_legacy_price_rows_for_list(db=db, price_list=row)
         sync_selected_competitor_configs(db=db, price_format_id=pf.id)
         rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id)
+    else:
+        refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
     stage_started_at = time.perf_counter()
     db.commit()
     if run_matching:
@@ -1190,7 +1192,6 @@ def upsert_unified_price_list(
         manufacturer_cache_size=len(manufacturer_cache),
         match_cache_size=len(preserved_match_fields),
     )
-    refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
     final_items_count = int(row.items_count or 0)
     logger.info(
         "[PROVISOR_ACCOUNT_PLK_ROUTE] account_id=%s external_price_list_id=%s source_key=%s "

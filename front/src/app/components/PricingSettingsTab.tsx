@@ -7,6 +7,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { listTypeLabel } from './listTypeLabels';
 import { resolvePricingRuleSettings } from '../pricingRuleSettings';
+import { parseRequiredDecimalInput } from '../decimalInput';
 import {
   canRetryPercentilePreparation,
   percentilePreparationClassName,
@@ -634,23 +635,23 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
         roundingRuleId: roundingRuleId === 'none' ? null : Number(roundingRuleId),
         competitorPriceMode,
         percentileNumber: Number(percentileNumber),
-        deflectionPercent: Number(deflectionPercent),
+        deflectionPercent: parseRequiredDecimalInput(deflectionPercent, 'Прогиб по умолчанию (%)'),
         recommendedMarkups: recommendedMarkups.map((r) => ({
           id: r.id,
-          lowerBound: Number(r.lowerBound),
-          upperBound: Number(r.upperBound),
-          markupPercent: Number(r.markupPercent),
+          lowerBound: parseRequiredDecimalInput(r.lowerBound, 'Нижняя граница'),
+          upperBound: parseRequiredDecimalInput(r.upperBound, 'Верхняя граница'),
+          markupPercent: parseRequiredDecimalInput(r.markupPercent, 'Наценка'),
         })),
         noCompetitorMarkups: noCompetitorMarkups.map((r) => ({
           id: r.id,
-          lowerBound: Number(r.lowerBound),
-          upperBound: Number(r.upperBound),
-          markupPercent: Number(r.markupPercent),
+          lowerBound: parseRequiredDecimalInput(r.lowerBound, 'Нижняя граница'),
+          upperBound: parseRequiredDecimalInput(r.upperBound, 'Верхняя граница'),
+          markupPercent: parseRequiredDecimalInput(r.markupPercent, 'Наценка'),
         })),
         bendRanges: bendRanges.map((r) => ({
           id: r.id,
-          priceFrom: Number(r.priceFrom),
-          bendPercent: Number(r.bendPercent),
+          priceFrom: parseRequiredDecimalInput(r.priceFrom, 'Цена от'),
+          bendPercent: parseRequiredDecimalInput(r.bendPercent, 'Прогиб (%)'),
         })),
       };
 
@@ -1031,6 +1032,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
             <Label htmlFor="deflection">Прогиб по умолчанию (%)</Label>
             <Input
               id="deflection"
+              inputMode="decimal"
               value={deflectionPercent}
               onChange={(e) => setDeflectionPercent(e.target.value)}
               disabled={isSettingsBusy}
@@ -1189,6 +1191,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
                     <td className="px-4 py-3 text-sm text-gray-700">
                       <Input
                         className="numeric-input"
+                        inputMode="decimal"
                         value={rule.lowerBound}
                         disabled={isLoading}
                         onChange={(e) =>
@@ -1201,6 +1204,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
                     <td className="px-4 py-3 text-sm text-gray-700">
                       <Input
                         className="numeric-input"
+                        inputMode="decimal"
                         value={rule.upperBound}
                         disabled={isLoading}
                         onChange={(e) =>
@@ -1214,6 +1218,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
                       <div className="percent-field">
                         <Input
                           className="numeric-input"
+                          inputMode="decimal"
                           value={rule.markupPercent}
                           disabled={isLoading}
                           onChange={(e) =>
@@ -1255,6 +1260,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
                     <td className="px-4 py-3 text-sm text-gray-700">
                       <Input
                         className="numeric-input"
+                        inputMode="decimal"
                         value={rule.lowerBound}
                         disabled={isLoading}
                         onChange={(e) =>
@@ -1267,6 +1273,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
                     <td className="px-4 py-3 text-sm text-gray-700">
                       <Input
                         className="numeric-input"
+                        inputMode="decimal"
                         value={rule.upperBound}
                         disabled={isLoading}
                         onChange={(e) =>
@@ -1280,6 +1287,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
                       <div className="percent-field">
                         <Input
                           className="numeric-input"
+                          inputMode="decimal"
                           value={rule.markupPercent}
                           disabled={isLoading}
                           onChange={(e) =>
@@ -1320,6 +1328,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
                     <td className="px-4 py-3 text-sm text-gray-700">
                       <Input
                         className="numeric-input"
+                        inputMode="decimal"
                         value={rule.priceFrom}
                         disabled={isLoading}
                         onChange={(e) =>
@@ -1333,6 +1342,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
                       <div className="percent-field">
                         <Input
                           className="numeric-input"
+                          inputMode="decimal"
                           value={rule.bendPercent}
                           disabled={isLoading}
                           onChange={(e) =>

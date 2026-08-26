@@ -57,6 +57,7 @@ from backend.app.services.competitor_percentiles import (
 from backend.app.services.competitor_source_config import MULTI_PRICE_PERCENTILE_MODE
 from backend.app.services.competitors.percentiles.sources import PERCENTILE_SOURCE_COMPETITOR, PERCENTILE_SOURCE_EMIT, percentile_source_id
 from backend.app.services.competitor_matching import rebuild_competitor_prices_for_selected
+from backend.app.services.competitor_read_models import refresh_price_list_item_counters
 from backend.app.services.pricing import (
     MISSING_STOCK_REFERENCE_ERROR,
     calculate_price_for_product,
@@ -698,6 +699,7 @@ def _workflow_price_list_source(db, pf, *, product=None, price=Decimal("1904.80"
             )
         )
         db.flush()
+        refresh_price_list_item_counters(db=db, price_list_ids=[row.id])
     return row
 
 
@@ -1935,7 +1937,12 @@ def test_percentile_price_generation_does_not_recalculate_from_raw_rows(monkeypa
     def fail_percentile_recalculation(**_kwargs):
         raise AssertionError("raw Emit rows must not be read to recalculate percentiles during price generation")
 
-    monkeypatch.setattr(pricing_service, "recalculate_competitor_percentiles_if_needed", fail_percentile_recalculation)
+    monkeypatch.setattr(
+        pricing_service,
+        "recalculate_competitor_percentiles_if_needed",
+        fail_percentile_recalculation,
+        raising=False,
+    )
 
     count = calculate_prices(
         db=db,
@@ -2998,6 +3005,7 @@ def _percentile_client_with_rows():
                     competitor_price_list_id=price_list.id,
                     is_active=True,
                     coefficient=1,
+                    percentile_mode=MULTI_PRICE_PERCENTILE_MODE,
                 )
             )
             db.add(
@@ -3008,6 +3016,8 @@ def _percentile_client_with_rows():
                     distributor_price=price,
                 )
             )
+            db.flush()
+            refresh_price_list_item_counters(db=db, price_list_ids=[price_list.id])
 
         for idx, price in enumerate([705, 702.23, 710, 685, 690], start=1):
             add_source("Almaty", "Emiti", f"Apteka {idx} Emiti", price)

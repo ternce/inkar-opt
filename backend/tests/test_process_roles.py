@@ -157,15 +157,12 @@ def test_role_separation_does_not_modify_competitor_assignments(monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(main, "settings", _copy_settings(main.settings, process_role="web", environment="prod"))
     _patch_startup_dependencies(monkeypatch, main, calls)
-    monkeypatch.setattr(
-        main,
-        "propagate_emit_assignments_to_new_price_format",
-        lambda *args, **kwargs: calls.append("propagate_emit_assignments"),
-    )
 
     asyncio.run(main._startup())
 
-    assert "propagate_emit_assignments" not in calls
+    assert not hasattr(main, "propagate_emit_assignments_to_new_price_format")
+    assert "propagate_emit_assignments_to_new_price_format" not in main._startup.__code__.co_names
+    assert "propagate_emit_assignments_to_price_formats" not in main._startup.__code__.co_names
 
 
 def test_refresh_endpoints_remain_available_in_web_mode(monkeypatch):

@@ -22,7 +22,12 @@ def _default_sqlite_url() -> str:
 
 
 def get_database_url() -> str:
-    url = os.getenv("DATABASE_URL", _default_sqlite_url())
+    raw_url = os.getenv("DATABASE_URL")
+    environment = os.getenv("ENVIRONMENT", "dev").strip().lower()
+    if not raw_url and environment in {"prod", "production"}:
+        raise RuntimeError("DATABASE_URL is required when ENVIRONMENT=prod")
+
+    url = raw_url or _default_sqlite_url()
 
     # Railway (and some other platforms) commonly provide Postgres URLs as:
     #   postgresql://user:pass@host:port/db
@@ -32,6 +37,9 @@ def get_database_url() -> str:
         url = "postgresql://" + url[len("postgres://") :]
     if url.startswith("postgresql://") and "+psycopg" not in url:
         url = "postgresql+psycopg://" + url[len("postgresql://") :]
+
+    if environment in {"prod", "production"} and url.startswith("sqlite"):
+        raise RuntimeError("SQLite DATABASE_URL is not allowed when ENVIRONMENT=prod")
 
     return url
 
@@ -68,9 +76,11 @@ def init_db() -> None:
     _ensure_nullable_percentile_values()
     _ensure_percentile_source_identity()
     _backfill_percentile_source_identity()
-    _backfill_account_scoped_provisor_source_keys()
+    if os.getenv("RUN_LEGACY_PROVISOR_SOURCE_KEY_BACKFILL_ON_STARTUP", "").strip().lower() in {"1", "true", "yes", "on"}:
+        _backfill_account_scoped_provisor_source_keys()
     _ensure_compatible_indexes()
-    _backfill_competitor_assignments()
+    if os.getenv("RUN_LEGACY_ASSIGNMENT_BACKFILL_ON_STARTUP", "").strip().lower() in {"1", "true", "yes", "on"}:
+        _backfill_competitor_assignments()
     _backfill_competitor_price_coefficients()
     _backfill_percentile_preparations()
 

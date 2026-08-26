@@ -31,6 +31,8 @@ import { ContractorsTab } from './components/ContractorsTab';
 import { PricingRulesTab } from './components/PricingRulesTab';
 import { AnalyticsTab } from './components/AnalyticsTab';
 import { UserGuideTab } from './components/UserGuideTab';
+import { VidmanMatchingReviewTab } from './components/VidmanMatchingReviewTab';
+import { VidmanInternalCoverageTab } from './components/VidmanInternalCoverageTab';
 import {
   competitorFreshnessClassName,
   competitorFreshnessLabel,
@@ -70,6 +72,8 @@ type NavigationKey =
   | 'pricing'
   | 'references'
   | 'competitor-domain'
+  | 'vidman-review'
+  | 'vidman-internal-coverage'
   | 'analytics'
   | 'help';
 
@@ -397,6 +401,10 @@ export default function App() {
         return <ReferencesTab isReadOnly={Boolean(currentUser?.isReadOnly)} />;
       case 'competitor-domain':
         return <CompetitorsTab formatCode={selectedFormat.code} />;
+      case 'vidman-review':
+        return <VidmanMatchingReviewTab isReadOnly={Boolean(currentUser?.isReadOnly)} />;
+      case 'vidman-internal-coverage':
+        return <VidmanInternalCoverageTab isReadOnly={Boolean(currentUser?.isReadOnly)} />;
       case 'analytics':
         return (
           <AnalyticsTab

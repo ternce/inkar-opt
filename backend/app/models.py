@@ -43,6 +43,45 @@ class ProductExtra(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
 
+class InternalProductNormalized(Base):
+    __tablename__ = "internal_product_normalized"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), unique=True, index=True)
+    raw_name: Mapped[str] = mapped_column(Text, default="")
+    raw_manufacturer: Mapped[str] = mapped_column(Text, default="")
+    normalized_name: Mapped[str] = mapped_column(Text, default="")
+    base_name: Mapped[str] = mapped_column(Text, default="")
+    normalized_manufacturer: Mapped[str] = mapped_column(Text, default="")
+    dosage_value: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    dosage_unit: Mapped[str] = mapped_column(String(32), default="")
+    strength_components: Mapped[str] = mapped_column(Text, default="")
+    concentration_value: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    concentration_unit: Mapped[str] = mapped_column(String(64), default="")
+    volume_value: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    volume_unit: Mapped[str] = mapped_column(String(32), default="")
+    weight_value: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    weight_unit: Mapped[str] = mapped_column(String(32), default="")
+    package_volume: Mapped[str] = mapped_column(Text, default="")
+    package_weight: Mapped[str] = mapped_column(Text, default="")
+    pack_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    dosage_form: Mapped[str] = mapped_column(String(64), default="")
+    variant_text: Mapped[str] = mapped_column(Text, default="")
+    identity_tokens_json: Mapped[str] = mapped_column(Text, default="[]")
+    normalized_signature: Mapped[str] = mapped_column(Text, default="")
+    parse_warnings_json: Mapped[str] = mapped_column(Text, default="[]")
+    parse_confidence: Mapped[float] = mapped_column(Numeric(18, 4), default=0)
+    source_updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    normalized_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    __table_args__ = (
+        Index("ix_internal_product_normalized_signature", "normalized_signature"),
+        Index("ix_internal_product_normalized_base_name", "base_name"),
+        Index("ix_internal_product_normalized_manufacturer", "normalized_manufacturer"),
+    )
+
+
 class PriceFormat(Base):
     __tablename__ = "price_formats"
 
@@ -381,6 +420,443 @@ class ManualPriceListImportError(Base):
     error_code: Mapped[str] = mapped_column(String(64), default="", index=True)
     message: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+
+class VidmanAccount(Base):
+    __tablename__ = "vidman_accounts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    login: Mapped[str] = mapped_column(Text, unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+
+class VidmanPriceList(Base):
+    __tablename__ = "vidman_price_lists"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("vidman_accounts.id"), index=True)
+    main_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    name: Mapped[str] = mapped_column(Text, default="")
+    source_url: Mapped[str] = mapped_column(Text, default="")
+    detected_pages: Mapped[int] = mapped_column(Integer, default=0)
+    last_collected_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    __table_args__ = (
+        UniqueConstraint("account_id", "main_id", name="uq_vidman_price_lists_account_main"),
+        Index("ix_vidman_price_lists_account_main", "account_id", "main_id"),
+    )
+
+
+class VidmanCompetitorPriceListSource(Base):
+    __tablename__ = "vidman_competitor_price_list_sources"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("vidman_accounts.id"), index=True)
+    main_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    price_format_code: Mapped[str] = mapped_column(Text, default="", index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    region: Mapped[str] = mapped_column(Text, default="")
+    branch_id: Mapped[str] = mapped_column(Text, default="")
+    branch_code: Mapped[str] = mapped_column(Text, default="")
+    branch_name: Mapped[str] = mapped_column(Text, default="")
+    competitor_name: Mapped[str] = mapped_column(Text, default="")
+    price_coefficient: Mapped[float] = mapped_column(Numeric(18, 6), default=1.0)
+    last_successful_import_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("vidman_import_runs.id"), nullable=True, index=True
+    )
+    competitor_price_list_id: Mapped[int | None] = mapped_column(
+        ForeignKey("competitor_price_lists.id"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    __table_args__ = (
+        UniqueConstraint("account_id", "main_id", "price_format_code", name="uq_vidman_competitor_plk_source"),
+        Index("ix_vidman_competitor_plk_source_active", "is_active", "price_format_code"),
+    )
+
+
+class VidmanLogicalCompetitor(Base):
+    __tablename__ = "vidman_logical_competitors"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(Text, index=True)
+    region: Mapped[str] = mapped_column(Text, default="", index=True)
+    price_format_id: Mapped[int | None] = mapped_column(ForeignKey("price_formats.id"), nullable=True, index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    collision_status: Mapped[str] = mapped_column(String(64), default="UNRESOLVED", index=True)
+    collision_notes: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    __table_args__ = (
+        UniqueConstraint("name", "region", "price_format_id", name="uq_vidman_logical_competitor_scope"),
+    )
+
+
+class VidmanLogicalCompetitorSource(Base):
+    __tablename__ = "vidman_logical_competitor_sources"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    logical_competitor_id: Mapped[int] = mapped_column(ForeignKey("vidman_logical_competitors.id"), index=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("vidman_accounts.id"), index=True)
+    main_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    role: Mapped[str] = mapped_column(String(32), default="FALLBACK", index=True)
+    priority: Mapped[int] = mapped_column(Integer, default=100, index=True)
+    approved_manually: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    __table_args__ = (
+        UniqueConstraint("account_id", "main_id", name="uq_vidman_logical_competitor_source_source"),
+        Index("ix_vidman_logical_source_competitor_role", "logical_competitor_id", "role", "active"),
+    )
+
+
+class VidmanImportRun(Base):
+    __tablename__ = "vidman_import_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("vidman_accounts.id"), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    total_plks: Mapped[int] = mapped_column(Integer, default=0)
+    completed_plks: Mapped[int] = mapped_column(Integer, default=0)
+    failed_plks: Mapped[int] = mapped_column(Integer, default=0)
+    total_pages: Mapped[int] = mapped_column(Integer, default=0)
+    total_rows: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class VidmanImportPage(Base):
+    __tablename__ = "vidman_import_pages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    import_run_id: Mapped[int] = mapped_column(ForeignKey("vidman_import_runs.id"), index=True)
+    price_list_id: Mapped[int] = mapped_column(ForeignKey("vidman_price_lists.id"), index=True)
+    main_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    page_number: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    rows_count: Mapped[int] = mapped_column(Integer, default=0)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    __table_args__ = (
+        UniqueConstraint("import_run_id", "price_list_id", "page_number", name="uq_vidman_import_pages_run_list_page"),
+        Index("ix_vidman_import_pages_resume", "import_run_id", "status", "main_id", "page_number"),
+    )
+
+
+class VidmanRawItem(Base):
+    __tablename__ = "vidman_raw_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    import_run_id: Mapped[int] = mapped_column(ForeignKey("vidman_import_runs.id"), index=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("vidman_accounts.id"), index=True)
+    price_list_id: Mapped[int] = mapped_column(ForeignKey("vidman_price_lists.id"), index=True)
+    main_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    page_number: Mapped[int] = mapped_column(Integer, index=True)
+    row_number: Mapped[int] = mapped_column(Integer)
+    raw_name: Mapped[str] = mapped_column(Text, default="")
+    raw_manufacturer: Mapped[str] = mapped_column(Text, default="")
+    raw_expiry_text: Mapped[str] = mapped_column(Text, default="")
+    expiry_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    raw_price_text: Mapped[str] = mapped_column(Text, default="")
+    price: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    raw_pack_qty: Mapped[str] = mapped_column(Text, default="")
+    pack_qty: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    raw_min_order: Mapped[str] = mapped_column(Text, default="")
+    min_order: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    raw_stock: Mapped[str] = mapped_column(Text, default="")
+    stock: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    raw_html: Mapped[str] = mapped_column(Text, default="")
+    row_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    __table_args__ = (
+        Index("ix_vidman_raw_items_run_list_page", "import_run_id", "price_list_id", "page_number"),
+    )
+
+
+class VidmanNormalizedItem(Base):
+    __tablename__ = "vidman_normalized_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    raw_item_id: Mapped[int] = mapped_column(ForeignKey("vidman_raw_items.id"), unique=True, index=True)
+    normalized_name: Mapped[str] = mapped_column(Text, default="")
+    normalized_manufacturer: Mapped[str] = mapped_column(Text, default="")
+    base_name: Mapped[str] = mapped_column(Text, default="", index=True)
+    dosage_value: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    dosage_unit: Mapped[str] = mapped_column(String(32), default="")
+    concentration_value: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    concentration_unit: Mapped[str] = mapped_column(String(32), default="")
+    volume_value: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    volume_unit: Mapped[str] = mapped_column(String(32), default="")
+    weight_value: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    weight_unit: Mapped[str] = mapped_column(String(32), default="")
+    pack_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    dosage_form: Mapped[str] = mapped_column(String(64), default="")
+    variant_text: Mapped[str] = mapped_column(Text, default="")
+    normalized_signature: Mapped[str] = mapped_column(Text, default="", index=True)
+    parse_confidence: Mapped[float] = mapped_column(Numeric(18, 4), default=0)
+    parse_warnings_json: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    __table_args__ = (
+        Index("ix_vidman_normalized_signature", "normalized_signature"),
+        Index("ix_vidman_normalized_base_name", "base_name"),
+        Index("ix_vidman_normalized_manufacturer", "normalized_manufacturer"),
+    )
+
+
+class VidmanCanonicalProduct(Base):
+    __tablename__ = "vidman_canonical_products"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    canonical_name: Mapped[str] = mapped_column(Text, default="")
+    canonical_manufacturer: Mapped[str] = mapped_column(Text, default="")
+    base_name: Mapped[str] = mapped_column(Text, default="", index=True)
+    dosage_value: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    dosage_unit: Mapped[str] = mapped_column(String(32), default="")
+    concentration_value: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    concentration_unit: Mapped[str] = mapped_column(String(32), default="")
+    volume_value: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    volume_unit: Mapped[str] = mapped_column(String(32), default="")
+    weight_value: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    weight_unit: Mapped[str] = mapped_column(String(32), default="")
+    pack_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    dosage_form: Mapped[str] = mapped_column(String(64), default="")
+    canonical_signature: Mapped[str] = mapped_column(Text, unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    raw_variants_count: Mapped[int] = mapped_column(Integer, default=0)
+    accounts_count: Mapped[int] = mapped_column(Integer, default=0)
+    plks_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    __table_args__ = (
+        Index("ix_vidman_canonical_signature", "canonical_signature"),
+        Index("ix_vidman_canonical_base_name", "base_name"),
+        Index("ix_vidman_canonical_manufacturer", "canonical_manufacturer"),
+    )
+
+
+class VidmanRawCanonicalLink(Base):
+    __tablename__ = "vidman_raw_canonical_links"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    raw_item_id: Mapped[int] = mapped_column(ForeignKey("vidman_raw_items.id"), unique=True, index=True)
+    normalized_item_id: Mapped[int] = mapped_column(ForeignKey("vidman_normalized_items.id"), index=True)
+    canonical_product_id: Mapped[int] = mapped_column(ForeignKey("vidman_canonical_products.id"), index=True)
+    match_type: Mapped[str] = mapped_column(String(64), default="")
+    confidence: Mapped[float] = mapped_column(Numeric(18, 4), default=0)
+    is_auto_linked: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    __table_args__ = (
+        Index("ix_vidman_raw_canonical_links_canonical", "canonical_product_id"),
+    )
+
+
+class VidmanProductMatch(Base):
+    __tablename__ = "vidman_product_matches"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    canonical_product_id: Mapped[int] = mapped_column(
+        ForeignKey("vidman_canonical_products.id"), unique=True, index=True
+    )
+    product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id"), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="UNMATCHED", index=True)
+    match_type: Mapped[str] = mapped_column(String(64), default="")
+    confidence: Mapped[float] = mapped_column(Numeric(18, 4), default=0)
+    candidate_count: Mapped[int] = mapped_column(Integer, default=0)
+    matched_by: Mapped[str] = mapped_column(Text, default="")
+    evidence_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class VidmanProductMatchCandidate(Base):
+    __tablename__ = "vidman_product_match_candidates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    canonical_product_id: Mapped[int] = mapped_column(ForeignKey("vidman_canonical_products.id"), index=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
+    rank: Mapped[int] = mapped_column(Integer, default=0)
+    score: Mapped[float] = mapped_column(Numeric(18, 4), default=0)
+    match_type: Mapped[str] = mapped_column(String(64), default="")
+    evidence_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "canonical_product_id",
+            "product_id",
+            name="uq_vidman_product_match_candidates_canonical_product",
+        ),
+        Index("ix_vidman_product_match_candidates_lookup", "canonical_product_id", "rank"),
+    )
+
+
+class VidmanProductReviewQueue(Base):
+    __tablename__ = "vidman_product_review_queue"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    canonical_product_id: Mapped[int] = mapped_column(
+        ForeignKey("vidman_canonical_products.id"), unique=True, index=True
+    )
+    tier: Mapped[str] = mapped_column(String(32), default="", index=True)
+    top_candidate_product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id"), nullable=True, index=True)
+    top_candidate_score: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    second_candidate_score: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    score_gap: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    candidate_count: Mapped[int] = mapped_column(Integer, default=0)
+    shared_structural_fields: Mapped[int] = mapped_column(Integer, default=0)
+    hard_conflicts_json: Mapped[str] = mapped_column(Text, default="[]")
+    review_reason: Mapped[str] = mapped_column(Text, default="")
+    candidate_rankings_json: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    __table_args__ = (
+        Index("ix_vidman_review_queue_tier_score", "tier", "top_candidate_score"),
+        Index("ix_vidman_review_queue_candidate", "top_candidate_product_id"),
+    )
+
+
+class VidmanRejectedCandidate(Base):
+    __tablename__ = "vidman_rejected_candidates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    canonical_product_id: Mapped[int] = mapped_column(ForeignKey("vidman_canonical_products.id"), index=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    actor: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "canonical_product_id",
+            "product_id",
+            name="uq_vidman_rejected_candidates_canonical_product",
+        ),
+        Index("ix_vidman_rejected_candidates_lookup", "canonical_product_id", "product_id"),
+    )
+
+
+class VidmanProductMatchAudit(Base):
+    __tablename__ = "vidman_product_match_audit"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    canonical_product_id: Mapped[int] = mapped_column(ForeignKey("vidman_canonical_products.id"), index=True)
+    previous_status: Mapped[str] = mapped_column(String(32), default="")
+    new_status: Mapped[str] = mapped_column(String(32), default="")
+    previous_product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id"), nullable=True)
+    new_product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id"), nullable=True)
+    action: Mapped[str] = mapped_column(String(64), default="", index=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    actor: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    __table_args__ = (
+        Index("ix_vidman_product_match_audit_canonical_created", "canonical_product_id", "created_at"),
+    )
+
+
+class VidmanInternalCoverageQueue(Base):
+    __tablename__ = "vidman_internal_coverage_queue"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), unique=True, index=True)
+    tier: Mapped[str] = mapped_column(String(32), default="", index=True)
+    top_candidate_canonical_id: Mapped[int | None] = mapped_column(
+        ForeignKey("vidman_canonical_products.id"), nullable=True, index=True
+    )
+    top_candidate_score: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    second_candidate_score: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    score_gap: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    candidate_count: Mapped[int] = mapped_column(Integer, default=0)
+    shared_structural_fields: Mapped[int] = mapped_column(Integer, default=0)
+    hard_conflicts_json: Mapped[str] = mapped_column(Text, default="[]")
+    coverage_reason: Mapped[str] = mapped_column(Text, default="")
+    candidate_rankings_json: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    __table_args__ = (
+        Index("ix_vidman_internal_coverage_tier_score", "tier", "top_candidate_score"),
+        Index("ix_vidman_internal_coverage_candidate", "top_candidate_canonical_id"),
+    )
+
+
+class VidmanInternalCoverageRejection(Base):
+    __tablename__ = "vidman_internal_coverage_rejections"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
+    canonical_product_id: Mapped[int] = mapped_column(ForeignKey("vidman_canonical_products.id"), index=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    actor: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "product_id",
+            "canonical_product_id",
+            name="uq_vidman_internal_coverage_rejection_product_canonical",
+        ),
+        Index("ix_vidman_internal_coverage_rejection_lookup", "product_id", "canonical_product_id"),
+    )
+
+
+class VidmanInternalCoverageDecision(Base):
+    __tablename__ = "vidman_internal_coverage_decisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="", index=True)
+    canonical_product_id: Mapped[int | None] = mapped_column(
+        ForeignKey("vidman_canonical_products.id"), nullable=True, index=True
+    )
+    reason: Mapped[str] = mapped_column(Text, default="")
+    actor: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+
+class VidmanInternalCoverageAudit(Base):
+    __tablename__ = "vidman_internal_coverage_audit"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
+    canonical_product_id: Mapped[int | None] = mapped_column(
+        ForeignKey("vidman_canonical_products.id"), nullable=True, index=True
+    )
+    previous_state: Mapped[str] = mapped_column(String(64), default="")
+    new_state: Mapped[str] = mapped_column(String(64), default="")
+    action: Mapped[str] = mapped_column(String(64), default="", index=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    actor: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    __table_args__ = (
+        Index("ix_vidman_internal_coverage_audit_product_created", "product_id", "created_at"),
+    )
 
 
 class CompetitorPricePercentile(Base):

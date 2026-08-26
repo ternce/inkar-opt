@@ -64,11 +64,12 @@ def get_settings() -> Settings:
         raise ValueError("PROCESS_ROLE must be one of: all, web, worker")
 
     cors_allow_origins_raw = os.getenv("CORS_ALLOW_ORIGINS")
-    cors_allow_origins = (
-        [x.strip() for x in cors_allow_origins_raw.split(",") if x.strip()]
-        if cors_allow_origins_raw
-        else ["http://localhost:5173"]
-    )
+    if cors_allow_origins_raw:
+        cors_allow_origins = [x.strip() for x in cors_allow_origins_raw.split(",") if x.strip()]
+    elif environment.strip().lower() in {"prod", "production"}:
+        cors_allow_origins = []
+    else:
+        cors_allow_origins = ["http://localhost:5173"]
 
     def env_bool(name: str, default: bool = False) -> bool:
         raw = os.getenv(name)

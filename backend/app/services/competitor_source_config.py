@@ -75,7 +75,7 @@ def canonical_competitor_source_key(row: CompetitorPriceList) -> str:
     if source_type == "provisor" and external_id:
         return f"plk:{external_id}"
     if source_type == "vidman" and account_id and external_id:
-        return f"{account_id}:{external_id}"
+        return f"account:{account_id}:main:{external_id}"
     if source_type == "manual" and external_id:
         return f"manual:{external_id}"
     if source_type and account_id and branch_id:

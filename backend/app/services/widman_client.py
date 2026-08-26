@@ -1018,9 +1018,7 @@ class WidmanClient:
         return main_id
 
     async def _load_items_page(self, main_id: str, page: int, *, referer_price_id: str | None = None) -> str:
-        data: dict[str, Any] = {"main_id": main_id}
-        if page > 1:
-            data["pageCurrent"] = page
+        data: dict[str, Any] = {"str": "", "main_id": main_id, "pageCurrent": page}
         return await self._post_html(
             "/price/see_view",
             data=data,

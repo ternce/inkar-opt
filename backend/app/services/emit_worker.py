@@ -32,7 +32,6 @@ from sqlalchemy.orm import Session, object_session, sessionmaker
 from ..config import Settings
 from ..models import CompetitorPriceList, CompetitorPriceListItem, PriceFormat, PriceFormatCompetitorAssignment, RefreshJob, RefreshLock
 from .db_time import db_now
-from .competitor_assignments import propagate_emit_assignments_to_price_formats, upsert_assignment
 from .competitor_percentiles import fanout_emit_percentiles_from_price_format, recalculate_competitor_percentiles
 from .competitor_read_models import refresh_price_list_item_counters
 from .competitor_source_config import canonical_competitor_source_key
@@ -2820,34 +2819,10 @@ def _recalculate_percentiles_for_emit_rows(
                 warning["message"],
             )
             return {"summaries": {}, "warnings": [warning], "assigned_price_format_ids": []}
-        for price_list_id in ids:
-            upsert_assignment(
-                db=db,
-                price_format_id=int(requested_pf.id),
-                competitor_price_list_id=price_list_id,
-                coefficient=1.0,
-                is_active=True,
-            )
-        db.flush()
-
     price_lists = {
         int(row.id): row
         for row in db.execute(select(CompetitorPriceList).where(CompetitorPriceList.id.in_(ids))).scalars().all()
     } if ids else {}
-
-    propagation = propagate_emit_assignments_to_price_formats(db=db, emit_price_list_ids=ids) if ids else None
-    if propagation is not None:
-        logger.info(
-            "[EMIT_FORMAT_CONTEXT] action=global_assignment_propagation price_list_ids=%s created=%s reused=%s "
-            "reactivated=%s skipped_incompatible=%s affected_price_format_ids=%s",
-            ids,
-            propagation.created_count,
-            propagation.reused_count,
-            propagation.reactivated_count,
-            propagation.skipped_incompatible_count,
-            propagation.affected_price_format_ids,
-        )
-        db.flush()
 
     assignment_rows = list(
         db.execute(
@@ -3021,7 +2996,7 @@ def _recalculate_percentiles_for_emit_rows(
         "summaries": summaries,
         "warnings": warnings,
         "assigned_price_format_ids": sorted(touched_format_ids),
-        "assignment_propagation": propagation.to_dict() if propagation is not None else {},
+        "assignment_propagation": {},
         "percentile_rebuild_scope": "emit_source_shared" if can_share_emit_calculation and len(touched_format_id_list) > 1 else "emit_format",
         "percentile_source_key": sorted(
             {
