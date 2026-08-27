@@ -13,6 +13,8 @@ import {
   buildPricingRuleCreatePayload,
   canSubmitPricingRuleCreate,
   draftFromCopySource,
+  emptyPricingRuleDraft,
+  hydratePricingRuleDraft,
   pricingRuleCreateErrorMessage,
 } from '../pricingRuleCreateFlow';
 import {
@@ -406,7 +408,7 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
   const [noCompetitors, setNoCompetitors] = useState<Template[]>([]);
   const [roundings, setRoundings] = useState<RoundingRule[]>([]);
   const [selectedRuleId, setSelectedRuleId] = useState<string>('new');
-  const [draft, setDraft] = useState<PricingRule>(() => emptyRule());
+  const [draft, setDraft] = useState<PricingRule>(() => emptyPricingRuleDraft());
   const [copyFromRuleId, setCopyFromRuleId] = useState<string>(NO_COPY_SOURCE);
   const [formatRuleId, setFormatRuleId] = useState<string>('none');
   const [appliedRule, setAppliedRule] = useState<AppliedRuleStatus | null>(null);
@@ -414,6 +416,7 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const loadRequestRef = useRef(0);
+  const ruleLoadRequestRef = useRef(0);
 
   const load = async () => {
     const requestId = ++loadRequestRef.current;
@@ -460,24 +463,34 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
   const ruleById = useMemo(() => new Map(rules.map((rule) => [String(rule.id), rule])), [rules]);
 
   const selectRule = async (value: string) => {
+    const requestId = ++ruleLoadRequestRef.current;
     setSelectedRuleId(value);
     if (value === 'new') {
-      setDraft(emptyRule());
+      setDraft(emptyPricingRuleDraft());
       setCopyFromRuleId(NO_COPY_SOURCE);
       return;
     }
     setCopyFromRuleId(NO_COPY_SOURCE);
-    const res = await fetch(`/api/pricing-rules/${value}`);
-    const text = await res.text();
-    const data = parseJsonOrNull(text);
-    if (res.ok && data) setDraft(normalizeRule(data));
+    const listedRule = ruleById.get(value);
+    if (listedRule) setDraft(hydratePricingRuleDraft(listedRule));
+    try {
+      const res = await fetch(`/api/pricing-rules/${value}`);
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (requestId !== ruleLoadRequestRef.current) return;
+      if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить правило ЦО');
+      if (data) setDraft(hydratePricingRuleDraft(data));
+    } catch (e: any) {
+      if (requestId !== ruleLoadRequestRef.current) return;
+      setError(e?.message || 'Ошибка загрузки правила ЦО');
+    }
   };
 
   const selectCopySource = async (value: string) => {
     setCopyFromRuleId(value);
     if (value === NO_COPY_SOURCE) {
       setDraft((prev) => ({
-        ...emptyRule(),
+        ...emptyPricingRuleDraft(),
         code: prev.code,
         name: prev.name,
       }));
@@ -490,7 +503,7 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
       const text = await res.text();
       const data = parseJsonOrNull(text);
       if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить правило-источник');
-      setDraft((prev) => draftFromCopySource(prev, normalizeRule(data)));
+      setDraft((prev) => draftFromCopySource(prev, hydratePricingRuleDraft(data)));
     } catch (e: any) {
       setError(e?.message || 'Ошибка загрузки правила-источника');
     } finally {
@@ -512,7 +525,7 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
       const text = await res.text();
       const data = parseJsonOrNull(text);
       if (!res.ok) throw new Error(pricingRuleCreateErrorMessage(data, text));
-      const normalized = normalizeRule(data);
+      const normalized = hydratePricingRuleDraft(data);
       const next = isNew ? applyPricingRuleCreateSuccess(normalized) : { selectedRuleId: String(data.id), draft: normalized, copyFromRuleId };
       setSelectedRuleId(next.selectedRuleId);
       setDraft(next.draft);
@@ -528,10 +541,10 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
 
   const copyRule = async () => {
     if (!draft.id) return;
-    const source = normalizeRule(draft);
+    const source = hydratePricingRuleDraft(draft);
     setSelectedRuleId('new');
     setCopyFromRuleId(String(source.id));
-    setDraft(draftFromCopySource(emptyRule(), source));
+    setDraft(draftFromCopySource(emptyPricingRuleDraft(), source));
   };
 
   const deleteRule = async () => {
@@ -539,7 +552,7 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
     const res = await fetch(`/api/pricing-rules/${draft.id}`, { method: 'DELETE' });
     if (res.ok) {
       setSelectedRuleId('new');
-      setDraft(emptyRule());
+      setDraft(emptyPricingRuleDraft());
       await load();
     }
   };
@@ -683,33 +696,6 @@ function FieldSelect({ label, value, items, disabled = false, onChange }: { labe
       </Select>
     </div>
   );
-}
-
-function emptyRule(): PricingRule {
-  return {
-    id: 0,
-    code: '',
-    name: '',
-    description: '',
-    regionScope: '',
-    branchScope: '',
-    markupTemplateId: null,
-    bendTemplateId: null,
-    noCompetitorTemplateId: null,
-    roundingRuleId: null,
-    isActive: true,
-  };
-}
-
-function normalizeRule(rule: PricingRule): PricingRule {
-  return {
-    ...emptyRule(),
-    ...rule,
-    markupTemplateId: rule.markupTemplateId ?? null,
-    bendTemplateId: rule.bendTemplateId ?? null,
-    noCompetitorTemplateId: rule.noCompetitorTemplateId ?? null,
-    roundingRuleId: rule.roundingRuleId ?? null,
-  };
 }
 
 function RoundingEditor({ items, appliedRoundingRuleId, onReload }: { items: RoundingRule[]; appliedRoundingRuleId: number | null; onReload: () => Promise<void> }) {

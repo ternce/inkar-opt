@@ -8,6 +8,7 @@ import { toast } from 'sonner';
 import { listTypeLabel } from './listTypeLabels';
 import { resolvePricingRuleSettings } from '../pricingRuleSettings';
 import { parseRequiredDecimalInput } from '../decimalInput';
+import { SUPPORTED_CITIES } from '../supportedCities';
 import {
   canRetryPercentilePreparation,
   percentilePreparationClassName,
@@ -932,10 +933,9 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="none">—</SelectItem>
-                <SelectItem value="Астана">Астана</SelectItem>
-                <SelectItem value="Алматы">Алматы</SelectItem>
-                <SelectItem value="Шымкент">Шымкент</SelectItem>
+                {SUPPORTED_CITIES.map((city) => (
+                  <SelectItem key={city} value={city}>{city}</SelectItem>
+                ))}
               </SelectContent>
             </Select>
           </div>

@@ -28,6 +28,25 @@ CITIES: list[City] = [
     City(17, "Шымкент"),
 ]
 
+SUPPORTED_USER_CITY_NAMES: tuple[str, ...] = (
+    "Алматы",
+    "Астана",
+    "Шымкент",
+    "Атырау",
+    "Есик",
+    "Караганда",
+    "Костанай",
+    "Семей",
+    "Усть-Каменогорск",
+    "Павлодар",
+    "Актау",
+    "Актобе",
+)
+
+SUPPORTED_USER_CITIES: tuple[City, ...] = tuple(
+    City(index, name) for index, name in enumerate(SUPPORTED_USER_CITY_NAMES, start=1)
+)
+
 CITY_ID_BY_NAME: dict[str, int] = {
     "Алматы": 1,
     "Нур-Султан": 2,

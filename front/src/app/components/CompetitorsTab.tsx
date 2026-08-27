@@ -19,6 +19,7 @@ import {
   formatLocalDateTime,
   usefulSourceTimestamp,
 } from '../competitorTimestamps';
+import { isSupportedCity } from '../supportedCities';
 
 type Platform = 'provisor' | 'vidman';
 type MappingStatus = 'all' | 'mapped' | 'unmapped' | 'rejected' | 'no_candidates';
@@ -468,7 +469,7 @@ function PercentileBrowser({
     ['Без конкурентов', summary.productsWithoutCompetitors],
     ['Покрытие', `${fmtNumber(summary.coveragePercent)}%`],
   ];
-  const groupOptions = groups.filter((group) => group.scope !== 'kazakhstan');
+  const groupOptions = groups.filter((group) => group.scope !== 'kazakhstan' && isSupportedCity(group.region));
   const isCompetitorSource = percentileSource === 'competitor';
   const selectedGroupId = isCompetitorSource
     ? selectedApiIdentity || groupOptions.find((group) => group.sourceKey === selectedSourceKey)?.apiIdentity || '__none__'

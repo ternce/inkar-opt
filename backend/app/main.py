@@ -270,7 +270,7 @@ from .services.references.ratings import RATING_DATA_TYPES, import_top_rating_ex
 from .services.references.sources import ReferenceFilePayload, make_reference_source
 from .services.references.statuses import import_job_to_dict, list_reference_imports, list_reference_statuses, reference_readiness_matrix
 from .services.references.templates import build_reference_template, reference_template_filename
-from .services.references.types import BRANCHES, REFERENCE_TYPES
+from .services.references.types import BRANCHES, REFERENCE_TYPES, USER_SELECTABLE_BRANCHES
 from .services.pricing_workflow.analytics import analytics_for_run, build_workflow_analytics
 from .services.pricing_workflow.contexts import list_contexts
 from .services.pricing_workflow.exports import export_workflow_run
@@ -6484,9 +6484,13 @@ def get_reference_types():
 @app.get("/api/references/branches")
 def get_reference_branches(current_user: AppUser = Depends(get_current_user)):
     if can_see_all_branches(current_user):
-        return BRANCHES
+        return USER_SELECTABLE_BRANCHES
     ids = assigned_branch_ids(current_user)
-    return [row for row in BRANCHES if str(row["id"]) in ids or user_can_access_branch(current_user, str(row["id"]), str(row["name"]))]
+    return [
+        row
+        for row in USER_SELECTABLE_BRANCHES
+        if str(row["id"]) in ids or user_can_access_branch(current_user, str(row["id"]), str(row["name"]))
+    ]
 
 
 @app.get("/api/references/status")

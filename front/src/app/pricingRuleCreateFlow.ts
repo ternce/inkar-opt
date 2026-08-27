@@ -14,6 +14,29 @@ export type PricingRuleDraft = {
 
 export const NO_COPY_SOURCE = 'none';
 
+export const emptyPricingRuleDraft = (): PricingRuleDraft => ({
+  id: 0,
+  code: '',
+  name: '',
+  description: '',
+  regionScope: '',
+  branchScope: '',
+  markupTemplateId: null,
+  bendTemplateId: null,
+  noCompetitorTemplateId: null,
+  roundingRuleId: null,
+  isActive: true,
+});
+
+export const hydratePricingRuleDraft = (rule: Partial<PricingRuleDraft>): PricingRuleDraft => ({
+  ...emptyPricingRuleDraft(),
+  ...rule,
+  markupTemplateId: rule.markupTemplateId ?? null,
+  bendTemplateId: rule.bendTemplateId ?? null,
+  noCompetitorTemplateId: rule.noCompetitorTemplateId ?? null,
+  roundingRuleId: rule.roundingRuleId ?? null,
+});
+
 export const buildPricingRuleCreatePayload = (draft: PricingRuleDraft, copyFromRuleId: string) => {
   const payload: Record<string, unknown> = { ...draft };
   if (copyFromRuleId !== NO_COPY_SOURCE) {

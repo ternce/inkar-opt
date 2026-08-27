@@ -7,6 +7,8 @@ import {
   buildPricingRuleCreatePayload,
   canSubmitPricingRuleCreate,
   draftFromCopySource,
+  emptyPricingRuleDraft,
+  hydratePricingRuleDraft,
   pricingRuleCreateErrorMessage,
   type PricingRuleDraft,
 } from './pricingRuleCreateFlow.ts';
@@ -62,4 +64,76 @@ test('copy source prefill does not mutate source frontend state', () => {
   assert.equal(copiedDraft.name, 'New name');
   assert.equal(copiedDraft.markupTemplateId, 10);
   assert.deepEqual(source, before);
+});
+
+test('new rule draft starts with empty linked settings', () => {
+  assert.deepEqual(emptyPricingRuleDraft(), draft({ code: '', name: '' }));
+});
+
+test('existing rule hydration preserves all linked settings', () => {
+  const hydrated = hydratePricingRuleDraft({
+    id: 3,
+    code: 'RULE',
+    name: 'Rule',
+    markupTemplateId: 10,
+    bendTemplateId: 20,
+    noCompetitorTemplateId: 30,
+    roundingRuleId: 40,
+  });
+
+  assert.equal(hydrated.markupTemplateId, 10);
+  assert.equal(hydrated.bendTemplateId, 20);
+  assert.equal(hydrated.noCompetitorTemplateId, 30);
+  assert.equal(hydrated.roundingRuleId, 40);
+});
+
+test('existing rule hydration preserves partial null linked settings', () => {
+  const hydrated = hydratePricingRuleDraft({
+    id: 4,
+    code: 'PARTIAL',
+    name: 'Partial',
+    markupTemplateId: 10,
+    bendTemplateId: null,
+    noCompetitorTemplateId: 30,
+  });
+
+  assert.equal(hydrated.markupTemplateId, 10);
+  assert.equal(hydrated.bendTemplateId, null);
+  assert.equal(hydrated.noCompetitorTemplateId, 30);
+  assert.equal(hydrated.roundingRuleId, null);
+});
+
+test('switching between existing and new rule drafts updates every linked field', () => {
+  const first = hydratePricingRuleDraft(draft({ id: 1, markupTemplateId: 10, bendTemplateId: 20, noCompetitorTemplateId: 30, roundingRuleId: 40 }));
+  const cleared = emptyPricingRuleDraft();
+  const second = hydratePricingRuleDraft(draft({ id: 2, markupTemplateId: 11, bendTemplateId: null, noCompetitorTemplateId: 31, roundingRuleId: null }));
+
+  assert.deepEqual(
+    [first.markupTemplateId, first.bendTemplateId, first.noCompetitorTemplateId, first.roundingRuleId],
+    [10, 20, 30, 40]
+  );
+  assert.deepEqual(
+    [cleared.markupTemplateId, cleared.bendTemplateId, cleared.noCompetitorTemplateId, cleared.roundingRuleId],
+    [null, null, null, null]
+  );
+  assert.deepEqual(
+    [second.markupTemplateId, second.bendTemplateId, second.noCompetitorTemplateId, second.roundingRuleId],
+    [11, null, 31, null]
+  );
+});
+
+test('save payload keeps unchanged relationships and isolated selector edits', () => {
+  const loaded = hydratePricingRuleDraft(draft({ id: 5, markupTemplateId: 10, bendTemplateId: 20, noCompetitorTemplateId: 30, roundingRuleId: 40 }));
+  assert.deepEqual(buildPricingRuleCreatePayload(loaded, NO_COPY_SOURCE), loaded);
+
+  const changed = { ...loaded, bendTemplateId: 21 };
+  assert.deepEqual(
+    [
+      changed.markupTemplateId,
+      changed.bendTemplateId,
+      changed.noCompetitorTemplateId,
+      changed.roundingRuleId,
+    ],
+    [10, 21, 30, 40]
+  );
 });

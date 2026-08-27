@@ -192,3 +192,89 @@ def test_applying_pricing_rule_persists_applied_template_identity_in_settings():
         assert payload["noCompetitorMarkups"][0]["markupPercent"] == 15
     finally:
         app.dependency_overrides.pop(get_db, None)
+
+
+def test_pricing_rule_update_without_selector_edits_preserves_relationships():
+    client, Session = _client()
+    try:
+        with Session() as db:
+            markup = MarkupTemplate(code="KEEP-M", name="Keep markup")
+            bend = BendTemplate(code="KEEP-B", name="Keep bend")
+            no_competitor = NoCompetitorMarkupTemplate(code="KEEP-N", name="Keep no competitor")
+            rounding = RoundingRule(code="KEEP-R", name="Keep rounding", mode="math", precision=2)
+            db.add_all([markup, bend, no_competitor, rounding])
+            db.flush()
+            rule = PricingRule(
+                code="KEEP-RULE",
+                name="Keep rule",
+                markup_template_id=markup.id,
+                bend_template_id=bend.id,
+                no_competitor_template_id=no_competitor.id,
+                rounding_rule_id=rounding.id,
+            )
+            db.add(rule)
+            db.commit()
+            ids = {
+                "rule": rule.id,
+                "markup": markup.id,
+                "bend": bend.id,
+                "no_competitor": no_competitor.id,
+                "rounding": rounding.id,
+            }
+
+        detail = client.get(f"/api/pricing-rules/{ids['rule']}")
+        assert detail.status_code == 200
+        payload = detail.json()
+        response = client.patch(f"/api/pricing-rules/{ids['rule']}", json=payload)
+
+        assert response.status_code == 200
+        saved = response.json()
+        assert saved["markupTemplateId"] == ids["markup"]
+        assert saved["bendTemplateId"] == ids["bend"]
+        assert saved["noCompetitorTemplateId"] == ids["no_competitor"]
+        assert saved["roundingRuleId"] == ids["rounding"]
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_pricing_rule_update_changes_one_relationship_without_clearing_others():
+    client, Session = _client()
+    try:
+        with Session() as db:
+            markup = MarkupTemplate(code="ONE-M", name="One markup")
+            old_bend = BendTemplate(code="ONE-B1", name="Old bend")
+            new_bend = BendTemplate(code="ONE-B2", name="New bend")
+            no_competitor = NoCompetitorMarkupTemplate(code="ONE-N", name="One no competitor")
+            rounding = RoundingRule(code="ONE-R", name="One rounding", mode="math", precision=2)
+            db.add_all([markup, old_bend, new_bend, no_competitor, rounding])
+            db.flush()
+            rule = PricingRule(
+                code="ONE-RULE",
+                name="One rule",
+                markup_template_id=markup.id,
+                bend_template_id=old_bend.id,
+                no_competitor_template_id=no_competitor.id,
+                rounding_rule_id=rounding.id,
+            )
+            db.add(rule)
+            db.commit()
+            ids = {
+                "rule": rule.id,
+                "markup": markup.id,
+                "new_bend": new_bend.id,
+                "no_competitor": no_competitor.id,
+                "rounding": rounding.id,
+            }
+
+        payload = client.get(f"/api/pricing-rules/{ids['rule']}").json()
+        payload["bendTemplateId"] = ids["new_bend"]
+        response = client.patch(f"/api/pricing-rules/{ids['rule']}", json=payload)
+
+        assert response.status_code == 200
+        saved = response.json()
+        assert saved["markupTemplateId"] == ids["markup"]
+        assert saved["bendTemplateId"] == ids["new_bend"]
+        assert saved["noCompetitorTemplateId"] == ids["no_competitor"]
+        assert saved["roundingRuleId"] == ids["rounding"]
+    finally:
+        app.dependency_overrides.pop(get_db, None)

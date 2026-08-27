@@ -33,6 +33,7 @@ import { AnalyticsTab } from './components/AnalyticsTab';
 import { UserGuideTab } from './components/UserGuideTab';
 import { VidmanMatchingReviewTab } from './components/VidmanMatchingReviewTab';
 import { VidmanInternalCoverageTab } from './components/VidmanInternalCoverageTab';
+import { SUPPORTED_CITIES, isSupportedCity } from './supportedCities';
 import {
   competitorFreshnessClassName,
   competitorFreshnessLabel,
@@ -124,23 +125,6 @@ navigationItems.push({
   icon: HelpCircle,
 });
 
-const defaultBranches = [
-  'Алматы',
-  'Астана',
-  'Шымкент',
-  'Актау',
-  'Актобе',
-  'Атырау',
-  'Караганда',
-  'Костанай',
-  'Кызылорда',
-  'Павлодар',
-  'Петропавловск',
-  'Талдыкорган',
-  'Уральск',
-  'Усть-Каменогорск',
-];
-
 const parseJsonOrNull = (text: string) => {
   try {
     return text ? JSON.parse(text) : null;
@@ -201,8 +185,8 @@ export default function App() {
   const [isResizingSidebar, setIsResizingSidebar] = useState(false);
 
   const branchOptions = useMemo(
-    () => uniqueByBranch([...priceFormats.map((format) => format.branch), ...defaultBranches]),
-    [priceFormats]
+    () => uniqueByBranch([...SUPPORTED_CITIES]),
+    []
   );
 
   const branchFormats = useMemo(
@@ -242,8 +226,9 @@ export default function App() {
       const userData = parseJsonOrNull(userText);
       if (userRes.ok && userData) setCurrentUser(userData);
 
-      const storedBranchHasFormats = selectedBranch && items.some((format) => isSameBranch(format.branch, selectedBranch));
-      const firstBranch = storedBranchHasFormats ? selectedBranch : (items[0]?.branch || '');
+      const storedBranchHasFormats = selectedBranch && isSupportedCity(selectedBranch) && items.some((format) => isSameBranch(format.branch, selectedBranch));
+      const firstSupportedFormat = items.find((format) => isSupportedCity(format.branch));
+      const firstBranch = storedBranchHasFormats ? selectedBranch : (firstSupportedFormat?.branch || SUPPORTED_CITIES[0]);
       const firstFormat = items.find((format) => isSameBranch(format.branch, firstBranch)) || items[0] || null;
       setPriceFormats(items);
       setSelectedBranch(firstBranch);
@@ -664,7 +649,8 @@ function HomeDashboard({
   }, [branch, referenceStatuses]);
 
   useEffect(() => {
-    setNewFormatBranch(branch || format.branch || '');
+    const nextBranch = branch || format.branch || '';
+    setNewFormatBranch(isSupportedCity(nextBranch) ? nextBranch : SUPPORTED_CITIES[0]);
   }, [branch, format.branch]);
 
   const createPriceFormat = async () => {
@@ -722,7 +708,7 @@ function HomeDashboard({
           <label>
             <span>Филиал / регион</span>
             <select value={branch} onChange={(event) => onBranchChange(event.target.value)}>
-              {uniqueByBranch([...branchFormats.map((item) => item.branch), branch, ...defaultBranches]).map((item) => (
+              {SUPPORTED_CITIES.map((item) => (
                 <option key={item} value={item}>{item || 'Без филиала'}</option>
               ))}
             </select>
@@ -766,7 +752,11 @@ function HomeDashboard({
             </label>
             <label>
               <span className="text-xs font-medium text-gray-500">Филиал</span>
-              <input className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm" value={newFormatBranch} onChange={(event) => setNewFormatBranch(event.target.value)} />
+              <select className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm" value={newFormatBranch} onChange={(event) => setNewFormatBranch(event.target.value)}>
+                {SUPPORTED_CITIES.map((item) => (
+                  <option key={item} value={item}>{item}</option>
+                ))}
+              </select>
             </label>
             <label>
               <span className="text-xs font-medium text-gray-500">Правило ЦО</span>

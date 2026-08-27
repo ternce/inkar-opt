@@ -8,6 +8,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { StickyTableToolbar } from './StickyTableToolbar';
 import { formatDateTimeKz } from '../timezone';
 import { shouldPollPercentilePreparation, type PercentilePreparation } from '../percentilePreparationStatus';
+import { SUPPORTED_CITIES, isSupportedCity } from '../supportedCities';
 
 type PriceFormat = {
   id?: string | number;
@@ -175,9 +176,8 @@ export function PricingWorkflowTab({
   const selectedDisplayDate = useMemo(() => inputDateToDisplayDate(activationDate), [activationDate]);
 
   const branchOptions = useMemo(() => {
-    const values = Array.from(new Map(priceFormats.map((format) => [branchKey(format.branch), format.branch])).values());
-    return values.length ? values : [selectedBranch];
-  }, [priceFormats, selectedBranch]);
+    return [...SUPPORTED_CITIES];
+  }, []);
 
   const priceByFormat = useMemo(() => {
     const map = new Map<string, GeneratedPriceList>();
@@ -284,7 +284,7 @@ export function PricingWorkflowTab({
   };
 
   useEffect(() => {
-    setSelectedBranch(branch || '');
+    setSelectedBranch(isSupportedCity(branch) ? branch : SUPPORTED_CITIES[0]);
   }, [branch]);
 
   useEffect(() => {

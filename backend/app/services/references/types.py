@@ -14,6 +14,23 @@ REFERENCE_TYPES = [
 
 REFERENCE_TYPE_BY_CODE = {row["code"]: row for row in REFERENCE_TYPES}
 
+SUPPORTED_USER_BRANCH_NAMES = [
+    "Алматы",
+    "Астана",
+    "Шымкент",
+    "Атырау",
+    "Есик",
+    "Караганда",
+    "Костанай",
+    "Семей",
+    "Усть-Каменогорск",
+    "Павлодар",
+    "Актау",
+    "Актобе",
+]
+
+USER_SELECTABLE_BRANCHES = [{"id": name, "name": name} for name in SUPPORTED_USER_BRANCH_NAMES]
+
 BRANCHES = [
     {"id": "1", "name": "Алматы"},
     {"id": "2", "name": "Астана"},
