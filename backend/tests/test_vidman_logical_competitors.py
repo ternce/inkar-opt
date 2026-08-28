@@ -35,6 +35,7 @@ def test_one_logical_competitor_can_have_primary_and_fallback():
     db.commit()
 
     [logical] = list_logical_competitors(db=db)
+    assert logical["region"] == "Актау"
     assert [row["role"] for row in logical["sources"]] == ["PRIMARY", "FALLBACK"]
 
 
@@ -87,6 +88,23 @@ def test_missing_region_blocks_assignment():
 
     with pytest.raises(ValueError, match="region"):
         assign_source_to_logical_competitor(db=db, logical_name="Inkar", account_id=2, main_id=11870, role="PRIMARY", price_format_code="004", apply=True)
+
+
+def test_unsupported_region_blocks_assignment():
+    db = _session()
+    _seed_format(db)
+
+    with pytest.raises(ValueError, match="supported regions"):
+        assign_source_to_logical_competitor(
+            db=db,
+            logical_name="Inkar",
+            account_id=2,
+            main_id=11870,
+            role="PRIMARY",
+            region="Кызылорда",
+            price_format_code="004",
+            apply=True,
+        )
 
 
 def test_missing_format_blocks_assignment():

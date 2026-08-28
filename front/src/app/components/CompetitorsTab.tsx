@@ -19,7 +19,7 @@ import {
   formatLocalDateTime,
   usefulSourceTimestamp,
 } from '../competitorTimestamps';
-import { isSupportedCity } from '../supportedCities';
+import { SUPPORTED_CITIES } from '../supportedCities';
 
 type Platform = 'provisor' | 'vidman';
 type MappingStatus = 'all' | 'mapped' | 'unmapped' | 'rejected' | 'no_candidates';
@@ -469,7 +469,7 @@ function PercentileBrowser({
     ['Без конкурентов', summary.productsWithoutCompetitors],
     ['Покрытие', `${fmtNumber(summary.coveragePercent)}%`],
   ];
-  const groupOptions = groups.filter((group) => group.scope !== 'kazakhstan' && isSupportedCity(group.region));
+  const groupOptions = groups.filter((group) => group.scope !== 'kazakhstan');
   const isCompetitorSource = percentileSource === 'competitor';
   const selectedGroupId = isCompetitorSource
     ? selectedApiIdentity || groupOptions.find((group) => group.sourceKey === selectedSourceKey)?.apiIdentity || '__none__'
@@ -676,6 +676,7 @@ export function CompetitorsTab({ formatCode }: Props) {
   const [percentileCompetitor, setPercentileCompetitor] = useState('');
   const [percentileSourceKey, setPercentileSourceKey] = useState('');
   const [percentileApiIdentity, setPercentileApiIdentity] = useState('');
+  const historicalManualBranch = manualTargetId && manualBranch && !SUPPORTED_CITIES.includes(manualBranch) ? manualBranch : '';
   const [percentilePriceColumns, setPercentilePriceColumns] = useState<PercentilePriceColumn[]>([]);
   const [percentileNumbers, setPercentileNumbers] = useState<number[]>([10, 20, 30, 40, 60]);
   const [percentileSearch, setPercentileSearch] = useState('');
@@ -1872,7 +1873,18 @@ export function CompetitorsTab({ formatCode }: Props) {
               <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
                 <Input placeholder="PLK name" value={manualName} onChange={(e) => setManualName(e.target.value)} />
                 <Input placeholder="Competitor" value={manualCompetitor} onChange={(e) => setManualCompetitor(e.target.value)} />
-                <Input placeholder="Branch / region" value={manualBranch} onChange={(e) => setManualBranch(e.target.value)} />
+                <Select value={manualBranch || '__none__'} onValueChange={(value) => setManualBranch(value === '__none__' ? '' : value)}>
+                  <SelectTrigger><SelectValue placeholder="Branch / region" /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__none__">Филиал ЦФ</SelectItem>
+                    {historicalManualBranch ? (
+                      <SelectItem value={historicalManualBranch}>{historicalManualBranch} (текущий исторический)</SelectItem>
+                    ) : null}
+                    {SUPPORTED_CITIES.map((city) => (
+                      <SelectItem key={city} value={city}>{city}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
                 <Input type="file" accept=".xlsx,.csv" onChange={(e) => setExcelFile(e.target.files?.[0] ?? null)} />
               </div>
               <div className="mt-3 flex flex-wrap items-center gap-2">

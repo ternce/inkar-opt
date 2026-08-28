@@ -271,6 +271,7 @@ from .services.references.sources import ReferenceFilePayload, make_reference_so
 from .services.references.statuses import import_job_to_dict, list_reference_imports, list_reference_statuses, reference_readiness_matrix
 from .services.references.templates import build_reference_template, reference_template_filename
 from .services.references.types import BRANCHES, REFERENCE_TYPES, USER_SELECTABLE_BRANCHES
+from .services.regions import canonical_supported_city_name
 from .services.pricing_workflow.analytics import analytics_for_run, build_workflow_analytics
 from .services.pricing_workflow.contexts import list_contexts
 from .services.pricing_workflow.exports import export_workflow_run
@@ -1855,6 +1856,16 @@ def _branch_id_for_name(branch_name: str) -> str:
     return next((str(row["id"]) for row in BRANCHES if _branch_norm(row["name"]) == normalized), "")
 
 
+def _canonical_user_selected_branch(branch: object, *, field_name: str = "branch") -> str:
+    text = str(branch or "").strip()
+    if not text:
+        return ""
+    canonical = canonical_supported_city_name(text)
+    if not canonical:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be one of supported regions")
+    return canonical
+
+
 def _filter_price_formats_for_user(rows: list[PriceFormat], user: AppUser) -> list[PriceFormat]:
     if can_see_all_branches(user):
         return rows
@@ -1902,6 +1913,7 @@ def create_price_format(
         raise HTTPException(status_code=400, detail="code is required")
     if not name:
         raise HTTPException(status_code=400, detail="name is required")
+    branch = _canonical_user_selected_branch(branch)
     if branch and not user_can_access_branch(current_user, _branch_id_for_name(branch), branch):
         raise HTTPException(status_code=403, detail="branch is not assigned to current user")
     existing = db.execute(select(PriceFormat).where(PriceFormat.code == code)).scalars().first()
@@ -6913,6 +6925,7 @@ async def create_manual_competitor_price_list(
     requested_by: str = Form(""),
     db: Session = Depends(get_db),
 ):
+    canonical_branch = _canonical_user_selected_branch(branch) if str(branch or "").strip() else ""
     content = await file.read()
     try:
         return import_manual_price_list(
@@ -6922,7 +6935,7 @@ async def create_manual_competitor_price_list(
             filename=file.filename or "manual.xlsx",
             display_name=name or None,
             competitor_name=competitor or None,
-            branch_name=branch or None,
+            branch_name=canonical_branch or None,
             address=address,
             requested_by=requested_by,
         )
@@ -6945,6 +6958,12 @@ async def reimport_manual_competitor_price_list(
     row = db.get(CompetitorPriceList, price_list_id)
     if row is None or row.source_type != "manual":
         raise HTTPException(status_code=404, detail="manual price list not found")
+    current_branch = str(row.branch_name or "").strip()
+    requested_branch = str(branch or "").strip()
+    if requested_branch and requested_branch != current_branch:
+        branch = _canonical_user_selected_branch(requested_branch)
+    elif not requested_branch:
+        branch = current_branch
     try:
         return import_manual_price_list(
             db=db,
@@ -9775,7 +9794,10 @@ def put_settings_for_format(
         percentile_relevant_change = False
 
     if isinstance(payload.get("branch"), str):
-        pf.branch = payload["branch"]
+        next_branch = str(payload["branch"]).strip()
+        if pf.branch != next_branch:
+            next_branch = _canonical_user_selected_branch(next_branch)
+        pf.branch = next_branch
     if isinstance(payload.get("pricingRule"), str):
         pf.pricing_rule = payload["pricingRule"]
     if "roundingRuleId" in payload and payload.get("roundingRuleId") in (None, "", "none"):

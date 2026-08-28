@@ -13,7 +13,6 @@ import {
   formatLocalDateTime,
 } from '../competitorTimestamps';
 import { parseRequiredDecimalInput } from '../decimalInput';
-import { isSupportedCity } from '../supportedCities';
 
 type PriceFormat = {
   id?: string;
@@ -375,7 +374,11 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
   }, [availableSources, branch, competitorFilter, regionFilter, searchTerm, sourceTypeFilter]);
 
   const regionOptions = useMemo(
-    () => Array.from(new Set(availableSources.map((row) => row.branchName || row.region).filter(isSupportedCity))).sort((a, b) => a.localeCompare(b, 'ru')),
+    () => Array.from(new Set(
+      availableSources
+        .map((row) => String(row.branchName || row.region || '').trim())
+        .filter(Boolean)
+    )).sort((a, b) => a.localeCompare(b, 'ru')),
     [availableSources]
   );
   const branchScopeLabel = selectedFormat?.branch || branch || 'текущего филиала';

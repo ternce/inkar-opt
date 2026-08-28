@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ..regions import SUPPORTED_USER_CITY_NAMES
+
 
 REFERENCE_TYPES = [
     {"code": "stock", "name": "Остатки"},
@@ -14,20 +16,7 @@ REFERENCE_TYPES = [
 
 REFERENCE_TYPE_BY_CODE = {row["code"]: row for row in REFERENCE_TYPES}
 
-SUPPORTED_USER_BRANCH_NAMES = [
-    "Алматы",
-    "Астана",
-    "Шымкент",
-    "Атырау",
-    "Есик",
-    "Караганда",
-    "Костанай",
-    "Семей",
-    "Усть-Каменогорск",
-    "Павлодар",
-    "Актау",
-    "Актобе",
-]
+SUPPORTED_USER_BRANCH_NAMES = list(SUPPORTED_USER_CITY_NAMES)
 
 USER_SELECTABLE_BRANCHES = [{"id": name, "name": name} for name in SUPPORTED_USER_BRANCH_NAMES]
 

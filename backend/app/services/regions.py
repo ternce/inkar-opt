@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,53 @@ SUPPORTED_USER_CITIES: tuple[City, ...] = tuple(
     City(index, name) for index, name in enumerate(SUPPORTED_USER_CITY_NAMES, start=1)
 )
 
+
+def _region_lookup_key(value: object) -> str:
+    text = str(value or "").replace("\u00a0", " ").strip().casefold()
+    text = re.sub(r"[.,]+", " ", text)
+    text = re.sub(r"^(?:г|город)\s+", "", text)
+    text = re.sub(r"\s+(?:г|город)$", "", text)
+    return " ".join(text.split())
+
+
+SUPPORTED_USER_CITY_ALIASES: dict[str, str] = {}
+for _name in SUPPORTED_USER_CITY_NAMES:
+    SUPPORTED_USER_CITY_ALIASES[_region_lookup_key(_name)] = _name
+SUPPORTED_USER_CITY_ALIASES.update(
+    {
+        "almaty": "Алматы",
+        "alma aty": "Алматы",
+        "astana": "Астана",
+        "нур султан": "Астана",
+        "нурсултан": "Астана",
+        "nur sultan": "Астана",
+        "nur-sultan": "Астана",
+        "nursultan": "Астана",
+        "shymkent": "Шымкент",
+        "atyrau": "Атырау",
+        "esik": "Есик",
+        "issyk": "Есик",
+        "karaganda": "Караганда",
+        "kostanay": "Костанай",
+        "semey": "Семей",
+        "усть каменогорск": "Усть-Каменогорск",
+        "ust kamenogorsk": "Усть-Каменогорск",
+        "ust-kamenogorsk": "Усть-Каменогорск",
+        "oskemen": "Усть-Каменогорск",
+        "pavlodar": "Павлодар",
+        "aktau": "Актау",
+        "aktobe": "Актобе",
+    }
+)
+
+
+def canonical_supported_city_name(value: object) -> str:
+    return SUPPORTED_USER_CITY_ALIASES.get(_region_lookup_key(value), "")
+
+
+def is_supported_user_city_name(value: object) -> bool:
+    return bool(canonical_supported_city_name(value))
+
 CITY_ID_BY_NAME: dict[str, int] = {
     "Алматы": 1,
     "Нур-Султан": 2,
@@ -92,7 +140,7 @@ def city_id_from_branch(branch: str | None) -> int | None:
     b = (branch or "").strip()
     if not b:
         return None
-    return CITY_ID_BY_NAME.get(b)
+    return CITY_ID_BY_NAME.get(canonical_supported_city_name(b) or b)
 
 
 def allowed_provisor_source_names_for_city_id(city_id: int | None) -> set[str] | None:

@@ -12,6 +12,7 @@ from ..models import (
     VidmanLogicalCompetitor,
     VidmanLogicalCompetitorSource,
 )
+from .regions import canonical_supported_city_name
 
 
 PRIMARY = "PRIMARY"
@@ -118,6 +119,9 @@ def assign_source_to_logical_competitor(
         raise ValueError("logical_name is required")
     if not region:
         raise ValueError("region is required")
+    region = canonical_supported_city_name(region)
+    if not region:
+        raise ValueError("region must be one of supported regions")
     if resolved_format_id is None:
         raise ValueError("price_format_id or price_format_code is required")
     priority_value = int(priority if priority is not None else (0 if normalized_role == PRIMARY else 100))
