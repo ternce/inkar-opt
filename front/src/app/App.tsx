@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { type FormEvent, useEffect, useMemo, useState } from 'react';
 import { Toaster } from 'sonner';
 import {
   BarChart3,
@@ -13,6 +13,7 @@ import {
   HelpCircle,
   Home,
   ListChecks,
+  LogOut,
   Plus,
   RefreshCw,
   Settings,
@@ -175,6 +176,7 @@ const priceDateFreshness = (value: any) => {
 export default function App() {
   const [priceFormats, setPriceFormats] = useState<PriceFormat[]>([]);
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
   const [selectedBranch, setSelectedBranch] = useState(() => localStorage.getItem('selectedBranch') || '');
   const [selectedFormat, setSelectedFormat] = useState<PriceFormat | null>(null);
   const [selectedPricingContext, setSelectedPricingContext] = useState<PricingContextState | null>(null);
@@ -216,28 +218,37 @@ export default function App() {
     return normalizeFormats(parseJsonOrNull(formatsText));
   };
 
-  useEffect(() => {
-    const load = async () => {
-      const [userRes, items] = await Promise.all([
-        fetch('/api/current-user'),
-        loadPriceFormats(),
-      ]);
-      const userText = await userRes.text();
-      const userData = parseJsonOrNull(userText);
-      if (userRes.ok && userData) setCurrentUser(userData);
+  const applyInitialFormats = (items: PriceFormat[]) => {
+    const storedBranchHasFormats = selectedBranch && isSupportedCity(selectedBranch) && items.some((format) => isSameBranch(format.branch, selectedBranch));
+    const firstSupportedFormat = items.find((format) => isSupportedCity(format.branch));
+    const firstBranch = storedBranchHasFormats ? selectedBranch : (firstSupportedFormat?.branch || SUPPORTED_CITIES[0]);
+    const firstFormat = items.find((format) => isSameBranch(format.branch, firstBranch)) || items[0] || null;
+    setPriceFormats(items);
+    setSelectedBranch(firstBranch);
+    setSelectedFormat((prev) => {
+      if (prev && items.some((format) => format.code === prev.code && isSameBranch(format.branch, firstBranch))) return prev;
+      return firstFormat;
+    });
+  };
 
-      const storedBranchHasFormats = selectedBranch && isSupportedCity(selectedBranch) && items.some((format) => isSameBranch(format.branch, selectedBranch));
-      const firstSupportedFormat = items.find((format) => isSupportedCity(format.branch));
-      const firstBranch = storedBranchHasFormats ? selectedBranch : (firstSupportedFormat?.branch || SUPPORTED_CITIES[0]);
-      const firstFormat = items.find((format) => isSameBranch(format.branch, firstBranch)) || items[0] || null;
-      setPriceFormats(items);
-      setSelectedBranch(firstBranch);
-      setSelectedFormat((prev) => {
-        if (prev && items.some((format) => format.code === prev.code && isSameBranch(format.branch, firstBranch))) return prev;
-        return firstFormat;
-      });
-    };
-    void load();
+  const loadApplication = async () => {
+    const userRes = await fetch('/api/current-user');
+    const userText = await userRes.text();
+    const userData = parseJsonOrNull(userText);
+    if (userRes.status === 401) {
+      setCurrentUser(null);
+      setAuthChecked(true);
+      return;
+    }
+    if (userRes.ok && userData) {
+      setCurrentUser(userData);
+      applyInitialFormats(await loadPriceFormats());
+    }
+    setAuthChecked(true);
+  };
+
+  useEffect(() => {
+    void loadApplication();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -317,6 +328,38 @@ export default function App() {
     setSelectedFormat(next);
     setActiveSection('home');
   };
+
+  const handleLogin = async (username: string, password: string) => {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    const text = await res.text();
+    const data = parseJsonOrNull(text);
+    if (!res.ok) throw new Error(data?.detail || 'Invalid username or password');
+    setCurrentUser(data);
+    applyInitialFormats(await loadPriceFormats());
+  };
+
+  const handleLogout = async () => {
+    await fetch('/api/auth/logout', { method: 'POST' });
+    setCurrentUser(null);
+    setPriceFormats([]);
+    setSelectedFormat(null);
+  };
+
+  if (!authChecked) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center text-sm text-gray-700">
+        Загрузка...
+      </div>
+    );
+  }
+
+  if (!currentUser) {
+    return <LoginScreen onLogin={handleLogin} />;
+  }
 
   if (!selectedFormat) {
     return (
@@ -424,6 +467,15 @@ export default function App() {
           <h1>Модуль ценообразования</h1>
           <p>Рабочее пространство менеджера ЦО: филиал, ценовые форматы, прайсы и готовность данных</p>
         </div>
+        <div className="app-user-panel">
+          <div>
+            <strong>{currentUser.displayName || currentUser.username}</strong>
+            <span>{currentUser.role}</span>
+          </div>
+          <Button type="button" variant="outline" size="sm" onClick={handleLogout} title="Выйти">
+            <LogOut className="h-4 w-4" />
+          </Button>
+        </div>
       </header>
 
       <div className="app-main">
@@ -511,6 +563,49 @@ export default function App() {
           {renderSection()}
         </main>
       </div>
+    </div>
+  );
+}
+
+function LoginScreen({ onLogin }: { onLogin: (username: string, password: string) => Promise<void> }) {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setError('');
+    setIsSubmitting(true);
+    try {
+      await onLogin(username.trim(), password);
+    } catch {
+      setError('Invalid username or password');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="login-screen">
+      <form className="login-panel" onSubmit={submit}>
+        <div>
+          <h1>INKAR OPT</h1>
+          <p>Вход в модуль ценообразования</p>
+        </div>
+        <label>
+          <span>Логин</span>
+          <input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" autoFocus />
+        </label>
+        <label>
+          <span>Пароль</span>
+          <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" autoComplete="current-password" />
+        </label>
+        {error ? <div className="login-error">{error}</div> : null}
+        <Button type="submit" disabled={isSubmitting || !username.trim() || !password}>
+          Войти
+        </Button>
+      </form>
     </div>
   );
 }

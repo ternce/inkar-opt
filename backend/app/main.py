@@ -19,7 +19,7 @@ from inspect import iscoroutinefunction
 from threading import current_thread
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
-from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import Body, Cookie, Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 import httpx
@@ -104,6 +104,14 @@ from .services.pricing import (
     normalize_list_type,
 )
 from .services.provisor import ProvisorAuthError, get_prices_by_filial_id, process_memory_snapshot
+from .services.auth import (
+    SESSION_COOKIE_NAME,
+    create_session,
+    revoke_session,
+    session_cookie_secure,
+    session_lifetime,
+    verify_password,
+)
 from .services.widman_client import WidmanInvalidCredentialsError
 from .services.competitor_persist import persist_phcenter_report, persist_provisor_prices
 from .services.competitor_price_lists import (
@@ -856,13 +864,15 @@ async def _startup() -> None:
             _start_emit_refresh_scheduler()
         else:
             logger.info("[PROCESS_ROLE] role=%s parser schedulers disabled", _process_role())
-    except Exception:
+    except Exception as exc:
         # In production deployments (e.g., Railway) the database might be configured
         # after the first deploy or might be temporarily unavailable.
         # We prefer the service to come up (serve UI + mock data) and log the error.
         import traceback
 
         traceback.print_exc()
+        if str(exc).startswith("Production auth schema is not ready"):
+            raise
         if settings.environment != "prod":
             raise
 
@@ -1880,6 +1890,49 @@ def _ensure_price_format_access(pf: PriceFormat, user: AppUser) -> None:
 @app.get("/api/current-user")
 def get_current_user_endpoint(current_user: AppUser = Depends(get_current_user)):
     return current_user_to_dict(current_user)
+
+
+@app.post("/api/auth/login")
+def login_endpoint(response: Response, payload: dict = Body(...), db: Session = Depends(get_db)):
+    username = str(payload.get("username") or "").strip()
+    password = str(payload.get("password") or "")
+    generic_error = "Invalid username or password"
+    if not username or not password:
+        raise HTTPException(status_code=401, detail=generic_error)
+
+    user = db.execute(select(AppUser).where(AppUser.username == username)).scalars().first()
+    if user is None or not user.is_active or not verify_password(password, user.password_hash):
+        raise HTTPException(status_code=401, detail=generic_error)
+
+    token, _session = create_session(db, user)
+    lifetime = session_lifetime()
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        max_age=int(lifetime.total_seconds()),
+        httponly=True,
+        secure=session_cookie_secure(),
+        samesite="lax",
+        path="/",
+    )
+    return current_user_to_dict(user)
+
+
+@app.post("/api/auth/logout")
+def logout_endpoint(
+    response: Response,
+    db: Session = Depends(get_db),
+    session_token: str | None = Cookie(None, alias=SESSION_COOKIE_NAME),
+):
+    revoke_session(db, session_token)
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        path="/",
+        httponly=True,
+        secure=session_cookie_secure(),
+        samesite="lax",
+    )
+    return {"status": "ok"}
 
 
 @app.get("/api/price-formats")

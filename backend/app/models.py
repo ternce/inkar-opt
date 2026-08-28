@@ -13,6 +13,7 @@ from sqlalchemy import (
     Index,
     Boolean,
     Text,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -134,14 +135,35 @@ class AppUser(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     username: Mapped[str] = mapped_column(Text, unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(Text, default="", server_default=text("''"), nullable=False)
     display_name: Mapped[str] = mapped_column(Text, default="")
     role: Mapped[str] = mapped_column(String(32), default="admin", index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    password_changed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     branches: Mapped[list["UserBranchAssignment"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
+    )
+
+
+class AppSession(Base):
+    __tablename__ = "app_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    user_id: Mapped[int] = mapped_column(ForeignKey("app_users.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive, server_default=text("CURRENT_TIMESTAMP"), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive, server_default=text("CURRENT_TIMESTAMP"), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
+    user: Mapped[AppUser] = relationship()
+
+    __table_args__ = (
+        Index("ix_app_sessions_session_token_hash", "session_token_hash"),
+        Index("ix_app_sessions_active_lookup", "session_token_hash", "expires_at", "revoked_at"),
     )
 
 

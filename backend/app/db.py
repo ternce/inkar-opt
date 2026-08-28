@@ -66,10 +66,91 @@ def _configure_sqlite_connection(dbapi_connection, connection_record) -> None:
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
+AUTH_SESSION_MIGRATION = "backend/scripts/migrations/20260828_app_user_sessions.sql"
+
+
+def _is_production_environment() -> bool:
+    return os.getenv("ENVIRONMENT", "dev").strip().lower() in {"prod", "production"}
+
+
+def _require_production_auth_schema_ready() -> None:
+    inspector = inspect(engine)
+    errors: list[str] = []
+
+    def columns_for(table: str) -> dict[str, dict]:
+        if not inspector.has_table(table):
+            errors.append(f"missing table {table}")
+            return {}
+        return {str(col["name"]): col for col in inspector.get_columns(table)}
+
+    app_users = columns_for("app_users")
+    password_hash = app_users.get("password_hash")
+    if password_hash is None:
+        errors.append("missing column app_users.password_hash")
+    elif password_hash.get("nullable") is not False:
+        errors.append("app_users.password_hash must be NOT NULL")
+    password_default = str(password_hash.get("default") or "") if password_hash else ""
+    if password_hash is not None and "''" not in password_default:
+        errors.append("app_users.password_hash must default to empty string")
+    password_changed_at = app_users.get("password_changed_at")
+    if password_changed_at is None:
+        errors.append("missing column app_users.password_changed_at")
+    elif password_changed_at.get("nullable") is not True:
+        errors.append("app_users.password_changed_at must be nullable")
+
+    app_sessions = columns_for("app_sessions")
+    for name in ("session_token_hash", "user_id", "created_at", "last_seen_at", "expires_at"):
+        column = app_sessions.get(name)
+        if column is None:
+            errors.append(f"missing column app_sessions.{name}")
+        elif column.get("nullable") is not False:
+            errors.append(f"app_sessions.{name} must be NOT NULL")
+    revoked_at = app_sessions.get("revoked_at")
+    if revoked_at is None:
+        errors.append("missing column app_sessions.revoked_at")
+    elif revoked_at.get("nullable") is not True:
+        errors.append("app_sessions.revoked_at must be nullable")
+    for name in ("created_at", "last_seen_at"):
+        column = app_sessions.get(name)
+        default = str(column.get("default") or "") if column else ""
+        if column is not None and "CURRENT_TIMESTAMP" not in default.upper() and "NOW()" not in default.upper():
+            errors.append(f"app_sessions.{name} must default to CURRENT_TIMESTAMP")
+
+    if app_sessions:
+        unique_sets = {tuple(item.get("column_names") or []) for item in inspector.get_unique_constraints("app_sessions")}
+        index_by_name = {str(item["name"]): item for item in inspector.get_indexes("app_sessions")}
+        unique_index_sets = {
+            tuple(item.get("column_names") or [])
+            for item in index_by_name.values()
+            if bool(item.get("unique"))
+        }
+        if ("session_token_hash",) not in unique_sets and ("session_token_hash",) not in unique_index_sets:
+            errors.append("app_sessions.session_token_hash must be unique")
+        required_indexes = {
+            "ix_app_sessions_session_token_hash": ("session_token_hash",),
+            "ix_app_sessions_user_id": ("user_id",),
+            "ix_app_sessions_expires_at": ("expires_at",),
+            "ix_app_sessions_revoked_at": ("revoked_at",),
+            "ix_app_sessions_active_lookup": ("session_token_hash", "expires_at", "revoked_at"),
+        }
+        for index_name, columns in required_indexes.items():
+            index = index_by_name.get(index_name)
+            if index is None:
+                errors.append(f"missing index {index_name}")
+            elif tuple(index.get("column_names") or []) != columns:
+                errors.append(f"index {index_name} must cover {', '.join(columns)}")
+
+    if errors:
+        detail = "; ".join(errors)
+        raise RuntimeError(f"Production auth schema is not ready; apply {AUTH_SESSION_MIGRATION} first: {detail}")
+
+
 def init_db() -> None:
     # Импорт моделей важен, чтобы Base увидел таблицы
     from . import models  # noqa: F401
 
+    if _is_production_environment():
+        _require_production_auth_schema_ready()
     Base.metadata.create_all(bind=engine)
     _ensure_compatible_columns()
     _ensure_compatible_column_types()
@@ -331,9 +412,11 @@ def _ensure_compatible_columns() -> None:
         ],
         "app_users": [
             ("username", "TEXT"),
+            ("password_hash", "TEXT NOT NULL DEFAULT ''"),
             ("display_name", "TEXT DEFAULT ''"),
             ("role", "VARCHAR(32) DEFAULT 'admin'"),
             ("is_active", "BOOLEAN DEFAULT TRUE"),
+            ("password_changed_at", "DATETIME"),
             ("created_at", "DATETIME"),
             ("updated_at", "DATETIME"),
         ],
@@ -368,8 +451,45 @@ def _ensure_compatible_columns() -> None:
                     else:
                         conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
     _ensure_regular_competitor_percentile_table()
+    _ensure_app_sessions_table()
 
 
+def _ensure_app_sessions_table() -> None:
+    inspector = inspect(engine)
+    if not inspector.has_table("app_sessions"):
+        with engine.begin() as conn:
+            if engine.dialect.name == "postgresql":
+                conn.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS app_sessions (
+                            id SERIAL PRIMARY KEY,
+                            session_token_hash VARCHAR(64) NOT NULL UNIQUE,
+                            user_id INTEGER NOT NULL REFERENCES app_users(id),
+                            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            last_seen_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            expires_at TIMESTAMP NOT NULL,
+                            revoked_at TIMESTAMP
+                        )
+                        """
+                    )
+                )
+            else:
+                conn.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS app_sessions (
+                            id INTEGER PRIMARY KEY,
+                            session_token_hash VARCHAR(64) NOT NULL UNIQUE,
+                            user_id INTEGER NOT NULL REFERENCES app_users(id),
+                            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            last_seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            expires_at DATETIME NOT NULL,
+                            revoked_at DATETIME
+                        )
+                        """
+                    )
+                )
 def _ensure_regular_competitor_percentile_table() -> None:
     inspector = inspect(engine)
     if inspector.has_table("regular_competitor_price_percentiles"):
@@ -984,6 +1104,31 @@ def _ensure_compatible_indexes() -> None:
             "ix_app_users_username",
             "app_users",
             ("username",),
+        ),
+        (
+            "ix_app_sessions_session_token_hash",
+            "app_sessions",
+            ("session_token_hash",),
+        ),
+        (
+            "ix_app_sessions_user_id",
+            "app_sessions",
+            ("user_id",),
+        ),
+        (
+            "ix_app_sessions_expires_at",
+            "app_sessions",
+            ("expires_at",),
+        ),
+        (
+            "ix_app_sessions_revoked_at",
+            "app_sessions",
+            ("revoked_at",),
+        ),
+        (
+            "ix_app_sessions_active_lookup",
+            "app_sessions",
+            ("session_token_hash", "expires_at", "revoked_at"),
         ),
         (
             "ix_user_branch_assignments_branch",

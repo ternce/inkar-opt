@@ -3,12 +3,13 @@ from __future__ import annotations
 from collections.abc import Generator
 import os
 
-from fastapi import Depends, Header, HTTPException
+from fastapi import Cookie, Depends, Header, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .db import SessionLocal
 from .models import AppUser, UserBranchAssignment
+from .services.auth import SESSION_COOKIE_NAME, get_user_for_session, is_production_environment
 from .services.references.types import BRANCHES
 
 
@@ -52,7 +53,19 @@ def _ensure_dev_user(db: Session, username: str) -> AppUser:
 def get_current_user(
     db: Session = Depends(get_db),
     x_dev_user: str | None = Header(None, alias="X-Dev-User"),
+    session_token: str | None = Cookie(None, alias=SESSION_COOKIE_NAME),
 ) -> AppUser:
+    if is_production_environment():
+        if x_dev_user:
+            raise HTTPException(status_code=403, detail="X-Dev-User is disabled in production")
+        user = get_user_for_session(db, session_token)
+        if user is None:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        return user
+
+    user = get_user_for_session(db, session_token)
+    if user is not None:
+        return user
     username = x_dev_user or os.getenv("DEV_CURRENT_USER") or "dev-admin"
     user = _ensure_dev_user(db, username)
     if not user.is_active:

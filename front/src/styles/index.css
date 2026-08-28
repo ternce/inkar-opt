@@ -12,6 +12,8 @@
   display: flex;
   min-height: 72px;
   align-items: center;
+  justify-content: space-between;
+  gap: 20px;
   border-bottom: 1px solid #dbe4ef;
   background: #ffffff;
   padding: 14px 24px;
@@ -30,6 +32,103 @@
   margin: 3px 0 0;
   color: #64748b;
   font-size: 13px;
+}
+
+.app-user-panel {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.app-user-panel > div {
+  display: grid;
+  justify-items: end;
+  gap: 2px;
+}
+
+.app-user-panel strong {
+  color: #0f172a;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.app-user-panel span {
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.login-screen {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  background: #f3f6fa;
+  color: #0f172a;
+  padding: 24px;
+}
+
+.login-panel {
+  display: grid;
+  width: min(100%, 380px);
+  gap: 16px;
+  border: 1px solid #dbe4ef;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 28px;
+  box-shadow: 0 18px 48px rgba(15, 23, 42, 0.1);
+}
+
+.login-panel h1 {
+  margin: 0;
+  color: #0f172a;
+  font-size: 24px;
+  font-weight: 800;
+  letter-spacing: 0;
+  line-height: 1.2;
+}
+
+.login-panel p {
+  margin: 6px 0 0;
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.login-panel label {
+  display: grid;
+  gap: 7px;
+  color: #334155;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.login-panel input {
+  height: 40px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #0f172a;
+  font: inherit;
+  padding: 0 12px;
+  outline: none;
+  transition: border-color 0.14s ease, box-shadow 0.14s ease;
+}
+
+.login-panel input:focus {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.16);
+}
+
+.login-error {
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  background: #fef2f2;
+  color: #b91c1c;
+  font-size: 13px;
+  font-weight: 700;
+  padding: 10px 12px;
 }
 
 .app-main {
@@ -1402,7 +1501,18 @@ td.sticky-action-column,
 
 @media (max-width: 620px) {
   .app-header {
+    align-items: flex-start;
+    flex-direction: column;
     padding: 14px 16px;
+  }
+
+  .app-user-panel {
+    justify-content: space-between;
+    width: 100%;
+  }
+
+  .app-user-panel > div {
+    justify-items: start;
   }
 
   .app-main {
