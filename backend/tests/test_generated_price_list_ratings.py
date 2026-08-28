@@ -5,6 +5,7 @@ import io
 
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -115,18 +116,39 @@ def test_generated_payload_and_exports_use_global_and_local_product_ratings():
     sheet = load_workbook(io.BytesIO(xlsx_response.content)).active
     xlsx_rows = list(sheet.iter_rows(values_only=True))
     xlsx_header = list(xlsx_rows[0])
+    assert sheet.title == "Прайс"
+    assert xlsx_header == list(csv_header)
+    assert len(xlsx_rows) - 1 == len(csv_rows)
+    assert sheet.auto_filter.ref == f"A1:{get_column_letter(sheet.max_column)}{sheet.max_row}"
+    assert sheet.row_dimensions[1].height == 73.5
+    assert all(sheet.cell(row=1, column=column).alignment.wrap_text is True for column in range(1, sheet.max_column + 1))
+    assert all(sheet.row_dimensions[row].height == 13.5 for row in range(2, sheet.max_row + 1))
+    assert sheet.freeze_panes is None
+    widths = {
+        sheet.cell(row=1, column=column).column_letter: sheet.column_dimensions[sheet.cell(row=1, column=column).column_letter].width
+        for column in range(1, sheet.max_column + 1)
+    }
+    assert widths["A"] == 13.14
+    assert widths["B"] == 11.43
+    assert widths["G"] == 11.43
+    assert max(widths.values()) <= 13.14
     assert "Рейтинг глобальный" in xlsx_header
     assert "Рейтинг локальный" in xlsx_header
     assert not any(value and ("PharmCenter Top" in value or "Топ фарм-центра" in value) for value in xlsx_header)
 
     xlsx_dicts = [dict(zip(xlsx_header, row)) for row in xlsx_rows[1:]]
     both_xlsx = next(row for row in xlsx_dicts if row["SKU"] == "BOTH")
+    assert isinstance(both_xlsx["Себестоимость"], (int, float))
+    cost_column = xlsx_header.index("Себестоимость") + 1
+    final_price_column = xlsx_header.index("Финальная цена") + 1
+    assert sheet.cell(row=2, column=cost_column).number_format == "#,##0.00"
+    assert sheet.cell(row=2, column=final_price_column).number_format == "#,##0.00"
     assert both_xlsx["Лог расчета цены"] == "pricing log for BOTH"
     assert "Rating fixed markup" in both_xlsx["Лог применения списка"]
     assert both_xlsx["Тип списка"] == "fixed_markup"
     assert both_xlsx["Код списка"] == "UL-RATING"
     assert both_xlsx["Значение списка"] == "10.5%"
     log_column = xlsx_header.index("Лог применения списка") + 1
-    assert sheet.column_dimensions[sheet.cell(row=1, column=log_column).column_letter].width >= 20
+    assert sheet.column_dimensions[sheet.cell(row=1, column=log_column).column_letter].width == 13.0
 
     app.dependency_overrides.pop(get_db, None)

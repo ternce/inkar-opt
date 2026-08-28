@@ -3157,6 +3157,55 @@ def get_generated_price_list_analytics(
     return build_workflow_analytics(db=db, price_list_id=pl.id)
 
 
+GENERATED_PRICE_EXPORT_HEADER_HEIGHT = 73.5
+GENERATED_PRICE_EXPORT_BODY_ROW_HEIGHT = 13.5
+GENERATED_PRICE_EXPORT_DEFAULT_WIDTH = 13.0
+GENERATED_PRICE_EXPORT_SKU_WIDTH = 13.14
+GENERATED_PRICE_EXPORT_COMPACT_WIDTH = 11.43
+GENERATED_PRICE_EXPORT_COMPACT_COLUMNS = {2, 7, 23}
+GENERATED_PRICE_EXPORT_MONEY_FORMAT = '#,##0.00'
+GENERATED_PRICE_EXPORT_MONEY_KEYS = {
+    "cost",
+    "basePrice",
+    "mdc",
+    "bestCompetitorPrice",
+    "lowestCompetitorPrice",
+    "chosenCompetitorPrice",
+    "priceAfterBend",
+    "finalPrice",
+    "memorandumMaxPrice",
+    "priceBeforeMemorandum",
+}
+
+
+def _apply_generated_price_export_xlsx_formatting(ws, headers: list[tuple[str, str]]) -> None:
+    if ws.max_row < 1 or ws.max_column < 1:
+        return
+
+    ws.auto_filter.ref = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
+    ws.row_dimensions[1].height = GENERATED_PRICE_EXPORT_HEADER_HEIGHT
+    for row_index in range(2, ws.max_row + 1):
+        ws.row_dimensions[row_index].height = GENERATED_PRICE_EXPORT_BODY_ROW_HEIGHT
+
+    for column_index in range(1, ws.max_column + 1):
+        column_letter = get_column_letter(column_index)
+        if column_index == 1:
+            width = GENERATED_PRICE_EXPORT_SKU_WIDTH
+        elif column_index in GENERATED_PRICE_EXPORT_COMPACT_COLUMNS:
+            width = GENERATED_PRICE_EXPORT_COMPACT_WIDTH
+        else:
+            width = GENERATED_PRICE_EXPORT_DEFAULT_WIDTH
+        ws.column_dimensions[column_letter].width = width
+        ws.cell(row=1, column=column_index).alignment = Alignment(wrap_text=True, vertical="top")
+
+    for column_index, (key, _label) in enumerate(headers, start=1):
+        if key in GENERATED_PRICE_EXPORT_MONEY_KEYS or key.startswith("competitor:"):
+            for row_index in range(2, ws.max_row + 1):
+                cell = ws.cell(row=row_index, column=column_index)
+                if isinstance(cell.value, (int, float, Decimal)):
+                    cell.number_format = GENERATED_PRICE_EXPORT_MONEY_FORMAT
+
+
 @app.get("/api/generated-price-lists/{price_list_id}/export.{fmt}")
 def export_generated_price_list(
     price_list_id: str,
@@ -3287,19 +3336,7 @@ def export_generated_price_list(
     ws.append([label for _, label in headers])
     for row in rows_payload:
         ws.append([_export_cell(row, key) for key, _ in headers])
-    long_text_headers = {"Лог расчета цены", "Лог применения списка", "Диагностика списка"}
-    for column_cells in ws.columns:
-        header = str(column_cells[0].value or "")
-        max_len = max(
-            len(line)
-            for cell in column_cells
-            for line in str(cell.value if cell.value is not None else "").splitlines()
-        )
-        width = min(max(max_len + 2, 10), 80 if header in long_text_headers else 32)
-        ws.column_dimensions[get_column_letter(column_cells[0].column)].width = width
-        if header in long_text_headers:
-            for cell in column_cells:
-                cell.alignment = Alignment(wrap_text=True, vertical="top")
+    _apply_generated_price_export_xlsx_formatting(ws, headers)
     bio = io.BytesIO()
     wb.save(bio)
     return StreamingResponse(
