@@ -9,12 +9,16 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from './ui/tabs';
 import { PricingSettingsTab } from './PricingSettingsTab';
 import {
   NO_COPY_SOURCE,
+  NEW_PRICING_RULE_SELECTION,
+  NO_FORMAT_PRICING_RULE_SELECTION,
   applyPricingRuleCreateSuccess,
   buildPricingRuleCreatePayload,
   canSubmitPricingRuleCreate,
   draftFromCopySource,
   emptyPricingRuleDraft,
   hydratePricingRuleDraft,
+  isLatestPricingRuleLoadResponse,
+  pricingRuleEditorTargetFromFormatSelection,
   pricingRuleCreateErrorMessage,
 } from '../pricingRuleCreateFlow';
 import {
@@ -407,10 +411,10 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
   const [bends, setBends] = useState<Template[]>([]);
   const [noCompetitors, setNoCompetitors] = useState<Template[]>([]);
   const [roundings, setRoundings] = useState<RoundingRule[]>([]);
-  const [selectedRuleId, setSelectedRuleId] = useState<string>('new');
+  const [selectedRuleId, setSelectedRuleId] = useState<string>(NEW_PRICING_RULE_SELECTION);
   const [draft, setDraft] = useState<PricingRule>(() => emptyPricingRuleDraft());
   const [copyFromRuleId, setCopyFromRuleId] = useState<string>(NO_COPY_SOURCE);
-  const [formatRuleId, setFormatRuleId] = useState<string>('none');
+  const [formatRuleId, setFormatRuleId] = useState<string>(NO_FORMAT_PRICING_RULE_SELECTION);
   const [appliedRule, setAppliedRule] = useState<AppliedRuleStatus | null>(null);
   const [formatSettings, setFormatSettings] = useState<PriceFormatSettings | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -445,7 +449,7 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
       setBends(Array.isArray(bendsData) ? bendsData : []);
       setNoCompetitors(Array.isArray(noCompData) ? noCompData : []);
       setRoundings(Array.isArray(roundingsData) ? roundingsData : []);
-      setFormatRuleId(settingsData?.pricingRuleId ? String(settingsData.pricingRuleId) : 'none');
+      setFormatRuleId(settingsData?.pricingRuleId ? String(settingsData.pricingRuleId) : NO_FORMAT_PRICING_RULE_SELECTION);
       setAppliedRule(settingsData?.appliedRule || null);
       setFormatSettings(settingsData || null);
     } catch (e: any) {
@@ -465,7 +469,7 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
   const selectRule = async (value: string) => {
     const requestId = ++ruleLoadRequestRef.current;
     setSelectedRuleId(value);
-    if (value === 'new') {
+    if (value === NEW_PRICING_RULE_SELECTION) {
       setDraft(emptyPricingRuleDraft());
       setCopyFromRuleId(NO_COPY_SOURCE);
       return;
@@ -477,12 +481,22 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
       const res = await fetch(`/api/pricing-rules/${value}`);
       const text = await res.text();
       const data = parseJsonOrNull(text);
-      if (requestId !== ruleLoadRequestRef.current) return;
+      if (!isLatestPricingRuleLoadResponse(requestId, ruleLoadRequestRef.current)) return;
       if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить правило ЦО');
       if (data) setDraft(hydratePricingRuleDraft(data));
     } catch (e: any) {
-      if (requestId !== ruleLoadRequestRef.current) return;
+      if (!isLatestPricingRuleLoadResponse(requestId, ruleLoadRequestRef.current)) return;
       setError(e?.message || 'Ошибка загрузки правила ЦО');
+    }
+  };
+
+  const selectFormatRule = (value: string) => {
+    const next = pricingRuleEditorTargetFromFormatSelection(value);
+    setFormatRuleId(next.formatRuleId);
+    if (next.hydrateEditorRuleId) {
+      void selectRule(next.hydrateEditorRuleId);
+    } else {
+      ruleLoadRequestRef.current += 1;
     }
   };
 
@@ -516,7 +530,7 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
     setIsLoading(true);
     setError(null);
     try {
-      const isNew = selectedRuleId === 'new' || !draft.id;
+      const isNew = selectedRuleId === NEW_PRICING_RULE_SELECTION || !draft.id;
       const res = await fetch(isNew ? '/api/pricing-rules' : `/api/pricing-rules/${draft.id}`, {
         method: isNew ? 'POST' : 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -542,7 +556,7 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
   const copyRule = async () => {
     if (!draft.id) return;
     const source = hydratePricingRuleDraft(draft);
-    setSelectedRuleId('new');
+    setSelectedRuleId(NEW_PRICING_RULE_SELECTION);
     setCopyFromRuleId(String(source.id));
     setDraft(draftFromCopySource(emptyPricingRuleDraft(), source));
   };
@@ -551,14 +565,14 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
     if (!draft.id) return;
     const res = await fetch(`/api/pricing-rules/${draft.id}`, { method: 'DELETE' });
     if (res.ok) {
-      setSelectedRuleId('new');
+      setSelectedRuleId(NEW_PRICING_RULE_SELECTION);
       setDraft(emptyPricingRuleDraft());
       await load();
     }
   };
 
   const applyToFormat = async () => {
-    if (formatRuleId === 'none') return;
+    if (formatRuleId === NO_FORMAT_PRICING_RULE_SELECTION) return;
     setIsLoading(true);
     setError(null);
     try {
@@ -595,17 +609,17 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
         <div className="space-y-4">
           <div className="admin-card p-4">
             <div className="grid grid-cols-1 gap-3 lg:grid-cols-[260px_1fr_auto]">
-              <Select value={formatRuleId} onValueChange={setFormatRuleId}>
+              <Select value={formatRuleId} onValueChange={selectFormatRule}>
                 <SelectTrigger><SelectValue placeholder="Правило для текущего ЦФ" /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="none">Не выбрано</SelectItem>
+                  <SelectItem value={NO_FORMAT_PRICING_RULE_SELECTION}>Не выбрано</SelectItem>
                   {rules.map((rule) => <SelectItem key={rule.id} value={String(rule.id)}>{rule.name}</SelectItem>)}
                 </SelectContent>
               </Select>
               <div className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-700">
-                {formatRuleId !== 'none' ? ruleById.get(formatRuleId)?.description || 'Правило будет синхронизировано в настройки формата' : 'Выберите правило ЦО для текущего ценового формата'}
+                {formatRuleId !== NO_FORMAT_PRICING_RULE_SELECTION ? ruleById.get(formatRuleId)?.description || 'Правило будет синхронизировано в настройки формата' : 'Выберите правило ЦО для текущего ценового формата'}
               </div>
-              <Button onClick={applyToFormat} disabled={isLoading || formatRuleId === 'none'} className="bg-blue-600 hover:bg-blue-700">Применить к ЦФ</Button>
+              <Button onClick={applyToFormat} disabled={isLoading || formatRuleId === NO_FORMAT_PRICING_RULE_SELECTION} className="bg-blue-600 hover:bg-blue-700">Применить к ЦФ</Button>
             </div>
             {appliedRule ? <AppliedRulePanel appliedRule={appliedRule} /> : null}
           </div>
@@ -615,7 +629,7 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
               <Select value={selectedRuleId} onValueChange={selectRule}>
                 <SelectTrigger><SelectValue placeholder="Правило" /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="new">Новое правило</SelectItem>
+                  <SelectItem value={NEW_PRICING_RULE_SELECTION}>Новое правило</SelectItem>
                   {rules.map((rule) => <SelectItem key={rule.id} value={String(rule.id)}>{rule.name}</SelectItem>)}
                 </SelectContent>
               </Select>
@@ -627,7 +641,7 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
                 <Button size="sm" variant="ghost" className="text-red-600 hover:text-red-700" onClick={deleteRule} disabled={isLoading || !draft.id}><Trash2 className="mr-2 h-4 w-4" />Удалить</Button>
               </div>
             </div>
-            {selectedRuleId === 'new' ? (
+            {selectedRuleId === NEW_PRICING_RULE_SELECTION ? (
               <div className="grid grid-cols-1 gap-3 lg:grid-cols-[260px_1fr]">
                 <div className="space-y-2">
                   <Label>Копировать из существующего правила</Label>
@@ -648,10 +662,10 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
             ) : null}
             <Input value={draft.description} onChange={(e) => setDraft((prev) => ({ ...prev, description: e.target.value }))} placeholder="Описание" />
             <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-              <FieldSelect label="Рекомендованные наценки" value={draft.markupTemplateId} items={markups} disabled={selectedRuleId === 'new' && copyFromRuleId !== NO_COPY_SOURCE} onChange={(id) => setDraft((prev) => ({ ...prev, markupTemplateId: id }))} />
-              <FieldSelect label="Прогибы" value={draft.bendTemplateId} items={bends} disabled={selectedRuleId === 'new' && copyFromRuleId !== NO_COPY_SOURCE} onChange={(id) => setDraft((prev) => ({ ...prev, bendTemplateId: id }))} />
-              <FieldSelect label="Наценки без конкурентов" value={draft.noCompetitorTemplateId} items={noCompetitors} disabled={selectedRuleId === 'new' && copyFromRuleId !== NO_COPY_SOURCE} onChange={(id) => setDraft((prev) => ({ ...prev, noCompetitorTemplateId: id }))} />
-              <FieldSelect label="Округление" value={draft.roundingRuleId} items={roundings} disabled={selectedRuleId === 'new' && copyFromRuleId !== NO_COPY_SOURCE} onChange={(id) => setDraft((prev) => ({ ...prev, roundingRuleId: id }))} />
+              <FieldSelect label="Рекомендованные наценки" value={draft.markupTemplateId} items={markups} disabled={selectedRuleId === NEW_PRICING_RULE_SELECTION && copyFromRuleId !== NO_COPY_SOURCE} onChange={(id) => setDraft((prev) => ({ ...prev, markupTemplateId: id }))} />
+              <FieldSelect label="Прогибы" value={draft.bendTemplateId} items={bends} disabled={selectedRuleId === NEW_PRICING_RULE_SELECTION && copyFromRuleId !== NO_COPY_SOURCE} onChange={(id) => setDraft((prev) => ({ ...prev, bendTemplateId: id }))} />
+              <FieldSelect label="Наценки без конкурентов" value={draft.noCompetitorTemplateId} items={noCompetitors} disabled={selectedRuleId === NEW_PRICING_RULE_SELECTION && copyFromRuleId !== NO_COPY_SOURCE} onChange={(id) => setDraft((prev) => ({ ...prev, noCompetitorTemplateId: id }))} />
+              <FieldSelect label="Округление" value={draft.roundingRuleId} items={roundings} disabled={selectedRuleId === NEW_PRICING_RULE_SELECTION && copyFromRuleId !== NO_COPY_SOURCE} onChange={(id) => setDraft((prev) => ({ ...prev, roundingRuleId: id }))} />
             </div>
           </div>
         </div>

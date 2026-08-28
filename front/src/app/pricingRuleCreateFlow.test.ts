@@ -3,13 +3,18 @@ import { test } from 'node:test';
 
 import {
   NO_COPY_SOURCE,
+  NO_FORMAT_PRICING_RULE_SELECTION,
+  NEW_PRICING_RULE_SELECTION,
   applyPricingRuleCreateSuccess,
   buildPricingRuleCreatePayload,
   canSubmitPricingRuleCreate,
   draftFromCopySource,
   emptyPricingRuleDraft,
   hydratePricingRuleDraft,
+  isLatestPricingRuleLoadResponse,
+  pricingRuleEditorTargetFromFormatSelection,
   pricingRuleCreateErrorMessage,
+  shouldHydrateEditorFromFormatRuleSelection,
   type PricingRuleDraft,
 } from './pricingRuleCreateFlow.ts';
 
@@ -70,6 +75,47 @@ test('new rule draft starts with empty linked settings', () => {
   assert.deepEqual(emptyPricingRuleDraft(), draft({ code: '', name: '' }));
 });
 
+test('top selector selecting Rule A opens lower editor through existing rule hydration target', () => {
+  const target = pricingRuleEditorTargetFromFormatSelection('1');
+  const ruleA = hydratePricingRuleDraft(draft({ id: 1, code: 'A', name: 'Rule A', markupTemplateId: 10, bendTemplateId: 20, noCompetitorTemplateId: 30, roundingRuleId: 40 }));
+
+  assert.deepEqual(target, { formatRuleId: '1', hydrateEditorRuleId: '1' });
+  assert.deepEqual(
+    [ruleA.id, ruleA.name, ruleA.markupTemplateId, ruleA.bendTemplateId, ruleA.noCompetitorTemplateId, ruleA.roundingRuleId],
+    [1, 'Rule A', 10, 20, 30, 40]
+  );
+});
+
+test('top selector selecting Rule B replaces all Rule A hydrated values', () => {
+  const ruleA = hydratePricingRuleDraft(draft({ id: 1, code: 'A', name: 'Rule A', markupTemplateId: 10, bendTemplateId: 20, noCompetitorTemplateId: 30, roundingRuleId: 40 }));
+  const ruleB = hydratePricingRuleDraft(draft({ id: 2, code: 'B', name: 'Rule B', markupTemplateId: 11, bendTemplateId: null, noCompetitorTemplateId: 31, roundingRuleId: null }));
+
+  assert.deepEqual(
+    [ruleA.markupTemplateId, ruleA.bendTemplateId, ruleA.noCompetitorTemplateId, ruleA.roundingRuleId],
+    [10, 20, 30, 40]
+  );
+  assert.deepEqual(
+    [ruleB.markupTemplateId, ruleB.bendTemplateId, ruleB.noCompetitorTemplateId, ruleB.roundingRuleId],
+    [11, null, 31, null]
+  );
+});
+
+test('top selector only targets editor hydration and does not build an apply or save payload', () => {
+  const target = pricingRuleEditorTargetFromFormatSelection('7');
+
+  assert.deepEqual(Object.keys(target).sort(), ['formatRuleId', 'hydrateEditorRuleId']);
+  assert.equal(target.formatRuleId, '7');
+  assert.equal(target.hydrateEditorRuleId, '7');
+});
+
+test('top selector none option does not open editor hydration', () => {
+  assert.equal(shouldHydrateEditorFromFormatRuleSelection(NO_FORMAT_PRICING_RULE_SELECTION), false);
+  assert.deepEqual(pricingRuleEditorTargetFromFormatSelection(NO_FORMAT_PRICING_RULE_SELECTION), {
+    formatRuleId: NO_FORMAT_PRICING_RULE_SELECTION,
+    hydrateEditorRuleId: null,
+  });
+});
+
 test('existing rule hydration preserves all linked settings', () => {
   const hydrated = hydratePricingRuleDraft({
     id: 3,
@@ -120,6 +166,31 @@ test('switching between existing and new rule drafts updates every linked field'
     [second.markupTemplateId, second.bendTemplateId, second.noCompetitorTemplateId, second.roundingRuleId],
     [11, null, 31, null]
   );
+});
+
+test('explicit lower New Rule selection still clears editor state', () => {
+  const loaded = hydratePricingRuleDraft(draft({ id: 1, markupTemplateId: 10, bendTemplateId: 20, noCompetitorTemplateId: 30, roundingRuleId: 40 }));
+  const cleared = NEW_PRICING_RULE_SELECTION === 'new' ? emptyPricingRuleDraft() : loaded;
+
+  assert.equal(NEW_PRICING_RULE_SELECTION, 'new');
+  assert.deepEqual(cleared, emptyPricingRuleDraft());
+});
+
+test('Rule A to Rule B to Rule A hydrates the latest selected rule values', () => {
+  const ruleA = draft({ id: 1, name: 'Rule A', markupTemplateId: 10, bendTemplateId: 20, noCompetitorTemplateId: 30, roundingRuleId: 40 });
+  const ruleB = draft({ id: 2, name: 'Rule B', markupTemplateId: 11, bendTemplateId: 21, noCompetitorTemplateId: null, roundingRuleId: 41 });
+  const sequence = [ruleA, ruleB, ruleA].map(hydratePricingRuleDraft);
+  const latest = sequence.at(-1)!;
+
+  assert.deepEqual([latest.id, latest.markupTemplateId, latest.bendTemplateId, latest.noCompetitorTemplateId, latest.roundingRuleId], [1, 10, 20, 30, 40]);
+});
+
+test('stale async rule response cannot overwrite the latest selected rule', () => {
+  const staleRequestId = 1;
+  const latestRequestId = 2;
+
+  assert.equal(isLatestPricingRuleLoadResponse(staleRequestId, latestRequestId), false);
+  assert.equal(isLatestPricingRuleLoadResponse(latestRequestId, latestRequestId), true);
 });
 
 test('save payload keeps unchanged relationships and isolated selector edits', () => {

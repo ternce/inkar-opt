@@ -13,6 +13,8 @@ export type PricingRuleDraft = {
 };
 
 export const NO_COPY_SOURCE = 'none';
+export const NEW_PRICING_RULE_SELECTION = 'new';
+export const NO_FORMAT_PRICING_RULE_SELECTION = 'none';
 
 export const emptyPricingRuleDraft = (): PricingRuleDraft => ({
   id: 0,
@@ -67,3 +69,14 @@ export const canSubmitPricingRuleCreate = (isLoading: boolean) => !isLoading;
 
 export const pricingRuleCreateErrorMessage = (data: any, text: string) =>
   data?.detail || text || 'Не удалось сохранить правило';
+
+export const shouldHydrateEditorFromFormatRuleSelection = (value: string) =>
+  value !== NO_FORMAT_PRICING_RULE_SELECTION;
+
+export const pricingRuleEditorTargetFromFormatSelection = (value: string) => ({
+  formatRuleId: value,
+  hydrateEditorRuleId: shouldHydrateEditorFromFormatRuleSelection(value) ? value : null,
+});
+
+export const isLatestPricingRuleLoadResponse = (requestId: number, latestRequestId: number) =>
+  requestId === latestRequestId;
