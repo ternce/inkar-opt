@@ -16,6 +16,7 @@ from ...models import (
     ReferenceUpdateStatus,
 )
 from ..competitor_assignments import get_assigned_competitor_price_lists
+from ..pricing import reference_branch_id_for_price_format
 from ...timezone import local_iso, now_kz_naive
 
 
@@ -63,23 +64,25 @@ def build_workflow_status(
         if days > 2:
             outdated_competitors += 1
 
+    region_id = int(context.branch_id) if str(context.branch_id).isdigit() else None
+    reference_branch_id = reference_branch_id_for_price_format(pf, region_id)
     ref_rows = {
         row.data_type: row
         for row in db.execute(
-            select(ReferenceUpdateStatus).where(ReferenceUpdateStatus.branch_id == str(context.branch_id))
+            select(ReferenceUpdateStatus).where(ReferenceUpdateStatus.branch_id == reference_branch_id)
         ).scalars().all()
     }
     product_count = int(db.execute(select(func.count(Product.id))).scalar() or 0)
     stock_count = int(
-        db.execute(select(func.count(BranchStock.id)).where(BranchStock.branch_id == str(context.branch_id))).scalar() or 0
+        db.execute(select(func.count(BranchStock.id)).where(BranchStock.branch_id == reference_branch_id)).scalar() or 0
     )
     cost_count = int(
-        db.execute(select(func.count(BranchCost.id)).where(BranchCost.branch_id == str(context.branch_id))).scalar() or 0
+        db.execute(select(func.count(BranchCost.id)).where(BranchCost.branch_id == reference_branch_id)).scalar() or 0
     )
     local_rating_count = int(
         db.execute(
             select(func.count(ProductRating.id))
-            .where(ProductRating.branch_id == str(context.branch_id))
+            .where(ProductRating.branch_id == reference_branch_id)
             .where(ProductRating.rating_type == "local")
         ).scalar()
         or 0
@@ -120,7 +123,7 @@ def build_workflow_status(
     warnings = [item for item in items if not item["ok"]]
     return {
         "context": {"id": context.id, "name": context.name, "branchId": context.branch_id, "region": context.region},
-        "priceFormat": {"id": pf.id, "code": pf.code, "name": pf.name, "pricingRuleId": pf.pricing_rule_id},
+        "priceFormat": {"id": pf.id, "code": pf.code, "name": pf.name, "pricingRuleId": pf.pricing_rule_id, "referenceBranchId": reference_branch_id},
         "items": items,
         "warnings": warnings,
         "canGenerate": product_count > 0 and bool(competitor_lists),

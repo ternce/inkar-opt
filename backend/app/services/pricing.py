@@ -41,7 +41,7 @@ from .competitor_percentiles import REGIONAL_SCOPE, REGULAR_COMPETITOR_SCOPE
 from .competitors.identity import canonical_regular_competitor_identity
 from .competitors.percentiles.sources import PERCENTILE_SOURCE_COMPETITOR, PERCENTILE_SOURCE_EMIT, is_emit_source_key, percentile_source_id
 from .competitor_assignments import get_assigned_competitor_price_lists
-from .references.types import canonical_branch_id
+from .references.types import branch_display_name, canonical_branch_id
 from .regions import allowed_provisor_source_names_for_city_id, city_id_from_branch
 
 LIST_TYPE_FIXED_PRICE = "fixed_price"
@@ -413,7 +413,6 @@ def lowest_available_competitor_price(
         str(row.source_name or ""): (_as_decimal(row.coefficient, Decimal("1")) or Decimal("1"))
         for row in config_rows
     }
-
     prices: list[Decimal] = []
     for row in rows:
         source_price = _as_decimal(row.source_price)
@@ -459,6 +458,16 @@ def zone_reference_for_product(
 def _competitor_price_mode(price_format: PriceFormat) -> str:
     mode = str(price_format.competitor_price_mode or "regular").strip().lower()
     return mode if mode in COMPETITOR_PRICE_MODES else "regular"
+
+
+def reference_branch_id_for_price_format(price_format: PriceFormat, region_id: int | str | None = None) -> str:
+    explicit_region = str(region_id or "").strip()
+    if explicit_region:
+        return canonical_branch_id(explicit_region)
+    reference_branch = str(getattr(price_format, "reference_branch_id", "") or "").strip()
+    if reference_branch:
+        return canonical_branch_id(reference_branch)
+    return canonical_branch_id(price_format.branch)
 
 
 def _selected_percentile_configs_from_rows(rows: list[CompetitorPrice]) -> dict[str, CompetitorPrice]:
@@ -1930,10 +1939,10 @@ def calculate_price_for_product(
             fallback_percent=fallback_percent,
         )
 
+    branch_id = reference_branch_id_for_price_format(price_format, region_id)
     cost = _as_decimal(cost_override if cost_override is not None else product.cost)
     if cost is None or cost <= 0:
         zero = Decimal("0")
-        branch_id = str(region_id if region_id is not None else (price_format.branch or ""))
         debug = {
             "cost": zero,
             "markup_percent": None,
@@ -2021,7 +2030,6 @@ def calculate_price_for_product(
         effect["listName"] = list_name
         markup_percent_used = markup_percent * Decimal("100")
         diagnostic_mdc = price_from_margin(cost, markup_percent)
-        branch_id = str(region_id if region_id is not None else (price_format.branch or ""))
         zone_competitor_price_min = zone_reference_for_product(
             db=db,
             price_format=price_format,
@@ -2105,7 +2113,6 @@ def calculate_price_for_product(
         effect["changedFinalPrice"] = True
         effect["effectMessage"] = "fixed_markup calculated MDC from list margin and used it as final price; competitors and bend were bypassed."
         markup_percent_used = markup_percent * Decimal("100")
-        branch_id = str(region_id if region_id is not None else (price_format.branch or ""))
         zone_competitor_price_min = zone_reference_for_product(
             db=db,
             price_format=price_format,
@@ -2171,8 +2178,8 @@ def calculate_price_for_product(
         debug.update({"zone": zone, "zone_reference_price": zone_reference, "deviation_pct": deviation_pct})
         return fixed_markup_mdc, debug
 
-    effective_city_id = region_id if region_id is not None else city_id_from_branch(price_format.branch)
-    allowed_provisor_sources = allowed_provisor_source_names_for_city_id(effective_city_id)
+    provisor_city_id = region_id if region_id is not None else city_id_from_branch(branch_display_name(branch_id))
+    allowed_provisor_sources = allowed_provisor_source_names_for_city_id(provisor_city_id)
     selected_meta = pricing_preload.selected_source_meta if pricing_preload is not None else _selected_source_meta(db, price_format.id)
 
     percentile_number = int(price_format.percentile_number or 10)
@@ -2433,7 +2440,6 @@ def calculate_price_for_product(
     )
     cached_match_type = _cached_source_match_type(pricing_preload, int(product.id), applied_source)
     source_match_type = cached_match_type if cached_match_type is not None else _source_match_type(db, price_format.id, product.id, applied_source)
-    branch_id = str(region_id if region_id is not None else (price_format.branch or ""))
     list_names = {int(row.id): str(row.name or row.code or row.id) for row in active_lists}
     for effect in applied_list_effects:
         list_id = effect.get("listId")
@@ -2831,8 +2837,7 @@ def calculate_prices(
         db.add(pl)
         db.flush()
 
-    branch_source = pf.branch if str(pf.branch or "").strip() else region_id
-    branch_id = canonical_branch_id(branch_source)
+    branch_id = reference_branch_id_for_price_format(pf, region_id)
     stock_snapshot = _load_stock_generation_snapshot(db, branch_id)
     stock_product_ids = list(stock_snapshot.product_ids)
     products_before_filter = int(db.execute(select(func.count(Product.id))).scalar() or 0)
@@ -2915,7 +2920,7 @@ def calculate_prices(
         price_format=pf,
         products=products,
         active_lists=active_lists,
-        branch_id=str(region_id if region_id is not None else (pf.branch or "")),
+        branch_id=branch_id,
     )
     percentile_price_cache = load_percentile_price_cache(db, pf.id) if percentile_mode else None
     existing_by_product_id = {

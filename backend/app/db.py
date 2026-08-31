@@ -173,6 +173,7 @@ def _ensure_compatible_columns() -> None:
             ("special_value", "TEXT DEFAULT ''"),
         ],
         "price_formats": [
+            ("reference_branch_id", "TEXT DEFAULT ''"),
             ("competitor_price_mode", "VARCHAR(32) DEFAULT 'regular'"),
             ("percentile_number", "INTEGER DEFAULT 10"),
             ("pricing_rule_id", "INTEGER"),

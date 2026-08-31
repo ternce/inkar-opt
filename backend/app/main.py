@@ -102,6 +102,7 @@ from .services.pricing import (
     lowest_available_competitor_price,
     margin_percent_from_price,
     normalize_list_type,
+    reference_branch_id_for_price_format,
 )
 from .services.provisor import ProvisorAuthError, get_prices_by_filial_id, process_memory_snapshot
 from .services.auth import (
@@ -2145,6 +2146,7 @@ def _branch_format_row(db: Session, pf: PriceFormat) -> dict:
         "code": pf.code,
         "name": pf.name,
         "branch": pf.branch,
+        "referenceBranchId": pf.reference_branch_id or "",
         "pricingRule": pf.pricing_rule or "",
         "pricingRuleId": int(pf.pricing_rule_id) if pf.pricing_rule_id is not None else None,
         "appliedMarkupTemplateId": int(pf.applied_markup_template_id) if getattr(pf, "applied_markup_template_id", None) is not None else None,
@@ -2182,16 +2184,17 @@ def _readiness_item(kind: str, label: str, status: str, message: str) -> dict:
 
 
 def _format_readiness(db: Session, pf: PriceFormat, branch_id: str) -> dict:
+    reference_branch_id = reference_branch_id_for_price_format(pf)
     product_count = int(db.execute(select(func.count(Product.id))).scalar() or 0)
-    stock_count = int(db.execute(select(func.count(BranchStock.id)).where(BranchStock.branch_id == branch_id)).scalar() or 0)
-    cost_count = int(db.execute(select(func.count(BranchCost.id)).where(BranchCost.branch_id == branch_id)).scalar() or 0)
+    stock_count = int(db.execute(select(func.count(BranchStock.id)).where(BranchStock.branch_id == reference_branch_id)).scalar() or 0)
+    cost_count = int(db.execute(select(func.count(BranchCost.id)).where(BranchCost.branch_id == reference_branch_id)).scalar() or 0)
     global_rating_count = int(
         db.execute(select(func.count(ProductRating.id)).where(ProductRating.rating_type == "global")).scalar() or 0
     )
     local_rating_count = int(
         db.execute(
             select(func.count(ProductRating.id))
-            .where(ProductRating.branch_id == branch_id)
+            .where(ProductRating.branch_id == reference_branch_id)
             .where(ProductRating.rating_type == "local")
         ).scalar()
         or 0
@@ -2275,6 +2278,8 @@ def _format_readiness(db: Session, pf: PriceFormat, branch_id: str) -> dict:
     return {
         "formatCode": pf.code,
         "formatName": pf.name,
+        "branchId": branch_id,
+        "referenceBranchId": reference_branch_id,
         "status": "error" if errors else "warning" if warnings else "ok",
         "canGenerate": not errors,
         "items": items,
@@ -2817,7 +2822,7 @@ def _generated_item_dict(
         final_price=final,
     )
     memorandum = _memorandum_summary(cp)
-    ratings = ratings if ratings is not None else _product_ratings_by_id(db, [int(product.id)], str(pf.branch or "")).get(int(product.id), {})
+    ratings = ratings if ratings is not None else _product_ratings_by_id(db, [int(product.id)], reference_branch_id_for_price_format(pf)).get(int(product.id), {})
     global_rating = ratings.get("global")
     local_rating = ratings.get("local")
     zone_reference = _zone_reference_for_saved_row(db, cp, pf.id, product.id)
@@ -3179,7 +3184,7 @@ def get_generated_price_list_items(
             if _calculated_zone(cp, db, pf.id, product.id) == zone
         ]
     ratings_by_product = _product_ratings_by_id(
-        db, [int(product.id) for _, product in all_rows], str(pf.branch or "")
+        db, [int(product.id) for _, product in all_rows], reference_branch_id_for_price_format(pf)
     )
     top_filter_normalized = (top_filter or "all").strip().lower()
     if top_filter_normalized in {"top", "top_only"}:
@@ -9784,6 +9789,7 @@ def get_settings_for_format(
     return {
         "name": pf.code,
         "branch": pf.branch,
+        "referenceBranchId": pf.reference_branch_id or "",
         "pricingRule": pf.pricing_rule or "",
         "pricingRuleId": int(pf.pricing_rule_id) if pf.pricing_rule_id is not None else None,
         "appliedMarkupTemplateId": int(pf.applied_markup_template_id) if getattr(pf, "applied_markup_template_id", None) is not None else None,
@@ -9851,6 +9857,8 @@ def put_settings_for_format(
         if pf.branch != next_branch:
             next_branch = _canonical_user_selected_branch(next_branch)
         pf.branch = next_branch
+    if "referenceBranchId" in payload or "reference_branch_id" in payload:
+        pf.reference_branch_id = str(payload.get("referenceBranchId") or payload.get("reference_branch_id") or "").strip()
     if isinstance(payload.get("pricingRule"), str):
         pf.pricing_rule = payload["pricingRule"]
     if "roundingRuleId" in payload and payload.get("roundingRuleId") in (None, "", "none"):

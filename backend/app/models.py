@@ -90,6 +90,7 @@ class PriceFormat(Base):
     code: Mapped[str] = mapped_column(Text, unique=True, index=True)
     name: Mapped[str] = mapped_column(Text)
     branch: Mapped[str] = mapped_column(Text, default="")
+    reference_branch_id: Mapped[str | None] = mapped_column(Text, nullable=True, default="", server_default=text("''"))
 
     pricing_rule: Mapped[str] = mapped_column(Text, default="")
     pricing_rule_id: Mapped[int | None] = mapped_column(ForeignKey("pricing_rules.id"), nullable=True, index=True)

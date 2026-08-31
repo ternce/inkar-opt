@@ -9,6 +9,8 @@ from sqlalchemy.orm import Session
 from ..models import CalculatedPrice, CompetitorPrice, CompetitorPriceList, PriceFormat, PriceList, Product, ProductExtra
 from .competitor_assignments import get_assigned_competitor_price_lists
 from .percentile_export import load_percentile_export_prices
+from .pricing import reference_branch_id_for_price_format
+from .references.types import branch_display_name
 from .regions import allowed_provisor_source_names_for_city_id, city_id_from_branch
 
 
@@ -53,8 +55,9 @@ def get_products_with_competitor_top5(
     pl_id: int | None = None
 
     if pf is not None:
-        effective_city_id = region_id if region_id is not None else city_id_from_branch(pf.branch)
-        allowed_provisor_sources = allowed_provisor_source_names_for_city_id(effective_city_id)
+        reference_branch_id = reference_branch_id_for_price_format(pf, region_id)
+        provisor_city_id = region_id if region_id is not None else city_id_from_branch(branch_display_name(reference_branch_id))
+        allowed_provisor_sources = allowed_provisor_source_names_for_city_id(provisor_city_id)
 
         # Resolve price list for model prices. If none is passed, use the latest
         # generated list for this price format so the table survives page refresh.

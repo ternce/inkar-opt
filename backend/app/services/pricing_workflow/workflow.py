@@ -20,7 +20,7 @@ from ..competitor_matching import rebuild_competitor_prices_for_selected
 from ..competitor_price_lists import list_competitor_price_lists, save_selected_competitor_price_lists_only
 from ..competitor_assignments import get_assigned_competitor_price_lists
 from ..percentile_preparation import enqueue_percentile_preparation, ensure_percentile_ready_for_generation
-from ..pricing import AMBIGUOUS_LIST_TYPES, calculate_price_zone, calculate_prices
+from ..pricing import AMBIGUOUS_LIST_TYPES, calculate_price_zone, calculate_prices, reference_branch_id_for_price_format
 from ...timezone import local_iso, now_kz_naive
 from .analytics import build_workflow_analytics
 from .snapshot import build_generate_snapshot, dumps_snapshot, loads_snapshot
@@ -109,6 +109,7 @@ def price_format_to_workflow_dict(row: PriceFormat) -> dict:
         "code": row.code,
         "name": row.name,
         "branch": row.branch,
+        "referenceBranchId": row.reference_branch_id or "",
         "pricingRule": row.pricing_rule,
         "pricingRuleId": row.pricing_rule_id,
         "status": "active",
@@ -256,11 +257,12 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
             price_list_number = f"{pf.code}_{context.branch_id}_{as_of.isoformat()}_wf{run.id}"
         price_list_number = _unique_price_list_number(db=db, requested=price_list_number, run_id=int(run.id))
         region_id = int(context.branch_id) if str(context.branch_id).isdigit() else None
+        reference_branch_id = reference_branch_id_for_price_format(pf, region_id)
 
         snapshot = build_generate_snapshot(
             db=db,
             price_format=pf,
-            branch_id=str(context.branch_id or ""),
+            branch_id=reference_branch_id,
             as_of=as_of,
             generated_by=user,
             activation_date=activation_date,
