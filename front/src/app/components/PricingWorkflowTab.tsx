@@ -3,6 +3,7 @@ import type { ReactNode } from 'react';
 import { toast } from 'sonner';
 import { Download, FileText, Play, RefreshCw } from 'lucide-react';
 import { Button } from './ui/button';
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from './ui/dialog';
 import { Input } from './ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { StickyTableToolbar } from './StickyTableToolbar';
@@ -30,6 +31,7 @@ type BranchFormatRow = {
   lastRunStatus: string;
   lastPriceListNumber: string;
   lastSkuCount: number;
+  sapCategory?: string;
 };
 
 type ReadinessItem = {
@@ -73,6 +75,25 @@ type BatchItem = {
   error?: string;
   workflowRunId?: number;
   priceListNumber?: string;
+};
+
+type SapExportMode = 'auto' | 'manual';
+
+type SapVersion = {
+  workflow_run_id: number;
+  price_list_id: number;
+  price_list_number: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  is_latest: boolean;
+};
+
+type SapFormatVersions = {
+  price_format_id: number;
+  code: string;
+  name: string;
+  sap_category: string | null;
+  versions: SapVersion[];
 };
 
 type Props = {
@@ -169,6 +190,11 @@ export function PricingWorkflowTab({
   const [generateCodes, setGenerateCodes] = useState<string[]>([]);
   const [exportCodes, setExportCodes] = useState<string[]>([]);
   const [batchItems, setBatchItems] = useState<BatchItem[]>([]);
+  const [sapDialogOpen, setSapDialogOpen] = useState(false);
+  const [sapMode, setSapMode] = useState<SapExportMode>('auto');
+  const [sapVersions, setSapVersions] = useState<SapFormatVersions[]>([]);
+  const [manualPriceLists, setManualPriceLists] = useState<Record<number, string>>({});
+  const [isSapLoading, setIsSapLoading] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -224,6 +250,10 @@ export function PricingWorkflowTab({
   const exportableRows = rows.filter((row) => row.canExport);
   const allGenerateSelected = generatableRows.length > 0 && generatableRows.every((row) => generateCodes.includes(row.format.code));
   const allExportSelected = exportableRows.length > 0 && exportableRows.every((row) => exportCodes.includes(row.format.code));
+  const selectedSapRows = useMemo(
+    () => rows.filter((row) => exportCodes.includes(row.format.code) && row.canExport),
+    [rows, exportCodes]
+  );
 
   const loadReadiness = async (codes: string[], nextBranch = selectedBranch) => {
     if (!codes.length) {
@@ -387,25 +417,108 @@ export function PricingWorkflowTab({
   };
 
   const exportSelectedForSap = () => {
-    const selectedRows = rows.filter((row) => exportCodes.includes(row.format.code) && row.priceList);
-    if (!selectedRows.length) return;
+    if (!selectedSapRows.length) return;
+    setSapMode('auto');
+    setSapDialogOpen(true);
+    void loadSapVersions();
+  };
 
-    // TODO: Replace file download with a real SAP integration only when SAP API/spec is available.
-    selectedRows.forEach((row, index) => {
-      const url = `/api/generated-price-lists/${encodeURIComponent(row.priceList!.number)}/export.xlsx`;
-      if (selectedRows.length === 1 && index === 0) {
-        window.location.href = url;
-      } else {
-        window.open(url, '_blank', 'noopener,noreferrer');
+  const loadSapVersions = async () => {
+    const selectedIds = selectedSapRows.map((row) => row.format.id).filter((id): id is number => typeof id === 'number');
+    if (!selectedIds.length) return;
+    setIsSapLoading(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams({
+        branch_id: selectedBranch,
+        activation_date: activationDate,
+        price_format_ids: selectedIds.join(','),
+      });
+      const res = await fetch(`/api/sap-export/versions?${params.toString()}`);
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) throw new Error(apiErrorMessage(data, text, 'Не удалось загрузить версии для SAP'));
+      const formats = Array.isArray(data?.formats) ? data.formats : [];
+      setSapVersions(formats);
+      const nextManual: Record<number, string> = {};
+      formats.forEach((format: SapFormatVersions) => {
+        const latest = format.versions.find((version) => version.is_latest) || format.versions[0];
+        if (latest) nextManual[format.price_format_id] = String(latest.price_list_id);
+      });
+      setManualPriceLists(nextManual);
+    } catch (e: any) {
+      setError(e?.message || 'Не удалось загрузить версии для SAP');
+      toast.error(e?.message || 'Не удалось загрузить версии для SAP');
+    } finally {
+      setIsSapLoading(false);
+    }
+  };
+
+  const confirmSapExport = async () => {
+    const selectedIds = selectedSapRows.map((row) => row.format.id).filter((id): id is number => typeof id === 'number');
+    if (!selectedIds.length) return;
+    setIsSapLoading(true);
+    setError(null);
+    try {
+      const body = sapMode === 'auto'
+        ? {
+            branch_id: selectedBranch,
+            activation_date: activationDate,
+            mode: 'auto',
+            price_format_ids: selectedIds,
+          }
+        : {
+            branch_id: selectedBranch,
+            activation_date: activationDate,
+            mode: 'manual',
+            items: selectedIds.map((priceFormatId) => ({
+              price_format_id: priceFormatId,
+              price_list_id: Number(manualPriceLists[priceFormatId] || 0),
+            })),
+          };
+      const res = await fetch('/api/sap-export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const blob = await res.blob();
+      if (!res.ok) {
+        const text = await blob.text();
+        const data = parseJsonOrNull(text);
+        throw new Error(apiErrorMessage(data, text, 'Не удалось сформировать SAP'));
       }
-    });
-    toast.success(selectedRows.length === 1 ? 'Файл для SAP выгружается' : `Запущена выгрузка файлов для SAP: ${selectedRows.length}`);
+      const disposition = res.headers.get('Content-Disposition') || '';
+      const match = disposition.match(/filename\*=UTF-8''([^;]+)/);
+      const filename = match ? decodeURIComponent(match[1]) : `SAP_${selectedBranch}_${activationDate}.xlsx`;
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setSapDialogOpen(false);
+      toast.success('Файл SAP сформирован');
+    } catch (e: any) {
+      setError(e?.message || 'Не удалось сформировать SAP');
+      toast.error(e?.message || 'Не удалось сформировать SAP');
+    } finally {
+      setIsSapLoading(false);
+    }
   };
 
   const openPriceList = (priceListNumber?: string) => {
     if (!priceListNumber) return;
     if (onOpenPriceList) onOpenPriceList(priceListNumber);
     else onNavigate('pricelists');
+  };
+
+  const sapVersionLabel = (version?: SapVersion) => {
+    if (!version) return 'Нет успешной версии';
+    const value = version.finished_at || version.started_at;
+    const time = value ? new Date(value).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }) : '—';
+    return `${time} — wf${version.workflow_run_id}`;
   };
 
   if (!selectedBranch && !formats.length && !priceFormats.length) {
@@ -445,9 +558,9 @@ export function PricingWorkflowTab({
           <Play className="mr-2 h-4 w-4" />
           Сформировать
         </Button>
-        <Button variant="outline" onClick={exportSelectedForSap} disabled={!exportCodes.length}>
+        <Button variant="outline" onClick={exportSelectedForSap} disabled={!exportCodes.length || isSapLoading}>
           <Download className="mr-2 h-4 w-4" />
-          Выгрузить
+          Сформировать файл SAP
         </Button>
         <Button variant="ghost" onClick={() => loadData(selectedBranch)} disabled={isLoading || isGenerating}>
           <RefreshCw className={`mr-2 h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} />
@@ -484,9 +597,9 @@ export function PricingWorkflowTab({
             <Play className="mr-2 h-4 w-4" />
             Generate
           </Button>
-          <Button variant="outline" onClick={exportSelectedForSap} disabled={!exportCodes.length} size="sm">
+          <Button variant="outline" onClick={exportSelectedForSap} disabled={!exportCodes.length || isSapLoading} size="sm">
             <Download className="mr-2 h-4 w-4" />
-            Export
+            SAP
           </Button>
         </StickyTableToolbar>
         <CompactTable
@@ -588,6 +701,87 @@ export function PricingWorkflowTab({
           />
         </section>
       ) : null}
+
+      <Dialog open={sapDialogOpen} onOpenChange={setSapDialogOpen}>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>Сформировать файл SAP</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="grid gap-2 text-sm text-gray-700 sm:grid-cols-2">
+              <div><span className="font-medium">Филиал:</span> {selectedBranch || '—'}</div>
+              <div><span className="font-medium">Дата начала действия:</span> {inputDateToDisplayDate(activationDate)}</div>
+            </div>
+            <div className="flex flex-wrap gap-3 text-sm">
+              <label className="inline-flex items-center gap-2">
+                <input type="radio" checked={sapMode === 'auto'} onChange={() => setSapMode('auto')} />
+                Последние сформированные
+              </label>
+              <label className="inline-flex items-center gap-2">
+                <input type="radio" checked={sapMode === 'manual'} onChange={() => setSapMode('manual')} />
+                Выбрать версии вручную
+              </label>
+            </div>
+            <div className="compact-table-wrap">
+              <table className="compact-table">
+                <thead>
+                  <tr>
+                    <th>Категория</th>
+                    <th>Ценовой формат</th>
+                    <th>Версия</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sapVersions.length ? sapVersions.map((format) => {
+                    const latest = format.versions.find((version) => version.is_latest) || format.versions[0];
+                    return (
+                      <tr key={format.price_format_id}>
+                        <td>{format.sap_category || 'Не настроено'}</td>
+                        <td>{format.code} · {format.name}</td>
+                        <td>
+                          {sapMode === 'manual' ? (
+                            <Select
+                              value={manualPriceLists[format.price_format_id] || ''}
+                              onValueChange={(value) => setManualPriceLists((prev) => ({ ...prev, [format.price_format_id]: value }))}
+                              disabled={isSapLoading || !format.versions.length}
+                            >
+                              <SelectTrigger>
+                                <SelectValue placeholder="Версия" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                {format.versions.map((version) => (
+                                  <SelectItem key={version.price_list_id} value={String(version.price_list_id)}>
+                                    {sapVersionLabel(version)}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          ) : (
+                            sapVersionLabel(latest)
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  }) : (
+                    <tr>
+                      <td colSpan={3} className="compact-empty">
+                        {isSapLoading ? 'Загрузка версий...' : 'Нет данных для SAP'}
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setSapDialogOpen(false)} disabled={isSapLoading}>Отмена</Button>
+            <Button onClick={confirmSapExport} disabled={isSapLoading || !sapVersions.length} className="bg-blue-600 hover:bg-blue-700">
+              <Download className="mr-2 h-4 w-4" />
+              Сформировать SAP
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <section className="pricing-run-links">
         <Button variant="outline" onClick={() => onNavigate('pricelists')}>Сформированные прайс-листы</Button>

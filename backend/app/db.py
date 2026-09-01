@@ -174,6 +174,7 @@ def _ensure_compatible_columns() -> None:
         ],
         "price_formats": [
             ("reference_branch_id", "TEXT DEFAULT ''"),
+            ("sap_category", "VARCHAR(32)"),
             ("competitor_price_mode", "VARCHAR(32) DEFAULT 'regular'"),
             ("percentile_number", "INTEGER DEFAULT 10"),
             ("pricing_rule_id", "INTEGER"),

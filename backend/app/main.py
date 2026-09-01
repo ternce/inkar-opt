@@ -136,6 +136,13 @@ from .services.competitor_assignments import (
 )
 from .services.competitor_coefficients import effective_price_coefficient, validate_price_coefficient
 from .services.percentile_export import load_percentile_export_price_cells
+from .services.sap_export import (
+    SAP_MEDIA_TYPE,
+    SapExportError,
+    build_export as build_sap_export,
+    list_versions as list_sap_versions,
+    validate_sap_category_payload,
+)
 from .services.manual_price_list_import import (
     deactivate_manual_price_list,
     delete_manual_price_list,
@@ -2147,6 +2154,7 @@ def _branch_format_row(db: Session, pf: PriceFormat) -> dict:
         "name": pf.name,
         "branch": pf.branch,
         "referenceBranchId": pf.reference_branch_id or "",
+        "sapCategory": pf.sap_category or "",
         "pricingRule": pf.pricing_rule or "",
         "pricingRuleId": int(pf.pricing_rule_id) if pf.pricing_rule_id is not None else None,
         "appliedMarkupTemplateId": int(pf.applied_markup_template_id) if getattr(pf, "applied_markup_template_id", None) is not None else None,
@@ -3414,6 +3422,73 @@ def export_generated_price_list(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
     )
+
+
+def _parse_sap_price_format_ids(value: str) -> list[int]:
+    ids: list[int] = []
+    for part in str(value or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.append(int(part))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="price_format_ids must be comma-separated integers")
+    return ids
+
+
+@app.get("/api/sap-export/versions")
+def get_sap_export_versions(
+    branch_id: str = Query(...),
+    activation_date: str = Query(...),
+    price_format_ids: str = Query(...),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    try:
+        return list_sap_versions(
+            db,
+            branch_id=branch_id,
+            activation_date=activation_date,
+            price_format_ids=_parse_sap_price_format_ids(price_format_ids),
+            user=current_user,
+        )
+    except SapExportError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+
+
+@app.post("/api/sap-export")
+def post_sap_export(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    try:
+        content, resolved, row_count = build_sap_export(
+            db,
+            branch_id=str(payload.get("branch_id") or payload.get("branchId") or ""),
+            activation_date=str(payload.get("activation_date") or payload.get("activationDate") or ""),
+            mode=str(payload.get("mode") or "auto"),
+            price_format_ids=[int(value) for value in payload.get("price_format_ids") or payload.get("priceFormatIds") or []],
+            items=payload.get("items") if isinstance(payload.get("items"), list) else None,
+            user=current_user,
+        )
+    except SapExportError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    timestamp = now_kz_naive().strftime("%H%M%S")
+    safe_branch = re.sub(r"[^0-9A-Za-zА-Яа-яЁё_-]+", "_", str(payload.get("branch_id") or payload.get("branchId") or "branch")).strip("_")
+    safe_date = str(payload.get("activation_date") or payload.get("activationDate") or date.today().isoformat())
+    filename = f"SAP_{safe_branch}_{safe_date}_{timestamp}.xlsx"
+    response = StreamingResponse(
+        io.BytesIO(content),
+        media_type=SAP_MEDIA_TYPE,
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
+            "X-SAP-Export-Rows": str(row_count),
+            "X-SAP-Export-Price-Lists": ",".join(str(item.price_list.id) for item in resolved),
+        },
+    )
+    return response
 
 
 @app.get("/api/generated-price-lists/{price_list_id}/compare/{other_id}")
@@ -9790,6 +9865,7 @@ def get_settings_for_format(
         "name": pf.code,
         "branch": pf.branch,
         "referenceBranchId": pf.reference_branch_id or "",
+        "sapCategory": pf.sap_category or "",
         "pricingRule": pf.pricing_rule or "",
         "pricingRuleId": int(pf.pricing_rule_id) if pf.pricing_rule_id is not None else None,
         "appliedMarkupTemplateId": int(pf.applied_markup_template_id) if getattr(pf, "applied_markup_template_id", None) is not None else None,
@@ -9859,6 +9935,11 @@ def put_settings_for_format(
         pf.branch = next_branch
     if "referenceBranchId" in payload or "reference_branch_id" in payload:
         pf.reference_branch_id = str(payload.get("referenceBranchId") or payload.get("reference_branch_id") or "").strip()
+    if "sapCategory" in payload or "sap_category" in payload:
+        try:
+            pf.sap_category = validate_sap_category_payload(payload.get("sapCategory", payload.get("sap_category")))
+        except SapExportError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc))
     if isinstance(payload.get("pricingRule"), str):
         pf.pricing_rule = payload["pricingRule"]
     if "roundingRuleId" in payload and payload.get("roundingRuleId") in (None, "", "none"):

@@ -161,6 +161,14 @@ const DEFAULT_BENDS: BendRow[] = [
   { id: 6, priceFrom: '10000', bendPercent: '0.1' },
 ];
 
+const SAP_CATEGORY_OPTIONS = [
+  { value: 'none', label: 'Не настроено' },
+  { value: 'SuperVIP', label: 'SuperVIP' },
+  { value: 'VIP', label: 'VIP' },
+  { value: '1', label: '1' },
+  { value: '2', label: '2' },
+];
+
 const fmtDateTime = (value?: string) => (value ? new Date(value).toLocaleString('ru-RU') : '—');
 const fmtDate = (value?: string) => (value ? new Date(value).toLocaleDateString('ru-RU') : '—');
 const fmtNumber = (value?: number | null) => (value === null || value === undefined ? '—' : Number(value).toLocaleString('ru-RU'));
@@ -217,6 +225,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
   const [ruleConfigMessage, setRuleConfigMessage] = useState<string | null>(null);
   const [competitorPriceMode, setCompetitorPriceMode] = useState('regular');
   const [percentileNumber, setPercentileNumber] = useState('10');
+  const [sapCategory, setSapCategory] = useState('none');
   const [deflectionPercent, setDeflectionPercent] = useState('0');
   const [recommendedMarkups, setRecommendedMarkups] = useState<MarkupRow[]>(DEFAULT_MARKUPS);
   const [noCompetitorMarkups, setNoCompetitorMarkups] = useState<MarkupRow[]>(DEFAULT_MARKUPS);
@@ -331,6 +340,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
         setRuleConfigMessage(null);
         setCompetitorPriceMode(String(data?.competitorPriceMode ?? 'regular'));
         setPercentileNumber(String(data?.percentileNumber ?? '10'));
+        setSapCategory(data?.sapCategory ? String(data.sapCategory) : 'none');
         setDeflectionPercent(String(data?.deflectionPercent ?? '0'));
         setPercentilePreparation(data?.percentilePreparation || null);
 
@@ -634,6 +644,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
         branch,
         pricingRule,
         roundingRuleId: roundingRuleId === 'none' ? null : Number(roundingRuleId),
+        sapCategory: sapCategory === 'none' ? null : sapCategory,
         competitorPriceMode,
         percentileNumber: Number(percentileNumber),
         deflectionPercent: parseRequiredDecimalInput(deflectionPercent, 'Прогиб по умолчанию (%)'),
@@ -674,6 +685,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
       setRuleConfigMessage(null);
       setCompetitorPriceMode(String(data?.competitorPriceMode ?? 'regular'));
       setPercentileNumber(String(data?.percentileNumber ?? '10'));
+      setSapCategory(data?.sapCategory ? String(data.sapCategory) : 'none');
       setDeflectionPercent(String(data?.deflectionPercent ?? '0'));
       setPercentilePreparation(data?.percentilePreparation || null);
       if (Array.isArray(data?.recommendedMarkups)) {
@@ -940,6 +952,20 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
             </Select>
           </div>
           
+          <div className="space-y-2">
+            <Label htmlFor="sap-category">SAP category</Label>
+            <Select value={sapCategory || 'none'} onValueChange={setSapCategory} disabled={isLoading}>
+              <SelectTrigger id="sap-category">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {SAP_CATEGORY_OPTIONS.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
           <div className="space-y-2 col-span-2">
             <Label htmlFor="rule">Правило ЦО</Label>
             <div className="grid grid-cols-1 gap-3 lg:grid-cols-[1fr_auto]">
