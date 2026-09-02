@@ -191,8 +191,8 @@ export function PricingWorkflowTab({
   const [exportCodes, setExportCodes] = useState<string[]>([]);
   const [batchItems, setBatchItems] = useState<BatchItem[]>([]);
   const [sapDialogOpen, setSapDialogOpen] = useState(false);
-  const [sapMode, setSapMode] = useState<SapExportMode>('auto');
   const [sapVersions, setSapVersions] = useState<SapFormatVersions[]>([]);
+  const [sapSelectionModes, setSapSelectionModes] = useState<Record<number, SapExportMode>>({});
   const [manualPriceLists, setManualPriceLists] = useState<Record<number, string>>({});
   const [isSapLoading, setIsSapLoading] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -418,7 +418,7 @@ export function PricingWorkflowTab({
 
   const exportSelectedForSap = () => {
     if (!selectedSapRows.length) return;
-    setSapMode('auto');
+    setSapSelectionModes(Object.fromEntries(selectedSapRows.map((row) => [row.format.id, 'auto'])));
     setSapDialogOpen(true);
     void loadSapVersions();
   };
@@ -440,6 +440,7 @@ export function PricingWorkflowTab({
       if (!res.ok) throw new Error(apiErrorMessage(data, text, 'Не удалось загрузить версии для SAP'));
       const formats = Array.isArray(data?.formats) ? data.formats : [];
       setSapVersions(formats);
+      setSapSelectionModes(Object.fromEntries(formats.map((format: SapFormatVersions) => [format.price_format_id, 'auto'])));
       const nextManual: Record<number, string> = {};
       formats.forEach((format: SapFormatVersions) => {
         const latest = format.versions.find((version) => version.is_latest) || format.versions[0];
@@ -460,22 +461,23 @@ export function PricingWorkflowTab({
     setIsSapLoading(true);
     setError(null);
     try {
-      const body = sapMode === 'auto'
-        ? {
-            branch_id: selectedBranch,
-            activation_date: activationDate,
-            mode: 'auto',
-            price_format_ids: selectedIds,
-          }
-        : {
-            branch_id: selectedBranch,
-            activation_date: activationDate,
-            mode: 'manual',
-            items: selectedIds.map((priceFormatId) => ({
-              price_format_id: priceFormatId,
-              price_list_id: Number(manualPriceLists[priceFormatId] || 0),
-            })),
-          };
+      const body = {
+        branch_id: selectedBranch,
+        activation_date: activationDate,
+        items: selectedIds.map((priceFormatId) => {
+          const selectionMode = sapSelectionModes[priceFormatId] || 'auto';
+          return selectionMode === 'manual'
+            ? {
+                price_format_id: priceFormatId,
+                selection_mode: 'manual',
+                price_list_id: Number(manualPriceLists[priceFormatId] || 0),
+              }
+            : {
+                price_format_id: priceFormatId,
+                selection_mode: 'auto',
+              };
+        }),
+      };
       const res = await fetch('/api/sap-export', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -518,7 +520,7 @@ export function PricingWorkflowTab({
     if (!version) return 'Нет успешной версии';
     const value = version.finished_at || version.started_at;
     const time = value ? new Date(value).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }) : '—';
-    return `${time} — wf${version.workflow_run_id}`;
+    return `wf${version.workflow_run_id} · ${time} · ${version.price_list_number || version.price_list_id}`;
   };
 
   if (!selectedBranch && !formats.length && !priceFormats.length) {
@@ -712,53 +714,60 @@ export function PricingWorkflowTab({
               <div><span className="font-medium">Филиал:</span> {selectedBranch || '—'}</div>
               <div><span className="font-medium">Дата начала действия:</span> {inputDateToDisplayDate(activationDate)}</div>
             </div>
-            <div className="flex flex-wrap gap-3 text-sm">
-              <label className="inline-flex items-center gap-2">
-                <input type="radio" checked={sapMode === 'auto'} onChange={() => setSapMode('auto')} />
-                Последние сформированные
-              </label>
-              <label className="inline-flex items-center gap-2">
-                <input type="radio" checked={sapMode === 'manual'} onChange={() => setSapMode('manual')} />
-                Выбрать версии вручную
-              </label>
-            </div>
             <div className="compact-table-wrap">
               <table className="compact-table">
                 <thead>
                   <tr>
-                    <th>Категория</th>
                     <th>Ценовой формат</th>
                     <th>Версия</th>
+                    <th>Конкретный прайс-лист</th>
                   </tr>
                 </thead>
                 <tbody>
                   {sapVersions.length ? sapVersions.map((format) => {
                     const latest = format.versions.find((version) => version.is_latest) || format.versions[0];
+                    const mode = sapSelectionModes[format.price_format_id] || 'auto';
                     return (
                       <tr key={format.price_format_id}>
-                        <td>{format.sap_category || 'Не настроено'}</td>
                         <td>{format.code} · {format.name}</td>
                         <td>
-                          {sapMode === 'manual' ? (
-                            <Select
-                              value={manualPriceLists[format.price_format_id] || ''}
-                              onValueChange={(value) => setManualPriceLists((prev) => ({ ...prev, [format.price_format_id]: value }))}
-                              disabled={isSapLoading || !format.versions.length}
-                            >
-                              <SelectTrigger>
-                                <SelectValue placeholder="Версия" />
-                              </SelectTrigger>
-                              <SelectContent>
-                                {format.versions.map((version) => (
-                                  <SelectItem key={version.price_list_id} value={String(version.price_list_id)}>
-                                    {sapVersionLabel(version)}
-                                  </SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
-                          ) : (
-                            sapVersionLabel(latest)
-                          )}
+                          <div className="space-y-2 text-sm">
+                            <label className="flex items-center gap-2">
+                              <input
+                                type="radio"
+                                checked={mode === 'auto'}
+                                onChange={() => setSapSelectionModes((prev) => ({ ...prev, [format.price_format_id]: 'auto' }))}
+                              />
+                              Последняя успешная
+                            </label>
+                            <div className="text-xs text-gray-500">Resolved: {sapVersionLabel(latest)}</div>
+                            <label className="flex items-center gap-2">
+                              <input
+                                type="radio"
+                                checked={mode === 'manual'}
+                                onChange={() => setSapSelectionModes((prev) => ({ ...prev, [format.price_format_id]: 'manual' }))}
+                              />
+                              Конкретный прайс-лист
+                            </label>
+                          </div>
+                        </td>
+                        <td>
+                          <Select
+                            value={manualPriceLists[format.price_format_id] || ''}
+                            onValueChange={(value) => setManualPriceLists((prev) => ({ ...prev, [format.price_format_id]: value }))}
+                            disabled={isSapLoading || mode !== 'manual' || !format.versions.length}
+                          >
+                            <SelectTrigger>
+                              <SelectValue placeholder="Версия" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {format.versions.map((version) => (
+                                <SelectItem key={version.price_list_id} value={String(version.price_list_id)}>
+                                  {sapVersionLabel(version)}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
                         </td>
                       </tr>
                     );

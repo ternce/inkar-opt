@@ -3,11 +3,10 @@ from __future__ import annotations
 import io
 from dataclasses import dataclass
 from datetime import date, datetime
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
 from typing import Iterable
 
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -17,7 +16,6 @@ from ..models import CalculatedPrice, PriceFormat, PriceList, PricingWorkflowRun
 
 
 SAP_CATEGORIES = ("SuperVIP", "VIP", "1", "2")
-SAP_CATEGORY_ORDER = {category: index for index, category in enumerate(SAP_CATEGORIES)}
 SAP_HEADERS = [
     "Номер материала",
     "Категория/Прайс-лист",
@@ -114,26 +112,6 @@ def _validate_unique_price_format_ids(price_format_ids: list[int]) -> None:
         )
 
 
-def _validate_unique_sap_categories(formats: list[PriceFormat]) -> None:
-    by_category: dict[str, PriceFormat] = {}
-    duplicates: list[str] = []
-    for pf in formats:
-        category = normalize_sap_category(pf.sap_category)
-        if category is None:
-            continue
-        existing = by_category.get(category)
-        if existing is not None:
-            duplicates.append(f"{category}: {_format_label(existing)}, {_format_label(pf)}")
-            continue
-        by_category[category] = pf
-    if duplicates:
-        raise SapExportError(
-            "SAP file was not generated.\n"
-            "Each selected SAP category must be unique:\n"
-            + "\n".join(f"- {message}" for message in duplicates)
-        )
-
-
 def _load_price_formats(db: Session, price_format_ids: Iterable[int], branch_id: str, user: AppUser) -> list[PriceFormat]:
     ids = [_coerce_int_id(value, "price_format_id") for value in price_format_ids]
     if not ids:
@@ -155,13 +133,9 @@ def _load_price_formats(db: Session, price_format_ids: Iterable[int], branch_id:
         if not user_can_access_branch(user, _branch_id_for_name(pf.branch), pf.branch):
             errors.append(f"{_format_label(pf)} is not available for current user")
             continue
-        if normalize_sap_category(pf.sap_category) is None:
-            errors.append(f"{_format_label(pf)} has no SAP category")
-            continue
         out.append(pf)
     if errors:
         raise SapExportError("SAP file was not generated.\n" + "\n".join(f"- {message}" for message in errors), status_code=403 if any("not available" in e for e in errors) else 400)
-    _validate_unique_sap_categories(out)
     return out
 
 
@@ -199,7 +173,7 @@ def list_versions(db: Session, *, branch_id: str, activation_date: str | date, p
                 "price_format_id": int(pf.id),
                 "code": pf.code,
                 "name": pf.name,
-                "sap_category": normalize_sap_category(pf.sap_category),
+                "sap_category": pf.sap_category,
                 "versions": [_version_dict(run, price_list, index == 0) for index, (run, price_list) in enumerate(rows)],
             }
         )
@@ -226,6 +200,65 @@ def resolve_latest_successful_versions(
             f"No successful price list exists for {effective_date.isoformat()}:\n"
             + "\n".join(f"- {label}" for label in missing)
         )
+    return resolved
+
+
+def resolve_selected_versions(
+    db: Session, *, branch_id: str, activation_date: str | date, items: list[dict], user: AppUser
+) -> list[ResolvedSapVersion]:
+    effective_date = _parse_activation_date(activation_date)
+    if not items:
+        raise SapExportError("no selected formats")
+    parsed_items: list[dict] = []
+    for item in items:
+        selection_mode = str(item.get("selection_mode") or item.get("selectionMode") or "auto").strip().lower()
+        if selection_mode not in {"auto", "manual"}:
+            raise SapExportError("selection_mode must be auto or manual")
+        parsed = {
+            "price_format_id": _coerce_int_id(item.get("price_format_id") or item.get("priceFormatId"), "price_format_id"),
+            "selection_mode": selection_mode,
+        }
+        if selection_mode == "manual":
+            parsed["price_list_id"] = _coerce_int_id(item.get("price_list_id") or item.get("priceListId"), "price_list_id")
+        parsed_items.append(parsed)
+
+    price_format_ids = [item["price_format_id"] for item in parsed_items]
+    formats = _load_price_formats(db, price_format_ids, branch_id, user)
+    by_id = {int(pf.id): pf for pf in formats}
+    resolved: list[ResolvedSapVersion] = []
+    errors: list[str] = []
+    for item in parsed_items:
+        price_format_id = item["price_format_id"]
+        pf = by_id.get(price_format_id)
+        if pf is None:
+            errors.append(f"PriceFormat {price_format_id} is invalid")
+            continue
+        if item["selection_mode"] == "auto":
+            row = db.execute(_successful_versions_stmt(price_format_id, effective_date).limit(1)).first()
+            if row is None:
+                errors.append(f"{_format_label(pf)} has no successful price list for {effective_date.isoformat()}")
+                continue
+        else:
+            price_list_id = item["price_list_id"]
+            row = db.execute(
+                select(PricingWorkflowRun, PriceList)
+                .join(PriceList, PricingWorkflowRun.price_list_id == PriceList.id)
+                .where(PricingWorkflowRun.price_format_id == price_format_id)
+                .where(PricingWorkflowRun.price_list_id == price_list_id)
+                .where(PricingWorkflowRun.status == "success")
+                .where(PriceList.id == price_list_id)
+                .where(PriceList.price_format_id == price_format_id)
+                .where(PriceList.activation_date == effective_date)
+                .order_by(PricingWorkflowRun.finished_at.desc().nulls_last(), PricingWorkflowRun.started_at.desc(), PricingWorkflowRun.id.desc())
+                .limit(1)
+            ).first()
+            if row is None:
+                errors.append(f"{_format_label(pf)} has invalid manual version {price_list_id}")
+                continue
+        run, price_list = row
+        resolved.append(ResolvedSapVersion(price_format=pf, price_list=price_list, workflow_run=run))
+    if errors:
+        raise SapExportError("SAP file was not generated.\n" + "\n".join(f"- {message}" for message in errors))
     return resolved
 
 
@@ -304,7 +337,7 @@ def _material_number(code: object) -> str:
 def _money(value: object) -> Decimal:
     if value is None:
         raise SapExportError("SAP file was not generated.\n- CalculatedPrice.final_price is missing")
-    return Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return Decimal(str(value))
 
 
 def build_sap_rows(db: Session, resolved_versions: list[ResolvedSapVersion]) -> list[dict]:
@@ -312,6 +345,7 @@ def build_sap_rows(db: Session, resolved_versions: list[ResolvedSapVersion]) -> 
         raise SapExportError("no selected formats")
     _validate_resolved_price_lists_have_rows(db, resolved_versions)
     by_price_list_id = {int(item.price_list.id): item for item in resolved_versions}
+    format_order = {int(item.price_format.id): index for index, item in enumerate(resolved_versions)}
     rows = db.execute(
         select(CalculatedPrice, Product)
         .join(Product, Product.id == CalculatedPrice.product_id)
@@ -320,44 +354,44 @@ def build_sap_rows(db: Session, resolved_versions: list[ResolvedSapVersion]) -> 
     out: list[dict] = []
     for cp, product in rows:
         resolved = by_price_list_id[int(cp.price_list_id)]
-        category = normalize_sap_category(resolved.price_format.sap_category)
-        if category is None:
-            raise SapExportError(f"SAP file was not generated.\n- {_format_label(resolved.price_format)} has no SAP category")
         material = _material_number(product.code)
         out.append(
             {
                 "material": material,
-                "category": category,
+                "category": resolved.price_format.name,
                 "unlock_status": "",
                 "price": _money(cp.final_price),
+                "price_format_id": int(resolved.price_format.id),
+                "format_order": format_order[int(resolved.price_format.id)],
             }
         )
+
     def sort_key(row: dict) -> tuple:
         material = str(row["material"])
         material_key = (0, int(material)) if material.isdigit() else (1, material)
-        return material_key, SAP_CATEGORY_ORDER[row["category"]]
+        return material_key, int(row["format_order"])
 
     out.sort(key=sort_key)
     return out
 
 
+def _excel_material(value: object) -> int | str:
+    text = str(value or "").strip()
+    if text.isdigit() and len(text) <= 15:
+        return int(text)
+    return text
+
+
 def build_workbook(rows: list[dict]) -> bytes:
     wb = Workbook()
     ws = wb.active
-    ws.title = "SAP"
+    ws.title = "Sheet1"
     ws.append(SAP_HEADERS)
-    header_fill = PatternFill("solid", fgColor="D9EAF7")
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-        cell.fill = header_fill
-        cell.alignment = Alignment(wrap_text=True, vertical="top")
     for row in rows:
-        ws.append([row["material"], row["category"], "", float(row["price"])])
-        ws.cell(row=ws.max_row, column=4).number_format = "0.00"
-    widths = [18, 24, 24, 56]
+        ws.append([_excel_material(row["material"]), row["category"], None, row["price"]])
+    widths = [22, 32, 28, 72]
     for index, width in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(index)].width = width
-    ws.auto_filter.ref = f"A1:D{ws.max_row}"
     stream = io.BytesIO()
     wb.save(stream)
     return stream.getvalue()
@@ -374,7 +408,13 @@ def build_export(
     user: AppUser,
 ) -> tuple[bytes, list[ResolvedSapVersion], int]:
     normalized_mode = str(mode or "").strip().lower()
-    if normalized_mode == "auto":
+    has_per_item_selection = any(
+        isinstance(item, dict) and ("selection_mode" in item or "selectionMode" in item)
+        for item in (items or [])
+    )
+    if items and has_per_item_selection:
+        resolved = resolve_selected_versions(db, branch_id=branch_id, activation_date=activation_date, items=items, user=user)
+    elif normalized_mode == "auto":
         resolved = resolve_latest_successful_versions(
             db,
             branch_id=branch_id,
