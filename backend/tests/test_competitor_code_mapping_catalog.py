@@ -17,6 +17,7 @@ from backend.app.models import (
     PriceFormat,
     PriceFormatCompetitorAssignment,
     Product,
+    ProductExtra,
 )
 from backend.app.main import create_competitor_code_mapping, unmap_competitor_code_mapping
 from backend.app.services.competitors.code_mappings import list_catalog_code_mappings, source_match_key
@@ -91,6 +92,31 @@ def _item(
     return row
 
 
+def _product(db: Session, code: str, name: str, manufacturer: str = "") -> Product:
+    row = Product(code=code, name=name, cost=1)
+    db.add(row)
+    db.flush()
+    db.add(ProductExtra(product_id=row.id, manufacturer=manufacturer))
+    db.flush()
+    return row
+
+
+def _candidate_items(db: Session, source: CompetitorPriceListItem, pf: PriceFormat) -> list[dict]:
+    db.commit()
+    result = list_catalog_code_mappings(
+        db=db,
+        platform="provisor",
+        price_format_id=pf.id,
+        status="unmapped",
+        source_q=str(source.provisor_goods_id),
+        page=1,
+        limit=1,
+        include_candidates=True,
+    )
+    assert result["pagination"]["total"] == 1
+    return result["items"][0]["candidates"]
+
+
 def test_unmatched_provisor_catalog_is_source_first_and_deduplicates_goods_id():
     db = _session()
     pf = _price_format(db)
@@ -149,6 +175,130 @@ def test_unmatched_provisor_catalog_is_source_first_and_deduplicates_goods_id():
     assert result["metrics"][0]["mapped"] == 3
     assert result["metrics"][0]["rejected"] == 1
     assert result["metrics"][0]["unmapped"] == 2
+
+
+def test_source_first_provisor_row_generates_exact_candidate():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="candidates", price_date=date(2026, 1, 1))
+    source = _item(db, price_list, 1001, name="Аспирин таб 500 мг N10", manufacturer="Bayer")
+    product = _product(db, "ASP-500-10", "Аспирин таб 500 мг N10", "Bayer")
+
+    candidates = _candidate_items(db, source, pf)
+
+    assert candidates
+    assert candidates[0]["ourProductId"] == product.id
+    assert candidates[0]["matchLevel"] == "exact"
+    assert candidates[0]["manufacturerMismatch"] is False
+    assert candidates[0]["sourceManufacturer"] == "Bayer"
+    assert candidates[0]["internalManufacturer"] == "Bayer"
+
+
+def test_source_first_provisor_row_generates_manufacturer_different_candidate():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="mfr-diff", price_date=date(2026, 1, 1))
+    source = _item(db, price_list, 1002, name="Аспирин таб 500 мг N10", manufacturer="Bayer")
+    product = _product(db, "ASP-OTHER", "Аспирин таб 500 мг N10", "Polpharma")
+
+    candidates = _candidate_items(db, source, pf)
+
+    assert [candidate["ourProductId"] for candidate in candidates] == [product.id]
+    assert candidates[0]["matchLevel"] == "characteristics"
+    assert candidates[0]["manufacturerMismatch"] is True
+    assert candidates[0]["sourceManufacturer"] == "Bayer"
+    assert candidates[0]["internalManufacturer"] == "Polpharma"
+
+
+def test_exact_candidate_appears_before_manufacturer_different_candidate():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="candidate-order", price_date=date(2026, 1, 1))
+    source = _item(db, price_list, 1003, name="Аспирин таб 500 мг N10", manufacturer="Bayer")
+    diff = _product(db, "ASP-DIFF", "Аспирин таб 500 мг N10", "Polpharma")
+    exact = _product(db, "ASP-EXACT", "Аспирин таб 500 мг N10", "Bayer")
+
+    candidates = _candidate_items(db, source, pf)
+
+    assert [candidate["ourProductId"] for candidate in candidates[:2]] == [exact.id, diff.id]
+    assert [candidate["matchLevel"] for candidate in candidates[:2]] == ["exact", "characteristics"]
+
+
+def test_different_dosage_is_not_characteristics_candidate():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="dosage", price_date=date(2026, 1, 1))
+    source = _item(db, price_list, 1004, name="Аспирин таб 500 мг N10", manufacturer="Bayer")
+    _product(db, "ASP-250", "Аспирин таб 250 мг N10", "Polpharma")
+
+    assert _candidate_items(db, source, pf) == []
+
+
+def test_different_volume_is_not_characteristics_candidate():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="volume", price_date=date(2026, 1, 1))
+    source = _item(db, price_list, 1005, name="Аспирин сироп 500 мг 10 мл N10", manufacturer="Bayer")
+    _product(db, "ASP-20ML", "Аспирин сироп 500 мг 20 мл N10", "Polpharma")
+
+    assert _candidate_items(db, source, pf) == []
+
+
+def test_different_dosage_form_is_not_characteristics_candidate():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="form", price_date=date(2026, 1, 1))
+    source = _item(db, price_list, 1006, name="Аспирин таб 500 мг N10", manufacturer="Bayer")
+    _product(db, "ASP-CAPS", "Аспирин капс 500 мг N10", "Polpharma")
+
+    assert _candidate_items(db, source, pf) == []
+
+
+def test_different_package_count_is_not_characteristics_candidate():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="quantity", price_date=date(2026, 1, 1))
+    source = _item(db, price_list, 1007, name="Аспирин таб 500 мг N10", manufacturer="Bayer")
+    _product(db, "ASP-N20", "Аспирин таб 500 мг N20", "Polpharma")
+
+    assert _candidate_items(db, source, pf) == []
+
+
+def test_no_candidate_row_still_supports_manual_product_search_endpoint():
+    db = _session()
+    pf = _price_format(db, "SEARCH")
+    price_list = _price_list(db, pf, source_key="search-products", price_date=date(2026, 1, 1))
+    source = _item(db, price_list, 1008, name="Неточный источник 10 мг N10", manufacturer="Source")
+    product = _product(db, "MANUAL-1", "Ручной товар 1 мг N1", "Manual")
+    db.commit()
+
+    result = list_catalog_code_mappings(
+        db=db,
+        platform="provisor",
+        price_format_id=pf.id,
+        status="unmapped",
+        source_q=str(source.provisor_goods_id),
+        page=1,
+        limit=1,
+        include_candidates=True,
+    )
+    assert result["items"][0]["candidates"] == []
+
+    def override_db():
+        try:
+            yield db
+        finally:
+            pass
+
+    main.app.dependency_overrides[main.get_db] = override_db
+    main.app.dependency_overrides[get_current_user] = _admin
+    try:
+        client = TestClient(main.app)
+        response = client.get("/api/products/search?q=MANUAL&limit=10")
+        assert response.status_code == 200
+        assert response.json()[0]["productId"] == product.id
+    finally:
+        main.app.dependency_overrides.clear()
 
 
 def test_provisor_catalog_paginates_distinct_goods_with_stable_ordering():

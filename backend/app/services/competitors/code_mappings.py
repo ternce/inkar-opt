@@ -21,6 +21,24 @@ from ..competitor_read_models import refresh_price_list_item_counters
 
 SUPPORTED_PLATFORMS = {"provisor", "vidman"}
 MANUAL_SUGGESTION_MIN_SCORE = 55.0
+MANUAL_CANDIDATE_POOL_LIMIT = 250
+MANUAL_CANDIDATE_LIMIT = 10
+
+
+STRUCTURED_MANUAL_FIELDS = (
+    "dosage",
+    "dosage_volume",
+    "strength_signature",
+    "concentration",
+    "percent_strength",
+    "iu_dosage",
+    "volume",
+    "weight",
+    "quantity",
+    "form",
+    "dimensions",
+    "critical_tokens",
+)
 
 
 def _same_manual_value(left: object, right: object) -> bool:
@@ -109,6 +127,175 @@ def _manual_suggestion_score(
         "formMatch": form_match,
         "manufacturerScore": round(manufacturer_score, 2),
     }
+
+
+def _manual_characteristic_values(structure) -> dict:
+    return {
+        "baseName": structure.base_name,
+        "dosage": structure.dosage,
+        "dosageVolume": structure.dosage_volume,
+        "strengthSignature": list(structure.strength_signature or ()),
+        "concentration": structure.concentration,
+        "percentStrength": structure.percent_strength,
+        "iuDosage": structure.iu_dosage,
+        "volume": structure.volume,
+        "weight": structure.weight,
+        "quantity": structure.quantity,
+        "form": structure.form,
+        "forms": list(structure.forms or ()),
+        "dimensions": list(structure.dimensions or ()),
+        "criticalTokens": list(structure.critical_tokens or ()),
+    }
+
+
+def _manual_field_value(structure, field: str):
+    if field == "form":
+        return set(structure.forms or ((structure.form,) if structure.form else ()))
+    return getattr(structure, field, None)
+
+
+def _manual_values_match(left: object, right: object) -> bool:
+    if isinstance(left, set) or isinstance(right, set):
+        left_set = set(left or ())
+        right_set = set(right or ())
+        return bool(left_set and right_set and not left_set.isdisjoint(right_set))
+    if isinstance(left, tuple) or isinstance(right, tuple):
+        return tuple(left or ()) == tuple(right or ())
+    return _same_manual_value(left, right)
+
+
+def _manual_structured_match(source_structure, product_structure) -> tuple[bool, str | None, int]:
+    matched = 0
+    for field in STRUCTURED_MANUAL_FIELDS:
+        source_value = _manual_field_value(source_structure, field)
+        product_value = _manual_field_value(product_structure, field)
+        source_has = bool(source_value) if field == "form" else source_value is not None
+        product_has = bool(product_value) if field == "form" else product_value is not None
+        if source_has and not product_has:
+            return False, f"missing_internal_{field}", matched
+        if source_has and product_has:
+            if not _manual_values_match(source_value, product_value):
+                return False, f"{field}_conflict", matched
+            matched += 1
+    return True, None, matched
+
+
+def _manual_candidate_level(
+    *,
+    source_name: str,
+    source_manufacturer: str,
+    product_name: str,
+    product_manufacturer: str,
+) -> tuple[str, bool, float, dict] | None:
+    from ..competitor_matching import _base_name_similarity, _manufacturer_match, normalize_manufacturer_text, parse_drug_structure
+
+    source_structure = parse_drug_structure(source_name)
+    product_structure = parse_drug_structure(product_name)
+    source_base = source_structure.base_name or normalize_mapping_text(source_name)
+    product_base = product_structure.base_name or normalize_mapping_text(product_name)
+    name_score = _base_name_similarity(source_base, product_base)
+    if name_score < 97:
+        return None
+
+    structured_ok, reject_reason, matched_fields = _manual_structured_match(source_structure, product_structure)
+    if not structured_ok:
+        return None
+
+    source_manufacturer_norm = normalize_manufacturer_text(source_manufacturer)
+    product_manufacturer_norm = normalize_manufacturer_text(product_manufacturer)
+    manufacturers_match = bool(
+        source_manufacturer_norm
+        and product_manufacturer_norm
+        and _manufacturer_match(source_manufacturer_norm, product_manufacturer_norm)
+    )
+    manufacturer_mismatch = bool(source_manufacturer_norm and product_manufacturer_norm and not manufacturers_match)
+    if manufacturers_match:
+        match_level = "exact"
+        confidence = 100.0
+    elif manufacturer_mismatch:
+        match_level = "characteristics"
+        confidence = 92.0
+    else:
+        return None
+
+    return match_level, manufacturer_mismatch, confidence, {
+        "nameScore": round(name_score, 2),
+        "matchedFields": matched_fields,
+        "rejectReason": reject_reason,
+        "sourceCharacteristics": _manual_characteristic_values(source_structure),
+        "internalCharacteristics": _manual_characteristic_values(product_structure),
+        "sourceManufacturerNormalized": source_manufacturer_norm,
+        "internalManufacturerNormalized": product_manufacturer_norm,
+    }
+
+
+def _manual_candidates_for_source(db: Session, source: dict, limit: int = MANUAL_CANDIDATE_LIMIT) -> list[dict]:
+    from ..competitor_matching import parse_drug_structure
+
+    source_name = str(source.get("sourceName") or "")
+    source_structure = parse_drug_structure(source_name)
+    source_base = source_structure.base_name or normalize_mapping_text(source_name)
+    source_tokens = [token for token in source_base.split() if len(token) >= 3 and not token.isdigit()]
+    source_tokens.extend(token for token in str(source_name).split() if len(token) >= 3 and not token.isdigit())
+    source_tokens.extend(token for token in normalize_mapping_text(source_name).split() if len(token) >= 3 and not token.isdigit())
+    source_tokens = list(dict.fromkeys(source_tokens))
+    if not source_tokens:
+        return []
+
+    name_filter = None
+    for token in source_tokens[:3]:
+        condition = Product.name.ilike(f"%{token}%")
+        name_filter = condition if name_filter is None else name_filter | condition
+    product_rows = (
+        db.execute(
+            select(Product, ProductExtra)
+            .join(ProductExtra, ProductExtra.product_id == Product.id, isouter=True)
+            .where(name_filter)
+            .order_by(Product.code.asc())
+            .limit(MANUAL_CANDIDATE_POOL_LIMIT)
+        )
+        .all()
+    )
+
+    candidate_by_product: dict[int, dict] = {}
+    for product, extra in product_rows:
+        product_manufacturer = (extra.manufacturer if extra else "") or ""
+        level = _manual_candidate_level(
+            source_name=source_name,
+            source_manufacturer=str(source.get("sourceManufacturer") or ""),
+            product_name=product.name,
+            product_manufacturer=product_manufacturer,
+        )
+        if level is None:
+            continue
+        match_level, manufacturer_mismatch, confidence, details = level
+        product_id = int(product.id)
+        candidate_by_product[product_id] = {
+            **source,
+            "ourProductId": product_id,
+            "productId": product_id,
+            "ourSku": product.code,
+            "ourName": product.name,
+            "ourManufacturer": product_manufacturer,
+            "confidence": confidence,
+            "matchType": f"manual_{match_level}_suggestion",
+            "matchLevel": match_level,
+            "manufacturerMismatch": manufacturer_mismatch,
+            "sourceManufacturer": str(source.get("sourceManufacturer") or ""),
+            "internalManufacturer": product_manufacturer,
+            "manualSuggestion": details,
+        }
+
+    level_rank = {"exact": 0, "characteristics": 1}
+    return sorted(
+        candidate_by_product.values(),
+        key=lambda item: (
+            level_rank.get(str(item.get("matchLevel") or ""), 9),
+            -float(item.get("confidence") or 0),
+            str(item.get("ourSku") or ""),
+            int(item.get("ourProductId") or 0),
+        ),
+    )[: max(1, min(int(limit or MANUAL_CANDIDATE_LIMIT), MANUAL_CANDIDATE_LIMIT))]
 
 
 def normalize_mapping_text(value: object) -> str:
@@ -451,6 +638,7 @@ def _list_provisor_catalog_code_mappings_sql_page(
     product_q: str,
     page: int,
     limit: int,
+    include_candidates: bool,
 ) -> dict:
     if assigned_ids == []:
         return {
@@ -517,8 +705,7 @@ def _list_provisor_catalog_code_mappings_sql_page(
             mapping_status = "rejected"
         elif data["manual_status"] == "mapped" or data["product_id"] is not None or data["matched_sku"]:
             mapping_status = "mapped"
-        items.append(
-            {
+        item_payload = {
                 "itemId": int(data["item_id"]),
                 "priceListId": int(data["price_list_id"]),
                 "priceListName": data["price_list_name"] or data["supplier"] or data["price_list_source_key"] or "",
@@ -554,7 +741,12 @@ def _list_provisor_catalog_code_mappings_sql_page(
                 "candidates": [],
                 "bestCandidate": None,
             }
-        )
+        if include_candidates and mapping_status == "unmapped":
+            candidates = _manual_candidates_for_source(db, item_payload)
+            item_payload["candidates"] = candidates
+            item_payload["candidatesCount"] = len(candidates)
+            item_payload["bestCandidate"] = candidates[0] if candidates else None
+        items.append(item_payload)
 
     def metric_count(metric_status: str) -> int:
         metric_base = _provisor_catalog_base(assigned_ids=assigned_ids)
@@ -825,6 +1017,7 @@ def list_catalog_code_mappings(
             product_q=product_q,
             page=page,
             limit=limit,
+            include_candidates=include_candidates,
         )
     if (
         not include_candidates

@@ -237,6 +237,14 @@ type CodeMappingCandidate = {
   sourceManufacturer?: string;
   sourceDosageForm?: string;
   sourceNormalizedName?: string;
+  ourProductId?: number | null;
+  productId?: number | null;
+  ourSku?: string;
+  ourName?: string;
+  ourManufacturer?: string;
+  internalManufacturer?: string;
+  matchLevel?: 'exact' | 'characteristics' | string;
+  manufacturerMismatch?: boolean;
 };
 
 type CodeMappingRow = CodeMappingCandidate & {
@@ -1142,7 +1150,7 @@ export function CompetitorsTab({ formatCode }: Props) {
       platform: mappingPlatform,
       status: 'unmapped',
       format_code: formatCode,
-      product_q: row.ourSku || row.ourName || '',
+      source_q: row.sourceExternalKey || row.sourceGoodsId || row.sourceName || '',
       page: '1',
       limit: '1',
       include_candidates: 'true',
@@ -1152,12 +1160,12 @@ export function CompetitorsTab({ formatCode }: Props) {
     const data = parseJsonOrNull(text);
     if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить кандидатов');
     const fresh = (Array.isArray(data?.items) ? data.items : []).find(
-      (item: CodeMappingRow) => item.ourProductId === row.ourProductId || item.ourSku === row.ourSku,
+      (item: CodeMappingRow) => item.sourceMatchKey === row.sourceMatchKey,
     );
     if (!fresh) return;
-    setSelectedRow((current) => (current?.ourProductId === row.ourProductId ? { ...current, ...fresh } : current));
+    setSelectedRow((current) => (current?.sourceMatchKey === row.sourceMatchKey ? { ...current, ...fresh } : current));
     setSelectedCandidate(fresh.bestCandidate || fresh.candidates?.[0] || (fresh.itemId ? fresh : null));
-    setCodeRows((current) => current.map((item) => (item.ourProductId === row.ourProductId ? { ...item, ...fresh } : item)));
+    setCodeRows((current) => current.map((item) => (item.sourceMatchKey === row.sourceMatchKey ? { ...item, ...fresh } : item)));
   };
 
   const selectMappingRow = (row: CodeMappingRow) => {
@@ -1167,7 +1175,6 @@ export function CompetitorsTab({ formatCode }: Props) {
     const query = candidateQueryForRow(row);
     setProductSearch(query);
     setProductResults([]);
-    if (!row.ourProductId && row.sourceMatchKey) return;
     void loadCandidatesForRow(row).catch((err: any) => setError(err?.message || 'Ошибка загрузки кандидатов'));
   };
 
@@ -1583,23 +1590,51 @@ export function CompetitorsTab({ formatCode }: Props) {
               </div>
 
               <div>
-                <div className="mb-2 text-sm font-semibold text-gray-900">Кандидаты конкурента</div>
+                <div className="mb-2 text-sm font-semibold text-gray-900">Кандидаты из нашей базы</div>
                 <div className="thin-scrollbar max-h-64 overflow-auto rounded-md border border-gray-200">
                   {selectedRow.candidates?.length ? selectedRow.candidates.map((row) => (
                     <button
-                      key={`${row.itemId}-${row.sourceMatchKey}`}
+                      key={`${row.ourProductId || row.productId}-${row.sourceMatchKey}`}
                       type="button"
-                      onClick={() => setSelectedCandidate(row)}
-                      className={`block w-full border-b border-gray-100 px-3 py-2 text-left text-sm hover:bg-gray-50 ${selectedCandidate?.sourceMatchKey === row.sourceMatchKey ? 'bg-blue-50' : ''}`}
+                      onClick={() => {
+                        setSelectedCandidate(row);
+                        if (row.ourProductId || row.productId) {
+                          setSelectedProduct({
+                            productId: Number(row.ourProductId || row.productId),
+                            sku: row.ourSku || '',
+                            name: row.ourName || '',
+                            manufacturer: row.ourManufacturer || row.internalManufacturer || '',
+                          });
+                        }
+                      }}
+                      className={`block w-full border-b border-gray-100 px-3 py-2 text-left text-sm hover:bg-gray-50 ${selectedProduct?.productId === (row.ourProductId || row.productId) ? 'bg-blue-50' : ''}`}
                     >
                       <div className="flex items-center justify-between gap-3">
-                        <span className="font-semibold text-gray-900">{row.sourceName || '—'}</span>
+                        <span className="font-semibold text-gray-900">{row.ourSku || '—'} · {row.ourName || '—'}</span>
                         <span className="text-xs text-gray-500">уверенность: {fmtNumber(row.confidence)}</span>
                       </div>
-                      <div className="mt-1 text-xs text-gray-500">{row.sourceManufacturer || 'Производитель не указан'} · {row.priceListName || 'Источник не указан'} · {row.priceDate || 'дата цены не указана'}</div>
+                      <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                        <span className="status-pill">
+                          {row.matchLevel === 'exact' ? 'Точное совпадение' : 'Совпадение по характеристикам'}
+                        </span>
+                        {row.manufacturerMismatch ? (
+                          <span className="status-pill border-yellow-300 bg-yellow-50 text-yellow-800">Производитель отличается</span>
+                        ) : null}
+                      </div>
+                      {row.manufacturerMismatch ? (
+                        <div className="mt-2 rounded-md border border-yellow-200 bg-yellow-50 px-2 py-1 text-xs text-yellow-900">
+                          Provisor manufacturer: {row.sourceManufacturer || 'не указан'}<br />
+                          Our manufacturer: {row.ourManufacturer || row.internalManufacturer || 'не указан'}
+                        </div>
+                      ) : (
+                        <div className="mt-1 text-xs text-gray-500">{row.ourManufacturer || row.internalManufacturer || 'Производитель не указан'}</div>
+                      )}
                     </button>
                   )) : (
-                    <div className="px-3 py-6 text-center text-sm text-gray-500">Кандидаты конкурента не найдены.</div>
+                    <div className="px-3 py-6 text-center text-sm text-gray-500">
+                      Подходящие совпадения автоматически не найдены.<br />
+                      Используйте поиск по нашей базе ниже.
+                    </div>
                   )}
                 </div>
                 <Button className="mt-3 w-full bg-blue-600 hover:bg-blue-700" onClick={mapSelected} disabled={isLoading || !selectedProduct || selectedRow.status === 'rejected'}>
