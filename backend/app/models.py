@@ -85,6 +85,16 @@ class InternalProductNormalized(Base):
 
 class PriceFormat(Base):
     __tablename__ = "price_formats"
+    __table_args__ = (
+        Index(
+            "uq_price_formats_sap_branch_sequence",
+            "sap_branch_code",
+            "sequence_number",
+            unique=True,
+            postgresql_where=text("sap_branch_code IS NOT NULL AND sequence_number IS NOT NULL"),
+            sqlite_where=text("sap_branch_code IS NOT NULL AND sequence_number IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     code: Mapped[str] = mapped_column(Text, unique=True, index=True)

@@ -153,6 +153,7 @@ def init_db() -> None:
         _require_production_auth_schema_ready()
     Base.metadata.create_all(bind=engine)
     _ensure_compatible_columns()
+    _ensure_price_format_sequence_index()
     _ensure_default_price_format_sap_mappings()
     _ensure_compatible_column_types()
     _ensure_nullable_percentile_values()
@@ -466,6 +467,28 @@ def _ensure_default_price_format_sap_mappings() -> None:
     with SessionLocal() as db:
         seed_default_sap_branch_mappings(db)
         db.commit()
+
+
+def _ensure_price_format_sequence_index() -> None:
+    inspector = inspect(engine)
+    if not inspector.has_table("price_formats"):
+        return
+    existing_columns = {col["name"] for col in inspector.get_columns("price_formats")}
+    if not {"sap_branch_code", "sequence_number"}.issubset(existing_columns):
+        return
+    existing_indexes = {idx["name"] for idx in inspector.get_indexes("price_formats")}
+    if "uq_price_formats_sap_branch_sequence" in existing_indexes:
+        return
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_price_formats_sap_branch_sequence
+                ON price_formats (sap_branch_code, sequence_number)
+                WHERE sap_branch_code IS NOT NULL AND sequence_number IS NOT NULL
+                """
+            )
+        )
 
 
 def _ensure_app_sessions_table() -> None:

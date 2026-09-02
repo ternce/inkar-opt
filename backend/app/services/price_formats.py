@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -105,12 +106,9 @@ def normalize_price_list_type(value: object) -> str:
     return price_list_type
 
 
-def allocate_price_format_code(db: Session, *, branch: str, price_list_type: object) -> GeneratedPriceFormatCode:
-    normalized_type = normalize_price_list_type(price_list_type)
-    mapping = resolve_sap_branch_mapping(db, branch)
-    sap_branch_code = str(mapping.sap_branch_code)
-
-    if db.bind is not None and db.bind.dialect.name == "postgresql":
+def _ensure_price_format_branch_counter(db: Session, sap_branch_code: str) -> None:
+    dialect = db.bind.dialect.name if db.bind is not None else ""
+    if dialect == "postgresql":
         db.execute(
             text(
                 """
@@ -121,9 +119,73 @@ def allocate_price_format_code(db: Session, *, branch: str, price_list_type: obj
             ),
             {"sap_branch_code": sap_branch_code},
         )
+    elif dialect == "sqlite":
+        db.execute(
+            text(
+                """
+                INSERT OR IGNORE INTO price_format_branch_counters (sap_branch_code, last_sequence, updated_at)
+                VALUES (:sap_branch_code, 0, CURRENT_TIMESTAMP)
+                """
+            ),
+            {"sap_branch_code": sap_branch_code},
+        )
     elif db.get(PriceFormatBranchCounter, sap_branch_code) is None:
         db.add(PriceFormatBranchCounter(sap_branch_code=sap_branch_code, last_sequence=0))
         db.flush()
+
+
+def _max_sequence_from_generated_metadata(db: Session, sap_branch_code: str) -> int:
+    return int(
+        db.scalar(
+            select(func.max(PriceFormat.sequence_number)).where(
+                PriceFormat.sap_branch_code == sap_branch_code,
+                PriceFormat.sequence_number.is_not(None),
+            )
+        )
+        or 0
+    )
+
+
+def _max_sequence_from_generated_codes(db: Session, sap_branch_code: str) -> int:
+    clauses = [
+        PriceFormat.code.like(f"{price_list_type}_{sap_branch_code}_%")
+        for price_list_type in PRICE_LIST_TYPES
+    ]
+    pattern = re.compile(
+        rf"^(?:{'|'.join(re.escape(price_list_type) for price_list_type in PRICE_LIST_TYPES)})_"
+        rf"{re.escape(sap_branch_code)}_([0-9]{{3,}})$"
+    )
+    max_sequence = 0
+    for code in db.scalars(select(PriceFormat.code).where(or_(*clauses))):
+        match = pattern.fullmatch(str(code or ""))
+        if match:
+            max_sequence = max(max_sequence, int(match.group(1)))
+    return max_sequence
+
+
+def _reconcile_price_format_branch_counter(db: Session, sap_branch_code: str) -> None:
+    _ensure_price_format_branch_counter(db, sap_branch_code)
+    counter = db.execute(
+        select(PriceFormatBranchCounter)
+        .where(PriceFormatBranchCounter.sap_branch_code == sap_branch_code)
+        .with_for_update()
+    ).scalar_one()
+    existing_max = max(
+        int(counter.last_sequence or 0),
+        _max_sequence_from_generated_metadata(db, sap_branch_code),
+        _max_sequence_from_generated_codes(db, sap_branch_code),
+    )
+    if int(counter.last_sequence or 0) < existing_max:
+        counter.last_sequence = existing_max
+        counter.updated_at = now_kz_naive()
+        db.flush()
+
+
+def allocate_price_format_code(db: Session, *, branch: str, price_list_type: object) -> GeneratedPriceFormatCode:
+    normalized_type = normalize_price_list_type(price_list_type)
+    mapping = resolve_sap_branch_mapping(db, branch)
+    sap_branch_code = str(mapping.sap_branch_code)
+    _reconcile_price_format_branch_counter(db, sap_branch_code)
 
     for _ in range(1000):
         if db.bind is not None and db.bind.dialect.name in {"postgresql", "sqlite"}:

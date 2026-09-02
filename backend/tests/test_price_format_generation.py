@@ -4,18 +4,32 @@ from concurrent.futures import ThreadPoolExecutor
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from backend.app import main
 from backend.app.db import Base
 from backend.app.deps import ROLE_ADMIN
-from backend.app.models import BranchSapMapping, CalculatedPrice, PriceFormat, PriceList, Product
+from backend.app.models import (
+    BranchSapMapping,
+    CalculatedPrice,
+    PriceFormat,
+    PriceFormatBranchCounter,
+    PriceList,
+    Product,
+)
 from backend.app.services.price_formats import (
     allocate_price_format_code,
     seed_default_sap_branch_mappings,
 )
 from backend.app.services.sap_export import build_sap_rows
+
+
+IPL = "\u0418\u041f\u041b"
+GPL = "\u0413\u041f\u041b"
+ALMATY = "\u0410\u043b\u043c\u0430\u0442\u044b"
+ESIK = "\u0415\u0441\u0438\u043a"
 
 
 def _session_factory(engine=None):
@@ -43,6 +57,25 @@ def _client(Session, monkeypatch):
     return TestClient(main.app)
 
 
+def _generated_format(
+    code: str,
+    *,
+    name: str | None = None,
+    branch: str = ALMATY,
+    price_list_type: str | None = None,
+    sap_branch_code: str | None = None,
+    sequence_number: int | None = None,
+) -> PriceFormat:
+    return PriceFormat(
+        code=code,
+        name=name or code,
+        branch=branch,
+        price_list_type=price_list_type,
+        sap_branch_code=sap_branch_code,
+        sequence_number=sequence_number,
+    )
+
+
 def test_create_price_format_generates_branch_scoped_shared_sequence(monkeypatch):
     Session = _session_factory()
     client = _client(Session, monkeypatch)
@@ -62,6 +95,155 @@ def test_create_price_format_generates_branch_scoped_shared_sequence(monkeypatch
     assert second.json()["code"] == "ГПЛ_1001_002"
     assert third.status_code == 200, third.text
     assert third.json()["code"] == "ИПЛ_1004_001"
+
+
+def test_allocator_bootstraps_from_existing_generated_codes_when_counter_absent():
+    Session = _session_factory()
+    db = Session()
+    db.add_all(
+        [
+            _generated_format(f"{IPL}_1001_001"),
+            _generated_format(f"{GPL}_1001_002"),
+            _generated_format(f"{IPL}_1001_005"),
+        ]
+    )
+    db.commit()
+
+    generated = allocate_price_format_code(db, branch=ALMATY, price_list_type=GPL)
+
+    assert generated.code == f"{GPL}_1001_006"
+    assert generated.sequence_number == 6
+    assert db.get(PriceFormatBranchCounter, "1001").last_sequence == 6
+
+
+def test_allocator_uses_shared_branch_sequence_across_price_list_types_when_counter_absent():
+    Session = _session_factory()
+    db = Session()
+    db.add(_generated_format(f"{IPL}_1001_001"))
+    db.commit()
+
+    generated = allocate_price_format_code(db, branch=ALMATY, price_list_type=GPL)
+
+    assert generated.code == f"{GPL}_1001_002"
+    assert generated.sequence_number == 2
+
+
+def test_allocator_starts_empty_branch_at_first_sequence():
+    Session = _session_factory()
+    db = Session()
+
+    generated = allocate_price_format_code(db, branch=ALMATY, price_list_type=IPL)
+
+    assert generated.code == f"{IPL}_1001_001"
+    assert generated.sequence_number == 1
+
+
+def test_allocator_ignores_legacy_codes_without_sap_branch_segment():
+    Session = _session_factory()
+    db = Session()
+    db.add(_generated_format(f"{GPL}_008"))
+    db.commit()
+
+    generated = allocate_price_format_code(db, branch=ALMATY, price_list_type=IPL)
+
+    assert generated.code == f"{IPL}_1001_001"
+    assert generated.sequence_number == 1
+
+
+def test_allocator_reconciles_metadata_parsed_codes_and_stale_counter():
+    Session = _session_factory()
+    db = Session()
+    db.add_all(
+        [
+            PriceFormatBranchCounter(sap_branch_code="1001", last_sequence=3),
+            _generated_format(f"{IPL}_1001_005"),
+            _generated_format(
+                "metadata-1001-007",
+                price_list_type=GPL,
+                sap_branch_code="1001",
+                sequence_number=7,
+            ),
+        ]
+    )
+    db.commit()
+
+    generated = allocate_price_format_code(db, branch=ALMATY, price_list_type=IPL)
+
+    assert generated.code == f"{IPL}_1001_008"
+    assert generated.sequence_number == 8
+    assert db.get(PriceFormatBranchCounter, "1001").last_sequence == 8
+
+
+def test_allocator_preserves_counter_when_it_is_ahead_of_existing_codes():
+    Session = _session_factory()
+    db = Session()
+    db.add_all(
+        [
+            PriceFormatBranchCounter(sap_branch_code="1001", last_sequence=10),
+            _generated_format(f"{IPL}_1001_005"),
+        ]
+    )
+    db.commit()
+
+    generated = allocate_price_format_code(db, branch=ALMATY, price_list_type=GPL)
+
+    assert generated.code == f"{GPL}_1001_011"
+    assert generated.sequence_number == 11
+
+
+def test_generated_sequence_is_unique_per_sap_branch_even_across_types():
+    Session = _session_factory()
+    db = Session()
+    db.add(
+        _generated_format(
+            f"{IPL}_1001_001",
+            price_list_type=IPL,
+            sap_branch_code="1001",
+            sequence_number=1,
+        )
+    )
+    db.commit()
+
+    db.add(
+        _generated_format(
+            f"{GPL}_1001_001",
+            price_list_type=GPL,
+            sap_branch_code="1001",
+            sequence_number=1,
+        )
+    )
+    try:
+        db.commit()
+        assert False, "duplicate generated sequence should fail"
+    except IntegrityError:
+        db.rollback()
+
+
+def test_same_sequence_is_allowed_for_different_sap_branches():
+    Session = _session_factory()
+    db = Session()
+    db.add_all(
+        [
+            _generated_format(
+                f"{IPL}_1001_001",
+                price_list_type=IPL,
+                sap_branch_code="1001",
+                sequence_number=1,
+            ),
+            _generated_format(
+                f"{IPL}_1004_001",
+                branch=ESIK,
+                price_list_type=IPL,
+                sap_branch_code="1004",
+                sequence_number=1,
+            ),
+        ]
+    )
+
+    db.commit()
+
+    assert db.scalar(select(PriceFormat.id).where(PriceFormat.code == f"{IPL}_1001_001")) is not None
+    assert db.scalar(select(PriceFormat.id).where(PriceFormat.code == f"{IPL}_1004_001")) is not None
 
 
 def test_create_price_format_rejects_invalid_type_and_missing_mapping(monkeypatch):
