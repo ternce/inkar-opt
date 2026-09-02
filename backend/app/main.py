@@ -6042,6 +6042,37 @@ def _price_format_id_or_none(db: Session, format_code: str | None) -> int | None
     return int(pf.id) if pf is not None else None
 
 
+def _price_format_for_mapping_request(
+    db: Session,
+    format_code: str | None,
+    current_user: AppUser | None,
+) -> PriceFormat | None:
+    if not isinstance(format_code, str) or not format_code:
+        return None
+    pf = db.execute(select(PriceFormat).where(PriceFormat.code == format_code.strip())).scalars().first()
+    if pf is None:
+        raise HTTPException(status_code=404, detail="price format not found")
+    if isinstance(current_user, AppUser):
+        _ensure_price_format_access(pf, current_user)
+    return pf
+
+
+def _ensure_mapping_item_format_access(db: Session, item_id: object, price_format_id: int | None) -> None:
+    if price_format_id is None or item_id in (None, ""):
+        return
+    allowed = db.execute(
+        select(PriceFormatCompetitorAssignment.id)
+        .join(CompetitorPriceList, CompetitorPriceList.id == PriceFormatCompetitorAssignment.competitor_price_list_id)
+        .join(CompetitorPriceListItem, CompetitorPriceListItem.price_list_id == CompetitorPriceList.id)
+        .where(PriceFormatCompetitorAssignment.price_format_id == price_format_id)
+        .where(PriceFormatCompetitorAssignment.is_active.is_(True))
+        .where(CompetitorPriceListItem.id == int(item_id))
+        .limit(1)
+    ).scalar()
+    if allowed is None:
+        raise HTTPException(status_code=403, detail="competitor item is not assigned to this price format")
+
+
 def _code_mapping_source_payload(payload: dict, platform: str, db: Session) -> dict:
     item_id = payload.get("itemId") or payload.get("item_id")
     if item_id not in (None, ""):
@@ -6071,15 +6102,17 @@ def get_competitor_code_mappings(
     product_q: str = Query(""),
     limit: int = Query(200, ge=1, le=1000),
     db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
 ):
     try:
         normalized_platform = platform_from_value(platform)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    pf = _price_format_for_mapping_request(db, format_code, current_user)
     return list_code_mappings(
         db=db,
         platform=normalized_platform,
-        price_format_id=_price_format_id_or_none(db, format_code),
+        price_format_id=int(pf.id) if pf is not None else None,
         status=status,
         source_q=source_q,
         product_q=product_q,
@@ -6098,15 +6131,17 @@ def get_competitor_code_mappings_catalog_view(
     limit: int = Query(300, ge=1, le=1000),
     include_candidates: bool = Query(True),
     db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
 ):
     try:
         normalized_platform = platform_from_value(platform)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    pf = _price_format_for_mapping_request(db, format_code, current_user)
     return list_catalog_code_mappings(
         db=db,
         platform=normalized_platform,
-        price_format_id=_price_format_id_or_none(db, format_code),
+        price_format_id=int(pf.id) if pf is not None else None,
         status=status,
         source_q=source_q,
         product_q=product_q,
@@ -6121,7 +6156,9 @@ def search_products_for_mapping(
     q: str = Query(..., min_length=1),
     limit: int = Query(30, ge=1, le=100),
     db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
 ):
+    _ = current_user
     return find_products_for_mapping(db=db, q=q, limit=limit)
 
 
@@ -6372,15 +6409,17 @@ def search_competitor_items_for_mapping(
     format_code: str | None = Query(None),
     limit: int = Query(30, ge=1, le=100),
     db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
 ):
     try:
         normalized_platform = platform_from_value(platform)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    pf = _price_format_for_mapping_request(db, format_code, current_user)
     result = list_code_mappings(
         db=db,
         platform=normalized_platform,
-        price_format_id=_price_format_id_or_none(db, format_code),
+        price_format_id=int(pf.id) if pf is not None else None,
         status="all",
         source_q=q,
         product_q="",
@@ -6390,7 +6429,11 @@ def search_competitor_items_for_mapping(
 
 
 @app.post("/api/competitors/code-mappings")
-def create_competitor_code_mapping(payload: dict = Body(...), db: Session = Depends(get_db)):
+def create_competitor_code_mapping(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+):
     try:
         platform = platform_from_value(payload.get("platform"))
     except ValueError as e:
@@ -6398,6 +6441,12 @@ def create_competitor_code_mapping(payload: dict = Body(...), db: Session = Depe
     status = str(payload.get("status") or "mapped").strip().lower()
     if status not in {"mapped", "unmapped", "rejected"}:
         raise HTTPException(status_code=400, detail="status must be mapped, unmapped or rejected")
+    pf = _price_format_for_mapping_request(
+        db,
+        payload.get("formatCode") or payload.get("format_code"),
+        current_user if isinstance(current_user, AppUser) else None,
+    )
+    _ensure_mapping_item_format_access(db, payload.get("itemId") or payload.get("item_id"), int(pf.id) if pf is not None else None)
     product = None
     product_id = payload.get("ourProductId") or payload.get("productId") or payload.get("our_product_id")
     if status == "mapped":
@@ -6414,7 +6463,11 @@ def create_competitor_code_mapping(payload: dict = Body(...), db: Session = Depe
         source_payload=source_payload,
         status=status,
         confidence=payload.get("confidence", 100),
-        created_by=str(payload.get("createdBy") or payload.get("created_by") or ""),
+        created_by=str(
+            payload.get("createdBy")
+            or payload.get("created_by")
+            or (current_user.username if isinstance(current_user, AppUser) else "")
+        ),
     )
     if platform == "provisor" and status == "mapped" and product is not None:
         item_id = payload.get("itemId") or payload.get("item_id")
@@ -6432,7 +6485,13 @@ def create_competitor_code_mapping(payload: dict = Body(...), db: Session = Depe
 
 
 @app.post("/api/competitors/code-mappings/{mapping_id}/unmap")
-def unmap_competitor_code_mapping(mapping_id: int, db: Session = Depends(get_db)):
+def unmap_competitor_code_mapping(
+    mapping_id: int,
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+    format_code: str | None = Query(None),
+):
+    _price_format_for_mapping_request(db, format_code, current_user if isinstance(current_user, AppUser) else None)
     row = db.get(CompetitorCodeMapping, mapping_id)
     if row is None:
         raise HTTPException(status_code=404, detail="mapping not found")
@@ -6462,7 +6521,13 @@ def unmap_competitor_code_mapping(mapping_id: int, db: Session = Depends(get_db)
 
 
 @app.post("/api/competitors/code-mappings/{mapping_id}/reject")
-def reject_competitor_code_mapping(mapping_id: int, db: Session = Depends(get_db)):
+def reject_competitor_code_mapping(
+    mapping_id: int,
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+    format_code: str | None = Query(None),
+):
+    _price_format_for_mapping_request(db, format_code, current_user if isinstance(current_user, AppUser) else None)
     row = db.get(CompetitorCodeMapping, mapping_id)
     if row is None:
         raise HTTPException(status_code=404, detail="mapping not found")

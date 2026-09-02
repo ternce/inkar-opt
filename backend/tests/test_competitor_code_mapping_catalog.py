@@ -1,12 +1,25 @@
 from datetime import date
 
+from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
-from backend.app.models import Base, CompetitorPriceList, CompetitorPriceListItem, PriceFormat, Product, ProductExtra
+from backend.app import main
+from backend.app.deps import get_current_user
+from backend.app.models import (
+    AppUser,
+    Base,
+    CompetitorCodeMapping,
+    CompetitorPriceList,
+    CompetitorPriceListItem,
+    PriceFormat,
+    PriceFormatCompetitorAssignment,
+    Product,
+)
 from backend.app.main import create_competitor_code_mapping, unmap_competitor_code_mapping
-from backend.app.services.competitors.code_mappings import list_catalog_code_mappings
+from backend.app.services.competitors.code_mappings import list_catalog_code_mappings, source_match_key
 
 
 def _session() -> Session:
@@ -19,183 +32,285 @@ def _session() -> Session:
     return Session(engine)
 
 
-def test_unmapped_queue_excludes_primary_goods_id_and_includes_no_candidate_products():
-    db = _session()
-    db.add_all(
-        [
-            Product(code="SKU-MAPPED", name="Mapped", cost=1, provisor_goods_id=101),
-            Product(code="SKU-OPEN", name="Open", cost=1),
-        ]
-    )
-    db.commit()
-
-    result = list_catalog_code_mappings(db=db, platform="provisor", status="unmapped", page=1, limit=50)
-
-    assert [row["ourSku"] for row in result["items"]] == ["SKU-OPEN"]
-    assert result["pagination"] == {"page": 1, "pageSize": 50, "total": 1, "pageCount": 1}
-    assert result["metrics"][0]["mapped"] == 1
-    assert result["metrics"][0]["noCandidates"] == 1
+def _admin() -> AppUser:
+    return AppUser(username="admin", role="admin", is_active=True)
 
 
-def test_sku_search_is_case_insensitive_and_paginates_filtered_unmapped_rows():
-    db = _session()
-    db.add_all(
-        [
-            Product(code="AbC-001", name="First", cost=1),
-            Product(code="abc-002", name="Second", cost=1),
-            Product(code="OTHER", name="Other", cost=1),
-        ]
-    )
-    db.commit()
-
-    first = list_catalog_code_mappings(
-        db=db, platform="provisor", status="unmapped", product_q="ABC-", page=1, limit=1
-    )
-    second = list_catalog_code_mappings(
-        db=db, platform="provisor", status="unmapped", product_q="abc-", page=2, limit=1
-    )
-
-    assert first["pagination"]["total"] == 2
-    assert first["pagination"]["pageCount"] == 2
-    assert first["metrics"][0]["total"] == 3
-    assert [row["ourSku"] for row in first["items"]] == ["AbC-001"]
-    assert [row["ourSku"] for row in second["items"]] == ["abc-002"]
+def _viewer() -> AppUser:
+    return AppUser(username="viewer", role="viewer", is_active=True)
 
 
-def test_candidates_reuse_match_score_ranking_and_deduplicate_goods_id():
-    db = _session()
-    product = Product(code="SKU-OPEN", name="Same product", cost=1)
-    price_format = PriceFormat(code="TEST", name="Test", branch="Test")
-    db.add(price_format)
+def _price_format(db: Session, code: str = "TEST") -> PriceFormat:
+    row = PriceFormat(code=code, name=code, branch="Test branch")
+    db.add(row)
     db.flush()
-    price_list = CompetitorPriceList(
-        price_format_id=price_format.id,
+    return row
+
+
+def _price_list(db: Session, pf: PriceFormat, *, source_key: str, price_date: date) -> CompetitorPriceList:
+    row = CompetitorPriceList(
+        price_format_id=pf.id,
         source_type="provisor",
-        source_key="test",
-        supplier="test",
-        display_name="test",
-        price_date=date(2026, 1, 1),
+        source_key=source_key,
+        supplier=source_key,
+        display_name=source_key,
+        price_date=price_date,
     )
-    db.add_all([product, price_list])
+    db.add(row)
     db.flush()
-    db.add_all(
-        [
-            CompetitorPriceListItem(
-                price_list_id=price_list.id,
-                provisor_goods_id=10,
-                name="Same product",
-                raw_name="Same product",
-                match_score=70,
-            ),
-            CompetitorPriceListItem(
-                price_list_id=price_list.id,
-                provisor_goods_id=20,
-                name="Same product",
-                raw_name="Same product",
-                match_score=95,
-            ),
-        ]
-    )
-    db.commit()
-
-    result = list_catalog_code_mappings(db=db, platform="provisor", status="unmapped", page=1, limit=50)
-
-    assert [row["sourceExternalKey"] for row in result["items"][0]["candidates"]] == ["20", "10"]
-
-
-def test_mapping_save_and_unmap_keep_primary_goods_id_in_sync():
-    db = _session()
-    product = Product(code="SKU-OPEN", name="Same product", cost=1)
-    price_format = PriceFormat(code="TEST", name="Test", branch="Test")
-    db.add_all([product, price_format])
+    db.add(PriceFormatCompetitorAssignment(price_format_id=pf.id, competitor_price_list_id=row.id, is_active=True))
     db.flush()
-    price_list = CompetitorPriceList(
-        price_format_id=price_format.id,
-        source_type="provisor",
-        source_key="test",
-        supplier="test",
-        display_name="test",
-        price_date=date(2026, 1, 1),
-    )
-    db.add(price_list)
-    db.flush()
-    item = CompetitorPriceListItem(
+    return row
+
+
+def _item(
+    db: Session,
+    price_list: CompetitorPriceList,
+    goods_id: int,
+    *,
+    name: str = "Source product",
+    manufacturer: str = "Source maker",
+    distributor_goods_id: str = "",
+    product_id: int | None = None,
+    matched_sku: str = "",
+) -> CompetitorPriceListItem:
+    row = CompetitorPriceListItem(
         price_list_id=price_list.id,
-        provisor_goods_id=777,
-        name="Same product",
-        raw_name="Same product",
+        product_id=product_id,
+        provisor_goods_id=goods_id,
+        name=name,
+        raw_name=name,
+        raw_manufacturer=manufacturer,
+        distributor_goods_id=distributor_goods_id,
+        match_type="sku" if product_id or matched_sku else "unmatched",
+        matched_sku=matched_sku,
+        match_score=100 if product_id or matched_sku else None,
     )
-    db.add(item)
+    db.add(row)
+    db.flush()
+    return row
+
+
+def test_unmatched_provisor_catalog_is_source_first_and_deduplicates_goods_id():
+    db = _session()
+    pf = _price_format(db)
+    older = _price_list(db, pf, source_key="older", price_date=date(2026, 1, 1))
+    newer = _price_list(db, pf, source_key="newer", price_date=date(2026, 2, 1))
+    product = Product(code="SKU-MAPPED", name="Mapped", cost=1)
+    db.add(product)
+    db.flush()
+
+    _item(db, older, 10, name="Old duplicate")
+    latest = _item(db, newer, 10, name="Latest duplicate")
+    open_row = _item(db, newer, 20, name="Open source")
+    _item(db, newer, 30, name="Auto product", product_id=product.id)
+    _item(db, newer, 40, name="Auto sku", matched_sku="SKU-MAPPED")
+    db.add(
+        CompetitorCodeMapping(
+            platform="provisor",
+            source_external_key="50",
+            source_match_key=source_match_key(platform="provisor", source_external_key=50),
+            source_name="Manual mapped",
+            status="mapped",
+            our_product_id=product.id,
+            our_sku=product.code,
+        )
+    )
+    db.add(
+        CompetitorCodeMapping(
+            platform="provisor",
+            source_external_key="60",
+            source_match_key=source_match_key(platform="provisor", source_external_key=60),
+            source_name="Rejected",
+            status="rejected",
+        )
+    )
+    _item(db, newer, 50, name="Manual mapped")
+    _item(db, newer, 60, name="Rejected")
     db.commit()
+
+    result = list_catalog_code_mappings(
+        db=db,
+        platform="provisor",
+        price_format_id=pf.id,
+        status="unmapped",
+        page=1,
+        limit=50,
+        include_candidates=False,
+    )
+
+    assert result["pagination"] == {"page": 1, "pageSize": 50, "total": 2, "pageCount": 1}
+    assert [row["sourceExternalKey"] for row in result["items"]] == ["10", "20"]
+    assert result["items"][0]["itemId"] == latest.id
+    assert result["items"][0]["sourceName"] == "Latest duplicate"
+    assert result["items"][1]["itemId"] == open_row.id
+    assert result["items"][0]["ourProductId"] is None
+    assert result["metrics"][0]["total"] == 6
+    assert result["metrics"][0]["mapped"] == 3
+    assert result["metrics"][0]["rejected"] == 1
+    assert result["metrics"][0]["unmapped"] == 2
+
+
+def test_provisor_catalog_paginates_distinct_goods_with_stable_ordering():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="page", price_date=date(2026, 1, 1))
+    for goods_id in [30, 10, 50, 20, 40]:
+        _item(db, price_list, goods_id, name=f"Product {goods_id}")
+    db.commit()
+
+    first = list_catalog_code_mappings(db=db, platform="provisor", price_format_id=pf.id, status="unmapped", page=1, limit=2)
+    second = list_catalog_code_mappings(db=db, platform="provisor", price_format_id=pf.id, status="unmapped", page=2, limit=2)
+    third = list_catalog_code_mappings(db=db, platform="provisor", price_format_id=pf.id, status="unmapped", page=3, limit=2)
+
+    assert first["pagination"] == {"page": 1, "pageSize": 2, "total": 5, "pageCount": 3}
+    assert [row["sourceExternalKey"] for row in first["items"]] == ["10", "20"]
+    assert [row["sourceExternalKey"] for row in second["items"]] == ["30", "40"]
+    assert [row["sourceExternalKey"] for row in third["items"]] == ["50"]
+
+
+def test_provisor_catalog_searches_goods_id_name_manufacturer_and_distributor_id():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="search", price_date=date(2026, 1, 1))
+    _item(db, price_list, 95822, name="\u0410\u0441\u043f\u0438\u0440\u0438\u043d \u043a\u0430\u0440\u0434\u0438\u043e", manufacturer="Bayer", distributor_goods_id="DIST-95822")
+    _item(db, price_list, 12345, name="Other", manufacturer="Other maker", distributor_goods_id="OTHER")
+    db.commit()
+
+    for query in ["95822", "582", "\u0410\u0441\u043f\u0438\u0440\u0438\u043d", "BAYER", "DIST-95822"]:
+        result = list_catalog_code_mappings(
+            db=db,
+            platform="provisor",
+            price_format_id=pf.id,
+            status="unmapped",
+            source_q=query,
+            page=1,
+            limit=50,
+        )
+        assert result["pagination"]["total"] == 1
+        assert result["items"][0]["sourceExternalKey"] == "95822"
+
+    empty = list_catalog_code_mappings(
+        db=db,
+        platform="provisor",
+        price_format_id=pf.id,
+        status="unmapped",
+        source_q="does-not-exist",
+        page=1,
+        limit=50,
+    )
+    assert empty["pagination"]["total"] == 0
+    assert empty["items"] == []
+
+
+def test_provisor_catalog_only_includes_assigned_price_lists_for_format():
+    db = _session()
+    pf = _price_format(db, "A")
+    other_pf = _price_format(db, "B")
+    assigned = _price_list(db, pf, source_key="assigned", price_date=date(2026, 1, 1))
+    other = _price_list(db, other_pf, source_key="other", price_date=date(2026, 1, 1))
+    _item(db, assigned, 100, name="Assigned")
+    _item(db, other, 200, name="Other")
+    db.commit()
+
+    result = list_catalog_code_mappings(db=db, platform="provisor", price_format_id=pf.id, status="unmapped")
+
+    assert result["pagination"]["total"] == 1
+    assert result["items"][0]["sourceExternalKey"] == "100"
+
+
+def test_mapping_save_uses_selected_product_and_row_disappears_from_unmapped_list():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="save", price_date=date(2026, 1, 1))
+    source = _item(db, price_list, 777, name="Source")
+    correct = Product(code="CORRECT", name="Correct", cost=1)
+    wrong = Product(code="WRONG", name="Wrong", cost=1)
+    db.add_all([correct, wrong])
+    db.commit()
+
+    before = list_catalog_code_mappings(db=db, platform="provisor", price_format_id=pf.id, status="unmapped")
+    assert before["pagination"]["total"] == 1
 
     saved = create_competitor_code_mapping(
-        {"platform": "provisor", "status": "mapped", "itemId": item.id, "ourProductId": product.id},
+        {
+            "platform": "provisor",
+            "status": "mapped",
+            "formatCode": pf.code,
+            "itemId": source.id,
+            "sourceMatchKey": source_match_key(platform="provisor", source_external_key=777),
+            "ourProductId": correct.id,
+        },
         db,
+        _admin(),
     )
-    db.refresh(product)
-    db.refresh(item)
+    db.refresh(correct)
+    db.refresh(wrong)
+    db.refresh(source)
 
-    assert product.provisor_goods_id == 777
-    assert item.product_id == product.id
-    assert item.matched_sku == "SKU-OPEN"
-    assert item.match_type == "manual_code_mapping"
+    assert saved["ourProductId"] == correct.id
+    assert correct.provisor_goods_id == 777
+    assert wrong.provisor_goods_id is None
+    assert source.product_id == correct.id
+    assert source.match_type == "manual_code_mapping"
 
-    unmap_competitor_code_mapping(saved["id"], db)
-    db.refresh(product)
-    db.refresh(item)
-    assert product.provisor_goods_id is None
-    assert item.product_id is None
-    assert item.matched_sku == ""
+    after = list_catalog_code_mappings(db=db, platform="provisor", price_format_id=pf.id, status="unmapped")
+    assert after["pagination"]["total"] == 0
+
+    unmap_competitor_code_mapping(saved["id"], db, _admin())
 
 
-def test_manual_suggestions_allow_different_manufacturer_but_reject_wrong_dosage():
+def test_mapping_catalog_requires_auth_and_write_requires_write_role():
     db = _session()
-    product = Product(code="PARA-A", name="Парацетамол 500 мг №20 таб", cost=1)
-    price_format = PriceFormat(code="TEST", name="Test", branch="Test")
-    db.add_all([product, price_format])
-    db.flush()
-    db.add(ProductExtra(product_id=product.id, manufacturer="Manufacturer A"))
-    price_list = CompetitorPriceList(
-        price_format_id=price_format.id,
-        source_type="provisor",
-        source_key="test",
-        supplier="test",
-        display_name="test",
-        price_date=date(2026, 1, 1),
-    )
-    db.add(price_list)
-    db.flush()
-    db.add_all(
-        [
-            CompetitorPriceListItem(
-                price_list_id=price_list.id,
-                provisor_goods_id=501,
-                name="Парацетамол 500 мг №20 таб",
-                raw_name="Парацетамол 500 мг №20 таб",
-                raw_manufacturer="Manufacturer B",
-            ),
-            CompetitorPriceListItem(
-                price_list_id=price_list.id,
-                provisor_goods_id=502,
-                name="Парацетамол 250 мг №20 таб",
-                raw_name="Парацетамол 250 мг №20 таб",
-                raw_manufacturer="Manufacturer C",
-            ),
-            CompetitorPriceListItem(
-                price_list_id=price_list.id,
-                provisor_goods_id=503,
-                name="Ибупрофен 500 мг №20 таб",
-                raw_name="Ибупрофен 500 мг №20 таб",
-                raw_manufacturer="Manufacturer D",
-            ),
-        ]
-    )
+    pf = _price_format(db, "AUTH")
+    price_list = _price_list(db, pf, source_key="auth", price_date=date(2026, 1, 1))
+    source = _item(db, price_list, 888, name="Auth source")
+    product = Product(code="AUTH-P", name="Auth product", cost=1)
+    db.add(product)
     db.commit()
 
-    result = list_catalog_code_mappings(db=db, platform="provisor", status="unmapped", page=1, limit=50)
-    candidates = result["items"][0]["candidates"]
+    def override_db():
+        try:
+            yield db
+        finally:
+            pass
 
-    assert [row["sourceExternalKey"] for row in candidates] == ["501"]
-    assert 55 <= candidates[0]["confidence"] < 100
-    assert candidates[0]["manualSuggestion"]["dosageMatch"] is True
-    assert candidates[0]["manualSuggestion"]["quantityMatch"] is True
+    def reject_user():
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    main.app.dependency_overrides[main.get_db] = override_db
+    main.app.dependency_overrides[get_current_user] = reject_user
+    try:
+        client = TestClient(main.app)
+        response = client.get("/api/competitors/code-mappings/catalog-view?platform=provisor&format_code=AUTH")
+        assert response.status_code == 401
+    finally:
+        main.app.dependency_overrides.clear()
+
+    main.app.dependency_overrides[main.get_db] = override_db
+    main.app.dependency_overrides[get_current_user] = _viewer
+    try:
+        client = TestClient(main.app)
+        response = client.post(
+            "/api/competitors/code-mappings",
+            json={
+                "platform": "provisor",
+                "status": "mapped",
+                "formatCode": "AUTH",
+                "itemId": source.id,
+                "ourProductId": product.id,
+            },
+        )
+        assert response.status_code == 403
+    finally:
+        main.app.dependency_overrides.clear()
+
+    main.app.dependency_overrides[main.get_db] = override_db
+    main.app.dependency_overrides[get_current_user] = _admin
+    try:
+        client = TestClient(main.app)
+        response = client.get("/api/competitors/code-mappings/catalog-view?platform=provisor&format_code=AUTH")
+        assert response.status_code == 200
+        assert response.json()["pagination"]["total"] == 1
+    finally:
+        main.app.dependency_overrides.clear()

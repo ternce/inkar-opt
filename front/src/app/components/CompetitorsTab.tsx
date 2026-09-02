@@ -241,6 +241,8 @@ type CodeMappingCandidate = {
 
 type CodeMappingRow = CodeMappingCandidate & {
   productId?: number | null;
+  goodsId?: string;
+  sourceGoodsId?: string;
   status: Exclude<MappingStatus, 'all'>;
   mappingStatus?: Exclude<MappingStatus, 'all'> | 'no_candidates';
   mappingId?: number | null;
@@ -880,7 +882,11 @@ export function CompetitorsTab({ formatCode }: Props) {
       setIsLoading(true);
       void loadCodeMappings(controller.signal)
         .catch((e: any) => {
-          if (e?.name !== 'AbortError') setError(e?.message || 'Ошибка загрузки таблицы соответствий');
+          if (e?.name !== 'AbortError') {
+            setCodeRows([]);
+            setMappingPagination({ page: mappingPage, pageSize: 50, total: 0, pageCount: 0 });
+            setError(e?.message || 'Mapping table load failed');
+          }
         })
         .finally(() => {
           if (mappingRequestRef.current === controller) {
@@ -1161,11 +1167,12 @@ export function CompetitorsTab({ formatCode }: Props) {
     const query = candidateQueryForRow(row);
     setProductSearch(query);
     setProductResults([]);
+    if (!row.ourProductId && row.sourceMatchKey) return;
     void loadCandidatesForRow(row).catch((err: any) => setError(err?.message || 'Ошибка загрузки кандидатов'));
   };
 
   const mapSelected = async () => {
-    const productId = selectedRow?.ourProductId || selectedRow?.productId;
+    const productId = selectedProduct?.productId;
     const candidate = selectedCandidate || selectedRow;
     if (!selectedRow || !productId || !candidate?.sourceMatchKey) {
       setError('Выберите наш товар и конкурентский товар-кандидат');
@@ -1180,6 +1187,7 @@ export function CompetitorsTab({ formatCode }: Props) {
         body: JSON.stringify({
           platform: mappingPlatform,
           status: 'mapped',
+          formatCode,
           itemId: candidate.itemId,
           sourceExternalKey: candidate.sourceExternalKey,
           sourceMatchKey: candidate.sourceMatchKey,
@@ -1211,13 +1219,14 @@ export function CompetitorsTab({ formatCode }: Props) {
     setError(null);
     try {
       const res = row.mappingId
-        ? await fetch(`/api/competitors/code-mappings/${row.mappingId}/reject`, { method: 'POST' })
+        ? await fetch(`/api/competitors/code-mappings/${row.mappingId}/reject?format_code=${encodeURIComponent(formatCode)}`, { method: 'POST' })
         : await fetch('/api/competitors/code-mappings', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               platform: row.platform,
               status: 'rejected',
+              formatCode,
               itemId: row.itemId,
               sourceExternalKey: row.sourceExternalKey,
               sourceMatchKey: row.sourceMatchKey,
@@ -1244,7 +1253,7 @@ export function CompetitorsTab({ formatCode }: Props) {
     setIsLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/competitors/code-mappings/${row.mappingId}/unmap`, { method: 'POST' });
+      const res = await fetch(`/api/competitors/code-mappings/${row.mappingId}/unmap?format_code=${encodeURIComponent(formatCode)}`, { method: 'POST' });
       const text = await res.text();
       const data = parseJsonOrNull(text);
       if (!res.ok) throw new Error(data?.detail || text || 'Не удалось отвязать позицию');
@@ -1489,7 +1498,7 @@ export function CompetitorsTab({ formatCode }: Props) {
             ))}
           </div>
           <div className="grid grid-cols-1 gap-2 lg:grid-cols-[minmax(220px,1fr)_minmax(220px,1fr)_auto]">
-            <Input value={sourceQuery} onChange={(e) => setSourceQuery(e.target.value)} placeholder="Товар конкурента или производитель" />
+            <Input value={sourceQuery} onChange={(e) => setSourceQuery(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') submitMappingSearch(); }} placeholder="Provisor product, goodsId, manufacturer" />
             <Input
               value={productQuery}
               onChange={(e) => setProductQuery(e.target.value)}
@@ -1514,9 +1523,9 @@ export function CompetitorsTab({ formatCode }: Props) {
             <table className="admin-table">
               <thead className="sticky top-0 z-10">
                 <tr>
-                  <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Наш SKU / товар</th>
-                  <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Наш производитель</th>
-                  <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Товар конкурента</th>
+                  <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">goodsId</th>
+                  <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Provisor product</th>
+                  <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Manufacturer</th>
                   <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Источник / дата цены</th>
                   <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Статус</th>
                 </tr>
@@ -1524,16 +1533,16 @@ export function CompetitorsTab({ formatCode }: Props) {
               <tbody>
                 {codeRows.map((row) => (
                   <tr
-                    key={`${row.platform}-${row.ourProductId}-${row.sourceMatchKey || row.ourSku}`}
-                    className={`cursor-pointer ${selectedRow?.ourProductId === row.ourProductId ? 'bg-blue-50' : ''}`}
+                    key={`${row.platform}-${row.sourceMatchKey || row.sourceExternalKey || row.itemId}`}
+                    className={`cursor-pointer ${selectedRow?.sourceMatchKey === row.sourceMatchKey ? 'bg-blue-50' : ''}`}
                     onClick={() => selectMappingRow(row)}
                   >
                     <td className="px-4 py-3 text-sm text-gray-900 min-w-72">
-                      <div className="font-medium">{row.ourSku || '—'} · {row.ourName || '—'}</div>
-                      <div className="mt-1 text-xs text-gray-500">{fmtNumber(row.candidatesCount)} кандидатов · {row.sourceName || 'нет выбранного конкурента'}</div>
+                      <div className="font-medium">{row.sourceExternalKey || row.sourceGoodsId || '-'}</div>
+                      <div className="mt-1 text-xs text-gray-500">{row.sourceMatchKey || ''}</div>
                     </td>
-                    <td className="px-4 py-3 text-sm text-gray-700">{row.ourManufacturer || '—'}</td>
-                    <td className="px-4 py-3 text-sm text-gray-700">{row.sourceName || '—'}<div className="text-xs text-gray-500">{row.sourceManufacturer || ''}</div></td>
+                    <td className="px-4 py-3 text-sm text-gray-900 min-w-72">{row.sourceName || '-'}</td>
+                    <td className="px-4 py-3 text-sm text-gray-700">{row.sourceManufacturer || '-'}</td>
                     <td className="px-4 py-3 text-sm text-gray-700">{platformLabel(row.platform)} · {row.priceDate || '—'}</td>
                     <td className="px-4 py-3 text-sm">
                       <span className={`status-pill ${catalogStatusClass(row)}`}>{catalogStatusLabel(row)}</span>
@@ -1563,9 +1572,9 @@ export function CompetitorsTab({ formatCode }: Props) {
           {selectedRow ? (
             <div className="space-y-4">
               <div>
-                <div className="text-xs font-medium uppercase tracking-wide text-gray-500">Наш товар</div>
-                <h3 className="mt-1 text-base font-semibold text-gray-900">{selectedRow.ourSku || '—'} · {selectedRow.ourName || '—'}</h3>
-                <div className="mt-1 text-sm text-gray-600">{selectedRow.ourManufacturer || 'Производитель не указан'}</div>
+                <div className="text-xs font-medium uppercase tracking-wide text-gray-500">Provisor source product</div>
+                <h3 className="mt-1 text-base font-semibold text-gray-900">{selectedRow.sourceExternalKey || selectedRow.sourceGoodsId || '-'} - {selectedRow.sourceName || '-'}</h3>
+                <div className="mt-1 text-sm text-gray-600">{selectedRow.sourceManufacturer || '-'}</div>
                 <div className="mt-2 flex flex-wrap gap-2 text-xs">
                   <span className={`status-pill ${catalogStatusClass(selectedRow)}`}>{catalogStatusLabel(selectedRow)}</span>
                   <span className="status-pill">{platformLabel(selectedRow.platform)}</span>
@@ -1593,7 +1602,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                     <div className="px-3 py-6 text-center text-sm text-gray-500">Кандидаты конкурента не найдены.</div>
                   )}
                 </div>
-                <Button className="mt-3 w-full bg-blue-600 hover:bg-blue-700" onClick={mapSelected} disabled={isLoading || !selectedCandidate || selectedRow.status === 'rejected'}>
+                <Button className="mt-3 w-full bg-blue-600 hover:bg-blue-700" onClick={mapSelected} disabled={isLoading || !selectedProduct || selectedRow.status === 'rejected'}>
                   <Link2 className="mr-2 h-4 w-4" />
                   Подтвердить соответствие
                 </Button>
@@ -1615,9 +1624,30 @@ export function CompetitorsTab({ formatCode }: Props) {
                     Найти товар
                   </Button>
                 </div>
-                <Button className="mt-2 w-full" onClick={mapSelected} disabled={isLoading || !selectedCandidate || selectedRow.status === 'rejected'}>
+                <Button className="mt-2 w-full" onClick={mapSelected} disabled={isLoading || !selectedProduct || selectedRow.status === 'rejected'}>
                   Сопоставить вручную
                 </Button>
+                {selectedProduct ? (
+                  <div className="mt-2 rounded-md bg-green-50 p-3 text-sm text-green-900">
+                    Selected product: <strong>{selectedProduct.sku}</strong> {selectedProduct.name}
+                  </div>
+                ) : null}
+                {productResults.length ? (
+                  <div className="mt-3 max-h-56 overflow-auto rounded-md border border-gray-200">
+                    {productResults.map((row) => (
+                      <button
+                        key={`${row.productId}-${row.sku}`}
+                        type="button"
+                        onClick={() => setSelectedProduct(row)}
+                        className={`block w-full border-b border-gray-100 px-3 py-2 text-left text-sm hover:bg-gray-50 ${selectedProduct?.productId === row.productId ? 'bg-blue-50' : ''}`}
+                      >
+                        <span className="font-medium text-gray-900">{row.sku}</span>
+                        <span className="ml-2 text-gray-700">{row.name}</span>
+                        <span className="ml-2 text-xs text-gray-500">{row.manufacturer}</span>
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
               </div>
 
               <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
