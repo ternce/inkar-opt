@@ -204,7 +204,7 @@ def test_copy_api_invalid_source_and_duplicate_rule_name():
 
         assert invalid.status_code == 400
         assert "pricing rule not found" in invalid.json()["detail"]
-        assert duplicate_name.status_code == 400
+        assert duplicate_name.status_code == 409
         assert duplicate_name.json()["detail"] == "name must be unique"
     finally:
         app.dependency_overrides.pop(get_db, None)

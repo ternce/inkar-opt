@@ -6605,8 +6605,10 @@ def get_markup_templates(db: Session = Depends(get_db)):
 def create_markup_template(payload: dict = Body(...), db: Session = Depends(get_db), current_user: AppUser = Depends(require_write_access)):
     try:
         return template_to_dict(upsert_template(db=db, kind="markup", payload=payload), "markup")
+    except IntegrityError as e:
+        _raise_conflict_for_integrity_error(db, e, "template code already exists")
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        _raise_value_error(e)
 
 
 @app.patch("/api/pricing-rules/markup-templates/{template_id}")
@@ -6634,8 +6636,10 @@ def get_bend_templates(db: Session = Depends(get_db)):
 def create_bend_template(payload: dict = Body(...), db: Session = Depends(get_db), current_user: AppUser = Depends(require_write_access)):
     try:
         return template_to_dict(upsert_template(db=db, kind="bend", payload=payload), "bend")
+    except IntegrityError as e:
+        _raise_conflict_for_integrity_error(db, e, "template code already exists")
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        _raise_value_error(e)
 
 
 @app.patch("/api/pricing-rules/bend-templates/{template_id}")
@@ -6663,8 +6667,10 @@ def get_no_competitor_templates(db: Session = Depends(get_db)):
 def create_no_competitor_template(payload: dict = Body(...), db: Session = Depends(get_db), current_user: AppUser = Depends(require_write_access)):
     try:
         return template_to_dict(upsert_template(db=db, kind="no_competitor", payload=payload), "no_competitor")
+    except IntegrityError as e:
+        _raise_conflict_for_integrity_error(db, e, "template code already exists")
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        _raise_value_error(e)
 
 
 @app.patch("/api/pricing-rules/no-competitor-templates/{template_id}")
@@ -6692,8 +6698,10 @@ def get_rounding_rules(db: Session = Depends(get_db)):
 def create_rounding_rule(payload: dict = Body(...), db: Session = Depends(get_db), current_user: AppUser = Depends(require_write_access)):
     try:
         return rounding_to_dict(upsert_rounding_rule(db=db, payload=payload))
+    except IntegrityError as e:
+        _raise_conflict_for_integrity_error(db, e, "rounding rule code already exists")
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        _raise_value_error(e)
 
 
 @app.patch("/api/pricing-rules/rounding-rules/{rule_id}")
@@ -6716,8 +6724,10 @@ def create_pricing_rule(payload: dict = Body(...), db: Session = Depends(get_db)
         if copy_from_rule_id not in (None, "", "none"):
             return pricing_rule_to_dict(copy_pricing_rule(db=db, rule_id=int(copy_from_rule_id), payload=payload))
         return pricing_rule_to_dict(upsert_pricing_rule(db=db, payload=payload))
+    except IntegrityError as e:
+        _raise_conflict_for_integrity_error(db, e, "pricing rule code already exists")
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        _raise_value_error(e)
 
 
 @app.get("/api/pricing-rules/{rule_id}")
