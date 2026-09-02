@@ -13,7 +13,6 @@ from sqlalchemy.pool import StaticPool
 
 from backend.app.db import Base
 from backend.app.deps import get_db
-from backend.app import data as app_data
 from backend.app.models import (
     BendRange,
     BranchCost,
@@ -2610,18 +2609,34 @@ def test_legacy_physical_competitor_replacement_preserves_percentile_configs():
         with Session() as db:
             yield db
 
-    original_available = list(app_data.COMPETITORS_AVAILABLE)
-    original_assigned = dict(app_data.COMPETITORS_ASSIGNED_BY_FORMAT)
     app.dependency_overrides[get_db] = override_db
     try:
-        app_data.COMPETITORS_AVAILABLE = [
-            {"id": 101, "name": "physical:A", "supplier": "Physical A", "coefficient": 1.0},
-            {"id": 202, "name": "physical:B", "supplier": "Physical B", "coefficient": 1.25},
-        ]
-        app_data.COMPETITORS_ASSIGNED_BY_FORMAT = {}
         with Session() as db:
             pf = _format(db)
             pf.code = "LEGACY-PHYSICAL-REPLACE"
+            physical_a = CompetitorPriceList(
+                price_format_id=pf.id,
+                source_type="manual",
+                source_key="legacy:physical:a",
+                display_name="Physical A",
+                supplier="Physical A",
+                competitor_name="Physical A",
+                last_refresh_status="success_zero_items",
+            )
+            physical_b = CompetitorPriceList(
+                price_format_id=pf.id,
+                source_type="manual",
+                source_key="legacy:physical:b",
+                display_name="Physical B",
+                supplier="Physical B",
+                competitor_name="Physical B",
+                price_coefficient=Decimal("1.25"),
+                last_refresh_status="success_zero_items",
+            )
+            db.add_all([physical_a, physical_b])
+            db.flush()
+            physical_b_id = int(physical_b.id)
+            db.add(PriceFormatCompetitorAssignment(price_format_id=pf.id, competitor_price_list_id=physical_a.id, is_active=True))
             emit_source_name = _emit_percentile_column_key(
                 pf,
                 source_key="emit:1106",
@@ -2640,9 +2655,9 @@ def test_legacy_physical_competitor_replacement_preserves_percentile_configs():
             db.commit()
 
         client = TestClient(app)
-        response = client.post("/api/price-formats/LEGACY-PHYSICAL-REPLACE/competitors", json={"assignedIds": [202]})
+        response = client.post("/api/price-formats/LEGACY-PHYSICAL-REPLACE/competitors", json={"assignedIds": [physical_b_id]})
         assert response.status_code == 200
-        assert response.json() == {"format": "LEGACY-PHYSICAL-REPLACE", "assignedIds": [202]}
+        assert response.json() == {"format": "LEGACY-PHYSICAL-REPLACE", "assignedIds": [physical_b_id]}
 
         with Session() as db:
             rows = (
@@ -2653,16 +2668,20 @@ def test_legacy_physical_competitor_replacement_preserves_percentile_configs():
             )
             source_names = [row.source_name for row in rows]
             assert "physical:A" not in source_names
-            assert source_names.count("physical:B") == 1
+            assert f"manual:legacy:physical:a" not in source_names
+            assert source_names.count("manual:legacy:physical:b") == 1
             assert source_names.count(emit_source_name) == 1
             assert source_names.count(amanat_source_name) == 1
-            physical_b = next(row for row in rows if row.source_name == "physical:B")
+            physical_b = next(row for row in rows if row.source_name == "manual:legacy:physical:b")
             assert physical_b.supplier == "Physical B"
             assert float(physical_b.coefficient) == pytest.approx(1.25)
+            active_assignment_ids = {
+                row.competitor_price_list_id
+                for row in db.query(PriceFormatCompetitorAssignment).filter(PriceFormatCompetitorAssignment.is_active.is_(True)).all()
+            }
+            assert active_assignment_ids == {physical_b_id}
     finally:
         app.dependency_overrides.pop(get_db, None)
-        app_data.COMPETITORS_AVAILABLE = original_available
-        app_data.COMPETITORS_ASSIGNED_BY_FORMAT = original_assigned
 
 
 def test_rebuild_competitor_prices_skips_multi_price_emit_raw_items():

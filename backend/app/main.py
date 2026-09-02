@@ -132,6 +132,7 @@ from .services.competitor_assignments import (
     get_assigned_competitor_price_lists,
     get_assignment,
     price_format_branch_matches,
+    set_competitor_assignments,
     upsert_assignment,
 )
 from .services.competitor_coefficients import effective_price_coefficient, validate_price_coefficient
@@ -5025,75 +5026,54 @@ def debug_matching(
 
 
 @app.get("/api/price-formats/{format_code}/competitors")
-def get_competitors_assigned(format_code: str):
-    assigned_ids = data.COMPETITORS_ASSIGNED_BY_FORMAT.get(format_code, [])
-    assigned = [x for x in data.COMPETITORS_AVAILABLE if x["id"] in assigned_ids]
+def get_competitors_assigned(
+    format_code: str,
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    pf = db.execute(select(PriceFormat).where(PriceFormat.code == format_code)).scalars().first()
+    if pf is None:
+        raise HTTPException(status_code=404, detail="price format not found")
+    _ensure_price_format_access(pf, current_user)
+    selected = get_assigned_competitor_price_lists(db=db, price_format_id=int(pf.id))
+    assigned = [
+        {
+            "id": int(item.price_list.id),
+            "supplier": item.price_list.supplier or item.price_list.competitor_name or item.price_list.display_name or "",
+            "priceDate": item.price_list.price_date.isoformat() if item.price_list.price_date else "",
+            "name": item.price_list.display_name or item.price_list.name or "",
+            "region": item.price_list.region or item.price_list.branch_name or item.price_list.branch_code or "",
+            "coefficient": float(item.assignment.coefficient or effective_price_coefficient(item.price_list)),
+        }
+        for item in selected
+    ]
+    assigned_ids = [int(row["id"]) for row in assigned]
     return {"format": format_code, "assigned": assigned, "assignedIds": assigned_ids}
 
 
 @app.post("/api/price-formats/{format_code}/competitors")
-def set_competitors_assigned(format_code: str, payload: dict, db: Session = Depends(get_db)):
+def set_competitors_assigned(
+    format_code: str,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+):
     ids = payload.get("assignedIds")
     if not isinstance(ids, list) or not all(isinstance(x, int) for x in ids):
         raise HTTPException(status_code=400, detail="assignedIds must be list[int]")
-    data.COMPETITORS_ASSIGNED_BY_FORMAT[format_code] = ids
 
-    # Persist selection to DB so pricing uses the selected sources.
-    # We map competitor.id -> competitor.name as source_name.
     pf = db.execute(select(PriceFormat).where(PriceFormat.code == format_code)).scalars().first()
     if pf is None:
-        pf = PriceFormat(code=format_code, name=format_code)
-        db.add(pf)
-        db.flush()
-
-    selected = [x for x in data.COMPETITORS_AVAILABLE if x.get("id") in ids]
-    selected_source_names = {str(x.get("name") or "").strip() for x in selected if str(x.get("name") or "").strip()}
-
-    # Delete configs that are no longer selected
-    existing_cfg = db.execute(
-        select(CompetitorPrice)
-        .where(CompetitorPrice.price_format_id == pf.id)
-        .where(CompetitorPrice.product_id.is_(None))
-    ).scalars().all()
-
-    for row in existing_cfg:
-        source_name = row.source_name or ""
-        if source_name.startswith("percentile:"):
-            continue
-        if source_name not in selected_source_names:
-            db.delete(row)
-
-    # Upsert selected configs
-    for comp in selected:
-        source_name = str(comp.get("name") or "").strip()
-        if not source_name:
-            continue
-
-        coeff = comp.get("coefficient")
-        coefficient = float(coeff) if isinstance(coeff, (int, float)) else 1.0
-        supplier = str(comp.get("supplier") or "").strip() or None
-
-        cfg = db.execute(
-            select(CompetitorPrice)
-            .where(CompetitorPrice.price_format_id == pf.id)
-            .where(CompetitorPrice.product_id.is_(None))
-            .where(CompetitorPrice.source_name == source_name)
-        ).scalars().first()
-
-        if cfg is None:
-            cfg = CompetitorPrice(
-                price_format_id=pf.id,
-                product_id=None,
-                source_name=source_name,
-                coefficient=coefficient,
-            )
-            db.add(cfg)
-
-        cfg.coefficient = coefficient
-        cfg.supplier = supplier
-
+        raise HTTPException(status_code=404, detail="price format not found")
+    _ensure_price_format_access(pf, current_user)
+    set_competitor_assignments(db=db, price_format=pf, selected_ids=ids)
+    sync_selected_competitor_configs(db=db, price_format_id=pf.id)
     db.commit()
-    return {"format": format_code, "assignedIds": ids}
+    assigned_ids = [
+        int(item.price_list.id)
+        for item in get_assigned_competitor_price_lists(db=db, price_format_id=int(pf.id))
+    ]
+    return {"format": format_code, "assignedIds": assigned_ids}
 
 
 @app.get("/api/price-formats/{format_code}/competitor-price-lists")
