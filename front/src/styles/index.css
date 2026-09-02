@@ -712,7 +712,7 @@
 .sticky-table-toolbar {
   position: sticky;
   top: 0;
-  z-index: 100;
+  z-index: 40;
   display: flex;
   align-items: center;
   justify-content: space-between;
