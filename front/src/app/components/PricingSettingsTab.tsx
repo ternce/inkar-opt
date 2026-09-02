@@ -215,6 +215,9 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
 
   const [name, setName] = useState(formatCode);
   const [branch, setBranch] = useState('');
+  const [priceListType, setPriceListType] = useState<string | null>(null);
+  const [sapBranchCode, setSapBranchCode] = useState<string | null>(null);
+  const [sequenceNumber, setSequenceNumber] = useState<number | null>(null);
   const [pricingRule, setPricingRule] = useState('');
   const [pricingRuleId, setPricingRuleId] = useState('none');
   const [pricingRules, setPricingRules] = useState<PricingRuleOption[]>([]);
@@ -332,7 +335,11 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
 
         setPricingRules(Array.isArray(rulesData) ? rulesData : []);
         setRoundingRules(Array.isArray(roundingsData) ? roundingsData : []);
+        setName(String(data?.name ?? formatCode));
         setBranch(String(data?.branch ?? ''));
+        setPriceListType(data?.priceListType ? String(data.priceListType) : null);
+        setSapBranchCode(data?.sapBranchCode ? String(data.sapBranchCode) : null);
+        setSequenceNumber(data?.sequenceNumber != null ? Number(data.sequenceNumber) : null);
         setPricingRule(String(data?.pricingRule ?? ''));
         setPricingRuleId(data?.pricingRuleId ? String(data.pricingRuleId) : 'none');
         setRoundingRuleId(data?.roundingRuleId ? String(data.roundingRuleId) : 'none');
@@ -677,7 +684,11 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
       if (!res.ok) throw new Error((data && data.detail) || 'Не удалось сохранить настройки');
 
       // refresh from server response
+      setName(String(data?.name ?? name));
       setBranch(String(data?.branch ?? ''));
+      setPriceListType(data?.priceListType ? String(data.priceListType) : null);
+      setSapBranchCode(data?.sapBranchCode ? String(data.sapBranchCode) : null);
+      setSequenceNumber(data?.sequenceNumber != null ? Number(data.sequenceNumber) : null);
       setPricingRule(String(data?.pricingRule ?? ''));
       setPricingRuleId(data?.pricingRuleId ? String(data.pricingRuleId) : 'none');
       setRoundingRuleId(data?.roundingRuleId ? String(data.roundingRuleId) : 'none');
@@ -759,6 +770,8 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
             <div className="mt-2 flex flex-wrap gap-2 text-sm">
               <span className="status-pill">{displayPassport.code}</span>
               <span className="status-pill">{displayPassport.branch || 'Филиал не указан'}</span>
+              {priceListType ? <span className="status-pill">{priceListType}</span> : null}
+              {sapBranchCode ? <span className="status-pill">SAP {sapBranchCode}{sequenceNumber ? ` / ${String(sequenceNumber).padStart(3, '0')}` : ''}</span> : null}
               <span className={`status-pill ${readinessClassName(readiness?.status || 'warning')}`}>{readinessText(readiness?.status || 'warning')}</span>
             </div>
           </div>
@@ -940,7 +953,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
           
           <div className="space-y-2">
             <Label htmlFor="branch">Филиал</Label>
-            <Select value={branch || 'none'} onValueChange={(v) => setBranch(v === 'none' ? '' : v)} disabled={isLoading}>
+            <Select value={branch || 'none'} onValueChange={(v) => setBranch(v === 'none' ? '' : v)} disabled>
               <SelectTrigger id="branch">
                 <SelectValue />
               </SelectTrigger>

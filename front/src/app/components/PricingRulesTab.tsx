@@ -95,6 +95,7 @@ type PriceFormatSettings = {
 
 type Props = {
   formatCode: string;
+  initialTab?: string;
   onNavigate?: (section: 'pricing-workflow' | 'analytics' | 'pricelists' | 'competitors' | 'pricing' | 'universal-lists') => void;
 };
 
@@ -405,7 +406,7 @@ function normalizeTemplate(template: Template, kind: 'markup' | 'bend' | 'noComp
   };
 }
 
-export function PricingRulesTab({ formatCode, onNavigate }: Props) {
+export function PricingRulesTab({ formatCode, initialTab = 'rules', onNavigate }: Props) {
   const [rules, setRules] = useState<PricingRule[]>([]);
   const [markups, setMarkups] = useState<Template[]>([]);
   const [bends, setBends] = useState<Template[]>([]);
@@ -417,6 +418,7 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
   const [formatRuleId, setFormatRuleId] = useState<string>(NO_FORMAT_PRICING_RULE_SELECTION);
   const [appliedRule, setAppliedRule] = useState<AppliedRuleStatus | null>(null);
   const [formatSettings, setFormatSettings] = useState<PriceFormatSettings | null>(null);
+  const [activeTab, setActiveTab] = useState(initialTab);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const loadRequestRef = useRef(0);
@@ -460,9 +462,10 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
   };
 
   useEffect(() => {
+    setActiveTab(initialTab);
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [formatCode]);
+  }, [formatCode, initialTab]);
 
   const ruleById = useMemo(() => new Map(rules.map((rule) => [String(rule.id), rule])), [rules]);
 
@@ -594,7 +597,7 @@ export function PricingRulesTab({ formatCode, onNavigate }: Props) {
   };
 
   return (
-    <Tabs defaultValue="rules" className="w-full">
+    <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
       {error ? <div className="mb-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</div> : null}
       <TabsList className="w-full justify-start border-b border-gray-200 rounded-none h-auto p-0 bg-transparent">
         <TabsTrigger value="rules" className="rounded-none border-b border-transparent data-[state=active]:border-blue-600 data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:text-blue-700 px-4 py-2">Правила ЦО</TabsTrigger>

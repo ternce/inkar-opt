@@ -153,6 +153,7 @@ def init_db() -> None:
         _require_production_auth_schema_ready()
     Base.metadata.create_all(bind=engine)
     _ensure_compatible_columns()
+    _ensure_default_price_format_sap_mappings()
     _ensure_compatible_column_types()
     _ensure_nullable_percentile_values()
     _ensure_percentile_source_identity()
@@ -175,6 +176,9 @@ def _ensure_compatible_columns() -> None:
         "price_formats": [
             ("reference_branch_id", "TEXT DEFAULT ''"),
             ("sap_category", "VARCHAR(32)"),
+            ("price_list_type", "VARCHAR(16)"),
+            ("sap_branch_code", "VARCHAR(16)"),
+            ("sequence_number", "INTEGER"),
             ("competitor_price_mode", "VARCHAR(32) DEFAULT 'regular'"),
             ("percentile_number", "INTEGER DEFAULT 10"),
             ("pricing_rule_id", "INTEGER"),
@@ -456,6 +460,14 @@ def _ensure_compatible_columns() -> None:
     _ensure_app_sessions_table()
 
 
+def _ensure_default_price_format_sap_mappings() -> None:
+    from .services.price_formats import seed_default_sap_branch_mappings
+
+    with SessionLocal() as db:
+        seed_default_sap_branch_mappings(db)
+        db.commit()
+
+
 def _ensure_app_sessions_table() -> None:
     inspector = inspect(engine)
     if not inspector.has_table("app_sessions"):
@@ -578,7 +590,15 @@ def _ensure_compatible_column_types() -> None:
     text_columns = {
         "products": ("code", "name"),
         "product_extras": ("manufacturer",),
-        "price_formats": ("code", "name", "branch", "pricing_rule", "pricing_rule_applied_tables_json"),
+        "price_formats": (
+            "code",
+            "name",
+            "branch",
+            "pricing_rule",
+            "pricing_rule_applied_tables_json",
+            "price_list_type",
+            "sap_branch_code",
+        ),
         "price_lists": ("number", "user", "status"),
         "competitors_prices": ("source_name", "supplier", "source_distributor_goods_id", "source_manufacturer"),
         "competitor_price_lists": (

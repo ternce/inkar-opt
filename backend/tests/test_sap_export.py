@@ -204,7 +204,7 @@ def test_wrong_format_missing_success_and_unauthorized_branch_fail(db):
         resolve_latest_successful_versions(db, branch_id="Астана", activation_date=ACTIVATION_DATE, price_format_ids=[pf.id], user=_limited_user())
 
 
-def test_export_works_when_sap_category_is_null_and_uses_price_format_name(db):
+def test_export_works_when_sap_category_is_null_and_uses_price_format_code(db):
     pf = _format(db, "NULL-CAT", None, name="Есик_ИПЛ_SuperVIP")
     product = _product(db, "000000000001000015")
     _run, price_list = _version(db, pf, "wf1")
@@ -224,7 +224,7 @@ def test_export_works_when_sap_category_is_null_and_uses_price_format_name(db):
     sheet = _sheet(content)
     assert len(resolved) == 1
     assert row_count == 1
-    assert sheet["B2"].value == "Есик_ИПЛ_SuperVIP"
+    assert sheet["B2"].value == "NULL-CAT"
     assert sheet["B2"].value != "SuperVIP"
 
 
@@ -270,7 +270,7 @@ def test_material_code_precision_blank_unlock_status_and_workbook_headers(db):
     resolved = resolve_latest_successful_versions(db, branch_id="Алматы", activation_date=ACTIVATION_DATE, price_format_ids=[pf.id], user=_admin())
     rows = build_sap_rows(db, resolved)
     assert rows[0]["material"] == "0"
-    assert rows[0]["category"] == "Есик_ИПЛ_VIP"
+    assert rows[0]["category"] == "VIP"
     assert rows[0]["unlock_status"] == ""
     assert rows[0]["price"] == Decimal("4186.0517")
     sheet = _sheet(build_workbook(rows))
@@ -314,10 +314,10 @@ def test_price_format_name_order_and_material_ascending(db):
     )
     rows = list(_sheet(content).iter_rows(min_row=2, values_only=True))
     assert rows[:4] == [
-        (9, "Есик_ИПЛ_SuperVIP", None, 200),
-        (9, "Есик_ИПЛ_VIP", None, 200),
-        (9, "Есик_ИПЛ_1", None, 200),
-        (9, "Есик_ИПЛ_2", None, 200),
+        (9, "SVIP", None, 200),
+        (9, "VIP", None, 200),
+        (9, "CAT1", None, 200),
+        (9, "CAT2", None, 200),
     ]
     assert rows[4][0] == int(products[0].code)
 
@@ -419,7 +419,7 @@ def test_duplicate_sap_category_allowed_in_auto_and_manual_modes(db):
     )
     assert len(resolved) == 2
     assert row_count == 4
-    assert {row[1] for row in _sheet(content).iter_rows(min_row=2, values_only=True)} == {"Есик_ИПЛ_SuperVIP", "Есик_ИПЛ_VIP"}
+    assert {row[1] for row in _sheet(content).iter_rows(min_row=2, values_only=True)} == {"SVIP", "VIP"}
 
     resolved = resolve_manual_versions(
         db,
@@ -454,7 +454,7 @@ def test_mixed_auto_and_manual_selected_versions_work(db):
     assert [item.price_list.id for item in resolved] == [versions[0][4].id, versions[1][2].id, versions[2][4].id]
     assert row_count == 6
     rows = list(_sheet(content).iter_rows(min_row=2, values_only=True))
-    assert "Есик_ИПЛ_VIP" in {row[1] for row in rows}
+    assert "VIP" in {row[1] for row in rows}
 
 
 def test_malformed_manual_ids_are_controlled_client_errors(db):
@@ -569,7 +569,7 @@ def test_export_endpoint_accepts_mixed_items_payload(db):
     assert response.headers["X-SAP-Export-Price-Lists"] == f"{versions[0][4].id},{versions[1][2].id}"
     sheet = _sheet(response.content)
     assert sheet.title == "Sheet1"
-    assert {row[1] for row in sheet.iter_rows(min_row=2, values_only=True)} == {"Есик_ИПЛ_SuperVIP", "Есик_ИПЛ_VIP"}
+    assert {row[1] for row in sheet.iter_rows(min_row=2, values_only=True)} == {"SVIP", "VIP"}
 
 
 def test_malformed_auto_id_endpoint_returns_controlled_client_error(db):

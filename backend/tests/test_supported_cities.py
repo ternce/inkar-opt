@@ -5,6 +5,7 @@ from sqlalchemy.pool import StaticPool
 
 from backend.app import main
 from backend.app.db import Base
+from backend.app.deps import ROLE_ADMIN
 from backend.app.models import CompetitorPriceList, PriceFormat
 from backend.app.services.references.types import BRANCHES, USER_SELECTABLE_BRANCHES
 from backend.app.services.regions import (
@@ -37,6 +38,8 @@ def _override_db(Session):
 def _client(Session, monkeypatch):
     monkeypatch.setattr(main, "enqueue_percentile_preparation", lambda **_: {"status": "skipped"})
     main.app.dependency_overrides[main.get_db] = _override_db(Session)
+    main.app.dependency_overrides[main.get_current_user] = lambda: main.AppUser(id=1, username="admin", role=ROLE_ADMIN, is_active=True)
+    main.app.dependency_overrides[main.require_write_access] = lambda: main.AppUser(id=1, username="admin", role=ROLE_ADMIN, is_active=True)
     return TestClient(main.app)
 
 
@@ -115,15 +118,16 @@ def test_new_price_format_rejects_unsupported_branch_and_canonicalizes_alias(mon
     Session = _session_factory()
     client = _client(Session, monkeypatch)
     try:
-        rejected = client.post("/api/price-formats", json={"code": "OLDCITY", "name": "Old City", "branch": "Кызылорда"})
-        created = client.post("/api/price-formats", json={"code": "ALIAS", "name": "Alias", "branch": "aktau"})
+        rejected = client.post("/api/price-formats", json={"name": "Old City", "branch": "Кызылорда", "priceListType": "ИПЛ"})
+        created = client.post("/api/price-formats", json={"name": "Alias", "branch": "aktau", "priceListType": "ИПЛ"})
     finally:
         main.app.dependency_overrides.clear()
 
     assert rejected.status_code == 400, rejected.text
     assert created.status_code == 200, created.text
+    assert created.json()["code"] == "ИПЛ_1010_001"
     db = Session()
-    assert db.scalar(select(PriceFormat.branch).where(PriceFormat.code == "ALIAS")) == "Актау"
+    assert db.scalar(select(PriceFormat.branch).where(PriceFormat.code == "ИПЛ_1010_001")) == "Актау"
 
 
 def test_existing_historical_price_format_can_be_resaved_unchanged(monkeypatch):

@@ -14,10 +14,12 @@ import {
   Home,
   ListChecks,
   LogOut,
+  Pencil,
   Plus,
   RefreshCw,
   Settings,
   SlidersHorizontal,
+  Trash2,
   Users,
 } from 'lucide-react';
 import { Button } from './components/ui/button';
@@ -50,6 +52,9 @@ interface PriceFormat {
   name: string;
   code: string;
   branch: string;
+  priceListType?: string | null;
+  sapBranchCode?: string | null;
+  sequenceNumber?: number | null;
 }
 
 type CurrentUser = {
@@ -96,6 +101,9 @@ type FormatDashboardRow = {
   code: string;
   name: string;
   branch: string;
+  priceListType?: string | null;
+  sapBranchCode?: string | null;
+  sequenceNumber?: number | null;
   pricingRule: string;
   status: string;
   lastGeneratedAt: string;
@@ -181,6 +189,7 @@ export default function App() {
   const [selectedFormat, setSelectedFormat] = useState<PriceFormat | null>(null);
   const [selectedPricingContext, setSelectedPricingContext] = useState<PricingContextState | null>(null);
   const [activeSection, setActiveSection] = useState<NavigationKey>('home');
+  const [pricingInitialTab, setPricingInitialTab] = useState('rules');
   const [focusedPriceListNumber, setFocusedPriceListNumber] = useState('');
   const [sidebarWidth, setSidebarWidth] = useState(() => Number(localStorage.getItem('sidebarWidth') || 320));
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem('sidebarCollapsed') === '1');
@@ -208,6 +217,9 @@ export default function App() {
           name: String(x.name ?? ''),
           code: String(x.code ?? ''),
           branch: String(x.branch ?? ''),
+          priceListType: x.priceListType ?? null,
+          sapBranchCode: x.sapBranchCode ?? null,
+          sequenceNumber: x.sequenceNumber ?? null,
         }))
       : []
   );
@@ -301,7 +313,14 @@ export default function App() {
   };
 
   const openSection = (section: NavigationKey) => {
+    if (section === 'pricing') setPricingInitialTab('rules');
     setActiveSection(section);
+  };
+
+  const openPriceFormatEditor = (next: PriceFormat) => {
+    setSelectedFormat(next);
+    setPricingInitialTab('format');
+    setActiveSection('pricing');
   };
 
   const openGeneratedPriceList = (priceListNumber: string) => {
@@ -327,6 +346,15 @@ export default function App() {
     setSelectedBranch(next.branch || '');
     setSelectedFormat(next);
     setActiveSection('home');
+  };
+
+  const handleFormatDeleted = async (deletedCode: string) => {
+    const items = await loadPriceFormats();
+    setPriceFormats(items);
+    setSelectedFormat((prev) => {
+      if (prev && prev.code !== deletedCode && items.some((item) => item.code === prev.code)) return prev;
+      return items.find((item) => isSameBranch(item.branch, selectedBranch)) || items[0] || null;
+    });
   };
 
   const handleLogin = async (username: string, password: string) => {
@@ -380,6 +408,8 @@ export default function App() {
             onBranchChange={selectBranch}
             onFormatChange={setSelectedFormat}
             onFormatCreated={handleFormatCreated}
+            onFormatDeleted={handleFormatDeleted}
+            onFormatEdit={openPriceFormatEditor}
             onNavigate={openSection}
           />
         );
@@ -424,7 +454,7 @@ export default function App() {
       case 'settings':
         return <SettingsOverview onNavigate={openSection} />;
       case 'pricing':
-        return <PricingRulesTab formatCode={selectedFormat.code} onNavigate={openSection} />;
+        return <PricingRulesTab formatCode={selectedFormat.code} initialTab={pricingInitialTab} onNavigate={openSection} />;
       case 'references':
         return <ReferencesTab isReadOnly={Boolean(currentUser?.isReadOnly)} />;
       case 'competitor-domain':
@@ -453,6 +483,8 @@ export default function App() {
             onBranchChange={selectBranch}
             onFormatChange={setSelectedFormat}
             onFormatCreated={handleFormatCreated}
+            onFormatDeleted={handleFormatDeleted}
+            onFormatEdit={openPriceFormatEditor}
             onNavigate={openSection}
           />
         );
@@ -617,6 +649,8 @@ function HomeDashboard({
   onBranchChange,
   onFormatChange,
   onFormatCreated,
+  onFormatDeleted,
+  onFormatEdit,
   onNavigate,
 }: {
   branch: string;
@@ -625,6 +659,8 @@ function HomeDashboard({
   onBranchChange: (branch: string) => void;
   onFormatChange: (format: PriceFormat) => void;
   onFormatCreated: (format: PriceFormat) => Promise<void>;
+  onFormatDeleted: (code: string) => Promise<void>;
+  onFormatEdit: (format: PriceFormat) => void;
   onNavigate: (section: NavigationKey) => void;
 }) {
   const [settings, setSettings] = useState<any | null>(null);
@@ -633,9 +669,9 @@ function HomeDashboard({
   const [assignedSources, setAssignedSources] = useState<any[]>([]);
   const [referenceStatuses, setReferenceStatuses] = useState<any[]>([]);
   const [showCreateFormat, setShowCreateFormat] = useState(false);
-  const [newFormatCode, setNewFormatCode] = useState('');
   const [newFormatName, setNewFormatName] = useState('');
   const [newFormatBranch, setNewFormatBranch] = useState(branch || format.branch || '');
+  const [newFormatType, setNewFormatType] = useState('ИПЛ');
   const [newFormatRule, setNewFormatRule] = useState('');
   const [pricingRules, setPricingRules] = useState<any[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -696,6 +732,9 @@ function HomeDashboard({
             code: priceFormat.code,
             name: priceFormat.name || priceFormat.code,
             branch: priceFormat.branch,
+            priceListType: priceFormat.priceListType ?? null,
+            sapBranchCode: priceFormat.sapBranchCode ?? null,
+            sequenceNumber: priceFormat.sequenceNumber ?? null,
             pricingRule: formatSettings.pricingRule || formatSettings.pricingRuleId || '—',
             status: 'Активен',
             lastGeneratedAt: last?.date || '',
@@ -757,9 +796,9 @@ function HomeDashboard({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          code: newFormatCode.trim(),
           name: newFormatName.trim(),
           branch: newFormatBranch.trim(),
+          priceListType: newFormatType,
           pricingRuleId: newFormatRule || undefined,
           pricingRule: selectedRule?.name || '',
         }),
@@ -768,18 +807,51 @@ function HomeDashboard({
       const data = parseJsonOrNull(text);
       if (!res.ok) throw new Error(data?.detail || text || 'Не удалось создать ценовой формат');
       await onFormatCreated({
-        id: String(data?.id ?? data?.code ?? newFormatCode),
-        code: String(data?.code ?? newFormatCode).trim(),
+        id: String(data?.id ?? data?.code ?? newFormatName),
+        code: String(data?.code ?? '').trim(),
         name: String(data?.name ?? newFormatName).trim(),
         branch: String(data?.branch ?? newFormatBranch).trim(),
+        priceListType: data?.priceListType ?? null,
+        sapBranchCode: data?.sapBranchCode ?? null,
+        sequenceNumber: data?.sequenceNumber ?? null,
       });
       setShowCreateFormat(false);
-      setNewFormatCode('');
       setNewFormatName('');
+      setNewFormatType('ИПЛ');
       setNewFormatRule('');
       await load();
     } catch (e: any) {
       setError(e?.message || 'Ошибка создания ценового формата');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const editPriceFormat = (code: string) => {
+    const next = branchFormats.find((item) => item.code === code);
+    if (next) onFormatEdit(next);
+  };
+
+  const deletePriceFormat = async (row: FormatDashboardRow) => {
+    const confirmed = window.confirm(`Удалить ценовой формат ${row.code}?`);
+    if (!confirmed) return;
+    setIsLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/price-formats/${encodeURIComponent(row.code)}`, { method: 'DELETE' });
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) {
+        const dependencies = Array.isArray(data?.detail?.dependencies)
+          ? data.detail.dependencies.map((item: any) => `${item.table}: ${item.count}`).join(', ')
+          : '';
+        const message = data?.detail?.message || data?.detail || text || 'Не удалось удалить ценовой формат';
+        throw new Error(dependencies ? `${message}: ${dependencies}` : message);
+      }
+      await onFormatDeleted(row.code);
+      await load();
+    } catch (e: any) {
+      setError(e?.message || 'Ошибка удаления ценового формата');
     } finally {
       setIsLoading(false);
     }
@@ -838,8 +910,11 @@ function HomeDashboard({
           </div>
           <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
             <label>
-              <span className="text-xs font-medium text-gray-500">Код ЦФ</span>
-              <input className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm" value={newFormatCode} onChange={(event) => setNewFormatCode(event.target.value)} />
+              <span className="text-xs font-medium text-gray-500">Тип прайс-листа</span>
+              <select className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm" value={newFormatType} onChange={(event) => setNewFormatType(event.target.value)}>
+                <option value="ИПЛ">ИПЛ</option>
+                <option value="ГПЛ">ГПЛ</option>
+              </select>
             </label>
             <label>
               <span className="text-xs font-medium text-gray-500">Название</span>
@@ -854,6 +929,10 @@ function HomeDashboard({
               </select>
             </label>
             <label>
+              <span className="text-xs font-medium text-gray-500">Предварительный код</span>
+              <input className="mt-1 w-full rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-600" value={`${newFormatType}_${newFormatBranch ? 'SAP' : '---'}_XXX`} readOnly />
+            </label>
+            <label>
               <span className="text-xs font-medium text-gray-500">Правило ЦО</span>
               <select className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm" value={newFormatRule} onChange={(event) => setNewFormatRule(event.target.value)}>
                 <option value="">Без правила</option>
@@ -865,7 +944,7 @@ function HomeDashboard({
           </div>
           <div className="mt-4 flex justify-end gap-2">
             <Button variant="outline" onClick={() => setShowCreateFormat(false)}>Отмена</Button>
-            <Button onClick={createPriceFormat} disabled={isLoading || !newFormatCode.trim() || !newFormatName.trim()} className="bg-blue-600 hover:bg-blue-700">
+            <Button onClick={createPriceFormat} disabled={isLoading || !newFormatName.trim() || !newFormatBranch.trim() || !newFormatType} className="bg-blue-600 hover:bg-blue-700">
               Создать ценовой формат
             </Button>
           </div>
@@ -886,13 +965,15 @@ function HomeDashboard({
         </div>
         <CompactTable
           empty="Для выбранного филиала пока нет ценовых форматов"
-          columns={['Код', 'Наименование', 'Филиал', 'Правило ЦО', 'Статус', 'Последнее формирование', 'Активация', 'Пользователь', 'Данные']}
+          columns={['Код', 'Наименование', 'Тип', 'SAP', 'Филиал', 'Правило ЦО', 'Статус', 'Последнее формирование', 'Активация', 'Пользователь', 'Данные', '']}
           rows={formatRows.map((row) => [
             <button key={row.code} type="button" className="table-link" onClick={() => {
               const next = branchFormats.find((item) => item.code === row.code);
               if (next) onFormatChange(next);
             }}>{row.code}</button>,
             row.name,
+            row.priceListType || '—',
+            row.sapBranchCode ? `${row.sapBranchCode}${row.sequenceNumber ? ` / ${String(row.sequenceNumber).padStart(3, '0')}` : ''}` : '—',
             row.branch || '—',
             row.pricingRule,
             <span key={`${row.code}-status`} className="status-pill ok">{row.status}</span>,
@@ -900,6 +981,14 @@ function HomeDashboard({
             row.lastActivationDate || '—',
             row.user || '—',
             <span key={`${row.code}-data`} className={`status-pill ${freshnessClassName(row.dataStatus)}`}>{statusLabel(row.dataStatus)}</span>,
+            <div key={`${row.code}-actions`} className="flex items-center gap-1">
+              <Button variant="ghost" size="sm" onClick={() => editPriceFormat(row.code)} title="Редактировать">
+                <Pencil className="h-4 w-4" />
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => void deletePriceFormat(row)} title="Удалить" className="text-red-600 hover:text-red-700">
+                <Trash2 className="h-4 w-4" />
+              </Button>
+            </div>,
           ])}
         />
       </section>

@@ -24,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 import httpx
 from sqlalchemy import delete, func, select, update
-from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 import io
 import csv
@@ -231,6 +231,11 @@ from .services.percentile_preparation import (
     percentile_preparation_to_dict,
     resume_pending_percentile_preparations,
     retry_waiting_percentile_preparations,
+)
+from .services.price_formats import (
+    allocate_price_format_code,
+    normalize_price_list_type,
+    price_format_dependency_counts,
 )
 from .services.competitor_source_config import (
     canonical_competitor_source_key,
@@ -1895,6 +1900,38 @@ def _ensure_price_format_access(pf: PriceFormat, user: AppUser) -> None:
         raise HTTPException(status_code=403, detail="branch is not assigned to current user")
 
 
+def _is_unique_integrity_error(exc: IntegrityError) -> bool:
+    text = " ".join(str(part) for part in (exc.orig, exc.statement, exc.params) if part is not None).casefold()
+    return any(marker in text for marker in ("unique", "duplicate", "uq_", "already exists"))
+
+
+def _raise_conflict_for_integrity_error(db: Session, exc: IntegrityError, detail: str) -> None:
+    db.rollback()
+    if _is_unique_integrity_error(exc):
+        raise HTTPException(status_code=409, detail=detail)
+    raise exc
+
+
+def _raise_value_error(value_error: ValueError) -> None:
+    detail = str(value_error)
+    if "unique" in detail.casefold() or "already exists" in detail.casefold():
+        raise HTTPException(status_code=409, detail=detail)
+    raise HTTPException(status_code=400, detail=detail)
+
+
+def _price_format_to_dict(db: Session, pf: PriceFormat) -> dict:
+    return {
+        "id": pf.id,
+        "name": pf.name,
+        "code": pf.code,
+        "branch": pf.branch,
+        "priceListType": pf.price_list_type,
+        "sapBranchCode": pf.sap_branch_code,
+        "sequenceNumber": pf.sequence_number,
+        "percentilePreparation": percentile_preparation_to_dict(db, int(pf.id)),
+    }
+
+
 @app.get("/api/current-user")
 def get_current_user_endpoint(current_user: AppUser = Depends(get_current_user)):
     return current_user_to_dict(current_user)
@@ -1949,16 +1986,7 @@ def get_price_formats(db: Session = Depends(get_db), current_user: AppUser = Dep
     rows = _filter_price_formats_for_user(rows, current_user)
     if not rows:
         return []
-    return [
-        {
-            "id": x.id,
-            "name": x.name,
-            "code": x.code,
-            "branch": x.branch,
-            "percentilePreparation": percentile_preparation_to_dict(db, int(x.id)),
-        }
-        for x in rows
-    ]
+    return [_price_format_to_dict(db, x) for x in rows]
 
 
 @app.post("/api/price-formats")
@@ -1967,23 +1995,33 @@ def create_price_format(
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(require_write_access),
 ):
-    code = str(payload.get("code") or "").strip()
-    name = str(payload.get("name") or code).strip()
+    name = str(payload.get("name") or "").strip()
     branch = str(payload.get("branch") or "").strip()
-    if not code:
-        raise HTTPException(status_code=400, detail="code is required")
     if not name:
         raise HTTPException(status_code=400, detail="name is required")
     branch = _canonical_user_selected_branch(branch)
     if branch and not user_can_access_branch(current_user, _branch_id_for_name(branch), branch):
         raise HTTPException(status_code=403, detail="branch is not assigned to current user")
-    existing = db.execute(select(PriceFormat).where(PriceFormat.code == code)).scalars().first()
-    if existing is not None:
-        raise HTTPException(status_code=400, detail="price format code already exists")
+    try:
+        generated = allocate_price_format_code(
+            db,
+            branch=branch,
+            price_list_type=payload.get("priceListType") or payload.get("price_list_type"),
+        )
+    except ValueError as exc:
+        _raise_value_error(exc)
 
     pricing_rule_id = payload.get("pricingRuleId") or payload.get("pricing_rule_id")
     pricing_rule_name = str(payload.get("pricingRule") or payload.get("pricing_rule") or "").strip()
-    row = PriceFormat(code=code, name=name, branch=branch, pricing_rule=pricing_rule_name)
+    row = PriceFormat(
+        code=generated.code,
+        name=name,
+        branch=branch,
+        price_list_type=generated.price_list_type,
+        sap_branch_code=generated.sap_branch_code,
+        sequence_number=generated.sequence_number,
+        pricing_rule=pricing_rule_name,
+    )
     if pricing_rule_id not in (None, "", "none"):
         row.pricing_rule_id = int(pricing_rule_id)
         if not pricing_rule_name:
@@ -1993,11 +2031,40 @@ def create_price_format(
             except ValueError:
                 raise HTTPException(status_code=400, detail="pricing rule not found")
     db.add(row)
-    db.flush()
-    db.commit()
+    try:
+        db.flush()
+        db.commit()
+    except IntegrityError as exc:
+        _raise_conflict_for_integrity_error(db, exc, "price format code already exists")
     db.refresh(row)
     percentile_status = enqueue_percentile_preparation(db=db, price_format_id=int(row.id), reason="price_format_created")
-    return {"id": row.id, "name": row.name, "code": row.code, "branch": row.branch, "percentilePreparation": percentile_status}
+    result = _price_format_to_dict(db, row)
+    result["percentilePreparation"] = percentile_status
+    return result
+
+
+@app.delete("/api/price-formats/{format_code}")
+def delete_price_format(
+    format_code: str,
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+):
+    pf = db.execute(select(PriceFormat).where(PriceFormat.code == format_code)).scalars().first()
+    if pf is None:
+        raise HTTPException(status_code=404, detail="price format not found")
+    _ensure_price_format_access(pf, current_user)
+    dependencies = price_format_dependency_counts(db, int(pf.id))
+    if dependencies:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "price format is used and cannot be deleted",
+                "dependencies": dependencies,
+            },
+        )
+    db.delete(pf)
+    db.commit()
+    return {"status": "deleted", "code": format_code}
 
 
 @app.get("/api/price-formats/{price_format_id}/percentile-preparation-status")
@@ -9927,8 +9994,12 @@ def get_settings_for_format(
     ).scalars().all()
 
     return {
-        "name": pf.code,
+        "name": pf.name,
+        "code": pf.code,
         "branch": pf.branch,
+        "priceListType": pf.price_list_type,
+        "sapBranchCode": pf.sap_branch_code,
+        "sequenceNumber": pf.sequence_number,
         "referenceBranchId": pf.reference_branch_id or "",
         "sapCategory": pf.sap_category or "",
         "pricingRule": pf.pricing_rule or "",
@@ -9983,21 +10054,47 @@ def put_settings_for_format(
     current_user: AppUser = Depends(require_write_access),
 ):
     pf = db.execute(select(PriceFormat).where(PriceFormat.code == format_code)).scalars().first()
-    if pf is not None:
-        _ensure_price_format_access(pf, current_user)
     if pf is None:
-        pf = PriceFormat(code=format_code, name=payload.get("name") or format_code)
-        db.add(pf)
-        db.flush()
-        percentile_relevant_change = True
-    else:
-        percentile_relevant_change = False
+        raise HTTPException(status_code=404, detail="price format not found")
+    _ensure_price_format_access(pf, current_user)
+    percentile_relevant_change = False
 
+    if "code" in payload and str(payload.get("code") or "").strip() not in {"", pf.code}:
+        raise HTTPException(status_code=400, detail="code is immutable")
+    if "priceListType" in payload or "price_list_type" in payload:
+        raw_type = payload.get("priceListType", payload.get("price_list_type"))
+        if raw_type not in (None, ""):
+            try:
+                next_type = normalize_price_list_type(raw_type)
+            except ValueError as exc:
+                _raise_value_error(exc)
+            if next_type != (pf.price_list_type or ""):
+                raise HTTPException(status_code=400, detail="priceListType is immutable")
+    if "sapBranchCode" in payload or "sap_branch_code" in payload:
+        next_sap_branch_code = str(payload.get("sapBranchCode", payload.get("sap_branch_code")) or "").strip()
+        if next_sap_branch_code != (pf.sap_branch_code or ""):
+            raise HTTPException(status_code=400, detail="sapBranchCode is immutable")
+    if "sequenceNumber" in payload or "sequence_number" in payload:
+        next_sequence = payload.get("sequenceNumber", payload.get("sequence_number"))
+        if next_sequence not in (None, ""):
+            try:
+                parsed_sequence = int(next_sequence)
+            except Exception:
+                raise HTTPException(status_code=400, detail="sequenceNumber is immutable")
+            if parsed_sequence != int(pf.sequence_number or 0):
+                raise HTTPException(status_code=400, detail="sequenceNumber is immutable")
+    if isinstance(payload.get("name"), str):
+        next_name = str(payload["name"]).strip()
+        if not next_name:
+            raise HTTPException(status_code=400, detail="name is required")
+        pf.name = next_name
     if isinstance(payload.get("branch"), str):
-        next_branch = str(payload["branch"]).strip()
-        if pf.branch != next_branch:
+        raw_branch = str(payload["branch"]).strip()
+        next_branch = raw_branch
+        if pf.branch != raw_branch:
             next_branch = _canonical_user_selected_branch(next_branch)
-        pf.branch = next_branch
+        if next_branch != (pf.branch or ""):
+            raise HTTPException(status_code=400, detail="branch is immutable")
     if "referenceBranchId" in payload or "reference_branch_id" in payload:
         pf.reference_branch_id = str(payload.get("referenceBranchId") or payload.get("reference_branch_id") or "").strip()
     if "sapCategory" in payload or "sap_category" in payload:

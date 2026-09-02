@@ -92,6 +92,9 @@ class PriceFormat(Base):
     branch: Mapped[str] = mapped_column(Text, default="")
     reference_branch_id: Mapped[str | None] = mapped_column(Text, nullable=True, default="", server_default=text("''"))
     sap_category: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    price_list_type: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    sap_branch_code: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    sequence_number: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
     pricing_rule: Mapped[str] = mapped_column(Text, default="")
     pricing_rule_id: Mapped[int | None] = mapped_column(ForeignKey("pricing_rules.id"), nullable=True, index=True)
@@ -112,6 +115,24 @@ class PriceFormat(Base):
     markup_ranges: Mapped[list[MarkupRange]] = relationship(
         back_populates="price_format", cascade="all, delete-orphan"
     )
+
+
+class BranchSapMapping(Base):
+    __tablename__ = "branch_sap_mappings"
+
+    canonical_branch_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    branch_name: Mapped[str] = mapped_column(Text)
+    sap_branch_code: Mapped[str] = mapped_column(String(16), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+
+class PriceFormatBranchCounter(Base):
+    __tablename__ = "price_format_branch_counters"
+
+    sap_branch_code: Mapped[str] = mapped_column(String(16), primary_key=True)
+    last_sequence: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
 
 class PricingContext(Base):

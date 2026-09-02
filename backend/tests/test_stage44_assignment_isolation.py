@@ -9,6 +9,7 @@ from sqlalchemy.pool import StaticPool
 
 from backend.app import main
 from backend.app.db import Base
+from backend.app.deps import ROLE_ADMIN
 from backend.app.models import (
     CompetitorPrice,
     CompetitorPriceList,
@@ -44,6 +45,12 @@ def _override_db(Session):
             db.close()
 
     return override
+
+
+def _override_auth():
+    user = lambda: main.AppUser(id=1, username="admin", role=ROLE_ADMIN, is_active=True)
+    main.app.dependency_overrides[main.get_current_user] = user
+    main.app.dependency_overrides[main.require_write_access] = user
 
 
 def _seed_price_list(
@@ -150,13 +157,15 @@ def test_create_price_format_separates_available_from_assigned_plks(monkeypatch)
 
     monkeypatch.setattr(main, "enqueue_percentile_preparation", lambda **_: {"status": "skipped"})
     main.app.dependency_overrides[main.get_db] = _override_db(Session)
+    _override_auth()
     try:
         client = TestClient(main.app)
-        created = client.post("/api/price-formats", json={"code": "NEW001", "name": "NEW001", "branch": ""})
+        created = client.post("/api/price-formats", json={"name": "NEW001", "branch": "Алматы", "priceListType": "ИПЛ"})
         assert created.status_code == 200, created.text
-        available = client.get("/api/price-formats/NEW001/competitor-price-lists")
+        format_code = created.json()["code"]
+        available = client.get(f"/api/price-formats/{format_code}/competitor-price-lists")
         assert available.status_code == 200, available.text
-        assigned = client.get("/api/price-formats/NEW001/competitor-assignments?include_summary=1")
+        assigned = client.get(f"/api/price-formats/{format_code}/competitor-assignments?include_summary=1")
         assert assigned.status_code == 200, assigned.text
     finally:
         main.app.dependency_overrides.clear()
@@ -215,6 +224,7 @@ def test_explicit_assignment_and_unassignment_still_work(monkeypatch):
 
     monkeypatch.setattr(main, "enqueue_percentile_preparation", lambda **_: {"status": "skipped"})
     main.app.dependency_overrides[main.get_db] = _override_db(Session)
+    _override_auth()
     try:
         client = TestClient(main.app)
         assigned = client.post(

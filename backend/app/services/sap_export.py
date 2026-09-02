@@ -358,7 +358,7 @@ def build_sap_rows(db: Session, resolved_versions: list[ResolvedSapVersion]) -> 
         out.append(
             {
                 "material": material,
-                "category": resolved.price_format.name,
+                "category": resolved.price_format.code,
                 "unlock_status": "",
                 "price": _money(cp.final_price),
                 "price_format_id": int(resolved.price_format.id),
