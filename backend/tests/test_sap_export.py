@@ -7,7 +7,7 @@ from decimal import Decimal
 import pytest
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
-from sqlalchemy import create_engine, func, select, update
+from sqlalchemy import create_engine, delete, func, select, update
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -280,6 +280,135 @@ def test_category_order_and_material_ascending(db):
     assert rows[4][0] == str(int(products[0].code))
 
 
+def test_partial_empty_selected_price_list_rejects_entire_export(db):
+    formats, _products, versions = _four_format_fixture(db)
+    branch = formats[0].branch
+    empty_price_list = versions[2][4]
+    db.execute(delete(CalculatedPrice).where(CalculatedPrice.price_list_id == empty_price_list.id))
+    db.commit()
+
+    with pytest.raises(SapExportError) as exc_info:
+        build_export(
+            db,
+            branch_id=branch,
+            activation_date=ACTIVATION_DATE,
+            mode="auto",
+            price_format_ids=[row.id for row in formats],
+            items=None,
+            user=_admin(),
+        )
+
+    message = str(exc_info.value)
+    assert "SAP file was not generated" in message
+    assert "contain no calculated rows" in message
+    assert empty_price_list.number in message
+
+
+def test_multiple_empty_selected_price_lists_are_reported_together(db):
+    formats, _products, versions = _four_format_fixture(db)
+    branch = formats[0].branch
+    empty_price_lists = [versions[1][4], versions[3][4]]
+    db.execute(delete(CalculatedPrice).where(CalculatedPrice.price_list_id.in_([row.id for row in empty_price_lists])))
+    db.commit()
+
+    with pytest.raises(SapExportError) as exc_info:
+        build_export(
+            db,
+            branch_id=branch,
+            activation_date=ACTIVATION_DATE,
+            mode="auto",
+            price_format_ids=[row.id for row in formats],
+            items=None,
+            user=_admin(),
+        )
+
+    message = str(exc_info.value)
+    assert empty_price_lists[0].number in message
+    assert empty_price_lists[1].number in message
+
+
+def test_auto_duplicate_format_id_rejected(db):
+    formats, _products, _versions = _four_format_fixture(db)
+    branch = formats[0].branch
+
+    with pytest.raises(SapExportError, match="Duplicate price_format_id"):
+        build_export(
+            db,
+            branch_id=branch,
+            activation_date=ACTIVATION_DATE,
+            mode="auto",
+            price_format_ids=[formats[0].id, formats[0].id],
+            items=None,
+            user=_admin(),
+        )
+
+
+def test_manual_duplicate_format_entry_rejected(db):
+    formats, _products, versions = _four_format_fixture(db)
+    branch = formats[0].branch
+
+    with pytest.raises(SapExportError, match="Duplicate price_format_id"):
+        resolve_manual_versions(
+            db,
+            branch_id=branch,
+            activation_date=ACTIVATION_DATE,
+            items=[
+                {"price_format_id": formats[0].id, "price_list_id": versions[0][4].id},
+                {"price_format_id": formats[0].id, "price_list_id": versions[0][2].id},
+            ],
+            user=_admin(),
+        )
+
+
+def test_duplicate_sap_category_rejected_in_auto_and_manual_modes(db):
+    formats, _products, versions = _four_format_fixture(db)
+    branch = formats[0].branch
+    formats[1].sap_category = "SuperVIP"
+    db.commit()
+
+    with pytest.raises(SapExportError, match="Each selected SAP category must be unique"):
+        build_export(
+            db,
+            branch_id=branch,
+            activation_date=ACTIVATION_DATE,
+            mode="auto",
+            price_format_ids=[formats[0].id, formats[1].id],
+            items=None,
+            user=_admin(),
+        )
+
+    with pytest.raises(SapExportError, match="Each selected SAP category must be unique"):
+        resolve_manual_versions(
+            db,
+            branch_id=branch,
+            activation_date=ACTIVATION_DATE,
+            items=[
+                {"price_format_id": formats[0].id, "price_list_id": versions[0][4].id},
+                {"price_format_id": formats[1].id, "price_list_id": versions[1][4].id},
+            ],
+            user=_admin(),
+        )
+
+
+def test_malformed_manual_ids_are_controlled_client_errors(db):
+    with pytest.raises(SapExportError, match="price_format_id must be an integer"):
+        resolve_manual_versions(
+            db,
+            branch_id="РђР»РјР°С‚С‹",
+            activation_date=ACTIVATION_DATE,
+            items=[{"price_format_id": "foo", "price_list_id": 1}],
+            user=_admin(),
+        )
+    with pytest.raises(SapExportError, match="price_list_id must be an integer"):
+        resolve_manual_versions(
+            db,
+            branch_id="РђР»РјР°С‚С‹",
+            activation_date=ACTIVATION_DATE,
+            items=[{"price_format_id": 1, "price_list_id": "bar"}],
+            user=_admin(),
+        )
+
+
 def test_missing_product_code_and_null_final_price_rejected(db):
     pf = _format(db, "VIP", "VIP")
     product = _product(db, "000000000001000015")
@@ -337,3 +466,30 @@ def test_versions_endpoint_contract(db):
     assert payload["branch_id"] == "Алматы"
     assert payload["activation_date"] == ACTIVATION_DATE.isoformat()
     assert payload["formats"][0]["versions"][0]["workflow_run_id"] == versions[0][3].id
+
+
+def test_malformed_auto_id_endpoint_returns_controlled_client_error(db):
+    def override_db():
+        yield db
+
+    def override_user():
+        return _admin()
+
+    app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[get_current_user] = override_user
+    try:
+        client = TestClient(app)
+        response = client.post(
+            "/api/sap-export",
+            json={
+                "branch_id": "РђР»РјР°С‚С‹",
+                "activation_date": ACTIVATION_DATE.isoformat(),
+                "mode": "auto",
+                "price_format_ids": ["abc"],
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_user, None)
+    assert response.status_code == 400
+    assert "price_format_id must be an integer" in response.json()["detail"]

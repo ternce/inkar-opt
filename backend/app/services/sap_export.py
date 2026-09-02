@@ -9,7 +9,7 @@ from typing import Iterable
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..deps import AppUser, user_can_access_branch
@@ -87,10 +87,58 @@ def _format_label(pf: PriceFormat) -> str:
     return code or name or f"PriceFormat {pf.id}"
 
 
+def _coerce_int_id(value: object, field_name: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise SapExportError(f"{field_name} must be an integer")
+
+
+def _duplicate_values(values: Iterable[int]) -> list[int]:
+    seen: set[int] = set()
+    duplicates: list[int] = []
+    for value in values:
+        if value in seen and value not in duplicates:
+            duplicates.append(value)
+        seen.add(value)
+    return duplicates
+
+
+def _validate_unique_price_format_ids(price_format_ids: list[int]) -> None:
+    duplicates = _duplicate_values(price_format_ids)
+    if duplicates:
+        raise SapExportError(
+            "SAP file was not generated.\n"
+            "Duplicate price_format_id values are not allowed:\n"
+            + "\n".join(f"- {value}" for value in duplicates)
+        )
+
+
+def _validate_unique_sap_categories(formats: list[PriceFormat]) -> None:
+    by_category: dict[str, PriceFormat] = {}
+    duplicates: list[str] = []
+    for pf in formats:
+        category = normalize_sap_category(pf.sap_category)
+        if category is None:
+            continue
+        existing = by_category.get(category)
+        if existing is not None:
+            duplicates.append(f"{category}: {_format_label(existing)}, {_format_label(pf)}")
+            continue
+        by_category[category] = pf
+    if duplicates:
+        raise SapExportError(
+            "SAP file was not generated.\n"
+            "Each selected SAP category must be unique:\n"
+            + "\n".join(f"- {message}" for message in duplicates)
+        )
+
+
 def _load_price_formats(db: Session, price_format_ids: Iterable[int], branch_id: str, user: AppUser) -> list[PriceFormat]:
-    ids = list(dict.fromkeys(int(value) for value in price_format_ids))
+    ids = [_coerce_int_id(value, "price_format_id") for value in price_format_ids]
     if not ids:
         raise SapExportError("no selected formats")
+    _validate_unique_price_format_ids(ids)
     _ensure_branch_access(branch_id, user)
     rows = db.execute(select(PriceFormat).where(PriceFormat.id.in_(ids))).scalars().all()
     by_id = {int(row.id): row for row in rows}
@@ -113,6 +161,7 @@ def _load_price_formats(db: Session, price_format_ids: Iterable[int], branch_id:
         out.append(pf)
     if errors:
         raise SapExportError("SAP file was not generated.\n" + "\n".join(f"- {message}" for message in errors), status_code=403 if any("not available" in e for e in errors) else 400)
+    _validate_unique_sap_categories(out)
     return out
 
 
@@ -186,14 +235,21 @@ def resolve_manual_versions(
     effective_date = _parse_activation_date(activation_date)
     if not items:
         raise SapExportError("no selected formats")
-    price_format_ids = [int(item.get("price_format_id") or 0) for item in items]
+    parsed_items = [
+        {
+            "price_format_id": _coerce_int_id(item.get("price_format_id"), "price_format_id"),
+            "price_list_id": _coerce_int_id(item.get("price_list_id"), "price_list_id"),
+        }
+        for item in items
+    ]
+    price_format_ids = [item["price_format_id"] for item in parsed_items]
     formats = _load_price_formats(db, price_format_ids, branch_id, user)
     by_id = {int(pf.id): pf for pf in formats}
     resolved: list[ResolvedSapVersion] = []
     errors: list[str] = []
-    for item in items:
-        price_format_id = int(item.get("price_format_id") or 0)
-        price_list_id = int(item.get("price_list_id") or 0)
+    for item in parsed_items:
+        price_format_id = item["price_format_id"]
+        price_list_id = item["price_list_id"]
         pf = by_id.get(price_format_id)
         if pf is None:
             errors.append(f"PriceFormat {price_format_id} is invalid")
@@ -220,6 +276,24 @@ def resolve_manual_versions(
     return resolved
 
 
+def _validate_resolved_price_lists_have_rows(db: Session, resolved_versions: list[ResolvedSapVersion]) -> None:
+    price_list_ids = [int(item.price_list.id) for item in resolved_versions]
+    counts = dict(
+        db.execute(
+            select(CalculatedPrice.price_list_id, func.count(CalculatedPrice.id))
+            .where(CalculatedPrice.price_list_id.in_(price_list_ids))
+            .group_by(CalculatedPrice.price_list_id)
+        ).all()
+    )
+    empty = [item for item in resolved_versions if int(counts.get(int(item.price_list.id), 0)) == 0]
+    if empty:
+        raise SapExportError(
+            "SAP file was not generated.\n"
+            "The following generated price lists contain no calculated rows:\n"
+            + "\n".join(f"- {item.price_list.number or _format_label(item.price_format)}" for item in empty)
+        )
+
+
 def _material_number(code: object) -> str:
     raw = str(code or "").strip()
     if not raw:
@@ -236,14 +310,13 @@ def _money(value: object) -> Decimal:
 def build_sap_rows(db: Session, resolved_versions: list[ResolvedSapVersion]) -> list[dict]:
     if not resolved_versions:
         raise SapExportError("no selected formats")
+    _validate_resolved_price_lists_have_rows(db, resolved_versions)
     by_price_list_id = {int(item.price_list.id): item for item in resolved_versions}
     rows = db.execute(
         select(CalculatedPrice, Product)
         .join(Product, Product.id == CalculatedPrice.product_id)
         .where(CalculatedPrice.price_list_id.in_(list(by_price_list_id)))
     ).all()
-    if not rows:
-        raise SapExportError("SAP file was not generated.\n- selected PriceList is empty")
     out: list[dict] = []
     for cp, product in rows:
         resolved = by_price_list_id[int(cp.price_list_id)]

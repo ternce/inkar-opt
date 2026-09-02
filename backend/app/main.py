@@ -3469,7 +3469,7 @@ def post_sap_export(
             branch_id=str(payload.get("branch_id") or payload.get("branchId") or ""),
             activation_date=str(payload.get("activation_date") or payload.get("activationDate") or ""),
             mode=str(payload.get("mode") or "auto"),
-            price_format_ids=[int(value) for value in payload.get("price_format_ids") or payload.get("priceFormatIds") or []],
+            price_format_ids=payload.get("price_format_ids") or payload.get("priceFormatIds") or [],
             items=payload.get("items") if isinstance(payload.get("items"), list) else None,
             user=current_user,
         )
