@@ -16,6 +16,7 @@ import {
   canSubmitPricingRuleCreate,
   draftFromCopySource,
   emptyPricingRuleDraft,
+  defaultCompetitorGapThresholds,
   hydratePricingRuleDraft,
   isLatestPricingRuleLoadResponse,
   pricingRuleEditorTargetFromFormatSelection,
@@ -69,7 +70,16 @@ type PricingRule = {
   bendTemplateId: number | null;
   noCompetitorTemplateId: number | null;
   roundingRuleId: number | null;
+  competitorGapThresholds: CompetitorGapThreshold[];
   isActive: boolean;
+};
+
+type CompetitorGapThreshold = {
+  id?: number;
+  minPrice: number;
+  maxPrice: number | null;
+  maxGapPercent: number | string;
+  sortOrder?: number;
 };
 
 type AppliedRuleStatus = {
@@ -134,6 +144,27 @@ const toPayloadRows = (rows: RangeRow[], valueKey: 'markupPercent' | 'bendPercen
     [valueKey]: parseRequiredDecimalInput(row[valueKey] || 0, valueKey === 'markupPercent' ? 'Наценка (%)' : 'Прогиб (%)'),
     sortOrder: index,
   }));
+
+const gapRangeLabel = (row: CompetitorGapThreshold) => {
+  const from = row.minPrice.toLocaleString('ru-RU');
+  if (row.maxPrice == null) return `>${from} ₸`;
+  return `${from}-${row.maxPrice.toLocaleString('ru-RU')} ₸`;
+};
+
+const toPayloadGapThresholds = (rows: CompetitorGapThreshold[]) => {
+  const source = rows.length ? rows : defaultCompetitorGapThresholds();
+  return source.map((row, index) => {
+    const maxGapPercent = parseRequiredDecimalInput(row.maxGapPercent, 'Максимальный разрыв (%)');
+    if (maxGapPercent < 0) throw new Error('Максимальный разрыв (%) должен быть >= 0');
+    if (maxGapPercent > 100) throw new Error('Максимальный разрыв (%) должен быть <= 100');
+    return {
+      minPrice: row.minPrice,
+      maxPrice: row.maxPrice,
+      maxGapPercent,
+      sortOrder: index,
+    };
+  });
+};
 
 const rowsFromFormatSettings = (
   settings: PriceFormatSettings | null,
@@ -534,10 +565,14 @@ export function PricingRulesTab({ formatCode, initialTab = 'rules', onNavigate }
     setError(null);
     try {
       const isNew = selectedRuleId === NEW_PRICING_RULE_SELECTION || !draft.id;
+      const payload = {
+        ...(isNew ? buildPricingRuleCreatePayload(draft, copyFromRuleId) : draft),
+        competitorGapThresholds: toPayloadGapThresholds(draft.competitorGapThresholds),
+      };
       const res = await fetch(isNew ? '/api/pricing-rules' : `/api/pricing-rules/${draft.id}`, {
         method: isNew ? 'POST' : 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(isNew ? buildPricingRuleCreatePayload(draft, copyFromRuleId) : draft),
+        body: JSON.stringify(payload),
       });
       const text = await res.text();
       const data = parseJsonOrNull(text);
@@ -670,6 +705,10 @@ export function PricingRulesTab({ formatCode, initialTab = 'rules', onNavigate }
               <FieldSelect label="Наценки без конкурентов" value={draft.noCompetitorTemplateId} items={noCompetitors} disabled={selectedRuleId === NEW_PRICING_RULE_SELECTION && copyFromRuleId !== NO_COPY_SOURCE} onChange={(id) => setDraft((prev) => ({ ...prev, noCompetitorTemplateId: id }))} />
               <FieldSelect label="Округление" value={draft.roundingRuleId} items={roundings} disabled={selectedRuleId === NEW_PRICING_RULE_SELECTION && copyFromRuleId !== NO_COPY_SOURCE} onChange={(id) => setDraft((prev) => ({ ...prev, roundingRuleId: id }))} />
             </div>
+            <CompetitorGapThresholdEditor
+              rows={draft.competitorGapThresholds}
+              onChange={(rows) => setDraft((prev) => ({ ...prev, competitorGapThresholds: rows }))}
+            />
           </div>
         </div>
       </TabsContent>
@@ -680,6 +719,53 @@ export function PricingRulesTab({ formatCode, initialTab = 'rules', onNavigate }
       <TabsContent value="rounding" className="m-0 pt-4"><RoundingEditor items={roundings} appliedRoundingRuleId={formatSettings?.appliedRoundingRuleId ?? null} onReload={load} /></TabsContent>
       <TabsContent value="format" className="m-0 pt-4"><PricingSettingsTab formatCode={formatCode} onNavigate={onNavigate} /></TabsContent>
     </Tabs>
+  );
+}
+
+function CompetitorGapThresholdEditor({
+  rows,
+  onChange,
+}: {
+  rows: CompetitorGapThreshold[];
+  onChange: (rows: CompetitorGapThreshold[]) => void;
+}) {
+  const normalizedRows = rows.length ? rows : defaultCompetitorGapThresholds();
+  const updateRow = (index: number, value: string) => {
+    onChange(normalizedRows.map((row, idx) => (idx === index ? { ...row, maxGapPercent: value } : row)));
+  };
+
+  return (
+    <div className="admin-table-card">
+      <div className="border-b border-gray-200 px-4 py-3">
+        <h3 className="text-sm font-semibold text-gray-900">Максимальный разрыв между ЦК</h3>
+      </div>
+      <table className="admin-table">
+        <thead>
+          <tr>
+            <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Диапазон цены</th>
+            <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Максимальный разрыв</th>
+          </tr>
+        </thead>
+        <tbody>
+          {normalizedRows.map((row, index) => (
+            <tr key={`${row.minPrice}-${row.maxPrice ?? 'inf'}`}>
+              <td className="px-4 py-3 text-sm text-gray-900">{gapRangeLabel(row)}</td>
+              <td className="px-4 py-3">
+                <div className="flex max-w-[160px] items-center gap-2">
+                  <Input
+                    className="numeric-input"
+                    inputMode="decimal"
+                    value={String(row.maxGapPercent)}
+                    onChange={(e) => updateRow(index, e.target.value)}
+                  />
+                  <span className="text-sm text-gray-500">%</span>
+                </div>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 

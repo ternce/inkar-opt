@@ -1726,3 +1726,24 @@ class PricingRule(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+
+    competitor_gap_tiers: Mapped[list["PricingRuleCompetitorGapTier"]] = relationship(cascade="all, delete-orphan")
+
+
+class PricingRuleCompetitorGapTier(Base):
+    __tablename__ = "pricing_rule_competitor_gap_tiers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    pricing_rule_id: Mapped[int] = mapped_column(ForeignKey("pricing_rules.id", ondelete="CASCADE"), index=True)
+    min_price: Mapped[float] = mapped_column(Numeric(18, 4))
+    max_price: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    max_gap_percent: Mapped[float] = mapped_column(Numeric(18, 4))
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive, server_default=text("CURRENT_TIMESTAMP"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive, server_default=text("CURRENT_TIMESTAMP"))
+
+    __table_args__ = (
+        UniqueConstraint("pricing_rule_id", "sort_order", name="uq_pricing_rule_competitor_gap_rule_order"),
+        UniqueConstraint("pricing_rule_id", "min_price", name="uq_pricing_rule_competitor_gap_rule_min_price"),
+        Index("ix_pricing_rule_competitor_gap_rule_order", "pricing_rule_id", "sort_order"),
+    )

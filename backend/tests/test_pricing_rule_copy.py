@@ -1,6 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -16,6 +17,7 @@ from backend.app.models import (
     NoCompetitorMarkupTemplateRow,
     PriceFormat,
     PricingRule,
+    PricingRuleCompetitorGapTier,
     RoundingRule,
 )
 from backend.app.services.pricing_rules import rules as rule_service
@@ -222,3 +224,127 @@ def test_copy_does_not_copy_price_format_assignments():
 
         assert db.query(PriceFormat).filter(PriceFormat.pricing_rule_id == source.id).count() == 1
         assert db.query(PriceFormat).filter(PriceFormat.pricing_rule_id == copied.id).count() == 0
+
+
+def test_new_pricing_rule_receives_default_competitor_gap_tiers():
+    Session = _db()
+    with Session() as db:
+        rule = rule_service.upsert_pricing_rule(db=db, payload={"code": "GAP_DEFAULT", "name": "Gap default"})
+
+        payload = rule_service.pricing_rule_to_dict(rule)
+
+        assert [row["minPrice"] for row in payload["competitorGapThresholds"]] == [0.0, 500.0, 2500.0, 5000.0, 10000.0, 25000.0]
+        assert [row["maxPrice"] for row in payload["competitorGapThresholds"]] == [500.0, 2500.0, 5000.0, 10000.0, 25000.0, None]
+        assert [row["maxGapPercent"] for row in payload["competitorGapThresholds"]] == [15.0, 12.0, 10.0, 8.0, 7.0, 5.0]
+
+
+def test_existing_pricing_rule_without_gap_tiers_is_bootstrapped_idempotently():
+    Session = _db()
+    with Session() as db:
+        rule = PricingRule(code="LEGACY_GAP", name="Legacy gap")
+        db.add(rule)
+        db.commit()
+
+        assert rule_service.bootstrap_competitor_gap_defaults(db=db) == 1
+        assert db.query(PricingRuleCompetitorGapTier).filter(PricingRuleCompetitorGapTier.pricing_rule_id == rule.id).count() == 6
+        assert rule_service.bootstrap_competitor_gap_defaults(db=db) == 0
+        assert db.query(PricingRuleCompetitorGapTier).filter(PricingRuleCompetitorGapTier.pricing_rule_id == rule.id).count() == 6
+
+
+def test_bootstrap_does_not_overwrite_existing_edited_gap_tiers():
+    Session = _db()
+    with Session() as db:
+        rule = PricingRule(code="EDITED_GAP", name="Edited gap")
+        db.add(rule)
+        db.flush()
+        db.add(PricingRuleCompetitorGapTier(pricing_rule_id=rule.id, min_price=0, max_price=500, max_gap_percent=33, sort_order=0))
+        db.commit()
+
+        assert rule_service.bootstrap_competitor_gap_defaults(db=db) == 0
+        rows = db.query(PricingRuleCompetitorGapTier).filter(PricingRuleCompetitorGapTier.pricing_rule_id == rule.id).all()
+
+        assert len(rows) == 1
+        assert float(rows[0].max_gap_percent) == 33
+
+
+def test_pricing_rule_patch_updates_competitor_gap_thresholds_with_fixed_boundaries():
+    Session = _db()
+    with Session() as db:
+        rule = rule_service.upsert_pricing_rule(db=db, payload={"code": "PATCH_GAP", "name": "Patch gap"})
+        payload = rule_service.pricing_rule_to_dict(rule)
+        rows = payload["competitorGapThresholds"]
+        rows[0]["maxGapPercent"] = 50
+
+        updated = rule_service.upsert_pricing_rule(
+            db=db,
+            rule_id=rule.id,
+            payload={
+                "code": "PATCH_GAP",
+                "name": "Patch gap",
+                "competitorGapThresholds": rows,
+            },
+        )
+
+        assert rule_service.pricing_rule_to_dict(updated)["competitorGapThresholds"][0]["maxGapPercent"] == 50.0
+
+
+def test_pricing_rule_patch_rejects_invalid_competitor_gap_threshold():
+    Session = _db()
+    with Session() as db:
+        rule = rule_service.upsert_pricing_rule(db=db, payload={"code": "BAD_GAP", "name": "Bad gap"})
+        payload = rule_service.pricing_rule_to_dict(rule)
+        rows = payload["competitorGapThresholds"]
+        rows[0]["maxGapPercent"] = 101
+
+        with pytest.raises(ValueError, match="maxGapPercent must be <= 100"):
+            rule_service.upsert_pricing_rule(
+                db=db,
+                rule_id=rule.id,
+                payload={
+                    "code": "BAD_GAP",
+                    "name": "Bad gap",
+                    "competitorGapThresholds": rows,
+                },
+            )
+
+
+def test_competitor_gap_tier_ids_autoincrement_on_persistence():
+    Session = _db()
+    with Session() as db:
+        rule = rule_service.upsert_pricing_rule(db=db, payload={"code": "AUTO_GAP", "name": "Auto gap"})
+        rows = (
+            db.query(PricingRuleCompetitorGapTier)
+            .filter(PricingRuleCompetitorGapTier.pricing_rule_id == rule.id)
+            .order_by(PricingRuleCompetitorGapTier.sort_order.asc())
+            .all()
+        )
+
+        assert len(rows) == 6
+        assert all(row.id is not None and row.id > 0 for row in rows)
+
+
+def test_competitor_gap_tiers_are_unique_per_rule_order_and_min_price():
+    Session = _db()
+    with Session() as db:
+        rule = rule_service.upsert_pricing_rule(db=db, payload={"code": "UNIQUE_GAP", "name": "Unique gap"})
+        db.add(PricingRuleCompetitorGapTier(pricing_rule_id=rule.id, min_price=999, max_price=1000, max_gap_percent=1, sort_order=0))
+
+        with pytest.raises(IntegrityError):
+            db.commit()
+        db.rollback()
+
+        db.add(PricingRuleCompetitorGapTier(pricing_rule_id=rule.id, min_price=0, max_price=1, max_gap_percent=1, sort_order=99))
+        with pytest.raises(IntegrityError):
+            db.commit()
+
+
+def test_deleting_pricing_rule_cascades_owned_competitor_gap_tiers():
+    Session = _db()
+    with Session() as db:
+        rule = rule_service.upsert_pricing_rule(db=db, payload={"code": "CASCADE_GAP", "name": "Cascade gap"})
+        rule_id = int(rule.id)
+        assert db.query(PricingRuleCompetitorGapTier).filter(PricingRuleCompetitorGapTier.pricing_rule_id == rule_id).count() == 6
+
+        rule_service.delete_pricing_rule(db=db, rule_id=rule_id)
+
+        assert db.query(PricingRuleCompetitorGapTier).filter(PricingRuleCompetitorGapTier.pricing_rule_id == rule_id).count() == 0

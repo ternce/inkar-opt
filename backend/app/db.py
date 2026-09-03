@@ -162,10 +162,22 @@ def init_db() -> None:
     if os.getenv("RUN_LEGACY_PROVISOR_SOURCE_KEY_BACKFILL_ON_STARTUP", "").strip().lower() in {"1", "true", "yes", "on"}:
         _backfill_account_scoped_provisor_source_keys()
     _ensure_compatible_indexes()
+    _bootstrap_competitor_gap_defaults()
     if os.getenv("RUN_LEGACY_ASSIGNMENT_BACKFILL_ON_STARTUP", "").strip().lower() in {"1", "true", "yes", "on"}:
         _backfill_competitor_assignments()
     _backfill_competitor_price_coefficients()
     _backfill_percentile_preparations()
+
+
+def _bootstrap_competitor_gap_defaults() -> None:
+    try:
+        from .services.pricing_rules.rules import bootstrap_competitor_gap_defaults
+
+        with SessionLocal() as db:
+            bootstrap_competitor_gap_defaults(db=db)
+    except Exception:
+        logger.exception("Failed to bootstrap competitor gap threshold defaults")
+        raise
 
 
 def _ensure_compatible_columns() -> None:

@@ -8,6 +8,7 @@ import {
   applyPricingRuleCreateSuccess,
   buildPricingRuleCreatePayload,
   canSubmitPricingRuleCreate,
+  defaultCompetitorGapThresholds,
   draftFromCopySource,
   emptyPricingRuleDraft,
   hydratePricingRuleDraft,
@@ -29,6 +30,7 @@ const draft = (patch: Partial<PricingRuleDraft> = {}): PricingRuleDraft => ({
   bendTemplateId: null,
   noCompetitorTemplateId: null,
   roundingRuleId: null,
+  competitorGapThresholds: defaultCompetitorGapThresholds(),
   isActive: true,
   ...patch,
 });
@@ -73,6 +75,22 @@ test('copy source prefill does not mutate source frontend state', () => {
 
 test('new rule draft starts with empty linked settings', () => {
   assert.deepEqual(emptyPricingRuleDraft(), draft({ code: '', name: '' }));
+});
+
+test('rule drafts include default competitor gap thresholds', () => {
+  const hydrated = hydratePricingRuleDraft({ code: 'GAP', name: 'Gap' });
+
+  assert.deepEqual(
+    hydrated.competitorGapThresholds.map((row) => [row.minPrice, row.maxPrice, row.maxGapPercent]),
+    [
+      [0, 500, 15],
+      [500, 2500, 12],
+      [2500, 5000, 10],
+      [5000, 10000, 8],
+      [10000, 25000, 7],
+      [25000, null, 5],
+    ]
+  );
 });
 
 test('top selector selecting Rule A opens lower editor through existing rule hydration target', () => {

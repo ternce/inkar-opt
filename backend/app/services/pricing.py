@@ -29,6 +29,7 @@ from ..models import (
     CalculatedPrice,
     ProductRating,
     PricingRule,
+    PricingRuleCompetitorGapTier,
     ReferenceImportJob,
     ReferenceUpdateStatus,
     RoundingRule,
@@ -189,6 +190,7 @@ class PricingPreload:
     markup_ranges: list[MarkupRange]
     no_competitor_markup_ranges: list[NoCompetitorMarkupRange]
     bend_ranges: list[BendRange]
+    competitor_gap_tiers: list[PricingRuleCompetitorGapTier]
     rounding_rule: RoundingRule | None
     selected_source_meta: SelectedSourceMeta
     competitor_configs: list[CompetitorPrice]
@@ -582,6 +584,82 @@ def _bend_percent_from_ranges(
         else:
             break
     return chosen if chosen is not None else fallback_percent
+
+
+def _competitor_gap_threshold_from_tiers(
+    tiers: list[PricingRuleCompetitorGapTier],
+    competitor_price: Decimal,
+) -> tuple[Decimal, dict[str, Decimal | None]] | None:
+    if competitor_price < 0:
+        return None
+    ordered = sorted(tiers, key=lambda x: (int(x.sort_order or 0), _as_decimal(x.min_price, Decimal("0")) or Decimal("0")))
+    for tier in ordered:
+        min_price = _as_decimal(tier.min_price, Decimal("0")) or Decimal("0")
+        max_price = _as_decimal(tier.max_price)
+        if competitor_price >= min_price and (max_price is None or competitor_price < max_price):
+            threshold = _as_decimal(tier.max_gap_percent)
+            if threshold is None:
+                return None
+            return threshold, {"minPrice": min_price, "maxPrice": max_price}
+    if ordered:
+        tier = ordered[-1]
+        threshold = _as_decimal(tier.max_gap_percent)
+        if threshold is None:
+            return None
+        return threshold, {"minPrice": _as_decimal(tier.min_price, Decimal("0")) or Decimal("0"), "maxPrice": _as_decimal(tier.max_price)}
+    return None
+
+
+def _competitor_gap_tiers_for_price_format(
+    db: Session,
+    price_format: PriceFormat,
+    pricing_preload: PricingPreload | None = None,
+) -> list[PricingRuleCompetitorGapTier]:
+    if pricing_preload is not None:
+        return pricing_preload.competitor_gap_tiers
+    if not price_format.pricing_rule_id:
+        return []
+    return db.execute(
+        select(PricingRuleCompetitorGapTier)
+        .where(PricingRuleCompetitorGapTier.pricing_rule_id == price_format.pricing_rule_id)
+        .order_by(PricingRuleCompetitorGapTier.sort_order.asc(), PricingRuleCompetitorGapTier.min_price.asc())
+    ).scalars().all()
+
+
+def _unique_competitor_levels(prices: list[tuple[Decimal, str]]) -> list[tuple[Decimal, str, list[str]]]:
+    levels: list[tuple[Decimal, str, list[str]]] = []
+    for price, source in prices:
+        if levels and price == levels[-1][0]:
+            levels[-1][2].append(source)
+            continue
+        levels.append((price, source, [source]))
+    return levels
+
+
+def _money_for_log(value: Decimal) -> str:
+    return f"{value.quantize(Decimal('0.01'))}"
+
+
+def _pct_for_log(value: Decimal) -> str:
+    return f"{value.quantize(Decimal('0.01'))}"
+
+
+def _range_for_log(range_info: dict[str, Decimal | None]) -> str:
+    min_price = range_info["minPrice"] or Decimal("0")
+    max_price = range_info.get("maxPrice")
+    if max_price is None:
+        return f">{_money_for_log(min_price)}"
+    return f"{_money_for_log(min_price)}-{_money_for_log(max_price)}"
+
+
+def _competitor_gap_block_log(event: dict) -> str:
+    return (
+        "Переход между уровнями ЦК остановлен: "
+        f"{_money_for_log(event['fromPrice'])} KZT -> {_money_for_log(event['toPrice'])} KZT. "
+        f"Разрыв {_pct_for_log(event['gapPercent'])}% превышает допустимый порог "
+        f"{_pct_for_log(event['thresholdPercent'])}% для диапазона {event['rangeLabel']} KZT. "
+        f"Применена минимально допустимая цена {_money_for_log(event['fallbackPrice'])} KZT."
+    )
 
 
 def get_markup_percent_by_range(db: Session, price_format_id: int, cost: Decimal) -> Decimal:
@@ -1679,6 +1757,13 @@ def _build_pricing_preload(
         bend_ranges=db.execute(
             select(BendRange).where(BendRange.price_format_id == price_format.id).order_by(BendRange.price_from.asc())
         ).scalars().all(),
+        competitor_gap_tiers=db.execute(
+            select(PricingRuleCompetitorGapTier)
+            .where(PricingRuleCompetitorGapTier.pricing_rule_id == price_format.pricing_rule_id)
+            .order_by(PricingRuleCompetitorGapTier.sort_order.asc(), PricingRuleCompetitorGapTier.min_price.asc())
+        ).scalars().all()
+        if price_format.pricing_rule_id
+        else [],
         rounding_rule=rounding_rule,
         selected_source_meta=_selected_source_meta(db, int(price_format.id)),
         competitor_configs=configs,
@@ -2271,6 +2356,7 @@ def calculate_price_for_product(
     competitor_source_min: str = resolved_many.prices[0][1] if resolved_many.prices else ""
     markup_percent_used = markup_percent * Decimal("100")
     competitor_candidate_price: Decimal | None = None
+    competitor_gap_event: dict | None = None
 
     chosen_competitor: Decimal | None = None
     chosen_source: str = ""
@@ -2291,7 +2377,9 @@ def calculate_price_for_product(
         no_competitor_candidate_below_mdc = price < mdc
     else:
         no_competitor_candidate_below_mdc = False
-        for idx, (competitor_price, competitor_source) in enumerate(resolved_many.prices, start=1):
+        gap_tiers = _competitor_gap_tiers_for_price_format(db, price_format, pricing_preload)
+        competitor_levels = _unique_competitor_levels(resolved_many.prices)
+        for idx, (competitor_price, competitor_source, _same_level_sources) in enumerate(competitor_levels, start=1):
             if no_bend_match is not None:
                 bend_percent = Decimal("0")
             else:
@@ -2321,6 +2409,25 @@ def calculate_price_for_product(
                     "mdc": mdc,
                 }
             )
+            if idx < len(competitor_levels) and gap_tiers:
+                next_price = competitor_levels[idx][0]
+                threshold_match = _competitor_gap_threshold_from_tiers(gap_tiers, competitor_price)
+                if threshold_match is not None and competitor_price > 0:
+                    threshold, range_info = threshold_match
+                    gap_percent = ((next_price - competitor_price) / competitor_price) * Decimal("100")
+                    if gap_percent > threshold:
+                        competitor_gap_event = {
+                            "fromPrice": competitor_price,
+                            "toPrice": next_price,
+                            "gapPercent": gap_percent,
+                            "thresholdPercent": threshold,
+                            "range": range_info,
+                            "rangeLabel": _range_for_log(range_info),
+                            "fallbackPrice": mdc,
+                            "fallbackReason": "mdc_floor",
+                        }
+                        reason = "competitor_gap_blocked"
+                        break
         else:
             reason = "all_competitors_failed_mdc"
 
@@ -2482,6 +2589,8 @@ def calculate_price_for_product(
             for effect in applied_list_effects
         ),
     )
+    if competitor_gap_event is not None:
+        calculation_log = _competitor_gap_block_log(competitor_gap_event)
     chosen_details = (resolved_many.details or {}).get(chosen_source) if chosen_source else None
     if chosen_details:
         calculation_log = (
@@ -2539,6 +2648,14 @@ def calculate_price_for_product(
         "chosen_competitor_rank": chosen_competitor_rank,
         "rejected_competitors": rejected_competitors,
         "price_from_competitor": price_from_competitor,
+        "competitorGapApplied": bool(competitor_gap_event),
+        "competitorGapFrom": competitor_gap_event.get("fromPrice") if competitor_gap_event else None,
+        "competitorGapTo": competitor_gap_event.get("toPrice") if competitor_gap_event else None,
+        "competitorGapPercent": competitor_gap_event.get("gapPercent") if competitor_gap_event else None,
+        "competitorGapThresholdPercent": competitor_gap_event.get("thresholdPercent") if competitor_gap_event else None,
+        "competitorGapRange": competitor_gap_event.get("range") if competitor_gap_event else None,
+        "competitorGapFallback": competitor_gap_event.get("fallbackPrice") if competitor_gap_event else None,
+        "competitorGapFallbackReason": competitor_gap_event.get("fallbackReason") if competitor_gap_event else "",
         "final_price": price,
         "reason": reason,
         "log": calculation_log,

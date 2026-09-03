@@ -9,12 +9,30 @@ export type PricingRuleDraft = {
   bendTemplateId: number | null;
   noCompetitorTemplateId: number | null;
   roundingRuleId: number | null;
+  competitorGapThresholds: CompetitorGapThreshold[];
   isActive: boolean;
+};
+
+export type CompetitorGapThreshold = {
+  id?: number;
+  minPrice: number;
+  maxPrice: number | null;
+  maxGapPercent: number | string;
+  sortOrder?: number;
 };
 
 export const NO_COPY_SOURCE = 'none';
 export const NEW_PRICING_RULE_SELECTION = 'new';
 export const NO_FORMAT_PRICING_RULE_SELECTION = 'none';
+
+export const defaultCompetitorGapThresholds = (): CompetitorGapThreshold[] => [
+  { minPrice: 0, maxPrice: 500, maxGapPercent: 15, sortOrder: 0 },
+  { minPrice: 500, maxPrice: 2500, maxGapPercent: 12, sortOrder: 1 },
+  { minPrice: 2500, maxPrice: 5000, maxGapPercent: 10, sortOrder: 2 },
+  { minPrice: 5000, maxPrice: 10000, maxGapPercent: 8, sortOrder: 3 },
+  { minPrice: 10000, maxPrice: 25000, maxGapPercent: 7, sortOrder: 4 },
+  { minPrice: 25000, maxPrice: null, maxGapPercent: 5, sortOrder: 5 },
+];
 
 export const emptyPricingRuleDraft = (): PricingRuleDraft => ({
   id: 0,
@@ -27,6 +45,7 @@ export const emptyPricingRuleDraft = (): PricingRuleDraft => ({
   bendTemplateId: null,
   noCompetitorTemplateId: null,
   roundingRuleId: null,
+  competitorGapThresholds: defaultCompetitorGapThresholds(),
   isActive: true,
 });
 
@@ -37,6 +56,15 @@ export const hydratePricingRuleDraft = (rule: Partial<PricingRuleDraft>): Pricin
   bendTemplateId: rule.bendTemplateId ?? null,
   noCompetitorTemplateId: rule.noCompetitorTemplateId ?? null,
   roundingRuleId: rule.roundingRuleId ?? null,
+  competitorGapThresholds: Array.isArray(rule.competitorGapThresholds) && rule.competitorGapThresholds.length
+    ? rule.competitorGapThresholds.map((row, index) => ({
+        id: row.id,
+        minPrice: Number(row.minPrice),
+        maxPrice: row.maxPrice == null ? null : Number(row.maxPrice),
+        maxGapPercent: row.maxGapPercent,
+        sortOrder: row.sortOrder ?? index,
+      }))
+    : defaultCompetitorGapThresholds(),
 });
 
 export const buildPricingRuleCreatePayload = (draft: PricingRuleDraft, copyFromRuleId: string) => {
@@ -56,6 +84,7 @@ export const draftFromCopySource = (currentDraft: PricingRuleDraft, source: Pric
   bendTemplateId: source.bendTemplateId ?? null,
   noCompetitorTemplateId: source.noCompetitorTemplateId ?? null,
   roundingRuleId: source.roundingRuleId ?? null,
+  competitorGapThresholds: source.competitorGapThresholds.map((row) => ({ ...row })),
   isActive: source.isActive,
 });
 

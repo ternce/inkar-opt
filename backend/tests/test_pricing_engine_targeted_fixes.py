@@ -29,6 +29,8 @@ from backend.app.models import (
     PriceFormatCompetitorAssignment,
     PriceFormat,
     PriceList,
+    PricingRule,
+    PricingRuleCompetitorGapTier,
     Product,
     ProductExtra,
     ProductRating,
@@ -62,6 +64,7 @@ from backend.app.services.pricing import (
     calculate_price_for_product,
     calculate_price_zone,
     calculate_prices,
+    _competitor_gap_threshold_from_tiers,
     load_percentile_price_cache,
     resolve_all_competitor_prices,
 )
@@ -103,6 +106,35 @@ def _competitor(db, pf, product, source, price):
     db.add(CompetitorPrice(price_format_id=pf.id, product_id=None, source_name=source, supplier=source, coefficient=1))
     db.add(CompetitorPrice(price_format_id=pf.id, product_id=product.id, source_name=source, supplier=source, source_price=price, coefficient=1))
     db.flush()
+
+
+def _gap_rule(db, pf, *, first_threshold=15, code="GAP_RULE"):
+    rule = PricingRule(code=code, name=code)
+    db.add(rule)
+    db.flush()
+    for index, (min_price, max_price, threshold) in enumerate(
+        [
+            (0, 500, first_threshold),
+            (500, 2500, 12),
+            (2500, 5000, 10),
+            (5000, 10000, 8),
+            (10000, 25000, 7),
+            (25000, None, 5),
+        ]
+    ):
+        db.add(
+            PricingRuleCompetitorGapTier(
+                pricing_rule_id=rule.id,
+                min_price=min_price,
+                max_price=max_price,
+                max_gap_percent=threshold,
+                sort_order=index,
+            )
+        )
+    pf.pricing_rule_id = rule.id
+    pf.pricing_rule = rule.code
+    db.flush()
+    return rule
 
 
 def _emit_percentile_column_key(pf, *, source_key, region, competitor, percentile, scope=REGIONAL_SCOPE):
@@ -4365,3 +4397,194 @@ def test_analytics_recalculates_old_rows_without_chosen_competitor():
 
     assert analytics["summary"]["optimalZone"] == 1
     assert analytics["summary"]["rightZone"] == 0
+
+
+def test_competitor_gap_blocks_supplied_296_to_410_case():
+    db = _session()
+    pf = _format(db)
+    db.query(MarkupRange).filter(MarkupRange.price_format_id == pf.id).delete()
+    db.add(MarkupRange(price_format_id=pf.id, cost_from=0, cost_to=None, markup_percent=0.2))
+    _gap_rule(db, pf, first_threshold=15)
+    product = _product(db, code="000000000001001886", cost=Decimal("242.2758"))
+    _competitor(db, pf, product, "competitor:low", Decimal("296.69"))
+    _competitor(db, pf, product, "competitor:high", Decimal("410"))
+
+    price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
+
+    assert debug["competitorGapApplied"] is True
+    assert debug["competitorGapFrom"] == Decimal("296.69")
+    assert debug["competitorGapTo"] == Decimal("410")
+    assert debug["competitorGapThresholdPercent"] == Decimal("15.000000")
+    assert debug["chosen_competitor_price"] is None
+    assert price != Decimal("407.95")
+    assert debug["mdc_price"].quantize(Decimal("0.0001")) == Decimal("302.8448")
+    assert price == Decimal("302.85")
+    assert "Переход между уровнями ЦК остановлен" in debug["log"]
+
+
+def test_competitor_gap_allows_normal_transition():
+    db = _session()
+    pf = _format(db)
+    db.query(MarkupRange).filter(MarkupRange.price_format_id == pf.id).delete()
+    db.add(MarkupRange(price_format_id=pf.id, cost_from=0, cost_to=None, markup_percent=0.12))
+    _gap_rule(db, pf, first_threshold=15)
+    product = _product(db, code="GAP-ALLOW", cost=Decimal("280"))
+    _competitor(db, pf, product, "competitor:low", Decimal("300"))
+    _competitor(db, pf, product, "competitor:next", Decimal("330"))
+
+    price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
+
+    assert debug["competitorGapApplied"] is False
+    assert debug["chosen_competitor_price"] == Decimal("330")
+    assert price == Decimal("328.35")
+
+
+def test_duplicate_competitor_prices_do_not_count_as_gap_transitions():
+    db = _session()
+    pf = _format(db)
+    db.query(MarkupRange).filter(MarkupRange.price_format_id == pf.id).delete()
+    db.add(MarkupRange(price_format_id=pf.id, cost_from=0, cost_to=None, markup_percent=0.2))
+    _gap_rule(db, pf, first_threshold=15)
+    product = _product(db, code="GAP-DUP", cost=Decimal("242.2758"))
+    for idx, value in enumerate([Decimal("296.69"), Decimal("296.69"), Decimal("296.69"), Decimal("410"), Decimal("410")]):
+        _competitor(db, pf, product, f"competitor:{idx}", value)
+
+    _price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
+
+    assert debug["competitorGapApplied"] is True
+    assert debug["competitorGapFrom"] == Decimal("296.69")
+    assert debug["competitorGapTo"] == Decimal("410")
+    assert [row["price"] for row in debug["rejected_competitors"]] == [Decimal("296.69")]
+
+
+def test_competitor_gap_blocks_second_transition_without_skipping_higher():
+    db = _session()
+    pf = _format(db)
+    db.query(MarkupRange).filter(MarkupRange.price_format_id == pf.id).delete()
+    db.add(MarkupRange(price_format_id=pf.id, cost_from=0, cost_to=None, markup_percent=0.2))
+    _gap_rule(db, pf, first_threshold=15)
+    product = _product(db, code="GAP-MULTI", cost=Decimal("300"))
+    _competitor(db, pf, product, "competitor:300", Decimal("300"))
+    _competitor(db, pf, product, "competitor:330", Decimal("330"))
+    _competitor(db, pf, product, "competitor:500", Decimal("500"))
+
+    price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
+
+    assert debug["competitorGapApplied"] is True
+    assert debug["competitorGapFrom"] == Decimal("330")
+    assert debug["competitorGapTo"] == Decimal("500")
+    assert debug["chosen_competitor_price"] is None
+    assert price == Decimal("375.00")
+
+
+def test_competitor_gap_boundary_tiers_use_lower_level():
+    tiers = [
+        PricingRuleCompetitorGapTier(pricing_rule_id=1, min_price=0, max_price=500, max_gap_percent=15, sort_order=0),
+        PricingRuleCompetitorGapTier(pricing_rule_id=1, min_price=500, max_price=2500, max_gap_percent=12, sort_order=1),
+        PricingRuleCompetitorGapTier(pricing_rule_id=1, min_price=2500, max_price=5000, max_gap_percent=10, sort_order=2),
+        PricingRuleCompetitorGapTier(pricing_rule_id=1, min_price=5000, max_price=10000, max_gap_percent=8, sort_order=3),
+        PricingRuleCompetitorGapTier(pricing_rule_id=1, min_price=10000, max_price=25000, max_gap_percent=7, sort_order=4),
+        PricingRuleCompetitorGapTier(pricing_rule_id=1, min_price=25000, max_price=None, max_gap_percent=5, sort_order=5),
+    ]
+    cases = [
+        ("499.99", "15"),
+        ("500", "12"),
+        ("2499.99", "12"),
+        ("2500", "10"),
+        ("4999.99", "10"),
+        ("5000", "8"),
+        ("9999.99", "8"),
+        ("10000", "7"),
+        ("24999.99", "7"),
+        ("25000", "5"),
+    ]
+
+    for price, expected in cases:
+        match = _competitor_gap_threshold_from_tiers(tiers, Decimal(price))
+        assert match is not None
+        threshold, _range = match
+        assert threshold == Decimal(expected)
+
+
+def test_custom_pricing_rule_gap_threshold_changes_calculation():
+    db = _session()
+    pf = _format(db)
+    db.query(MarkupRange).filter(MarkupRange.price_format_id == pf.id).delete()
+    db.add(MarkupRange(price_format_id=pf.id, cost_from=0, cost_to=None, markup_percent=0.2))
+    _gap_rule(db, pf, first_threshold=50)
+    product = _product(db, code="GAP-CUSTOM", cost=Decimal("242.2758"))
+    _competitor(db, pf, product, "competitor:low", Decimal("296.69"))
+    _competitor(db, pf, product, "competitor:high", Decimal("410"))
+
+    price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
+
+    assert debug["competitorGapApplied"] is False
+    assert debug["chosen_competitor_price"] == Decimal("410")
+    assert price == Decimal("407.95")
+
+
+def test_no_competitor_and_first_usable_paths_are_unchanged_without_gap_rule():
+    db = _session()
+    pf = _format(db)
+    product_no_comp = _product(db, code="NO-COMP", cost=Decimal("100"))
+    no_comp_price, no_comp_debug = calculate_price_for_product(db=db, product=product_no_comp, price_format=pf, as_of=date.today())
+    assert no_comp_debug["reason"] in {"no_competitor_markup", "no_competitor_markup_bumped_to_mdc"}
+    assert no_comp_price == Decimal("117.65")
+
+    product_usable = _product(db, code="FIRST-USABLE", cost=Decimal("100"))
+    _competitor(db, pf, product_usable, "competitor:first", Decimal("130"))
+    price, debug = calculate_price_for_product(db=db, product=product_usable, price_format=pf, as_of=date.today())
+    assert debug["competitorGapApplied"] is False
+    assert debug["chosen_competitor_price"] == Decimal("130")
+    assert price == Decimal("129.35")
+
+
+def test_gap_equal_to_threshold_is_allowed():
+    db = _session()
+    pf = _format(db)
+    db.query(MarkupRange).filter(MarkupRange.price_format_id == pf.id).delete()
+    db.add(MarkupRange(price_format_id=pf.id, cost_from=0, cost_to=None, markup_percent=0.2))
+    _gap_rule(db, pf, first_threshold=10)
+    product = _product(db, code="GAP-EQUAL", cost=Decimal("260"))
+    _competitor(db, pf, product, "competitor:300", Decimal("300"))
+    _competitor(db, pf, product, "competitor:330", Decimal("330"))
+
+    _price, debug = calculate_price_for_product(db=db, product=product, price_format=pf, as_of=date.today())
+
+    assert debug["competitorGapApplied"] is False
+    assert debug["chosen_competitor_price"] == Decimal("330")
+
+
+def test_price_formats_sharing_rule_share_gap_configuration():
+    db = _session()
+    pf_a = _format(db)
+    pf_b = PriceFormat(code="0002", name="0002", branch="Almaty")
+    db.add(pf_b)
+    db.flush()
+    db.add(NoCompetitorMarkupRange(price_format_id=pf_b.id, cost_from=0, cost_to=None, markup_percent=0.03))
+    db.add(BendRange(price_format_id=pf_b.id, price_from=0, bend_percent=0.5))
+    db.add(BendRange(price_format_id=pf_b.id, price_from=2000, bend_percent=0.2))
+    db.add(BendRange(price_format_id=pf_b.id, price_from=5000, bend_percent=0.1))
+    db.query(MarkupRange).filter(MarkupRange.price_format_id.in_([pf_a.id, pf_b.id])).delete(synchronize_session=False)
+    db.add_all(
+        [
+            MarkupRange(price_format_id=pf_a.id, cost_from=0, cost_to=None, markup_percent=0.2),
+            MarkupRange(price_format_id=pf_b.id, cost_from=0, cost_to=None, markup_percent=0.2),
+        ]
+    )
+    rule = _gap_rule(db, pf_a, first_threshold=15)
+    pf_b.pricing_rule_id = rule.id
+    pf_b.pricing_rule = rule.code
+    product_a = _product(db, code="SHARED-A", cost=Decimal("242.2758"))
+    product_b = _product(db, code="SHARED-B", cost=Decimal("242.2758"))
+    _competitor(db, pf_a, product_a, "competitor:low", Decimal("296.69"))
+    _competitor(db, pf_a, product_a, "competitor:high", Decimal("410"))
+    _competitor(db, pf_b, product_b, "competitor:low", Decimal("296.69"))
+    _competitor(db, pf_b, product_b, "competitor:high", Decimal("410"))
+
+    _price_a, debug_a = calculate_price_for_product(db=db, product=product_a, price_format=pf_a, as_of=date.today())
+    _price_b, debug_b = calculate_price_for_product(db=db, product=product_b, price_format=pf_b, as_of=date.today())
+
+    assert debug_a["competitorGapApplied"] is True
+    assert debug_b["competitorGapApplied"] is True
+    assert debug_a["competitorGapThresholdPercent"] == debug_b["competitorGapThresholdPercent"]

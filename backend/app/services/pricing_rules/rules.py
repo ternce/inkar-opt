@@ -19,11 +19,92 @@ from ...models import (
     NoCompetitorMarkupTemplateRow,
     PriceFormat,
     PricingRule,
+    PricingRuleCompetitorGapTier,
     RoundingRule,
 )
 from .common import touch
 from .templates import rounding_to_dict, template_to_dict
 from ...timezone import local_iso, now_kz_naive
+
+
+DEFAULT_COMPETITOR_GAP_TIERS = (
+    (Decimal("0"), Decimal("500"), Decimal("15")),
+    (Decimal("500"), Decimal("2500"), Decimal("12")),
+    (Decimal("2500"), Decimal("5000"), Decimal("10")),
+    (Decimal("5000"), Decimal("10000"), Decimal("8")),
+    (Decimal("10000"), Decimal("25000"), Decimal("7")),
+    (Decimal("25000"), None, Decimal("5")),
+)
+
+
+def competitor_gap_tier_to_dict(row: PricingRuleCompetitorGapTier) -> dict:
+    return {
+        "id": row.id,
+        "minPrice": float(row.min_price),
+        "maxPrice": float(row.max_price) if row.max_price is not None else None,
+        "maxGapPercent": float(row.max_gap_percent),
+        "sortOrder": int(row.sort_order or 0),
+    }
+
+
+def default_competitor_gap_thresholds() -> list[dict]:
+    return [
+        {
+            "minPrice": float(min_price),
+            "maxPrice": float(max_price) if max_price is not None else None,
+            "maxGapPercent": float(max_gap_percent),
+            "sortOrder": index,
+        }
+        for index, (min_price, max_price, max_gap_percent) in enumerate(DEFAULT_COMPETITOR_GAP_TIERS)
+    ]
+
+
+def ensure_competitor_gap_defaults_for_rule(*, db: Session, rule: PricingRule) -> bool:
+    existing = db.execute(
+        select(PricingRuleCompetitorGapTier.id)
+        .where(PricingRuleCompetitorGapTier.pricing_rule_id == rule.id)
+        .limit(1)
+    ).first()
+    if existing is not None:
+        return False
+    for idx, (min_price, max_price, max_gap_percent) in enumerate(DEFAULT_COMPETITOR_GAP_TIERS):
+        db.add(
+            PricingRuleCompetitorGapTier(
+                pricing_rule_id=int(rule.id),
+                min_price=float(min_price),
+                max_price=float(max_price) if max_price is not None else None,
+                max_gap_percent=float(max_gap_percent),
+                sort_order=idx,
+            )
+        )
+    return True
+
+
+def bootstrap_competitor_gap_defaults(*, db: Session) -> int:
+    rows = db.execute(select(PricingRule).order_by(PricingRule.id.asc())).scalars().all()
+    created_for = 0
+    for row in rows:
+        if ensure_competitor_gap_defaults_for_rule(db=db, rule=row):
+            created_for += 1
+    if created_for:
+        db.commit()
+    return created_for
+
+
+def _attach_competitor_gap_tiers(db: Session, rows: list[PricingRule]) -> None:
+    rule_ids = [int(row.id) for row in rows if row.id is not None]
+    if not rule_ids:
+        return
+    tiers = db.execute(
+        select(PricingRuleCompetitorGapTier)
+        .where(PricingRuleCompetitorGapTier.pricing_rule_id.in_(rule_ids))
+        .order_by(PricingRuleCompetitorGapTier.pricing_rule_id.asc(), PricingRuleCompetitorGapTier.sort_order.asc(), PricingRuleCompetitorGapTier.min_price.asc())
+    ).scalars().all()
+    grouped: dict[int, list[PricingRuleCompetitorGapTier]] = {}
+    for tier in tiers:
+        grouped.setdefault(int(tier.pricing_rule_id), []).append(tier)
+    for row in rows:
+        row.competitor_gap_tiers = grouped.get(int(row.id), [])
 
 
 def pricing_rule_to_dict(row: PricingRule, *, include_templates: bool = True) -> dict:
@@ -45,6 +126,13 @@ def pricing_rule_to_dict(row: PricingRule, *, include_templates: bool = True) ->
         "bendTemplate": template_to_dict(row.bend_template, "bend") if include_templates and getattr(row, "bend_template", None) else None,
         "noCompetitorTemplate": template_to_dict(row.no_competitor_template, "no_competitor") if include_templates and getattr(row, "no_competitor_template", None) else None,
         "roundingRule": rounding_to_dict(row.rounding_rule) if include_templates and getattr(row, "rounding_rule", None) else None,
+        "competitorGapThresholds": (
+            [
+                competitor_gap_tier_to_dict(tier)
+                for tier in sorted(getattr(row, "competitor_gap_tiers", []) or [], key=lambda x: (x.sort_order, float(x.min_price)))
+            ]
+            or default_competitor_gap_thresholds()
+        ),
     }
     warnings = getattr(row, "copy_warnings", None)
     if warnings:
@@ -87,6 +175,7 @@ def _attach_templates(db: Session, rows: list[PricingRule]) -> None:
         row.bend_template = bends.get(row.bend_template_id)
         row.no_competitor_template = no_comps.get(row.no_competitor_template_id)
         row.rounding_rule = roundings.get(row.rounding_rule_id)
+    _attach_competitor_gap_tiers(db, rows)
 
 
 def list_pricing_rules(*, db: Session) -> list[dict]:
@@ -129,6 +218,11 @@ def upsert_pricing_rule(*, db: Session, payload: dict, rule_id: int | None = Non
     row.rounding_rule_id = _optional_int(payload.get("roundingRuleId"))
     if payload.get("isActive") is not None:
         row.is_active = bool(payload.get("isActive"))
+    gap_payload = payload.get("competitorGapThresholds")
+    if isinstance(gap_payload, list) and gap_payload:
+        update_competitor_gap_thresholds(db=db, rule=row, rows=gap_payload)
+    else:
+        ensure_competitor_gap_defaults_for_rule(db=db, rule=row)
     touch(row)
     db.commit()
     db.refresh(row)
@@ -150,6 +244,54 @@ def _d(value: object) -> Decimal | None:
 
 def _same_decimal(a: object, b: object) -> bool:
     return _d(a) == _d(b)
+
+
+def validate_competitor_gap_thresholds(rows: list[dict]) -> list[dict]:
+    if len(rows) != len(DEFAULT_COMPETITOR_GAP_TIERS):
+        raise ValueError("all competitor gap ranges are required")
+    normalized: list[dict] = []
+    for idx, (row, defaults) in enumerate(zip(rows, DEFAULT_COMPETITOR_GAP_TIERS)):
+        expected_min, expected_max, _default_gap = defaults
+        min_price = _d(row.get("minPrice", row.get("min_price")))
+        max_price = _d(row.get("maxPrice", row.get("max_price")))
+        max_gap = _d(row.get("maxGapPercent", row.get("max_gap_percent")))
+        if min_price != expected_min or max_price != expected_max:
+            raise ValueError("competitor gap range boundaries are fixed")
+        if max_gap is None:
+            raise ValueError("maxGapPercent is required")
+        if max_gap < 0:
+            raise ValueError("maxGapPercent must be >= 0")
+        if max_gap > 100:
+            raise ValueError("maxGapPercent must be <= 100")
+        normalized.append(
+            {
+                "min_price": expected_min,
+                "max_price": expected_max,
+                "max_gap_percent": max_gap,
+                "sort_order": int(row.get("sortOrder", row.get("sort_order", idx))),
+            }
+        )
+    return normalized
+
+
+def update_competitor_gap_thresholds(*, db: Session, rule: PricingRule, rows: list[dict]) -> None:
+    normalized = validate_competitor_gap_thresholds(rows)
+    old_rows = db.execute(
+        select(PricingRuleCompetitorGapTier).where(PricingRuleCompetitorGapTier.pricing_rule_id == rule.id)
+    ).scalars().all()
+    for old in old_rows:
+        db.delete(old)
+    db.flush()
+    for idx, item in enumerate(normalized):
+        db.add(
+            PricingRuleCompetitorGapTier(
+                pricing_rule_id=int(rule.id),
+                min_price=float(item["min_price"]),
+                max_price=float(item["max_price"]) if item["max_price"] is not None else None,
+                max_gap_percent=float(item["max_gap_percent"]),
+                sort_order=int(item.get("sort_order", idx)),
+            )
+        )
 
 
 def _markup_rows_match(template: MarkupTemplate | NoCompetitorMarkupTemplate | None, rows: list[MarkupRange | NoCompetitorMarkupRange]) -> bool:
@@ -362,6 +504,21 @@ def copy_pricing_rule(*, db: Session, rule_id: int, payload: dict | None = None)
             else:
                 copied = _copy_rounding_rule(db, source=source.rounding_rule, code=f"{code}_rounding", name=f"{name} — округление")
                 row.rounding_rule_id = copied.id
+
+        source_tiers = sorted(getattr(source, "competitor_gap_tiers", []) or [], key=lambda x: (x.sort_order, float(x.min_price)))
+        if not source_tiers:
+            ensure_competitor_gap_defaults_for_rule(db=db, rule=row)
+        else:
+            for tier in source_tiers:
+                db.add(
+                    PricingRuleCompetitorGapTier(
+                        pricing_rule_id=int(row.id),
+                        min_price=float(tier.min_price),
+                        max_price=float(tier.max_price) if tier.max_price is not None else None,
+                        max_gap_percent=float(tier.max_gap_percent),
+                        sort_order=int(tier.sort_order or 0),
+                    )
+                )
 
         touch(row)
         db.commit()
