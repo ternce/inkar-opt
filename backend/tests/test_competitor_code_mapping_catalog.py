@@ -165,16 +165,144 @@ def test_unmatched_provisor_catalog_is_source_first_and_deduplicates_goods_id():
         include_candidates=False,
     )
 
-    assert result["pagination"] == {"page": 1, "pageSize": 50, "total": 2, "pageCount": 1}
-    assert [row["sourceExternalKey"] for row in result["items"]] == ["10", "20"]
+    assert result["pagination"] == {"page": 1, "pageSize": 50, "total": 4, "pageCount": 1}
+    assert [row["sourceExternalKey"] for row in result["items"]] == ["10", "20", "30", "40"]
     assert result["items"][0]["itemId"] == latest.id
     assert result["items"][0]["sourceName"] == "Latest duplicate"
     assert result["items"][1]["itemId"] == open_row.id
     assert result["items"][0]["ourProductId"] is None
     assert result["metrics"][0]["total"] == 6
-    assert result["metrics"][0]["mapped"] == 3
+    assert result["metrics"][0]["mapped"] == 1
     assert result["metrics"][0]["rejected"] == 1
-    assert result["metrics"][0]["unmapped"] == 2
+    assert result["metrics"][0]["unmapped"] == 4
+
+
+def test_provisor_catalog_assigned_format_returns_unmapped_by_global_mapping_only():
+    db = _session()
+    pf = _price_format(db, "003")
+    price_list = _price_list(db, pf, source_key="assigned-003", price_date=date(2026, 1, 1))
+    product = _product(db, "MAPPED-SKU", "Mapped product")
+    for goods_id in range(1, 8):
+        _item(db, price_list, goods_id, name=f"Source {goods_id}")
+    db.add(
+        CompetitorCodeMapping(
+            platform="provisor",
+            source_external_key="4",
+            source_match_key=source_match_key(platform="provisor", source_external_key=4),
+            source_name="Source 4",
+            status="mapped",
+            our_product_id=product.id,
+            our_sku=product.code,
+        )
+    )
+    db.commit()
+
+    result = list_catalog_code_mappings(
+        db=db,
+        platform="provisor",
+        price_format_id=pf.id,
+        status="unmapped",
+        page=1,
+        limit=50,
+        include_candidates=False,
+    )
+
+    assert result["pagination"] == {"page": 1, "pageSize": 50, "total": 6, "pageCount": 1}
+    assert [row["sourceExternalKey"] for row in result["items"]] == ["1", "2", "3", "5", "6", "7"]
+    assert result["metrics"][0]["total"] == 7
+    assert result["metrics"][0]["mapped"] == 1
+    assert result["metrics"][0]["unmapped"] == 6
+
+
+def test_provisor_catalog_global_mode_deduplicates_across_price_lists():
+    db = _session()
+    pf_a = _price_format(db, "GLOBAL-A")
+    pf_b = _price_format(db, "GLOBAL-B")
+    older = _price_list(db, pf_a, source_key="older-global", price_date=date(2026, 1, 1))
+    newer = _price_list(db, pf_b, source_key="newer-global", price_date=date(2026, 2, 1))
+    _item(db, older, 100, name="Old duplicate")
+    _item(db, newer, 100, name="New duplicate")
+    _item(db, newer, 200, name="Second")
+    db.commit()
+
+    result = list_catalog_code_mappings(
+        db=db,
+        platform="provisor",
+        price_format_id=None,
+        status="unmapped",
+        page=1,
+        limit=50,
+        include_candidates=False,
+    )
+
+    assert result["pagination"] == {"page": 1, "pageSize": 50, "total": 2, "pageCount": 1}
+    assert [row["sourceExternalKey"] for row in result["items"]] == ["100", "200"]
+    assert result["items"][0]["sourceName"] == "New duplicate"
+
+
+def test_global_mapping_removes_goods_id_from_global_and_format_filtered_unmapped_views():
+    db = _session()
+    pf_a = _price_format(db, "MAP-A")
+    pf_b = _price_format(db, "MAP-B")
+    list_a = _price_list(db, pf_a, source_key="map-a", price_date=date(2026, 1, 1))
+    list_b = _price_list(db, pf_b, source_key="map-b", price_date=date(2026, 1, 2))
+    product = _product(db, "GLOBAL-MAPPED", "Globally mapped")
+    _item(db, list_a, 555, name="Mapped in A")
+    _item(db, list_b, 555, name="Mapped in B")
+    _item(db, list_b, 777, name="Still open")
+    db.add(
+        CompetitorCodeMapping(
+            platform="provisor",
+            source_external_key="555",
+            source_match_key=source_match_key(platform="provisor", source_external_key=555),
+            source_name="Mapped",
+            status="mapped",
+            our_product_id=product.id,
+            our_sku=product.code,
+        )
+    )
+    db.commit()
+
+    global_result = list_catalog_code_mappings(db=db, platform="provisor", price_format_id=None, status="unmapped", page=1, limit=50)
+    filtered_a = list_catalog_code_mappings(db=db, platform="provisor", price_format_id=pf_a.id, status="unmapped", page=1, limit=50)
+    filtered_b = list_catalog_code_mappings(db=db, platform="provisor", price_format_id=pf_b.id, status="unmapped", page=1, limit=50)
+
+    assert [row["sourceExternalKey"] for row in global_result["items"]] == ["777"]
+    assert filtered_a["pagination"]["total"] == 0
+    assert [row["sourceExternalKey"] for row in filtered_b["items"]] == ["777"]
+
+
+def test_price_format_with_zero_assignments_does_not_empty_global_default_queue():
+    db = _session()
+    pf_with_source = _price_format(db, "HAS-SOURCE")
+    pf_without_source = _price_format(db, "NO-SOURCE")
+    price_list = _price_list(db, pf_with_source, source_key="global-source", price_date=date(2026, 1, 1))
+    _item(db, price_list, 900, name="Global source")
+    db.commit()
+
+    filtered = list_catalog_code_mappings(db=db, platform="provisor", price_format_id=pf_without_source.id, status="unmapped")
+    global_result = list_catalog_code_mappings(db=db, platform="provisor", price_format_id=None, status="unmapped")
+
+    assert filtered["pagination"]["total"] == 0
+    assert [row["sourceExternalKey"] for row in global_result["items"]] == ["900"]
+
+
+def test_auto_match_metadata_does_not_remove_source_from_manual_unmapped_queue():
+    db = _session()
+    pf = _price_format(db, "AUTO")
+    price_list = _price_list(db, pf, source_key="auto", price_date=date(2026, 1, 1))
+    product = _product(db, "AUTO-SKU", "Auto matched product")
+    _item(db, price_list, 333, name="Auto product id", product_id=product.id, matched_sku=product.code)
+    db.commit()
+
+    result = list_catalog_code_mappings(db=db, platform="provisor", price_format_id=pf.id, status="unmapped", page=1, limit=50)
+
+    assert result["pagination"]["total"] == 1
+    assert result["items"][0]["sourceExternalKey"] == "333"
+    assert result["items"][0]["ourProductId"] is None
+    assert result["items"][0]["ourSku"] == ""
+    assert result["metrics"][0]["mapped"] == 0
+    assert result["metrics"][0]["unmapped"] == 1
 
 
 def test_source_first_provisor_row_generates_exact_candidate():
@@ -351,6 +479,41 @@ def test_provisor_catalog_searches_goods_id_name_manufacturer_and_distributor_id
     )
     assert empty["pagination"]["total"] == 0
     assert empty["items"] == []
+
+
+def test_provisor_catalog_searches_mapped_rows_by_our_sku():
+    db = _session()
+    pf = _price_format(db, "SKU-SEARCH")
+    price_list = _price_list(db, pf, source_key="sku-search", price_date=date(2026, 1, 1))
+    product = _product(db, "SKU-777", "Internal product")
+    _item(db, price_list, 777, name="Mapped source")
+    db.add(
+        CompetitorCodeMapping(
+            platform="provisor",
+            source_external_key="777",
+            source_match_key=source_match_key(platform="provisor", source_external_key=777),
+            source_name="Mapped source",
+            status="mapped",
+            our_product_id=product.id,
+            our_sku=product.code,
+        )
+    )
+    db.commit()
+
+    result = list_catalog_code_mappings(
+        db=db,
+        platform="provisor",
+        price_format_id=None,
+        status="mapped",
+        product_q="SKU-777",
+        page=1,
+        limit=50,
+        include_candidates=False,
+    )
+
+    assert result["pagination"]["total"] == 1
+    assert result["items"][0]["sourceExternalKey"] == "777"
+    assert result["items"][0]["ourSku"] == "SKU-777"
 
 
 def test_provisor_catalog_only_includes_assigned_price_lists_for_format():

@@ -5,7 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import String, cast, desc, exists, func, literal, or_, select
-from sqlalchemy.orm import Session, aliased
+from sqlalchemy.orm import Session
 
 from ...models import (
     CompetitorCodeMapping,
@@ -514,7 +514,7 @@ def _provisor_source_key_expr(goods_id_col):
     return literal("provisor:") + cast(goods_id_col, String)
 
 
-def _provisor_catalog_status_exists(base, assigned_ids: list[int] | None) -> tuple:
+def _provisor_catalog_status_exists(base) -> tuple:
     mapped_mapping_exists = exists(
         select(1)
         .select_from(CompetitorCodeMapping)
@@ -531,19 +531,7 @@ def _provisor_catalog_status_exists(base, assigned_ids: list[int] | None) -> tup
         .where(CompetitorCodeMapping.source_match_key == base.c.source_match_key)
         .correlate(base)
     )
-    item_alias = aliased(CompetitorPriceListItem)
-    list_alias = aliased(CompetitorPriceList)
-    item_mapped_stmt = (
-        select(1)
-        .select_from(item_alias)
-        .join(list_alias, list_alias.id == item_alias.price_list_id)
-        .where(list_alias.source_type == "provisor")
-        .where(item_alias.provisor_goods_id == base.c.provisor_goods_id)
-        .where((item_alias.product_id.is_not(None)) | (func.coalesce(item_alias.matched_sku, "") != ""))
-    )
-    if assigned_ids is not None:
-        item_mapped_stmt = item_mapped_stmt.where(list_alias.id.in_(assigned_ids))
-    return mapped_mapping_exists, rejected_mapping_exists, exists(item_mapped_stmt.correlate(base))
+    return mapped_mapping_exists, rejected_mapping_exists
 
 
 def _provisor_catalog_base(
@@ -607,12 +595,12 @@ def _provisor_catalog_base(
     return stmt.subquery()
 
 
-def _apply_provisor_catalog_filters(stmt, base, assigned_ids: list[int] | None, status: str, product_q: str):
-    mapped_mapping_exists, rejected_mapping_exists, item_mapped_exists = _provisor_catalog_status_exists(base, assigned_ids)
+def _apply_provisor_catalog_filters(stmt, base, status: str, product_q: str):
+    mapped_mapping_exists, rejected_mapping_exists = _provisor_catalog_status_exists(base)
     if status == "unmapped":
-        stmt = stmt.where(~mapped_mapping_exists).where(~rejected_mapping_exists).where(~item_mapped_exists)
+        stmt = stmt.where(~mapped_mapping_exists).where(~rejected_mapping_exists)
     elif status == "mapped":
-        stmt = stmt.where(~rejected_mapping_exists).where(mapped_mapping_exists | item_mapped_exists)
+        stmt = stmt.where(~rejected_mapping_exists).where(mapped_mapping_exists)
     elif status == "rejected":
         stmt = stmt.where(rejected_mapping_exists)
     product_search = product_q.strip()
@@ -665,7 +653,7 @@ def _list_provisor_catalog_code_mappings_sql_page(
         & (CompetitorCodeMapping.source_match_key == base.c.source_match_key)
         & (CompetitorCodeMapping.status.in_(["mapped", "rejected"]))
     )
-    product_join_id = func.coalesce(CompetitorCodeMapping.our_product_id, base.c.product_id)
+    product_join_id = CompetitorCodeMapping.our_product_id
     row_stmt = (
         select(
             base,
@@ -682,7 +670,7 @@ def _list_provisor_catalog_code_mappings_sql_page(
         .outerjoin(ProductExtra, ProductExtra.product_id == Product.id)
         .where(base.c.rn == 1)
     )
-    row_stmt = _apply_provisor_catalog_filters(row_stmt, base, assigned_ids, status, product_q)
+    row_stmt = _apply_provisor_catalog_filters(row_stmt, base, status, product_q)
 
     count_stmt = select(func.count()).select_from(row_stmt.with_only_columns(base.c.source_match_key).order_by(None).subquery())
     filtered_total = int(db.scalar(count_stmt) or 0)
@@ -703,7 +691,7 @@ def _list_provisor_catalog_code_mappings_sql_page(
         mapping_status = "unmapped"
         if data["manual_status"] == "rejected":
             mapping_status = "rejected"
-        elif data["manual_status"] == "mapped" or data["product_id"] is not None or data["matched_sku"]:
+        elif data["manual_status"] == "mapped":
             mapping_status = "mapped"
         item_payload = {
                 "itemId": int(data["item_id"]),
@@ -751,7 +739,7 @@ def _list_provisor_catalog_code_mappings_sql_page(
     def metric_count(metric_status: str) -> int:
         metric_base = _provisor_catalog_base(assigned_ids=assigned_ids)
         metric_stmt = select(metric_base.c.source_match_key).where(metric_base.c.rn == 1)
-        metric_stmt = _apply_provisor_catalog_filters(metric_stmt, metric_base, assigned_ids, metric_status, "")
+        metric_stmt = _apply_provisor_catalog_filters(metric_stmt, metric_base, metric_status, "")
         return int(db.scalar(select(func.count()).select_from(metric_stmt.subquery())) or 0)
 
     total = metric_count("all")

@@ -704,6 +704,7 @@ export function CompetitorsTab({ formatCode }: Props) {
 
   const [mappingPlatform, setMappingPlatform] = useState<Platform>('provisor');
   const [mappingStatus, setMappingStatus] = useState<MappingStatus>('unmapped');
+  const [mappingFormatScope, setMappingFormatScope] = useState<'global' | 'current'>('global');
   const [sourceQuery, setSourceQuery] = useState('');
   const [productQuery, setProductQuery] = useState('');
   const [appliedSourceQuery, setAppliedSourceQuery] = useState('');
@@ -815,14 +816,15 @@ export function CompetitorsTab({ formatCode }: Props) {
       mappingRequestRef.current = controller;
     }
     const requestSignal = signal || controller?.signal;
+    const selectedMappingFormatCode = mappingFormatScope === 'current' ? formatCode : '';
     const params = new URLSearchParams({
       platform: mappingPlatform,
       status: mappingStatus,
-      format_code: formatCode,
       page: String(mappingPage),
       limit: '50',
       include_candidates: 'false',
     });
+    if (selectedMappingFormatCode) params.set('format_code', selectedMappingFormatCode);
     if (appliedSourceQuery) params.set('source_q', appliedSourceQuery);
     if (appliedProductQuery) params.set('product_q', appliedProductQuery);
     const res = await fetch(`/api/competitors/code-mappings/catalog-view?${params.toString()}`, { signal: requestSignal });
@@ -908,7 +910,7 @@ export function CompetitorsTab({ formatCode }: Props) {
       mappingRequestRef.current?.abort();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, mappingPlatform, mappingStatus, appliedSourceQuery, appliedProductQuery, mappingPage, formatCode]);
+  }, [activeTab, mappingPlatform, mappingStatus, mappingFormatScope, appliedSourceQuery, appliedProductQuery, mappingPage, formatCode]);
 
   const submitMappingSearch = () => {
     setAppliedSourceQuery(sourceQuery.trim());
@@ -1149,12 +1151,12 @@ export function CompetitorsTab({ formatCode }: Props) {
     const params = new URLSearchParams({
       platform: mappingPlatform,
       status: 'unmapped',
-      format_code: formatCode,
       source_q: row.sourceExternalKey || row.sourceGoodsId || row.sourceName || '',
       page: '1',
       limit: '1',
       include_candidates: 'true',
     });
+    if (mappingFormatScope === 'current') params.set('format_code', formatCode);
     const res = await fetch(`/api/competitors/code-mappings/catalog-view?${params.toString()}`);
     const text = await res.text();
     const data = parseJsonOrNull(text);
@@ -1194,7 +1196,7 @@ export function CompetitorsTab({ formatCode }: Props) {
         body: JSON.stringify({
           platform: mappingPlatform,
           status: 'mapped',
-          formatCode,
+          formatCode: mappingFormatScope === 'current' ? formatCode : undefined,
           itemId: candidate.itemId,
           sourceExternalKey: candidate.sourceExternalKey,
           sourceMatchKey: candidate.sourceMatchKey,
@@ -1226,14 +1228,14 @@ export function CompetitorsTab({ formatCode }: Props) {
     setError(null);
     try {
       const res = row.mappingId
-        ? await fetch(`/api/competitors/code-mappings/${row.mappingId}/reject?format_code=${encodeURIComponent(formatCode)}`, { method: 'POST' })
+        ? await fetch(`/api/competitors/code-mappings/${row.mappingId}/reject${mappingFormatScope === 'current' ? `?format_code=${encodeURIComponent(formatCode)}` : ''}`, { method: 'POST' })
         : await fetch('/api/competitors/code-mappings', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               platform: row.platform,
               status: 'rejected',
-              formatCode,
+              formatCode: mappingFormatScope === 'current' ? formatCode : undefined,
               itemId: row.itemId,
               sourceExternalKey: row.sourceExternalKey,
               sourceMatchKey: row.sourceMatchKey,
@@ -1260,7 +1262,7 @@ export function CompetitorsTab({ formatCode }: Props) {
     setIsLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/competitors/code-mappings/${row.mappingId}/unmap?format_code=${encodeURIComponent(formatCode)}`, { method: 'POST' });
+      const res = await fetch(`/api/competitors/code-mappings/${row.mappingId}/unmap${mappingFormatScope === 'current' ? `?format_code=${encodeURIComponent(formatCode)}` : ''}`, { method: 'POST' });
       const text = await res.text();
       const data = parseJsonOrNull(text);
       if (!res.ok) throw new Error(data?.detail || text || 'Не удалось отвязать позицию');
@@ -1443,6 +1445,26 @@ export function CompetitorsTab({ formatCode }: Props) {
             </p>
           </div>
           <div className="grid grid-cols-2 gap-2 sm:flex">
+            {[
+              ['global', 'Все ЦФ / Global'],
+              ['current', `ЦФ ${formatCode}`],
+            ].map(([scope, label]) => (
+              <Button
+                key={scope}
+                type="button"
+                variant={mappingFormatScope === scope ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => {
+                  setMappingFormatScope(scope as 'global' | 'current');
+                  setMappingPage(1);
+                  setSelectedRow(null);
+                  setSelectedProduct(null);
+                  setProductResults([]);
+                }}
+              >
+                {label}
+              </Button>
+            ))}
             {(['provisor', 'vidman'] as Platform[]).map((platform) => (
               <Button
                 key={platform}
@@ -1533,6 +1555,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                   <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">goodsId</th>
                   <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Provisor product</th>
                   <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Manufacturer</th>
+                  <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Наш SKU</th>
                   <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Источник / дата цены</th>
                   <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Статус</th>
                 </tr>
@@ -1550,6 +1573,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                     </td>
                     <td className="px-4 py-3 text-sm text-gray-900 min-w-72">{row.sourceName || '-'}</td>
                     <td className="px-4 py-3 text-sm text-gray-700">{row.sourceManufacturer || '-'}</td>
+                    <td className="px-4 py-3 text-sm font-medium text-gray-900">{row.ourSku || '—'}</td>
                     <td className="px-4 py-3 text-sm text-gray-700">{platformLabel(row.platform)} · {row.priceDate || '—'}</td>
                     <td className="px-4 py-3 text-sm">
                       <span className={`status-pill ${catalogStatusClass(row)}`}>{catalogStatusLabel(row)}</span>
@@ -1558,7 +1582,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                 ))}
                 {!codeRows.length ? (
                   <tr>
-                    <td colSpan={5} className="px-4 py-8 text-center text-sm text-gray-500">
+                    <td colSpan={6} className="px-4 py-8 text-center text-sm text-gray-500">
                       Нет позиций по выбранным фильтрам
                     </td>
                   </tr>
