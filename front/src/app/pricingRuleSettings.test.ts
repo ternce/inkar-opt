@@ -7,6 +7,7 @@ test('resolves linked markup, bend, no-competitor and rounding settings', () => 
   const resolved = resolvePricingRuleSettings({
     id: 1,
     code: 'RULE-A',
+    name: 'Rule A',
     roundingRuleId: 4,
     markupTemplateId: 10,
     bendTemplateId: 20,
@@ -16,7 +17,7 @@ test('resolves linked markup, bend, no-competitor and rounding settings', () => 
     noCompetitorTemplate: { rows: [{ costFrom: 0, costTo: null, markupPercent: 7 }] },
   });
 
-  assert.equal(resolved.pricingRule, 'RULE-A');
+  assert.equal(resolved.pricingRule, 'Rule A');
   assert.equal(resolved.roundingRuleId, '4');
   assert.equal(resolved.hasLinkedSettings, true);
   assert.deepEqual(resolved.recommendedMarkups, [{ id: 1, lowerBound: '0', upperBound: '999', markupPercent: '12' }]);

@@ -76,7 +76,7 @@ export function resolvePricingRuleSettings(rule: ResolvedPricingRule): ResolvedP
   ].filter(Boolean);
 
   return {
-    pricingRule: String(rule.code || rule.name || ''),
+    pricingRule: String(rule.name || rule.code || ''),
     roundingRuleId: rule.roundingRuleId ? String(rule.roundingRuleId) : 'none',
     recommendedMarkups,
     noCompetitorMarkups,

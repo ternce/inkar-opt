@@ -24,6 +24,7 @@ from ..pricing import AMBIGUOUS_LIST_TYPES, calculate_price_zone, calculate_pric
 from ...timezone import local_iso, now_kz_naive
 from .analytics import build_workflow_analytics
 from .snapshot import build_generate_snapshot, dumps_snapshot, loads_snapshot
+from ..pricing_rules.rules import resolve_price_format_pricing_rule
 
 
 def _json(value: object) -> str:
@@ -103,15 +104,18 @@ def _apply_snapshot(target: object, snapshot: dict) -> None:
     setattr(target, "run_snapshot_json", dumps_snapshot(snapshot))
 
 
-def price_format_to_workflow_dict(row: PriceFormat) -> dict:
+def price_format_to_workflow_dict(*, db: Session, row: PriceFormat) -> dict:
+    pricing_rule = resolve_price_format_pricing_rule(db=db, pf=row)
     return {
         "id": row.id,
         "code": row.code,
         "name": row.name,
         "branch": row.branch,
         "referenceBranchId": row.reference_branch_id or "",
-        "pricingRule": row.pricing_rule,
-        "pricingRuleId": row.pricing_rule_id,
+        "pricingRule": pricing_rule["pricingRuleName"],
+        "pricingRuleId": pricing_rule["pricingRuleId"],
+        "pricingRuleCode": pricing_rule["pricingRuleCode"],
+        "pricingRuleName": pricing_rule["pricingRuleName"],
         "status": "active",
         "updatedAt": local_iso(row.created_at) if row.created_at else "",
     }
@@ -119,7 +123,7 @@ def price_format_to_workflow_dict(row: PriceFormat) -> dict:
 
 def list_workflow_price_formats(*, db: Session) -> list[dict]:
     rows = db.execute(select(PriceFormat).order_by(PriceFormat.code.asc())).scalars().all()
-    return [price_format_to_workflow_dict(row) for row in rows]
+    return [price_format_to_workflow_dict(db=db, row=row) for row in rows]
 
 
 def _unique_price_list_number(*, db: Session, requested: str, run_id: int) -> str:
@@ -328,7 +332,7 @@ def run_to_dict(*, db: Session, run: PricingWorkflowRun, include_items: bool = F
         "status": run.status,
         "error": run.error,
         "context": {"name": context.name, "region": context.region, "salesChannel": context.sales_channel} if context else None,
-        "priceFormat": price_format_to_workflow_dict(pf) if pf else None,
+        "priceFormat": price_format_to_workflow_dict(db=db, row=pf) if pf else None,
         "competitorSources": _loads(run.competitor_sources_json, []),
         "percentileSources": _loads(run.percentile_sources_json, []),
         "snapshot": loads_snapshot(run.run_snapshot_json, {}),

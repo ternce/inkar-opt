@@ -184,6 +184,7 @@ from .services.pricing_rules.rules import (
     list_pricing_rules,
     pricing_rule_application_status,
     pricing_rule_to_dict,
+    resolve_price_format_pricing_rule,
     upsert_pricing_rule,
 )
 from .services.pricing_rules.templates import (
@@ -2103,7 +2104,7 @@ def get_pricing_workflow_contexts(db: Session = Depends(get_db), current_user: A
     )
     return {
         "contexts": contexts,
-        "priceFormats": [price_format_to_workflow_dict(row) for row in price_formats],
+        "priceFormats": [price_format_to_workflow_dict(db=db, row=row) for row in price_formats],
     }
 
 
@@ -2216,6 +2217,7 @@ def _latest_price_list_for_format(db: Session, pf: PriceFormat) -> tuple[PriceLi
 def _branch_format_row(db: Session, pf: PriceFormat) -> dict:
     assignments = _format_assignments(db, pf)
     latest, sku_count = _latest_price_list_for_format(db, pf)
+    pricing_rule = resolve_price_format_pricing_rule(db=db, pf=pf)
     return {
         "id": pf.id,
         "code": pf.code,
@@ -2223,8 +2225,10 @@ def _branch_format_row(db: Session, pf: PriceFormat) -> dict:
         "branch": pf.branch,
         "referenceBranchId": pf.reference_branch_id or "",
         "sapCategory": pf.sap_category or "",
-        "pricingRule": pf.pricing_rule or "",
-        "pricingRuleId": int(pf.pricing_rule_id) if pf.pricing_rule_id is not None else None,
+        "pricingRule": pricing_rule["pricingRuleName"],
+        "pricingRuleId": pricing_rule["pricingRuleId"],
+        "pricingRuleCode": pricing_rule["pricingRuleCode"],
+        "pricingRuleName": pricing_rule["pricingRuleName"],
         "appliedMarkupTemplateId": int(pf.applied_markup_template_id) if getattr(pf, "applied_markup_template_id", None) is not None else None,
         "appliedBendTemplateId": int(pf.applied_bend_template_id) if getattr(pf, "applied_bend_template_id", None) is not None else None,
         "appliedNoCompetitorTemplateId": int(pf.applied_no_competitor_template_id) if getattr(pf, "applied_no_competitor_template_id", None) is not None else None,
@@ -2568,14 +2572,17 @@ def _generated_price_list_summary(db: Session, pl: PriceList, pf: PriceFormat) -
         ).scalar()
         or 0
     )
+    pricing_rule = resolve_price_format_pricing_rule(db=db, pf=pf)
     return {
         "id": pl.id,
         "number": pl.number,
         "format": pf.code,
         "formatName": pf.name,
         "branch": pf.branch,
-        "pricingRule": pf.pricing_rule or "",
-        "pricingRuleId": int(pf.pricing_rule_id) if pf.pricing_rule_id is not None else None,
+        "pricingRule": pricing_rule["pricingRuleName"],
+        "pricingRuleId": pricing_rule["pricingRuleId"],
+        "pricingRuleCode": pricing_rule["pricingRuleCode"],
+        "pricingRuleName": pricing_rule["pricingRuleName"],
         "date": _fmt_dt(pl.created_at),
         "createdAt": local_iso(pl.created_at) if pl.created_at else "",
         "activationDate": _fmt_d(pl.activation_date),
@@ -2960,7 +2967,7 @@ def _generated_item_dict(
         "ratingGlobal": global_rating,
         "ratingLocal": local_rating,
         "pricingReason": cp.applied_reason or "",
-        "pricingRule": cp.applied_rule_name or pf.pricing_rule or "",
+        "pricingRule": cp.applied_rule_name or resolve_price_format_pricing_rule(db=db, pf=pf)["pricingRuleName"],
         "pricingRuleVersion": cp.applied_rule_version or "",
         "log": _pricing_log(db, cp, product, None),
     }
@@ -9983,6 +9990,7 @@ def get_settings_for_format(
         .order_by(NoCompetitorMarkupRange.cost_from.asc())
     ).scalars().all()
 
+    pricing_rule = resolve_price_format_pricing_rule(db=db, pf=pf)
     return {
         "name": pf.name,
         "code": pf.code,
@@ -9992,8 +10000,10 @@ def get_settings_for_format(
         "sequenceNumber": pf.sequence_number,
         "referenceBranchId": pf.reference_branch_id or "",
         "sapCategory": pf.sap_category or "",
-        "pricingRule": pf.pricing_rule or "",
-        "pricingRuleId": int(pf.pricing_rule_id) if pf.pricing_rule_id is not None else None,
+        "pricingRule": pricing_rule["pricingRuleName"],
+        "pricingRuleId": pricing_rule["pricingRuleId"],
+        "pricingRuleCode": pricing_rule["pricingRuleCode"],
+        "pricingRuleName": pricing_rule["pricingRuleName"],
         "appliedMarkupTemplateId": int(pf.applied_markup_template_id) if getattr(pf, "applied_markup_template_id", None) is not None else None,
         "appliedBendTemplateId": int(pf.applied_bend_template_id) if getattr(pf, "applied_bend_template_id", None) is not None else None,
         "appliedNoCompetitorTemplateId": int(pf.applied_no_competitor_template_id) if getattr(pf, "applied_no_competitor_template_id", None) is not None else None,

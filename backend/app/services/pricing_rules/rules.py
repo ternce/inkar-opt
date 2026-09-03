@@ -52,6 +52,27 @@ def pricing_rule_to_dict(row: PricingRule, *, include_templates: bool = True) ->
     return data
 
 
+def resolve_price_format_pricing_rule(*, db: Session, pf: PriceFormat) -> dict:
+    legacy = str(pf.pricing_rule or "").strip()
+    linked_rule_id = int(pf.pricing_rule_id) if pf.pricing_rule_id is not None else None
+    rule = db.get(PricingRule, linked_rule_id) if linked_rule_id else None
+    if rule is None and legacy:
+        rule = db.execute(select(PricingRule).where(PricingRule.code == legacy)).scalars().first()
+    if rule is not None:
+        return {
+            "pricingRuleId": linked_rule_id,
+            "pricingRuleCode": rule.code,
+            "pricingRuleName": rule.name,
+            "pricingRuleLegacy": legacy,
+        }
+    return {
+        "pricingRuleId": None,
+        "pricingRuleCode": "",
+        "pricingRuleName": legacy,
+        "pricingRuleLegacy": legacy,
+    }
+
+
 def _attach_templates(db: Session, rows: list[PricingRule]) -> None:
     markup_ids = {r.markup_template_id for r in rows if r.markup_template_id}
     bend_ids = {r.bend_template_id for r in rows if r.bend_template_id}

@@ -735,7 +735,7 @@ function HomeDashboard({
             priceListType: priceFormat.priceListType ?? null,
             sapBranchCode: priceFormat.sapBranchCode ?? null,
             sequenceNumber: priceFormat.sequenceNumber ?? null,
-            pricingRule: formatSettings.pricingRule || formatSettings.pricingRuleId || '—',
+            pricingRule: formatSettings.pricingRuleName || formatSettings.pricingRule || '—',
             status: 'Активен',
             lastGeneratedAt: last?.date || '',
             lastActivationDate: last?.activationDate || '',

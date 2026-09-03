@@ -320,7 +320,7 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
         const settings = parseJsonOrNull(await settingsRes.text());
         const latest = parseJsonOrNull(await latestRes.text());
         const summary = {
-          pricingRule: settings?.pricingRule || '—',
+          pricingRule: settings?.pricingRuleName || settings?.pricingRule || '—',
           assignmentsCount: activePhysicalAssignmentCount(assignedRows),
           percentileSourceCount: assignmentItems(assignedRows).filter((row: any) => row.assignmentKind === 'percentile_config').length,
           totalRowsCount: assignmentItems(assignedRows).length,

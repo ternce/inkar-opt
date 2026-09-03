@@ -340,7 +340,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
         setPriceListType(data?.priceListType ? String(data.priceListType) : null);
         setSapBranchCode(data?.sapBranchCode ? String(data.sapBranchCode) : null);
         setSequenceNumber(data?.sequenceNumber != null ? Number(data.sequenceNumber) : null);
-        setPricingRule(String(data?.pricingRule ?? ''));
+        setPricingRule(String(data?.pricingRuleName ?? data?.pricingRule ?? ''));
         setPricingRuleId(data?.pricingRuleId ? String(data.pricingRuleId) : 'none');
         setRoundingRuleId(data?.roundingRuleId ? String(data.roundingRuleId) : 'none');
         setAppliedRule(data?.appliedRule || null);
@@ -624,7 +624,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
       const settingsText = await settingsRes.text();
       const settings = parseJsonOrNull(settingsText);
       if (settingsRes.ok && settings) {
-        setPricingRule(String(settings?.pricingRule ?? ''));
+        setPricingRule(String(settings?.pricingRuleName ?? settings?.pricingRule ?? ''));
         setPricingRuleId(settings?.pricingRuleId ? String(settings.pricingRuleId) : 'none');
         setRoundingRuleId(settings?.roundingRuleId ? String(settings.roundingRuleId) : 'none');
         setAppliedRule(settings?.appliedRule || data?.appliedRule || null);
@@ -689,7 +689,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
       setPriceListType(data?.priceListType ? String(data.priceListType) : null);
       setSapBranchCode(data?.sapBranchCode ? String(data.sapBranchCode) : null);
       setSequenceNumber(data?.sequenceNumber != null ? Number(data.sequenceNumber) : null);
-      setPricingRule(String(data?.pricingRule ?? ''));
+      setPricingRule(String(data?.pricingRuleName ?? data?.pricingRule ?? ''));
       setPricingRuleId(data?.pricingRuleId ? String(data.pricingRuleId) : 'none');
       setRoundingRuleId(data?.roundingRuleId ? String(data.roundingRuleId) : 'none');
       setAppliedRule(data?.appliedRule || null);

@@ -1,12 +1,14 @@
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
+from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from backend.app.db import Base
-from backend.app.deps import get_db
+from backend.app.deps import get_current_user, get_db, require_write_access
 from backend.app.main import app
 from backend.app.models import (
+    AppUser,
     BendTemplate,
     BendTemplateRow,
     MarkupTemplate,
@@ -14,6 +16,7 @@ from backend.app.models import (
     NoCompetitorMarkupTemplate,
     NoCompetitorMarkupTemplateRow,
     PriceFormat,
+    PriceList,
     PricingRule,
     RoundingRule,
 )
@@ -28,7 +31,12 @@ def _client():
         with Session() as db:
             yield db
 
+    def override_user():
+        return AppUser(id=1, username="test-admin", display_name="Test admin", role="admin", is_active=True)
+
     app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[get_current_user] = override_user
+    app.dependency_overrides[require_write_access] = override_user
     return TestClient(app), Session
 
 
@@ -276,5 +284,120 @@ def test_pricing_rule_update_changes_one_relationship_without_clearing_others():
         assert saved["bendTemplateId"] == ids["new_bend"]
         assert saved["noCompetitorTemplateId"] == ids["no_competitor"]
         assert saved["roundingRuleId"] == ids["rounding"]
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_price_format_branch_formats_display_linked_pricing_rule_name_without_assignment_change():
+    client, Session = _client()
+    try:
+        with Session() as db:
+            rule = PricingRule(code="111111", name="Общее_1,25")
+            db.add(rule)
+            db.flush()
+            pf = PriceFormat(code="PF-LINKED", name="Linked", branch="Pavlodar", pricing_rule="111111", pricing_rule_id=rule.id)
+            db.add(pf)
+            db.commit()
+            ids = {"format": pf.id, "rule": rule.id}
+
+        response = client.get("/api/pricing-workflow/branch-formats", params={"branch_id": "Pavlodar"})
+
+        assert response.status_code == 200
+        payload = response.json()
+        row = next(item for item in payload if item["code"] == "PF-LINKED")
+        assert row["pricingRule"] == "Общее_1,25"
+        assert row["pricingRuleName"] == "Общее_1,25"
+        assert row["pricingRuleCode"] == "111111"
+        assert row["pricingRuleId"] == ids["rule"]
+        with Session() as db:
+            pf = db.get(PriceFormat, ids["format"])
+            assert pf.pricing_rule == "111111"
+            assert pf.pricing_rule_id == ids["rule"]
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_price_format_settings_display_legacy_code_as_pricing_rule_name_when_code_matches():
+    client, Session = _client()
+    try:
+        with Session() as db:
+            db.add(PricingRule(code="111112", name="Общее_0,75"))
+            db.add(PriceFormat(code="PF-LEGACY-CODE", name="Legacy code", branch="Kostanay", pricing_rule="111112"))
+            db.commit()
+
+        response = client.get("/api/price-formats/PF-LEGACY-CODE/settings")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["pricingRule"] == "Общее_0,75"
+        assert payload["pricingRuleName"] == "Общее_0,75"
+        assert payload["pricingRuleCode"] == "111112"
+        assert payload["pricingRuleId"] is None
+        with Session() as db:
+            pf = db.execute(select(PriceFormat).where(PriceFormat.code == "PF-LEGACY-CODE")).scalars().first()
+            assert pf.pricing_rule == "111112"
+            assert pf.pricing_rule_id is None
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_price_format_settings_preserve_raw_legacy_pricing_rule_when_no_code_match():
+    client, Session = _client()
+    try:
+        with Session() as db:
+            db.add(PriceFormat(code="PF-RAW", name="Raw", branch="Kostanay", pricing_rule="legacy raw"))
+            db.commit()
+
+        response = client.get("/api/price-formats/PF-RAW/settings")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["pricingRule"] == "legacy raw"
+        assert payload["pricingRuleName"] == "legacy raw"
+        assert payload["pricingRuleCode"] == ""
+        assert payload["pricingRuleId"] is None
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_price_format_settings_display_empty_rule_as_existing_api_empty_value():
+    client, Session = _client()
+    try:
+        with Session() as db:
+            db.add(PriceFormat(code="PF-NONE", name="No rule", branch="Semey"))
+            db.commit()
+
+        response = client.get("/api/price-formats/PF-NONE/settings")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["pricingRule"] == ""
+        assert payload["pricingRuleName"] == ""
+        assert payload["pricingRuleCode"] == ""
+        assert payload["pricingRuleId"] is None
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_generated_price_lists_display_canonical_pricing_rule_name():
+    client, Session = _client()
+    try:
+        with Session() as db:
+            rule = PricingRule(code="01", name="Общее_1,0")
+            db.add(rule)
+            db.flush()
+            pf = PriceFormat(code="PF-GENERATED", name="Generated", branch="Kostanay", pricing_rule="01", pricing_rule_id=rule.id)
+            db.add(pf)
+            db.flush()
+            db.add(PriceList(number="PL-GENERATED", price_format_id=pf.id, user="tester"))
+            db.commit()
+
+        response = client.get("/api/generated-price-lists", params={"format_code": "PF-GENERATED"})
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload[0]["pricingRule"] == "Общее_1,0"
+        assert payload[0]["pricingRuleName"] == "Общее_1,0"
+        assert payload[0]["pricingRuleCode"] == "01"
     finally:
         app.dependency_overrides.pop(get_db, None)
