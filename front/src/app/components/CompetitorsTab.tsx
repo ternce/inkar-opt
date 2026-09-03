@@ -723,6 +723,7 @@ export function CompetitorsTab({ formatCode }: Props) {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const mappingRequestRef = useRef<AbortController | null>(null);
+  const mappingRequestKeyRef = useRef('');
 
   const loadSources = async () => {
     const res = await fetch(`/api/competitors/price-lists?format_code=${encodeURIComponent(formatCode)}`);
@@ -810,12 +811,6 @@ export function CompetitorsTab({ formatCode }: Props) {
   };
 
   const loadCodeMappings = async (signal?: AbortSignal) => {
-    const controller = signal ? null : new AbortController();
-    if (controller) {
-      mappingRequestRef.current?.abort();
-      mappingRequestRef.current = controller;
-    }
-    const requestSignal = signal || controller?.signal;
     const selectedMappingFormatCode = mappingFormatScope === 'current' ? formatCode : '';
     const params = new URLSearchParams({
       platform: mappingPlatform,
@@ -827,15 +822,28 @@ export function CompetitorsTab({ formatCode }: Props) {
     if (selectedMappingFormatCode) params.set('format_code', selectedMappingFormatCode);
     if (appliedSourceQuery) params.set('source_q', appliedSourceQuery);
     if (appliedProductQuery) params.set('product_q', appliedProductQuery);
-    const res = await fetch(`/api/competitors/code-mappings/catalog-view?${params.toString()}`, { signal: requestSignal });
-    const text = await res.text();
-    const data = parseJsonOrNull(text);
-    if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить таблицу соответствий');
-    setCodeRows(Array.isArray(data?.items) ? data.items : []);
-    setMetrics(Array.isArray(data?.metrics) ? data.metrics : []);
-    setMappingPagination(data?.pagination || { page: mappingPage, pageSize: 50, total: 0, pageCount: 0 });
-    if (data?.pagination?.page && data.pagination.page !== mappingPage) setMappingPage(data.pagination.page);
-    if (controller && mappingRequestRef.current === controller) mappingRequestRef.current = null;
+    const requestKey = params.toString();
+    if (mappingRequestRef.current && mappingRequestKeyRef.current === requestKey) return;
+    const controller = signal ? null : new AbortController();
+    if (controller) {
+      mappingRequestRef.current?.abort();
+      mappingRequestRef.current = controller;
+    }
+    mappingRequestKeyRef.current = requestKey;
+    const requestSignal = signal || controller?.signal;
+    try {
+      const res = await fetch(`/api/competitors/code-mappings/catalog-view?${params.toString()}`, { signal: requestSignal });
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить таблицу соответствий');
+      setCodeRows(Array.isArray(data?.items) ? data.items : []);
+      setMetrics(Array.isArray(data?.metrics) ? data.metrics : []);
+      setMappingPagination(data?.pagination || { page: mappingPage, pageSize: 50, total: 0, pageCount: 0 });
+      if (data?.pagination?.page && data.pagination.page !== mappingPage) setMappingPage(data.pagination.page);
+    } finally {
+      if (controller && mappingRequestRef.current === controller) mappingRequestRef.current = null;
+      if (mappingRequestKeyRef.current === requestKey) mappingRequestKeyRef.current = '';
+    }
   };
 
   const loadPriceListTab = async () => {
@@ -908,6 +916,7 @@ export function CompetitorsTab({ formatCode }: Props) {
     return () => {
       window.clearTimeout(timer);
       mappingRequestRef.current?.abort();
+      mappingRequestKeyRef.current = '';
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, mappingPlatform, mappingStatus, mappingFormatScope, appliedSourceQuery, appliedProductQuery, mappingPage, formatCode]);

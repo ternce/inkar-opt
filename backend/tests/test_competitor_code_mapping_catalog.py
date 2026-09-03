@@ -2,7 +2,7 @@ from datetime import date
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
@@ -240,6 +240,41 @@ def test_provisor_catalog_global_mode_deduplicates_across_price_lists():
     assert result["items"][0]["sourceName"] == "New duplicate"
 
 
+def test_provisor_catalog_global_default_uses_bounded_query_count():
+    db = _session()
+    pf = _price_format(db, "QUERY-COUNT")
+    price_list = _price_list(db, pf, source_key="query-count", price_date=date(2026, 1, 1))
+    for goods_id in range(1, 101):
+        _item(db, price_list, goods_id, name=f"Source {goods_id}")
+    db.commit()
+
+    select_count = 0
+
+    def count_selects(_conn, _cursor, statement, _parameters, _context, _executemany):
+        nonlocal select_count
+        if statement.lstrip().upper().startswith("SELECT"):
+            select_count += 1
+
+    engine = db.get_bind()
+    event.listen(engine, "before_cursor_execute", count_selects)
+    try:
+        result = list_catalog_code_mappings(
+            db=db,
+            platform="provisor",
+            price_format_id=None,
+            status="unmapped",
+            page=1,
+            limit=50,
+            include_candidates=False,
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", count_selects)
+
+    assert result["pagination"] == {"page": 1, "pageSize": 50, "total": 100, "pageCount": 2}
+    assert len(result["items"]) == 50
+    assert select_count <= 3
+
+
 def test_global_mapping_removes_goods_id_from_global_and_format_filtered_unmapped_views():
     db = _session()
     pf_a = _price_format(db, "MAP-A")
@@ -455,7 +490,7 @@ def test_provisor_catalog_searches_goods_id_name_manufacturer_and_distributor_id
     _item(db, price_list, 12345, name="Other", manufacturer="Other maker", distributor_goods_id="OTHER")
     db.commit()
 
-    for query in ["95822", "582", "\u0410\u0441\u043f\u0438\u0440\u0438\u043d", "BAYER", "DIST-95822"]:
+    for query in ["95822", "\u0410\u0441\u043f\u0438\u0440\u0438\u043d", "BAYER", "DIST-95822"]:
         result = list_catalog_code_mappings(
             db=db,
             platform="provisor",
@@ -467,6 +502,18 @@ def test_provisor_catalog_searches_goods_id_name_manufacturer_and_distributor_id
         )
         assert result["pagination"]["total"] == 1
         assert result["items"][0]["sourceExternalKey"] == "95822"
+
+    partial_numeric = list_catalog_code_mappings(
+        db=db,
+        platform="provisor",
+        price_format_id=pf.id,
+        status="unmapped",
+        source_q="582",
+        page=1,
+        limit=50,
+    )
+    assert partial_numeric["pagination"]["total"] == 0
+    assert partial_numeric["items"] == []
 
     empty = list_catalog_code_mappings(
         db=db,

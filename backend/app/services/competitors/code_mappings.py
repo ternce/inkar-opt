@@ -4,7 +4,7 @@ import re
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import String, cast, desc, exists, func, literal, or_, select
+from sqlalchemy import String, case, cast, desc, exists, func, literal, or_, select
 from sqlalchemy.orm import Session
 
 from ...models import (
@@ -538,6 +538,7 @@ def _provisor_catalog_base(
     *,
     assigned_ids: list[int] | None,
     source_q: str = "",
+    goods_ids: list[int] | None = None,
 ) -> object:
     source_key = _provisor_source_key_expr(CompetitorPriceListItem.provisor_goods_id).label("source_match_key")
     stmt = (
@@ -579,20 +580,60 @@ def _provisor_catalog_base(
     )
     if assigned_ids is not None:
         stmt = stmt.where(CompetitorPriceList.id.in_(assigned_ids))
+    if goods_ids is not None:
+        stmt = stmt.where(CompetitorPriceListItem.provisor_goods_id.in_(goods_ids))
     search = source_q.strip()
     if search:
-        like = f"%{search}%"
-        stmt = stmt.where(
-            or_(
-                cast(CompetitorPriceListItem.provisor_goods_id, String).ilike(like),
-                CompetitorPriceListItem.name.ilike(like),
-                CompetitorPriceListItem.raw_name.ilike(like),
-                CompetitorPriceListItem.distributor_goods_name.ilike(like),
-                CompetitorPriceListItem.raw_manufacturer.ilike(like),
-                CompetitorPriceListItem.distributor_goods_id.ilike(like),
+        if search.isdigit():
+            stmt = stmt.where(CompetitorPriceListItem.provisor_goods_id == int(search))
+        else:
+            like = f"%{search}%"
+            stmt = stmt.where(
+                or_(
+                    CompetitorPriceListItem.name.ilike(like),
+                    CompetitorPriceListItem.raw_name.ilike(like),
+                    CompetitorPriceListItem.distributor_goods_name.ilike(like),
+                    CompetitorPriceListItem.raw_manufacturer.ilike(like),
+                    CompetitorPriceListItem.distributor_goods_id.ilike(like),
+                )
             )
-        )
     return stmt.subquery()
+
+
+def _provisor_goods_base(
+    *,
+    assigned_ids: list[int] | None,
+    source_q: str = "",
+) -> object:
+    source_key = _provisor_source_key_expr(CompetitorPriceListItem.provisor_goods_id).label("source_match_key")
+    stmt = (
+        select(
+            CompetitorPriceListItem.provisor_goods_id.label("provisor_goods_id"),
+            source_key,
+        )
+        .select_from(CompetitorPriceListItem)
+        .join(CompetitorPriceList, CompetitorPriceList.id == CompetitorPriceListItem.price_list_id)
+        .where(CompetitorPriceList.source_type == "provisor")
+        .where(CompetitorPriceListItem.provisor_goods_id.is_not(None))
+    )
+    if assigned_ids is not None:
+        stmt = stmt.where(CompetitorPriceList.id.in_(assigned_ids))
+    search = source_q.strip()
+    if search:
+        if search.isdigit():
+            stmt = stmt.where(CompetitorPriceListItem.provisor_goods_id == int(search))
+        else:
+            like = f"%{search}%"
+            stmt = stmt.where(
+                or_(
+                    CompetitorPriceListItem.name.ilike(like),
+                    CompetitorPriceListItem.raw_name.ilike(like),
+                    CompetitorPriceListItem.distributor_goods_name.ilike(like),
+                    CompetitorPriceListItem.raw_manufacturer.ilike(like),
+                    CompetitorPriceListItem.distributor_goods_id.ilike(like),
+                )
+            )
+    return stmt.group_by(CompetitorPriceListItem.provisor_goods_id, source_key).subquery()
 
 
 def _apply_provisor_catalog_filters(stmt, base, status: str, product_q: str):
@@ -614,6 +655,25 @@ def _apply_provisor_catalog_filters(stmt, base, status: str, product_q: str):
             )
         )
     return stmt
+
+
+def _provisor_metrics_counts(db: Session, assigned_ids: list[int] | None) -> tuple[int, int, int]:
+    base = _provisor_goods_base(assigned_ids=assigned_ids)
+    mapping_join = (
+        (CompetitorCodeMapping.platform == "provisor")
+        & (CompetitorCodeMapping.source_match_key == base.c.source_match_key)
+        & (CompetitorCodeMapping.status.in_(["mapped", "rejected"]))
+    )
+    row = db.execute(
+        select(
+            func.count(func.distinct(base.c.provisor_goods_id)).label("total"),
+            func.count(func.distinct(case((CompetitorCodeMapping.status == "mapped", base.c.provisor_goods_id)))).label("mapped"),
+            func.count(func.distinct(case((CompetitorCodeMapping.status == "rejected", base.c.provisor_goods_id)))).label("rejected"),
+        )
+        .select_from(base)
+        .outerjoin(CompetitorCodeMapping, mapping_join)
+    ).one()
+    return int(row.total or 0), int(row.mapped or 0), int(row.rejected or 0)
 
 
 def _list_provisor_catalog_code_mappings_sql_page(
@@ -647,13 +707,75 @@ def _list_provisor_catalog_code_mappings_sql_page(
             "pagination": {"page": 1, "pageSize": limit, "total": 0, "pageCount": 0},
         }
 
-    base = _provisor_catalog_base(assigned_ids=assigned_ids, source_q=source_q)
+    total, mapped, rejected = _provisor_metrics_counts(db, assigned_ids)
+    unmapped = max(0, total - mapped - rejected)
+    metrics = {
+        "platform": "provisor",
+        "total": total,
+        "mapped": mapped,
+        "unmapped": unmapped,
+        "rejected": rejected,
+        "noCandidates": 0,
+        "coveragePercent": round((mapped / total) * 100, 2) if total else 0,
+        "mappingCoveragePercent": round((mapped / total) * 100, 2) if total else 0,
+        "generatedPricingCoverage": _generated_pricing_coverage(db, price_format_id),
+    }
+
+    goods_base = _provisor_goods_base(assigned_ids=assigned_ids, source_q=source_q)
     mapping_join = (
+        (CompetitorCodeMapping.platform == "provisor")
+        & (CompetitorCodeMapping.source_match_key == goods_base.c.source_match_key)
+        & (CompetitorCodeMapping.status.in_(["mapped", "rejected"]))
+    )
+    goods_stmt = (
+        select(goods_base.c.provisor_goods_id)
+        .select_from(goods_base)
+        .outerjoin(CompetitorCodeMapping, mapping_join)
+        .outerjoin(Product, Product.id == CompetitorCodeMapping.our_product_id)
+        .outerjoin(ProductExtra, ProductExtra.product_id == Product.id)
+    )
+    goods_stmt = _apply_provisor_catalog_filters(goods_stmt, goods_base, status, product_q)
+
+    if not source_q.strip() and not product_q.strip():
+        filtered_total = {
+            "all": total,
+            "mapped": mapped,
+            "rejected": rejected,
+            "unmapped": unmapped,
+            "no_candidates": unmapped,
+        }.get(status, total)
+    else:
+        count_stmt = select(func.count()).select_from(goods_stmt.order_by(None).subquery())
+        filtered_total = int(db.scalar(count_stmt) or 0)
+
+    page_count = (filtered_total + limit - 1) // limit if filtered_total else 0
+    if page_count and page > page_count:
+        page = page_count
+
+    page_goods_ids = [
+        int(goods_id)
+        for goods_id in db.execute(
+            goods_stmt.distinct().order_by(goods_base.c.provisor_goods_id.asc()).limit(limit).offset((page - 1) * limit)
+        ).scalars().all()
+    ]
+    if not page_goods_ids:
+        return {
+            "items": [],
+            "metrics": [metrics],
+            "pagination": {
+                "page": 1 if not filtered_total else page,
+                "pageSize": limit,
+                "total": filtered_total,
+                "pageCount": page_count,
+            },
+        }
+
+    base = _provisor_catalog_base(assigned_ids=assigned_ids, goods_ids=page_goods_ids)
+    row_mapping_join = (
         (CompetitorCodeMapping.platform == "provisor")
         & (CompetitorCodeMapping.source_match_key == base.c.source_match_key)
         & (CompetitorCodeMapping.status.in_(["mapped", "rejected"]))
     )
-    product_join_id = CompetitorCodeMapping.our_product_id
     row_stmt = (
         select(
             base,
@@ -665,21 +787,14 @@ def _list_provisor_catalog_code_mappings_sql_page(
             Product.name.label("our_name"),
             ProductExtra.manufacturer.label("our_manufacturer"),
         )
-        .outerjoin(CompetitorCodeMapping, mapping_join)
-        .outerjoin(Product, Product.id == product_join_id)
+        .outerjoin(CompetitorCodeMapping, row_mapping_join)
+        .outerjoin(Product, Product.id == CompetitorCodeMapping.our_product_id)
         .outerjoin(ProductExtra, ProductExtra.product_id == Product.id)
         .where(base.c.rn == 1)
     )
-    row_stmt = _apply_provisor_catalog_filters(row_stmt, base, status, product_q)
-
-    count_stmt = select(func.count()).select_from(row_stmt.with_only_columns(base.c.source_match_key).order_by(None).subquery())
-    filtered_total = int(db.scalar(count_stmt) or 0)
-    page_count = (filtered_total + limit - 1) // limit if filtered_total else 0
-    if page_count and page > page_count:
-        page = page_count
 
     rows = db.execute(
-        row_stmt.order_by(base.c.provisor_goods_id.asc(), base.c.item_id.desc()).limit(limit).offset((page - 1) * limit)
+        row_stmt.order_by(base.c.provisor_goods_id.asc(), base.c.item_id.desc())
     ).all()
 
     items = []
@@ -736,27 +851,6 @@ def _list_provisor_catalog_code_mappings_sql_page(
             item_payload["bestCandidate"] = candidates[0] if candidates else None
         items.append(item_payload)
 
-    def metric_count(metric_status: str) -> int:
-        metric_base = _provisor_catalog_base(assigned_ids=assigned_ids)
-        metric_stmt = select(metric_base.c.source_match_key).where(metric_base.c.rn == 1)
-        metric_stmt = _apply_provisor_catalog_filters(metric_stmt, metric_base, metric_status, "")
-        return int(db.scalar(select(func.count()).select_from(metric_stmt.subquery())) or 0)
-
-    total = metric_count("all")
-    mapped = metric_count("mapped")
-    rejected = metric_count("rejected")
-    unmapped = max(0, total - mapped - rejected)
-    metrics = {
-        "platform": "provisor",
-        "total": total,
-        "mapped": mapped,
-        "unmapped": unmapped,
-        "rejected": rejected,
-        "noCandidates": 0,
-        "coveragePercent": round((mapped / total) * 100, 2) if total else 0,
-        "mappingCoveragePercent": round((mapped / total) * 100, 2) if total else 0,
-        "generatedPricingCoverage": _generated_pricing_coverage(db, price_format_id),
-    }
     return {
         "items": items,
         "metrics": [metrics],
