@@ -73,6 +73,10 @@ class CreateUniversalListRequest(BaseModel):
     start_date: date | None = None
     end_date: date | None = None
     price_format_code: str | None = None
+    price_format_ids: list[int] | None = None
+    priceFormatIds: list[int] | None = None
+    priceFormatCodes: list[str] | None = None
+    formatCodes: list[str] | None = None
 
 
 class CreateUniversalListResponse(BaseModel):

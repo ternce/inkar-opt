@@ -23,7 +23,7 @@ from fastapi import Body, Cookie, Depends, FastAPI, File, Form, HTTPException, Q
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 import httpx
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 import io
@@ -3740,15 +3740,70 @@ def _list_bindings(db: Session, list_ids: list[int]) -> dict[int, list[PriceForm
     return out
 
 
-def _sync_universal_list_bindings(db: Session, ul: UniversalList, format_codes: list[str] | None) -> None:
-    if format_codes is None:
+def _price_format_scope_payload(pf: PriceFormat) -> dict:
+    return {
+        "id": int(pf.id),
+        "code": pf.code,
+        "name": pf.name,
+        "branch": pf.branch,
+        "priceListType": pf.price_list_type,
+    }
+
+
+def _resolve_price_format_scope(db: Session, payload: dict) -> tuple[list[PriceFormat] | None, bool]:
+    has_ids = "priceFormatIds" in payload or "price_format_ids" in payload
+    has_codes = "formatCodes" in payload or "priceFormatCodes" in payload or "price_format_codes" in payload
+    if not has_ids and not has_codes:
+        return None, False
+
+    raw_ids = payload.get("priceFormatIds", payload.get("price_format_ids", [])) if has_ids else []
+    raw_codes = payload.get("formatCodes", payload.get("priceFormatCodes", payload.get("price_format_codes", []))) if has_codes else []
+
+    ids: list[int] = []
+    for raw_id in raw_ids or []:
+        try:
+            parsed_id = int(raw_id)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="priceFormatIds must contain valid PriceFormat ids")
+        if parsed_id not in ids:
+            ids.append(parsed_id)
+
+    codes: list[str] = []
+    for raw_code in raw_codes or []:
+        code = str(raw_code or "").strip()
+        if code and code not in codes:
+            codes.append(code)
+
+    if not ids and not codes:
+        return [], True
+
+    clauses = []
+    if ids:
+        clauses.append(PriceFormat.id.in_(ids))
+    if codes:
+        clauses.append(PriceFormat.code.in_(codes))
+    rows = db.execute(select(PriceFormat).where(or_(*clauses)).order_by(PriceFormat.code.asc())).scalars().all()
+
+    found_ids = {int(row.id) for row in rows}
+    found_codes = {str(row.code) for row in rows}
+    missing_ids = [item for item in ids if item not in found_ids]
+    missing_codes = [item for item in codes if item not in found_codes]
+    if missing_ids or missing_codes:
+        missing = [f"id={item}" for item in missing_ids] + [f"code={item}" for item in missing_codes]
+        raise HTTPException(status_code=400, detail="unknown PriceFormat scope: " + ", ".join(missing))
+    return rows, True
+
+
+def _sync_universal_list_bindings(db: Session, ul: UniversalList, payload: dict | None) -> None:
+    if payload is None:
         return
-    codes = [str(code).strip() for code in format_codes if str(code).strip()]
+    formats, provided = _resolve_price_format_scope(db, payload)
+    if not provided or formats is None:
+        return
     db.execute(delete(UniversalListPriceFormat).where(UniversalListPriceFormat.universal_list_id == ul.id))
     ul.price_format_id = None
-    if not codes:
+    if not formats:
         return
-    formats = db.execute(select(PriceFormat).where(PriceFormat.code.in_(codes))).scalars().all()
     for pf in formats:
         db.add(UniversalListPriceFormat(universal_list_id=ul.id, price_format_id=pf.id))
     if len(formats) == 1:
@@ -3757,6 +3812,10 @@ def _sync_universal_list_bindings(db: Session, ul: UniversalList, format_codes: 
 
 def _universal_list_row(db: Session, ul: UniversalList, item_count: int, bindings: list[PriceFormat] | None) -> dict:
     bindings = bindings or []
+    if ul.price_format_id is not None and all(int(pf.id) != int(ul.price_format_id) for pf in bindings):
+        direct_pf = db.get(PriceFormat, int(ul.price_format_id))
+        if direct_pf is not None:
+            bindings = [*bindings, direct_pf]
     is_global = ul.price_format_id is None and not bindings
     raw_status = _list_status_label(ul.status)
     today = date.today()
@@ -3779,7 +3838,8 @@ def _universal_list_row(db: Session, ul: UniversalList, item_count: int, binding
             "expired": bool(ul.end_date is not None and ul.end_date < today),
         },
         "itemsCount": int(item_count or 0),
-        "priceFormats": [{"code": pf.code, "name": pf.name, "branch": pf.branch} for pf in bindings],
+        "priceFormatIds": [int(pf.id) for pf in bindings],
+        "priceFormats": [_price_format_scope_payload(pf) for pf in bindings],
         "scope": "global" if is_global else "formats",
         "startDate": _fmt_d(ul.start_date),
         "endDate": _fmt_d(ul.end_date),
@@ -3943,7 +4003,7 @@ def create_lists_management(payload: dict = Body(...), db: Session = Depends(get
     db.flush()
     if not ul.code:
         ul.code = f"UL_{ul.id:06d}"
-    _sync_universal_list_bindings(db, ul, payload.get("formatCodes"))
+    _sync_universal_list_bindings(db, ul, payload)
     db.commit()
     return {"id": ul.id}
 
@@ -3968,7 +4028,7 @@ def update_lists_management(list_id: int, payload: dict = Body(...), db: Session
         ul.start_date = _parse_list_date(payload.get("startDate"))
     if "endDate" in payload:
         ul.end_date = _parse_list_date(payload.get("endDate"))
-    _sync_universal_list_bindings(db, ul, payload.get("formatCodes") if "formatCodes" in payload else None)
+    _sync_universal_list_bindings(db, ul, payload)
     db.commit()
     return {"status": "ok"}
 
@@ -10948,23 +11008,25 @@ def get_universal_lists(db: Session = Depends(get_db)):
             return "Черновик"
         return "Неактивен"
 
-    return [
-        {
-            "id": ul.id,
-            "name": ul.name,
-            "type": ul.type,
-            "status": _map_status(ul.status),
-            "period": f"{_fmt_d(ul.start_date)} - {_fmt_d(ul.end_date)}".strip(),
-            "itemsCount": int(counts.get(ul.id, 0)),
-        }
-        for ul in rows
-    ]
+    bindings = _list_bindings(db, [row.id for row in rows])
+    payload = [_universal_list_row(db, ul, int(counts.get(ul.id, 0)), bindings.get(ul.id)) for ul in rows]
+    for row in payload:
+        row["status"] = _map_status(row.get("rawStatus") or row.get("status") or "")
+        row["period"] = f"{row.get('startDate') or ''} - {row.get('endDate') or ''}".strip()
+    return payload
 
 
 @app.post("/api/universal-lists", response_model=CreateUniversalListResponse)
 def create_universal_list(payload: CreateUniversalListRequest = Body(...), db: Session = Depends(get_db)):
-    price_format_id: int | None = None
+    scope_payload = {
+        "priceFormatIds": payload.priceFormatIds or payload.price_format_ids or [],
+        "priceFormatCodes": payload.priceFormatCodes or payload.formatCodes or [],
+    }
     if payload.price_format_code:
+        scope_payload["priceFormatCodes"] = [*scope_payload["priceFormatCodes"], payload.price_format_code]
+
+    price_format_id: int | None = None
+    if payload.price_format_code and not scope_payload["priceFormatIds"] and len(scope_payload["priceFormatCodes"]) == 1:
         pf = (
             db.execute(select(PriceFormat).where(PriceFormat.code == payload.price_format_code))
             .scalars()
@@ -10989,6 +11051,8 @@ def create_universal_list(payload: CreateUniversalListRequest = Body(...), db: S
 
     if not ul.code:
         ul.code = f"UL_{ul.id:06d}"
+    if scope_payload["priceFormatIds"] or scope_payload["priceFormatCodes"]:
+        _sync_universal_list_bindings(db, ul, scope_payload)
 
     db.commit()
     return CreateUniversalListResponse(id=ul.id)

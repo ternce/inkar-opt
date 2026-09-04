@@ -440,6 +440,154 @@ def test_lists_management_patch_accepts_dd_mm_yyyy_and_format_codes():
         db.close()
 
 
+def test_lists_management_accepts_price_format_ids_and_exposes_scope_payload():
+    client, Session = _client()
+    db = Session()
+    try:
+        price_format_1 = PriceFormat(code="PF-SCOPE-1", name="Format 1", branch="Almaty")
+        price_format_2 = PriceFormat(code="PF-SCOPE-2", name="Format 2", branch="Astana")
+        price_format_3 = PriceFormat(code="PF-SCOPE-3", name="Format 3", branch="Almaty")
+        db.add_all([price_format_1, price_format_2, price_format_3])
+        db.commit()
+        pf1_id = int(price_format_1.id)
+        pf2_id = int(price_format_2.id)
+        pf3_id = int(price_format_3.id)
+    finally:
+        db.close()
+
+    created = client.post(
+        "/api/lists-management",
+        json={
+            "name": "Scoped list",
+            "code": "SCOPED-LIST",
+            "type": "fixed_price",
+            "active": True,
+            "priceFormatIds": [pf1_id, pf2_id, pf1_id],
+        },
+    )
+
+    assert created.status_code == 200, created.text
+    list_id = created.json()["id"]
+    card = client.get(f"/api/lists-management/{list_id}").json()
+    assert card["scope"] == "formats"
+    assert card["priceFormatIds"] == [pf1_id, pf2_id]
+    assert [(item["id"], item["code"], item["branch"]) for item in card["priceFormats"]] == [
+        (pf1_id, "PF-SCOPE-1", "Almaty"),
+        (pf2_id, "PF-SCOPE-2", "Astana"),
+    ]
+
+    db = Session()
+    try:
+        saved = db.get(UniversalList, list_id)
+        assert saved.price_format_id is None
+        assert db.scalar(select(func.count(UniversalListPriceFormat.id)).where(UniversalListPriceFormat.universal_list_id == list_id)) == 2
+    finally:
+        db.close()
+
+    changed = client.patch(f"/api/lists-management/{list_id}", json={"priceFormatIds": [pf3_id]})
+    assert changed.status_code == 200, changed.text
+    card = client.get(f"/api/lists-management/{list_id}").json()
+    assert card["priceFormatIds"] == [pf3_id]
+    assert card["priceFormats"][0]["code"] == "PF-SCOPE-3"
+
+    db = Session()
+    try:
+        saved = db.get(UniversalList, list_id)
+        assert saved.price_format_id == pf3_id
+        assert db.scalar(select(func.count(UniversalListPriceFormat.id)).where(UniversalListPriceFormat.universal_list_id == list_id)) == 1
+    finally:
+        db.close()
+
+    cleared = client.patch(f"/api/lists-management/{list_id}", json={"priceFormatIds": []})
+    assert cleared.status_code == 200, cleared.text
+    card = client.get(f"/api/lists-management/{list_id}").json()
+    assert card["scope"] == "global"
+    assert card["priceFormatIds"] == []
+    assert card["priceFormats"] == []
+
+
+def test_lists_management_rejects_unknown_price_format_scope():
+    client, Session = _client()
+    db = Session()
+    try:
+        universal_list = UniversalList(code="BAD-SCOPE", name="Bad scope", type="fixed_price", status="active")
+        db.add(universal_list)
+        db.commit()
+        list_id = universal_list.id
+    finally:
+        db.close()
+
+    response = client.patch(f"/api/lists-management/{list_id}", json={"priceFormatIds": [999999]})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "unknown PriceFormat scope: id=999999"
+
+
+def test_lists_management_legacy_single_price_format_id_is_visible():
+    client, Session = _client()
+    db = Session()
+    try:
+        price_format = PriceFormat(code="PF-LEGACY", name="Legacy", branch="Karaganda")
+        db.add(price_format)
+        db.flush()
+        universal_list = UniversalList(
+            code="LEGACY-SCOPE",
+            name="Legacy scope",
+            type="fixed_price",
+            status="active",
+            price_format_id=price_format.id,
+        )
+        db.add(universal_list)
+        db.commit()
+        list_id = universal_list.id
+        pf_id = int(price_format.id)
+    finally:
+        db.close()
+
+    rows = {row["code"]: row for row in client.get("/api/lists-management").json()}
+    assert rows["LEGACY-SCOPE"]["scope"] == "formats"
+    assert rows["LEGACY-SCOPE"]["priceFormatIds"] == [pf_id]
+    assert rows["LEGACY-SCOPE"]["priceFormats"][0]["code"] == "PF-LEGACY"
+
+    universal_rows = {row["code"]: row for row in client.get("/api/universal-lists").json()}
+    assert universal_rows["LEGACY-SCOPE"]["priceFormatIds"] == [pf_id]
+
+
+def test_lists_management_memorandum_uses_same_price_format_scope_payload():
+    client, Session = _client()
+    db = Session()
+    try:
+        price_format_1 = PriceFormat(code="PF-MEMO-1", name="Memo 1", branch="Almaty")
+        price_format_2 = PriceFormat(code="PF-MEMO-2", name="Memo 2", branch="Astana")
+        price_format_3 = PriceFormat(code="PF-MEMO-3", name="Memo 3", branch="Shymkent")
+        db.add_all([price_format_1, price_format_2, price_format_3])
+        db.commit()
+        pf1_id = int(price_format_1.id)
+        pf2_id = int(price_format_2.id)
+        pf3_id = int(price_format_3.id)
+    finally:
+        db.close()
+
+    created = client.post(
+        "/api/lists-management",
+        json={"name": "Memo scoped", "type": "memorandum", "active": True, "priceFormatIds": [pf1_id, pf2_id]},
+    )
+
+    assert created.status_code == 200, created.text
+    list_id = created.json()["id"]
+    card = client.get(f"/api/lists-management/{list_id}").json()
+    assert card["type"] == "memorandum"
+    assert card["scope"] == "formats"
+    assert card["priceFormatIds"] == [pf1_id, pf2_id]
+
+    changed = client.patch(f"/api/lists-management/{list_id}", json={"priceFormatIds": [pf3_id]})
+    assert changed.status_code == 200, changed.text
+    card = client.get(f"/api/lists-management/{list_id}").json()
+    assert card["type"] == "memorandum"
+    assert card["priceFormatIds"] == [pf3_id]
+    assert card["priceFormats"][0]["branch"] == "Shymkent"
+
+
 def test_lists_management_patch_bad_date_returns_json_400():
     client, Session = _client()
     db = Session()

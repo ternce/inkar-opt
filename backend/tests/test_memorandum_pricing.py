@@ -12,12 +12,13 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from backend.app.db import Base
-from backend.app.deps import get_db
+from backend.app.deps import ROLE_ADMIN, get_current_user, get_db, require_write_access
 from backend.app.main import app
 from backend.app.models import (
     BranchCost,
     BranchStock,
     CalculatedPrice,
+    AppUser,
     ListItem,
     MarkupRange,
     PriceFormat,
@@ -109,6 +110,8 @@ def test_create_memorandum_list_and_reject_non_positive_item():
             yield db
 
     app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[get_current_user] = lambda: AppUser(id=1, username="admin", role=ROLE_ADMIN, is_active=True)
+    app.dependency_overrides[require_write_access] = lambda: AppUser(id=1, username="admin", role=ROLE_ADMIN, is_active=True)
     with Session() as db:
         pf = _pf(db)
         product = _product(db)
@@ -133,6 +136,53 @@ def test_create_memorandum_list_and_reject_non_positive_item():
     assert details["type"] == "memorandum"
     assert details["typeLabel"] == "Меморандум"
     app.dependency_overrides.pop(get_db, None)
+    app.dependency_overrides.pop(get_current_user, None)
+    app.dependency_overrides.pop(require_write_access, None)
+    engine.dispose()
+
+
+def test_memorandum_created_with_price_format_ids_only_applies_to_assigned_format():
+    engine, Session = _session_factory()
+
+    def override_db():
+        with Session() as db:
+            yield db
+
+    app.dependency_overrides[get_db] = override_db
+    with Session() as db:
+        pf = _pf(db, code="MEMO-SCOPED")
+        other_pf = _pf(db, code="MEMO-OTHER")
+        product = _product(db, code="MEMO-SKU", cost=Decimal("100"))
+        db.commit()
+        pf_id = int(pf.id)
+        sku = product.code
+
+    client = TestClient(app)
+    created = client.post(
+        "/api/lists-management",
+        json={"name": "Scoped memorandum", "type": "memorandum", "active": True, "priceFormatIds": [pf_id]},
+    )
+    assert created.status_code == 200, created.text
+    list_id = created.json()["id"]
+    added = client.post(f"/api/lists-management/{list_id}/items", json={"sku": sku, "value": 115})
+    assert added.status_code == 200, added.text
+
+    with Session() as db:
+        scoped_pf = db.query(PriceFormat).filter_by(code="MEMO-SCOPED").one()
+        unscoped_pf = db.query(PriceFormat).filter_by(code="MEMO-OTHER").one()
+        product = db.query(Product).filter_by(code="MEMO-SKU").one()
+
+        scoped_price, scoped_debug = _price(db, scoped_pf, product)
+        other_price, other_debug = _price(db, unscoped_pf, product)
+
+        assert scoped_price == Decimal("115.000000")
+        assert scoped_debug["memorandum_applied"] is True
+        assert other_price == Decimal("125.00")
+        assert other_debug["memorandum_max_price"] is None
+
+    app.dependency_overrides.pop(get_db, None)
+    app.dependency_overrides.pop(get_current_user, None)
+    app.dependency_overrides.pop(require_write_access, None)
     engine.dispose()
 
 
@@ -347,6 +397,8 @@ def test_generated_result_export_includes_memorandum_columns():
             yield db
 
     app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[get_current_user] = lambda: AppUser(id=1, username="admin", role=ROLE_ADMIN, is_active=True)
+    app.dependency_overrides[require_write_access] = lambda: AppUser(id=1, username="admin", role=ROLE_ADMIN, is_active=True)
     with Session() as db:
         pf = _pf(db)
         product = _product(db)
@@ -400,6 +452,8 @@ def test_generated_result_export_includes_memorandum_columns():
     assert row_by_header["Меморандум применён"] == "да"
     assert row_by_header["Меморандум ниже МДЦ"] == "да"
     app.dependency_overrides.pop(get_db, None)
+    app.dependency_overrides.pop(get_current_user, None)
+    app.dependency_overrides.pop(require_write_access, None)
     engine.dispose()
 
 

@@ -7,9 +7,11 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from './ui/dialog';
 import { isFixedPriceType, listTypeCode, listTypeHelper, listTypeLabel, listTypeOptions, listTypeUnit } from './listTypeLabels';
 
 type PriceFormat = {
+  id?: number | string;
   code: string;
   name: string;
   branch: string;
+  priceListType?: string | null;
 };
 
 type ListRow = {
@@ -25,6 +27,7 @@ type ListRow = {
   effectiveStatusLabel?: string;
   effectiveStatusReason?: string;
   itemsCount: number;
+  priceFormatIds?: number[];
   priceFormats: PriceFormat[];
   scope: 'global' | 'formats';
   startDate: string;
@@ -87,7 +90,20 @@ const parseJson = (text: string) => {
 const formatScope = (row: ListRow) => {
   if (row.scope === 'global') return 'Глобально: все ЦФ';
   if (!row.priceFormats.length) return 'Не привязан';
-  return row.priceFormats.map((format) => format.code).join(', ');
+  if (row.priceFormats.length <= 3) return row.priceFormats.map((format) => format.code).join(', ');
+  const branchCounts = row.priceFormats.reduce<Record<string, number>>((acc, format) => {
+    const branch = format.branch || 'Без филиала';
+    acc[branch] = (acc[branch] || 0) + 1;
+    return acc;
+  }, {});
+  return Object.entries(branchCounts)
+    .map(([branch, count]) => `${branch}: ${count}`)
+    .join(' · ');
+};
+
+const formatScopeTitle = (row: ListRow) => {
+  if (row.scope === 'global') return 'Глобально: все ЦФ';
+  return row.priceFormats.map((format) => `${format.code} ${format.name || ''}`.trim()).join(', ');
 };
 
 const effectiveStatusClass = (row: ListRow) => {
@@ -123,8 +139,10 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
     active: true,
     startDate: '',
     endDate: '',
-    formatCodes: [] as string[],
+    priceFormatIds: [] as number[],
   });
+  const [formatBranchFilter, setFormatBranchFilter] = useState('__all__');
+  const [formatSearch, setFormatSearch] = useState('');
   const [newItem, setNewItem] = useState({ sku: '', value: '' });
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importStatus, setImportStatus] = useState('');
@@ -132,7 +150,36 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
   const [importErrors, setImportErrors] = useState<ImportIssue[]>([]);
   const [isImporting, setIsImporting] = useState(false);
 
-  const selectedCodes = useMemo(() => new Set(form.formatCodes), [form.formatCodes]);
+  const priceFormatByCode = useMemo(() => {
+    const map = new Map<string, PriceFormat>();
+    priceFormats.forEach((format) => map.set(format.code, format));
+    return map;
+  }, [priceFormats]);
+  const selectedFormatIds = useMemo(() => new Set(form.priceFormatIds), [form.priceFormatIds]);
+  const selectedFormatId = useMemo(() => {
+    if (!selectedFormatCode) return null;
+    const id = Number(priceFormatByCode.get(selectedFormatCode)?.id);
+    return Number.isFinite(id) ? id : null;
+  }, [priceFormatByCode, selectedFormatCode]);
+  const branchOptions = useMemo(() => {
+    return Array.from(new Set(priceFormats.map((format) => format.branch).filter(Boolean))).sort();
+  }, [priceFormats]);
+  const filteredPriceFormats = useMemo(() => {
+    const needle = formatSearch.trim().toLowerCase();
+    return priceFormats.filter((format) => {
+      const branchMatches = formatBranchFilter === '__all__' || format.branch === formatBranchFilter;
+      if (!branchMatches) return false;
+      if (!needle) return true;
+      return [format.code, format.name, format.branch, format.priceListType || ''].some((value) =>
+        String(value || '').toLowerCase().includes(needle)
+      );
+    });
+  }, [formatBranchFilter, formatSearch, priceFormats]);
+  const filteredPriceFormatIds = useMemo(() => {
+    return filteredPriceFormats
+      .map((format) => Number(format.id))
+      .filter((id) => Number.isFinite(id));
+  }, [filteredPriceFormats]);
   const formTypeHelper = listTypeHelper(form.type);
   const openedValueUnit = listTypeUnit(opened?.type);
   const typeChangedWithItems = Boolean(editing && editing.itemsCount > 0 && listTypeCode(editing.type) !== listTypeCode(form.type));
@@ -181,6 +228,18 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
   };
 
   const openEditor = (row?: ListRow) => {
+    const rowFormatIds = row
+      ? (row.priceFormatIds?.length
+        ? row.priceFormatIds
+        : row.priceFormats
+            .map((format) => {
+              const explicitId = Number(format.id);
+              if (Number.isFinite(explicitId)) return explicitId;
+              const idByCode = Number(priceFormatByCode.get(format.code)?.id);
+              return Number.isFinite(idByCode) ? idByCode : null;
+            })
+            .filter((id): id is number => id !== null))
+      : (selectedFormatId ? [selectedFormatId] : []);
     setEditing(row || null);
     setForm({
       name: row?.name || '',
@@ -189,7 +248,7 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
       active: row?.active ?? true,
       startDate: row?.startDate || '',
       endDate: row?.endDate || '',
-      formatCodes: row?.priceFormats.map((format) => format.code) || (selectedFormatCode ? [selectedFormatCode] : []),
+      priceFormatIds: rowFormatIds,
     });
     setEditorOpen(true);
   };
@@ -204,7 +263,7 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
     const res = await fetch(url, {
       method: editing ? 'PATCH' : 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(form),
+      body: JSON.stringify({ ...form, priceFormatIds: form.priceFormatIds }),
     });
     const text = await res.text();
     const data = parseJson(text);
@@ -429,7 +488,7 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
                       <div className="muted">DB: {row.rawStatus || row.status || '—'}</div>
                     </td>
                     <td>{row.itemsCount}</td>
-                    <td>{formatScope(row)}</td>
+                    <td title={formatScopeTitle(row)}>{formatScope(row)}</td>
                     <td>{row.startDate || '—'}</td>
                     <td>{row.endDate || '—'}</td>
                     <td>{row.updatedAt || '—'}</td>
@@ -485,7 +544,7 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
                   </strong>
                 </div>
                 <div><span>Период</span><strong>{opened.startDate || '—'} — {opened.endDate || '—'}</strong></div>
-                <div><span>Привязка</span><strong>{formatScope(opened)}</strong></div>
+                <div><span>Привязка</span><strong title={formatScopeTitle(opened)}>{formatScope(opened)}</strong></div>
               </div>
               <div className="import-row">
                 <label className="file-button">
@@ -605,32 +664,76 @@ export function ListsManagementTab({ priceFormats = [], selectedFormatCode = '' 
           <div className="format-picker">
             <div className="format-picker-head">
               <strong>Привязанные ЦФ</strong>
-              <Button variant="ghost" size="sm" onClick={() => setForm((prev) => ({ ...prev, formatCodes: [] }))}>Глобально: все ЦФ</Button>
+              <span className="muted">Выбрано: {form.priceFormatIds.length}</span>
+              <Button variant="ghost" size="sm" onClick={() => setForm((prev) => ({ ...prev, priceFormatIds: [] }))}>Глобально: все ЦФ</Button>
             </div>
-            {!form.formatCodes.length ? (
+            {!form.priceFormatIds.length ? (
               <div className="business-alert warn">
                 Глобальный список применяется ко всем ЦФ. Для ограничения области выберите один или несколько ЦФ ниже.
               </div>
             ) : null}
+            <div className="business-filters format-picker-filters">
+              <Select value={formatBranchFilter} onValueChange={setFormatBranchFilter}>
+                <SelectTrigger><SelectValue placeholder="Филиал" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__all__">Все филиалы</SelectItem>
+                  {branchOptions.map((branch) => <SelectItem key={branch} value={branch}>{branch}</SelectItem>)}
+                </SelectContent>
+              </Select>
+              <div className="business-search">
+                <Search className="h-4 w-4" />
+                <Input placeholder="Поиск ЦФ" value={formatSearch} onChange={(e) => setFormatSearch(e.target.value)} />
+              </div>
+            </div>
+            <div className="format-picker-actions">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setForm((prev) => ({
+                  ...prev,
+                  priceFormatIds: Array.from(new Set([...prev.priceFormatIds, ...filteredPriceFormatIds])),
+                }))}
+                disabled={!filteredPriceFormatIds.length}
+              >
+                Выбрать в фильтре
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setForm((prev) => ({
+                  ...prev,
+                  priceFormatIds: prev.priceFormatIds.filter((id) => !filteredPriceFormatIds.includes(id)),
+                }))}
+                disabled={!filteredPriceFormatIds.length}
+              >
+                Снять в фильтре
+              </Button>
+            </div>
             <div className="format-chip-grid">
-              {priceFormats.map((format) => (
-                <label key={format.code} className={`format-chip ${selectedCodes.has(format.code) ? 'selected' : ''}`}>
-                  <input
-                    type="checkbox"
-                    checked={selectedCodes.has(format.code)}
-                    onChange={(e) => {
-                      setForm((prev) => ({
-                        ...prev,
-                        formatCodes: e.target.checked
-                          ? [...prev.formatCodes, format.code]
-                          : prev.formatCodes.filter((code) => code !== format.code),
-                      }));
-                    }}
-                  />
-                  <span>{format.code}</span>
-                  <small>{format.branch}</small>
-                </label>
-              ))}
+              {filteredPriceFormats.map((format) => {
+                const id = Number(format.id);
+                if (!Number.isFinite(id)) return null;
+                return (
+                  <label key={id} className={`format-chip ${selectedFormatIds.has(id) ? 'selected' : ''}`}>
+                    <input
+                      type="checkbox"
+                      checked={selectedFormatIds.has(id)}
+                      onChange={(e) => {
+                        setForm((prev) => ({
+                          ...prev,
+                          priceFormatIds: e.target.checked
+                            ? Array.from(new Set([...prev.priceFormatIds, id]))
+                            : prev.priceFormatIds.filter((priceFormatId) => priceFormatId !== id),
+                        }));
+                      }}
+                    />
+                    <span>{format.code}</span>
+                    <small>{format.branch || 'Без филиала'}</small>
+                    <em>{format.name}</em>
+                  </label>
+                );
+              })}
+              {!filteredPriceFormats.length ? <div className="empty-cell">ЦФ не найдены</div> : null}
             </div>
           </div>
           <div className="dialog-actions">

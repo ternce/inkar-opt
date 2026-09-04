@@ -2461,6 +2461,17 @@ td.sticky-action-column,
   justify-content: space-between;
 }
 
+.format-picker-filters {
+  grid-template-columns: minmax(180px, 240px) minmax(220px, 1fr);
+  margin: 0;
+}
+
+.format-picker-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .format-chip-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -2487,6 +2498,16 @@ td.sticky-action-column,
 .format-chip small {
   grid-column: 2;
   color: #64748b;
+}
+
+.format-chip em {
+  grid-column: 2;
+  overflow: hidden;
+  color: #334155;
+  font-size: 12px;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .dialog-actions {
