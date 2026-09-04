@@ -236,8 +236,9 @@ from .services.percentile_preparation import (
 )
 from .services.price_formats import (
     allocate_price_format_code,
+    cleanup_price_format_owned_rows,
     normalize_price_list_type,
-    price_format_dependency_counts,
+    price_format_business_dependency_counts,
 )
 from .services.competitor_source_config import (
     canonical_competitor_source_key,
@@ -2055,17 +2056,31 @@ def delete_price_format(
     if pf is None:
         raise HTTPException(status_code=404, detail="price format not found")
     _ensure_price_format_access(pf, current_user)
-    dependencies = price_format_dependency_counts(db, int(pf.id))
+    dependencies = price_format_business_dependency_counts(db, int(pf.id))
     if dependencies:
         raise HTTPException(
             status_code=409,
             detail={
-                "message": "price format is used and cannot be deleted",
+                "code": "price_format_in_use",
+                "message": "ЦФ нельзя удалить: по нему уже выполнялись расчёты.",
                 "dependencies": dependencies,
             },
         )
-    db.delete(pf)
-    db.commit()
+    try:
+        cleanup_price_format_owned_rows(db, int(pf.id))
+        db.delete(pf)
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        logger.exception("price format delete failed after dependency cleanup")
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "price_format_in_use",
+                "message": "ЦФ нельзя удалить: найдены связанные данные, которые нельзя удалить автоматически.",
+                "dependencies": {"integrity": 1},
+            },
+        ) from exc
     return {"status": "deleted", "code": format_code}
 
 

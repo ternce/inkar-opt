@@ -1,5 +1,5 @@
 import { type FormEvent, useEffect, useMemo, useState } from 'react';
-import { Toaster } from 'sonner';
+import { toast, Toaster } from 'sonner';
 import {
   BarChart3,
   BookOpen,
@@ -23,6 +23,7 @@ import {
   Users,
 } from 'lucide-react';
 import { Button } from './components/ui/button';
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from './components/ui/dialog';
 import { PriceListsTab } from './components/PriceListsTab';
 import { CompetitorAssignmentTab } from './components/CompetitorAssignmentTab';
 import { CompetitorsTab } from './components/CompetitorsTab';
@@ -357,6 +358,15 @@ export default function App() {
     });
   };
 
+  const handleFormatUpdated = async (updated: PriceFormat) => {
+    const items = await loadPriceFormats();
+    setPriceFormats(items);
+    setSelectedFormat((prev) => {
+      const next = items.find((item) => item.code === updated.code) || updated;
+      return prev?.code === updated.code ? next : prev;
+    });
+  };
+
   const handleLogin = async (username: string, password: string) => {
     const res = await fetch('/api/auth/login', {
       method: 'POST',
@@ -409,6 +419,7 @@ export default function App() {
             onFormatChange={setSelectedFormat}
             onFormatCreated={handleFormatCreated}
             onFormatDeleted={handleFormatDeleted}
+            onFormatUpdated={handleFormatUpdated}
             onFormatEdit={openPriceFormatEditor}
             onNavigate={openSection}
           />
@@ -650,6 +661,7 @@ function HomeDashboard({
   onFormatChange,
   onFormatCreated,
   onFormatDeleted,
+  onFormatUpdated,
   onFormatEdit,
   onNavigate,
 }: {
@@ -660,6 +672,7 @@ function HomeDashboard({
   onFormatChange: (format: PriceFormat) => void;
   onFormatCreated: (format: PriceFormat) => Promise<void>;
   onFormatDeleted: (code: string) => Promise<void>;
+  onFormatUpdated: (format: PriceFormat) => Promise<void>;
   onFormatEdit: (format: PriceFormat) => void;
   onNavigate: (section: NavigationKey) => void;
 }) {
@@ -676,6 +689,8 @@ function HomeDashboard({
   const [pricingRules, setPricingRules] = useState<any[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [editingFormat, setEditingFormat] = useState<PriceFormat | null>(null);
+  const [editingFormatName, setEditingFormatName] = useState('');
 
   const load = async () => {
     setIsLoading(true);
@@ -827,9 +842,83 @@ function HomeDashboard({
     }
   };
 
-  const editPriceFormat = (code: string) => {
+  const openBasicEditModal = (code: string) => {
+    const next = branchFormats.find((item) => item.code === code);
+    if (!next) return;
+    setEditingFormat(next);
+    setEditingFormatName(next.name || next.code);
+  };
+
+  const saveBasicEdit = async () => {
+    if (!editingFormat) return;
+    const nextName = editingFormatName.trim();
+    if (!nextName) {
+      setError('Название обязательно.');
+      return;
+    }
+    setIsLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/price-formats/${encodeURIComponent(editingFormat.code)}/settings`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: nextName,
+          code: editingFormat.code,
+          branch: editingFormat.branch,
+          priceListType: editingFormat.priceListType ?? undefined,
+          sapBranchCode: editingFormat.sapBranchCode ?? undefined,
+          sequenceNumber: editingFormat.sequenceNumber ?? undefined,
+        }),
+      });
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) throw new Error(data?.detail || text || 'Не удалось сохранить ЦФ');
+      const updated = { ...editingFormat, name: String(data?.name ?? nextName) };
+      await onFormatUpdated(updated);
+      setEditingFormat(null);
+      setEditingFormatName('');
+      await load();
+      toast.success('ЦФ сохранён.');
+    } catch (e: any) {
+      setError(e?.message || 'Ошибка сохранения ЦФ');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const openPriceFormatSettings = (code: string) => {
     const next = branchFormats.find((item) => item.code === code);
     if (next) onFormatEdit(next);
+  };
+
+  const dependencyLabels: Record<string, string> = {
+    price_lists: 'сформированные прайс-листы',
+    pricing_workflow_runs: 'история расчётов',
+    counterparty_price_formats: 'привязки контрагентов',
+    integrity: 'связанные данные',
+  };
+
+  const formatDeleteConflict = (detail: any, fallback: string) => {
+    const rawDependencies = detail?.dependencies;
+    const dependencies = rawDependencies && !Array.isArray(rawDependencies) && typeof rawDependencies === 'object'
+      ? Object.entries(rawDependencies)
+          .filter(([, value]) => Number(value) > 0)
+          .map(([key, value]) => `${dependencyLabels[key] || key}: ${value}`)
+          .join(', ')
+      : '';
+    const message = typeof detail?.message === 'string'
+      ? detail.message
+      : typeof detail === 'string'
+        ? detail
+        : fallback;
+    return dependencies ? `${message} ${dependencies}.` : message;
+  };
+
+  const closeBasicEditModal = (open: boolean) => {
+    if (open) return;
+    setEditingFormat(null);
+    setEditingFormatName('');
   };
 
   const deletePriceFormat = async (row: FormatDashboardRow) => {
@@ -842,16 +931,13 @@ function HomeDashboard({
       const text = await res.text();
       const data = parseJsonOrNull(text);
       if (!res.ok) {
-        const dependencies = Array.isArray(data?.detail?.dependencies)
-          ? data.detail.dependencies.map((item: any) => `${item.table}: ${item.count}`).join(', ')
-          : '';
-        const message = data?.detail?.message || data?.detail || text || 'Не удалось удалить ценовой формат';
-        throw new Error(dependencies ? `${message}: ${dependencies}` : message);
+        throw new Error(formatDeleteConflict(data?.detail, 'Не удалось удалить ЦФ'));
       }
       await onFormatDeleted(row.code);
       await load();
+      toast.success('ЦФ удалён.');
     } catch (e: any) {
-      setError(e?.message || 'Ошибка удаления ценового формата');
+      setError(e?.message || 'Ошибка удаления ЦФ');
     } finally {
       setIsLoading(false);
     }
@@ -982,8 +1068,11 @@ function HomeDashboard({
             row.user || '—',
             <span key={`${row.code}-data`} className={`status-pill ${freshnessClassName(row.dataStatus)}`}>{statusLabel(row.dataStatus)}</span>,
             <div key={`${row.code}-actions`} className="flex items-center gap-1">
-              <Button variant="ghost" size="sm" onClick={() => editPriceFormat(row.code)} title="Редактировать">
+              <Button variant="ghost" size="sm" onClick={() => openBasicEditModal(row.code)} title="Редактировать">
                 <Pencil className="h-4 w-4" />
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => openPriceFormatSettings(row.code)} title="Открыть паспорт">
+                <Settings className="h-4 w-4" />
               </Button>
               <Button variant="ghost" size="sm" onClick={() => void deletePriceFormat(row)} title="Удалить" className="text-red-600 hover:text-red-700">
                 <Trash2 className="h-4 w-4" />
@@ -1080,6 +1169,39 @@ function HomeDashboard({
           ])}
         />
       </section>
+
+      <Dialog open={Boolean(editingFormat)} onOpenChange={closeBasicEditModal}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Редактирование ЦФ</DialogTitle>
+          </DialogHeader>
+          {editingFormat ? (
+            <div className="space-y-4">
+              <label className="block">
+                <span className="text-xs font-medium text-gray-500">Название</span>
+                <input
+                  className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm"
+                  value={editingFormatName}
+                  onChange={(event) => setEditingFormatName(event.target.value)}
+                />
+              </label>
+              <div className="grid grid-cols-1 gap-3 text-sm sm:grid-cols-2">
+                <div><span className="text-gray-500">Код</span><div className="font-medium">{editingFormat.code}</div></div>
+                <div><span className="text-gray-500">Тип</span><div className="font-medium">{editingFormat.priceListType || '—'}</div></div>
+                <div><span className="text-gray-500">Филиал</span><div className="font-medium">{editingFormat.branch || '—'}</div></div>
+                <div><span className="text-gray-500">SAP-код</span><div className="font-medium">{editingFormat.sapBranchCode || '—'}</div></div>
+                <div><span className="text-gray-500">Номер</span><div className="font-medium">{editingFormat.sequenceNumber ?? '—'}</div></div>
+              </div>
+            </div>
+          ) : null}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => closeBasicEditModal(false)}>Отмена</Button>
+            <Button onClick={() => void saveBasicEdit()} disabled={isLoading || !editingFormatName.trim()} className="bg-blue-600 hover:bg-blue-700">
+              Сохранить
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

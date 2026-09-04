@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import delete, func, or_, select, text, update
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -225,25 +225,41 @@ def allocate_price_format_code(db: Session, *, branch: str, price_list_type: obj
     raise ValueError("Could not allocate a unique price format code")
 
 
-PRICE_FORMAT_DEPENDENCIES: tuple[tuple[str, object], ...] = (
+PRICE_FORMAT_BUSINESS_DEPENDENCIES: tuple[tuple[str, object], ...] = (
     ("price_lists", PriceList),
     ("pricing_workflow_runs", PricingWorkflowRun),
-    ("competitors_prices", CompetitorPrice),
-    ("competitor_price_lists", CompetitorPriceList),
-    ("price_format_competitor_assignments", PriceFormatCompetitorAssignment),
-    ("vidman_logical_competitors", VidmanLogicalCompetitor),
-    ("competitor_price_percentiles", CompetitorPricePercentile),
-    ("competitor_price_percentile_source_summaries", CompetitorPricePercentileSourceSummary),
-    ("jobs", Job),
-    ("price_format_percentile_preparations", PriceFormatPercentilePreparation),
+    ("counterparty_price_formats", CounterpartyPriceFormat),
+)
+
+PRICE_FORMAT_OWNED_CONFIGURATION_DEPENDENCIES: tuple[tuple[str, object], ...] = (
     ("markup_ranges", MarkupRange),
     ("bend_ranges", BendRange),
     ("no_competitor_markup_ranges", NoCompetitorMarkupRange),
+    ("price_format_competitor_assignments", PriceFormatCompetitorAssignment),
+    ("vidman_logical_competitors", VidmanLogicalCompetitor),
     ("provisor_goods_map", ProvisorGoodsMap),
     ("source_goods_matches", SourceGoodsMatch),
     ("universal_lists", UniversalList),
     ("universal_list_price_formats", UniversalListPriceFormat),
-    ("counterparty_price_formats", CounterpartyPriceFormat),
+)
+
+PRICE_FORMAT_TECHNICAL_DEPENDENCIES: tuple[tuple[str, object], ...] = (
+    ("competitors_prices", CompetitorPrice),
+    ("competitor_price_percentiles", CompetitorPricePercentile),
+    ("competitor_price_percentile_source_summaries", CompetitorPricePercentileSourceSummary),
+    ("jobs", Job),
+    ("price_format_percentile_preparations", PriceFormatPercentilePreparation),
+)
+
+PRICE_FORMAT_COMPETITOR_SOURCE_DEPENDENCIES: tuple[tuple[str, object], ...] = (
+    ("competitor_price_lists", CompetitorPriceList),
+)
+
+PRICE_FORMAT_DEPENDENCIES: tuple[tuple[str, object], ...] = (
+    PRICE_FORMAT_BUSINESS_DEPENDENCIES
+    + PRICE_FORMAT_COMPETITOR_SOURCE_DEPENDENCIES
+    + PRICE_FORMAT_OWNED_CONFIGURATION_DEPENDENCIES
+    + PRICE_FORMAT_TECHNICAL_DEPENDENCIES
 )
 
 
@@ -261,3 +277,75 @@ def price_format_dependency_counts(db: Session, price_format_id: int) -> list[di
         if count:
             dependencies.append({"table": table_name, "count": count})
     return dependencies
+
+
+def price_format_business_dependency_counts(db: Session, price_format_id: int) -> dict[str, int]:
+    dependencies: dict[str, int] = {}
+    for table_name, model in PRICE_FORMAT_BUSINESS_DEPENDENCIES:
+        count = int(
+            db.scalar(
+                select(func.count())
+                .select_from(model)
+                .where(model.price_format_id == price_format_id)
+            )
+            or 0
+        )
+        if count:
+            dependencies[table_name] = count
+    return dependencies
+
+
+def cleanup_price_format_owned_rows(db: Session, price_format_id: int) -> dict[str, int]:
+    """Remove rows whose lifecycle belongs to the price format.
+
+    Competitor price lists are intentionally preserved: they contain imported
+    source data and may be reused globally. Only the legacy owner link is
+    cleared.
+    """
+
+    deleted: dict[str, int] = {}
+
+    delete_models: tuple[tuple[str, object], ...] = (
+        ("competitor_price_percentile_source_summaries", CompetitorPricePercentileSourceSummary),
+        ("competitor_price_percentiles", CompetitorPricePercentile),
+        ("competitors_prices", CompetitorPrice),
+        ("jobs", Job),
+        ("price_format_percentile_preparations", PriceFormatPercentilePreparation),
+        ("markup_ranges", MarkupRange),
+        ("bend_ranges", BendRange),
+        ("no_competitor_markup_ranges", NoCompetitorMarkupRange),
+        ("price_format_competitor_assignments", PriceFormatCompetitorAssignment),
+        ("provisor_goods_map", ProvisorGoodsMap),
+        ("source_goods_matches", SourceGoodsMatch),
+        ("universal_list_price_formats", UniversalListPriceFormat),
+    )
+    for table_name, model in delete_models:
+        result = db.execute(delete(model).where(model.price_format_id == price_format_id))
+        if result.rowcount:
+            deleted[table_name] = int(result.rowcount)
+
+    result = db.execute(
+        update(UniversalList)
+        .where(UniversalList.price_format_id == price_format_id)
+        .values(price_format_id=None)
+    )
+    if result.rowcount:
+        deleted["universal_lists_unlinked"] = int(result.rowcount)
+
+    result = db.execute(
+        update(VidmanLogicalCompetitor)
+        .where(VidmanLogicalCompetitor.price_format_id == price_format_id)
+        .values(price_format_id=None)
+    )
+    if result.rowcount:
+        deleted["vidman_logical_competitors_unlinked"] = int(result.rowcount)
+
+    result = db.execute(
+        update(CompetitorPriceList)
+        .where(CompetitorPriceList.price_format_id == price_format_id)
+        .values(price_format_id=None, is_selected=False)
+    )
+    if result.rowcount:
+        deleted["competitor_price_lists_unlinked"] = int(result.rowcount)
+
+    return deleted

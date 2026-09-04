@@ -309,7 +309,7 @@ class CompetitorPriceList(Base):
     # Legacy owner from the old format-centric architecture. Competitor price
     # lists are now treated as a global pool; per-format usage lives in
     # PriceFormatCompetitorAssignment below.
-    price_format_id: Mapped[int] = mapped_column(ForeignKey("price_formats.id"), index=True)
+    price_format_id: Mapped[int | None] = mapped_column(ForeignKey("price_formats.id"), nullable=True, index=True)
 
     source_type: Mapped[str] = mapped_column(String(64), index=True)  # provisor|phcenter|vidman|manual
     source_key: Mapped[str] = mapped_column(Text, index=True)

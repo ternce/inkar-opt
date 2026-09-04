@@ -153,6 +153,7 @@ def init_db() -> None:
         _require_production_auth_schema_ready()
     Base.metadata.create_all(bind=engine)
     _ensure_compatible_columns()
+    _ensure_competitor_price_lists_global_owner_nullable()
     _ensure_price_format_sequence_index()
     _ensure_default_price_format_sap_mappings()
     _ensure_compatible_column_types()
@@ -178,6 +179,70 @@ def _bootstrap_competitor_gap_defaults() -> None:
     except Exception:
         logger.exception("Failed to bootstrap competitor gap threshold defaults")
         raise
+
+
+def _ensure_competitor_price_lists_global_owner_nullable() -> None:
+    inspector = inspect(engine)
+    if not inspector.has_table("competitor_price_lists"):
+        return
+    columns = inspector.get_columns("competitor_price_lists")
+    price_format_column = next((col for col in columns if col["name"] == "price_format_id"), None)
+    if price_format_column is None or price_format_column.get("nullable", True):
+        return
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE competitor_price_lists ALTER COLUMN price_format_id DROP NOT NULL"))
+        return
+    if engine.dialect.name != "sqlite":
+        return
+
+    temp_table = "competitor_price_lists__nonnull_backup"
+    column_names = [str(col["name"]) for col in columns]
+    quoted_columns = ", ".join(f'"{name}"' for name in column_names)
+    with engine.begin() as conn:
+        conn.execute(text("PRAGMA foreign_keys=OFF"))
+        conn.execute(text(f"DROP TABLE IF EXISTS {temp_table}"))
+        conn.execute(text(f"ALTER TABLE competitor_price_lists RENAME TO {temp_table}"))
+        conn.execute(
+            text(
+                """
+                CREATE TABLE competitor_price_lists (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    price_format_id INTEGER REFERENCES price_formats (id),
+                    source_type VARCHAR(64) NOT NULL,
+                    source_key TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    supplier TEXT NOT NULL,
+                    region TEXT NOT NULL,
+                    branch_id TEXT DEFAULT '',
+                    branch_code TEXT DEFAULT '',
+                    branch_name TEXT DEFAULT 'Без филиала',
+                    competitor_name TEXT DEFAULT '',
+                    account_id TEXT DEFAULT '',
+                    account_login TEXT DEFAULT '',
+                    external_price_list_id TEXT DEFAULT '',
+                    sync_batch_id VARCHAR(64) DEFAULT '',
+                    source_updated_at TEXT DEFAULT '',
+                    last_checked_at DATETIME,
+                    last_success_at DATETIME,
+                    last_refresh_status VARCHAR(64) DEFAULT '',
+                    last_refresh_message TEXT DEFAULT '',
+                    price_date DATE,
+                    coefficient NUMERIC(18, 6) NOT NULL,
+                    price_coefficient NUMERIC(18, 6) DEFAULT 1.0,
+                    is_selected BOOLEAN NOT NULL,
+                    items_count INTEGER DEFAULT 0,
+                    matched_positive_items_count INTEGER DEFAULT 0,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    CONSTRAINT uq_competitor_price_list_source UNIQUE (price_format_id, source_type, source_key)
+                )
+                """
+            )
+        )
+        conn.execute(text(f"INSERT INTO competitor_price_lists ({quoted_columns}) SELECT {quoted_columns} FROM {temp_table}"))
+        conn.execute(text(f"DROP TABLE {temp_table}"))
+        conn.execute(text("PRAGMA foreign_keys=ON"))
 
 
 def _ensure_compatible_columns() -> None:

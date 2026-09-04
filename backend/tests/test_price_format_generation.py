@@ -12,12 +12,29 @@ from backend.app import main
 from backend.app.db import Base
 from backend.app.deps import ROLE_ADMIN
 from backend.app.models import (
+    BendRange,
     BranchSapMapping,
     CalculatedPrice,
+    CompetitorPrice,
+    CompetitorPriceList,
+    CompetitorPriceListItem,
+    CompetitorPricePercentile,
+    CompetitorPricePercentileSourceSummary,
+    Job,
+    MarkupRange,
+    NoCompetitorMarkupRange,
     PriceFormat,
     PriceFormatBranchCounter,
+    PriceFormatCompetitorAssignment,
+    PriceFormatPercentilePreparation,
     PriceList,
+    PricingContext,
+    PricingWorkflowRun,
     Product,
+    ProvisorGoodsMap,
+    SourceGoodsMatch,
+    UniversalList,
+    UniversalListPriceFormat,
 )
 from backend.app.services.price_formats import (
     allocate_price_format_code,
@@ -318,7 +335,157 @@ def test_delete_unused_format_and_reject_used_format(monkeypatch):
     assert deleted.status_code == 200, deleted.text
     assert Session().scalar(select(PriceFormat.id).where(PriceFormat.code == "UNUSED")) is None
     assert blocked.status_code == 409
-    assert blocked.json()["detail"]["dependencies"] == [{"table": "price_lists", "count": 1}]
+    assert blocked.json()["detail"]["code"] == "price_format_in_use"
+    assert blocked.json()["detail"]["dependencies"] == {"price_lists": 1}
+
+
+def test_delete_format_cleans_owned_configuration_and_technical_state(monkeypatch):
+    Session = _session_factory()
+    db = Session()
+    pf = PriceFormat(code="CONFIG-ONLY", name="Config only", branch=ALMATY)
+    db.add(pf)
+    db.flush()
+    db.add_all(
+        [
+            *(MarkupRange(price_format_id=pf.id, cost_from=i * 10, cost_to=(i + 1) * 10, markup_percent=0.1) for i in range(5)),
+            *(BendRange(price_format_id=pf.id, price_from=i * 100, bend_percent=0.3) for i in range(6)),
+            NoCompetitorMarkupRange(price_format_id=pf.id, cost_from=0, cost_to=None, markup_percent=0.2),
+            PriceFormatPercentilePreparation(price_format_id=pf.id, status="ready"),
+            CompetitorPrice(price_format_id=pf.id, product_id=None, source_name="provisor:1", supplier="Config", source_price=None),
+            CompetitorPricePercentile(
+                price_format_id=pf.id,
+                product_id=1,
+                source_type="provisor",
+                source_key="provisor:1",
+                branch_name="Almaty",
+                competitor_name="A",
+                percentile_scope="regional",
+                percentile=10,
+                value=12,
+            ),
+            CompetitorPricePercentileSourceSummary(
+                price_format_id=pf.id,
+                source_type="provisor",
+                source_key="provisor:1",
+                branch_name="Almaty",
+                competitor_name="A",
+                percentile_scope="regional",
+                percentile=10,
+            ),
+            Job(id="job-config-only", type="percentile_preparation", status="finished", format_code=pf.code, price_format_id=pf.id),
+            ProvisorGoodsMap(price_format_id=pf.id, goods_id=10, product_id=1),
+            SourceGoodsMatch(price_format_id=pf.id, source_type="provisor", distributor_goods_id="SKU-1", product_id=1),
+        ]
+    )
+    universal = UniversalList(name="Scoped list", type="max_markup", price_format_id=pf.id)
+    db.add(universal)
+    db.flush()
+    db.add(UniversalListPriceFormat(universal_list_id=universal.id, price_format_id=pf.id))
+    db.commit()
+
+    client = _client(Session, monkeypatch)
+    try:
+        response = client.delete("/api/price-formats/CONFIG-ONLY")
+    finally:
+        main.app.dependency_overrides.clear()
+
+    check = Session()
+    assert response.status_code == 200, response.text
+    assert check.scalar(select(PriceFormat.id).where(PriceFormat.code == "CONFIG-ONLY")) is None
+    assert check.query(MarkupRange).count() == 0
+    assert check.query(BendRange).count() == 0
+    assert check.query(NoCompetitorMarkupRange).count() == 0
+    assert check.query(PriceFormatPercentilePreparation).count() == 0
+    assert check.query(CompetitorPricePercentile).count() == 0
+    assert check.query(CompetitorPricePercentileSourceSummary).count() == 0
+    assert check.query(UniversalListPriceFormat).count() == 0
+    assert check.query(ProvisorGoodsMap).count() == 0
+    assert check.query(SourceGoodsMatch).count() == 0
+    assert check.scalar(select(UniversalList.price_format_id).where(UniversalList.id == universal.id)) is None
+
+
+def test_delete_format_preserves_competitor_price_lists_and_items_by_unlinking(monkeypatch):
+    Session = _session_factory()
+    db = Session()
+    pf = PriceFormat(code="WITH-PLK", name="With PLK", branch=ALMATY)
+    db.add(pf)
+    db.flush()
+    price_list = CompetitorPriceList(
+        price_format_id=pf.id,
+        source_type="provisor",
+        source_key="account:101",
+        display_name="Amanat",
+        supplier="Amanat",
+        region=ALMATY,
+        competitor_name="Amanat",
+        items_count=1,
+        is_selected=True,
+    )
+    db.add(price_list)
+    db.flush()
+    db.add_all(
+        [
+            PriceFormatCompetitorAssignment(price_format_id=pf.id, competitor_price_list_id=price_list.id, is_active=True),
+            CompetitorPriceListItem(price_list_id=price_list.id, name="Item", distributor_goods_id="D-1", distributor_price=100),
+        ]
+    )
+    db.commit()
+
+    client = _client(Session, monkeypatch)
+    try:
+        response = client.delete("/api/price-formats/WITH-PLK")
+    finally:
+        main.app.dependency_overrides.clear()
+
+    check = Session()
+    kept_list = check.get(CompetitorPriceList, price_list.id)
+    assert response.status_code == 200, response.text
+    assert check.scalar(select(PriceFormat.id).where(PriceFormat.code == "WITH-PLK")) is None
+    assert kept_list is not None
+    assert kept_list.price_format_id is None
+    assert kept_list.is_selected is False
+    assert check.query(CompetitorPriceListItem).count() == 1
+    assert check.query(PriceFormatCompetitorAssignment).count() == 0
+
+
+def test_delete_format_rejects_workflow_history(monkeypatch):
+    Session = _session_factory()
+    db = Session()
+    pf = PriceFormat(code="RUN-HISTORY", name="Run history", branch=ALMATY)
+    context = PricingContext(branch_id="1001", region=ALMATY, sales_channel="retail", name="Retail")
+    db.add_all([pf, context])
+    db.flush()
+    db.add(PricingWorkflowRun(pricing_context_id=context.id, price_format_id=pf.id, status="finished"))
+    db.commit()
+
+    client = _client(Session, monkeypatch)
+    try:
+        response = client.delete("/api/price-formats/RUN-HISTORY")
+    finally:
+        main.app.dependency_overrides.clear()
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["dependencies"] == {"pricing_workflow_runs": 1}
+
+
+def test_delete_does_not_reuse_generated_sequence(monkeypatch):
+    Session = _session_factory()
+    db = Session()
+    seed_default_sap_branch_mappings(db)
+    first = allocate_price_format_code(db, branch=ALMATY, price_list_type=IPL)
+    db.add(PriceFormat(code=first.code, name="First", branch=ALMATY, price_list_type=first.price_list_type, sap_branch_code=first.sap_branch_code, sequence_number=first.sequence_number))
+    db.commit()
+
+    client = _client(Session, monkeypatch)
+    try:
+        deleted = client.delete(f"/api/price-formats/{first.code}")
+    finally:
+        main.app.dependency_overrides.clear()
+
+    db = Session()
+    second = allocate_price_format_code(db, branch=ALMATY, price_list_type=IPL)
+    assert deleted.status_code == 200, deleted.text
+    assert second.sequence_number == first.sequence_number + 1
 
 
 def test_legacy_price_format_keeps_null_metadata(monkeypatch):
