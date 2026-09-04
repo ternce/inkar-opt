@@ -20,7 +20,12 @@ from backend.app.models import (
     ProductExtra,
 )
 from backend.app.main import create_competitor_code_mapping, unmap_competitor_code_mapping
-from backend.app.services.competitors.code_mappings import list_catalog_code_mappings, source_match_key
+from backend.app.services.competitors.code_mappings import (
+    auto_match_product_catalog_code_mappings,
+    list_catalog_code_mappings,
+    list_product_catalog_code_mappings,
+    source_match_key,
+)
 
 
 def _session() -> Session:
@@ -618,6 +623,196 @@ def test_mapping_save_uses_selected_product_and_row_disappears_from_unmapped_lis
     assert after["pagination"]["total"] == 0
 
     unmap_competitor_code_mapping(saved["id"], db, _admin())
+
+
+def test_product_catalog_returns_product_rows_and_existing_mappings():
+    db = _session()
+    product = _product(db, "SKU-1", "Aspirin tab 500 mg N10", "Bayer")
+    other = _product(db, "SKU-2", "Paracetamol tab 200 mg N20", "Other")
+    db.add(
+        CompetitorCodeMapping(
+            platform="provisor",
+            source_external_key="84721",
+            source_match_key=source_match_key(platform="provisor", source_external_key=84721),
+            source_name="Aspirin tab 500 mg N10",
+            source_manufacturer="Bayer",
+            status="mapped",
+            our_product_id=product.id,
+            our_sku=product.code,
+        )
+    )
+    db.commit()
+
+    result = list_product_catalog_code_mappings(db=db, platform="all", status="all", page=1, limit=50, include_candidates=False)
+
+    assert result["pagination"]["total"] == 2
+    rows = {row["sku"]: row for row in result["items"]}
+    assert rows["SKU-1"]["productId"] == product.id
+    assert rows["SKU-1"]["status"] == "mapped"
+    assert rows["SKU-1"]["mappingCount"] == 1
+    assert rows["SKU-1"]["mappings"][0]["externalId"] == "84721"
+    assert rows["SKU-2"]["productId"] == other.id
+    assert rows["SKU-2"]["status"] == "unmapped"
+    assert result["metrics"][0]["total"] == 2
+    assert result["metrics"][0]["mapped"] == 1
+
+
+def test_product_catalog_supports_multiple_external_mappings_per_product():
+    db = _session()
+    product = _product(db, "SKU-MULTI", "Nurofen 200 mg N20", "Reckitt")
+    db.add_all(
+        [
+            CompetitorCodeMapping(
+                platform="provisor",
+                source_external_key="84721",
+                source_match_key=source_match_key(platform="provisor", source_external_key=84721),
+                source_name="Nurofen 200 mg N20",
+                status="mapped",
+                our_product_id=product.id,
+                our_sku=product.code,
+            ),
+            CompetitorCodeMapping(
+                platform="provisor",
+                source_external_key="91234",
+                source_match_key=source_match_key(platform="provisor", source_external_key=91234),
+                source_name="Nurofen tab 200 mg N20",
+                status="mapped",
+                our_product_id=product.id,
+                our_sku=product.code,
+            ),
+            CompetitorCodeMapping(
+                platform="vidman",
+                source_external_key="1106:44556",
+                source_match_key=source_match_key(platform="vidman", source_external_key="1106:44556"),
+                source_name="Nurofen 200 mg N20",
+                status="mapped",
+                our_product_id=product.id,
+                our_sku=product.code,
+            ),
+        ]
+    )
+    db.commit()
+
+    row = list_product_catalog_code_mappings(db=db, platform="all", include_candidates=False)["items"][0]
+
+    assert row["sku"] == "SKU-MULTI"
+    assert row["mappingCount"] == 3
+    assert [item["externalId"] for item in row["mappings"]] == ["84721", "91234", "1106:44556"]
+
+
+def test_product_catalog_searches_internal_and_external_fields():
+    db = _session()
+    product = _product(db, "SKU-SEARCH", "Citramon forte N20", "Pharm")
+    _product(db, "SKU-OTHER", "Ibuprofen N10", "Other")
+    db.add(
+        CompetitorCodeMapping(
+            platform="provisor",
+            source_external_key="95822",
+            source_match_key=source_match_key(platform="provisor", source_external_key=95822),
+            source_name="External Citramon",
+            status="mapped",
+            our_product_id=product.id,
+            our_sku=product.code,
+        )
+    )
+    db.commit()
+
+    by_sku = list_product_catalog_code_mappings(db=db, q="SKU-SEARCH", include_candidates=False)
+    by_name = list_product_catalog_code_mappings(db=db, q="Citramon", include_candidates=False)
+    by_external = list_product_catalog_code_mappings(db=db, q="95822", include_candidates=False)
+
+    assert [row["sku"] for row in by_sku["items"]] == ["SKU-SEARCH"]
+    assert [row["sku"] for row in by_name["items"]] == ["SKU-SEARCH"]
+    assert [row["sku"] for row in by_external["items"]] == ["SKU-SEARCH"]
+
+
+def test_product_catalog_candidates_treat_manufacturer_as_soft_and_critical_fields_as_hard():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="candidates", price_date=date(2026, 1, 1))
+    product = _product(db, "ASP-500", "Aspirin tab 500 mg N10", "Polpharma")
+    _item(db, price_list, 1001, name="Aspirin tab 500 mg N10", manufacturer="Bayer")
+    _item(db, price_list, 1002, name="Aspirin tab 200 mg N10", manufacturer="Polpharma")
+    _item(db, price_list, 1003, name="Aspirin caps 500 mg N10", manufacturer="Polpharma")
+    _item(db, price_list, 1004, name="Aspirin tab 500 mg N20", manufacturer="Polpharma")
+    _item(db, price_list, 1005, name="Aspirin tab 500 mg N10 200 ml", manufacturer="Polpharma")
+    db.commit()
+
+    row = list_product_catalog_code_mappings(db=db, platform="provisor", q=product.code, status="review", include_candidates=True)["items"][0]
+
+    assert row["status"] == "review"
+    assert [candidate["sourceExternalKey"] for candidate in row["reviewCandidates"]] == ["1001"]
+    assert row["reviewCandidates"][0]["manufacturerMismatch"] is True
+
+
+def test_product_catalog_auto_match_creates_global_mapping_for_exact_candidate():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="auto-product", price_date=date(2026, 1, 1))
+    product = _product(db, "AUTO-1", "Aspirin tab 500 mg N10", "Bayer")
+    source = _item(db, price_list, 7777, name="Aspirin tab 500 mg N10", manufacturer="Bayer")
+    db.commit()
+
+    result = auto_match_product_catalog_code_mappings(db=db, platform="provisor", limit=10, created_by="test")
+
+    assert result["createdMappings"] == 1
+    mapping = db.query(CompetitorCodeMapping).filter_by(source_match_key=source_match_key(platform="provisor", source_external_key=7777)).one()
+    db.refresh(source)
+    assert mapping.our_product_id == product.id
+    assert mapping.status == "mapped"
+    assert source.product_id == product.id
+    assert source.match_type == "manual_code_mapping"
+
+
+def test_manual_confirm_reuses_global_source_key_and_reject_is_source_specific():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="manual", price_date=date(2026, 1, 1))
+    product = _product(db, "MANUAL-1", "Ibuprofen tab 200 mg N20", "A")
+    other = _product(db, "MANUAL-2", "Ibuprofen tab 200 mg N20", "A")
+    source = _item(db, price_list, 8888, name="Ibuprofen tab 200 mg N20", manufacturer="A")
+    rejected_source = _item(db, price_list, 9999, name="Ibuprofen tab 200 mg N10", manufacturer="A")
+    db.commit()
+
+    first = create_competitor_code_mapping(
+        {
+            "platform": "provisor",
+            "status": "mapped",
+            "itemId": source.id,
+            "sourceMatchKey": source_match_key(platform="provisor", source_external_key=8888),
+            "ourProductId": product.id,
+        },
+        db,
+        _admin(),
+    )
+    second = create_competitor_code_mapping(
+        {
+            "platform": "provisor",
+            "status": "mapped",
+            "itemId": source.id,
+            "sourceMatchKey": source_match_key(platform="provisor", source_external_key=8888),
+            "ourProductId": other.id,
+        },
+        db,
+        _admin(),
+    )
+    rejected = create_competitor_code_mapping(
+        {
+            "platform": "provisor",
+            "status": "rejected",
+            "itemId": rejected_source.id,
+            "sourceMatchKey": source_match_key(platform="provisor", source_external_key=9999),
+        },
+        db,
+        _admin(),
+    )
+
+    assert first["id"] == second["id"]
+    assert second["ourProductId"] == other.id
+    assert db.query(CompetitorCodeMapping).filter_by(source_match_key=source_match_key(platform="provisor", source_external_key=8888)).count() == 1
+    assert rejected["status"] == "rejected"
+    assert rejected["sourceMatchKey"] == source_match_key(platform="provisor", source_external_key=9999)
+    assert not hasattr(db.query(CompetitorCodeMapping).first(), "price_format_id")
 
 
 def test_mapping_catalog_requires_auth_and_write_requires_write_role():

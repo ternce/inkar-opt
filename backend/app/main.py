@@ -254,9 +254,11 @@ from .services.competitors.mappings.read_models import (
 )
 from .services.competitors.code_mappings import (
     apply_mapping_to_matching_items,
+    auto_match_product_catalog_code_mappings,
     find_products_for_mapping,
     list_catalog_code_mappings,
     list_code_mappings,
+    list_product_catalog_code_mappings,
     mapping_source_payload,
     mapping_to_dict,
     platform_from_value,
@@ -6278,6 +6280,50 @@ def get_competitor_code_mappings_catalog_view(
         limit=limit,
         include_candidates=include_candidates,
     )
+
+
+@app.get("/api/competitors/code-mappings/product-catalog")
+def get_competitor_code_mappings_product_catalog(
+    platform: str = Query("all"),
+    source: str | None = Query(None),
+    status: str = Query("all"),
+    q: str = Query(""),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=200),
+    include_candidates: bool = Query(True),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    _ = current_user
+    try:
+        return list_product_catalog_code_mappings(
+            db=db,
+            platform=source or platform,
+            q=q,
+            status=status,
+            page=page,
+            limit=limit,
+            include_candidates=include_candidates,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/competitors/code-mappings/product-catalog/auto-match")
+def post_competitor_code_mappings_product_catalog_auto_match(
+    payload: dict = Body(default={}),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+):
+    try:
+        return auto_match_product_catalog_code_mappings(
+            db=db,
+            platform=payload.get("source") or payload.get("platform") or "all",
+            limit=int(payload.get("limit") or 100),
+            created_by=current_user.username or "",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/api/products/search")

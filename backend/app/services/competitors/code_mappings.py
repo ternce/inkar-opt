@@ -20,6 +20,7 @@ from ..competitor_assignments import get_assigned_competitor_price_lists
 from ..competitor_read_models import refresh_price_list_item_counters
 
 SUPPORTED_PLATFORMS = {"provisor", "vidman"}
+PRODUCT_CATALOG_CANDIDATE_LIMIT = 5
 MANUAL_SUGGESTION_MIN_SCORE = 55.0
 MANUAL_CANDIDATE_POOL_LIMIT = 250
 MANUAL_CANDIDATE_LIMIT = 10
@@ -1415,6 +1416,380 @@ def list_catalog_code_mappings(
             "pageCount": page_count,
         },
     }
+
+
+def _product_catalog_platforms(platform: str) -> list[str]:
+    value = str(platform or "all").strip().lower()
+    if value in {"", "all", "__all__"}:
+        return sorted(SUPPORTED_PLATFORMS)
+    return [platform_from_value(value)]
+
+
+def _product_catalog_mapping_payload(row: CompetitorCodeMapping) -> dict:
+    external = str(row.source_external_key or "")
+    return {
+        "id": int(row.id),
+        "mappingId": int(row.id),
+        "platform": row.platform,
+        "sourceKey": row.source_match_key,
+        "sourceMatchKey": row.source_match_key,
+        "externalId": external,
+        "sourceExternalKey": external,
+        "externalName": row.source_name,
+        "sourceName": row.source_name,
+        "externalManufacturer": row.source_manufacturer,
+        "sourceManufacturer": row.source_manufacturer,
+        "status": row.status,
+        "confidence": float(row.confidence) if row.confidence is not None else None,
+    }
+
+
+def _product_catalog_candidate_explanation(candidate: dict) -> list[dict]:
+    details = candidate.get("manualSuggestion") if isinstance(candidate.get("manualSuggestion"), dict) else {}
+    items = [
+        {"label": "Название", "status": "match", "message": f"Совпадение {float(candidate.get('confidence') or 0):.0f}%"},
+    ]
+    if details.get("dosageMatch"):
+        items.append({"label": "Дозировка", "status": "match", "message": "Критические значения совместимы"})
+    if details.get("formMatch") is True:
+        items.append({"label": "Форма", "status": "match", "message": "Форма совместима"})
+    if details.get("quantityMatch") is True:
+        items.append({"label": "Количество", "status": "match", "message": "Количество совпадает"})
+    if candidate.get("manufacturerMismatch"):
+        items.append({"label": "Производитель", "status": "warning", "message": "Производитель отличается"})
+    elif candidate.get("sourceManufacturer") or candidate.get("ourManufacturer") or candidate.get("internalManufacturer"):
+        items.append({"label": "Производитель", "status": "match", "message": "Производитель совместим или не критичен"})
+    return items
+
+
+def _product_catalog_candidate_payload(product: Product, extra: ProductExtra | None, source: dict, level: tuple[str, bool, float, dict]) -> dict:
+    match_level, manufacturer_mismatch, confidence, score_details = level
+    payload = {
+        **source,
+        "productId": int(product.id),
+        "ourProductId": int(product.id),
+        "ourSku": product.code,
+        "ourName": product.name,
+        "ourManufacturer": (extra.manufacturer if extra else "") or "",
+        "internalManufacturer": (extra.manufacturer if extra else "") or "",
+        "confidence": confidence,
+        "matchType": "auto_match_candidate" if match_level == "exact" and confidence >= 99 else "manual_review_candidate",
+        "matchLevel": match_level,
+        "classification": "auto_match" if match_level == "exact" and confidence >= 99 else "manual_review",
+        "manufacturerMismatch": manufacturer_mismatch,
+        "manualSuggestion": score_details,
+    }
+    payload["explanation"] = _product_catalog_candidate_explanation(payload)
+    return payload
+
+
+def _product_catalog_source_candidates_for_products(
+    db: Session,
+    *,
+    products: list[tuple[Product, ProductExtra | None]],
+    platforms: list[str],
+    limit_per_product: int = PRODUCT_CATALOG_CANDIDATE_LIMIT,
+) -> dict[int, list[dict]]:
+    from ..competitor_matching import parse_drug_structure
+
+    if not products:
+        return {}
+
+    token_by_product: dict[int, str] = {}
+    tokens: list[str] = []
+    for product, _extra in products:
+        normalized_name = normalize_mapping_text(product.name)
+        structure = parse_drug_structure(product.name)
+        base_name = structure.base_name or normalize_mapping_text(product.name)
+        token = base_name.split(" ", 1)[0] if base_name else ""
+        raw_normalized_token = normalized_name.split(" ", 1)[0] if normalized_name else ""
+        raw_token = str(product.name or "").split(" ", 1)[0].strip()
+        if token and raw_normalized_token and token not in normalized_name:
+            token = raw_normalized_token
+        if len(token) < 3 or token.isdigit():
+            continue
+        token_by_product[int(product.id)] = token
+        if token not in tokens:
+            tokens.append(token)
+        if raw_normalized_token and raw_normalized_token not in tokens:
+            tokens.append(raw_normalized_token)
+        if raw_token and raw_token not in tokens:
+            tokens.append(raw_token)
+    if not tokens:
+        return {int(product.id): [] for product, _extra in products}
+
+    token_filter = None
+    for token in tokens[:50]:
+        condition = CompetitorPriceListItem.name.ilike(f"%{token}%") | CompetitorPriceListItem.raw_name.ilike(f"%{token}%")
+        token_filter = condition if token_filter is None else token_filter | condition
+
+    rows = (
+        db.execute(
+            select(CompetitorPriceListItem, CompetitorPriceList)
+            .join(CompetitorPriceList, CompetitorPriceList.id == CompetitorPriceListItem.price_list_id)
+            .where(CompetitorPriceList.source_type.in_(platforms))
+            .where(token_filter)
+            .order_by(desc(CompetitorPriceList.price_date), desc(CompetitorPriceListItem.id))
+            .limit(750)
+        )
+        .all()
+    )
+    if not rows:
+        return {int(product.id): [] for product, _extra in products}
+
+    source_by_key: dict[str, dict] = {}
+    for item, price_list in rows:
+        source = _source_item_to_payload(price_list.source_type, item, price_list)
+        key = str(source.get("sourceMatchKey") or "")
+        if key and key not in source_by_key:
+            source_by_key[key] = source
+
+    existing_keys = set(source_by_key)
+    if existing_keys:
+        for row in db.execute(
+            select(CompetitorCodeMapping)
+            .where(CompetitorCodeMapping.platform.in_(platforms))
+            .where(CompetitorCodeMapping.source_match_key.in_(existing_keys))
+            .where(CompetitorCodeMapping.status.in_(["mapped", "rejected"]))
+        ).scalars():
+            source_by_key.pop(row.source_match_key, None)
+
+    out: dict[int, list[dict]] = {}
+    source_rows = list(source_by_key.values())
+    for product, extra in products:
+        product_id = int(product.id)
+        token = token_by_product.get(product_id, "")
+        candidates: dict[str, dict] = {}
+        for source in source_rows:
+            source_name = str(source.get("sourceName") or "")
+            if token and token not in normalize_mapping_text(source_name):
+                continue
+            level = _manual_candidate_level(
+                source_name=source_name,
+                source_manufacturer=str(source.get("sourceManufacturer") or ""),
+                product_name=product.name,
+                product_manufacturer=(extra.manufacturer if extra else "") or "",
+            )
+            if level is None:
+                continue
+            candidate = _product_catalog_candidate_payload(product, extra, source, level)
+            key = str(candidate.get("sourceMatchKey") or "")
+            previous = candidates.get(key)
+            if previous is None or float(previous.get("confidence") or 0) < float(candidate.get("confidence") or 0):
+                candidates[key] = candidate
+        out[product_id] = sorted(candidates.values(), key=lambda item: float(item.get("confidence") or 0), reverse=True)[:limit_per_product]
+    return out
+
+
+def _product_catalog_search_external_product_ids(db: Session, *, platforms: list[str], q: str) -> set[int]:
+    query = q.strip()
+    if not query:
+        return set()
+    like = f"%{query}%"
+    rows = db.execute(
+        select(CompetitorCodeMapping.our_product_id)
+        .where(CompetitorCodeMapping.platform.in_(platforms))
+        .where(CompetitorCodeMapping.status == "mapped")
+        .where(CompetitorCodeMapping.our_product_id.is_not(None))
+        .where(
+            or_(
+                CompetitorCodeMapping.source_external_key.ilike(like),
+                CompetitorCodeMapping.source_name.ilike(like),
+                CompetitorCodeMapping.source_manufacturer.ilike(like),
+                CompetitorCodeMapping.source_match_key.ilike(like),
+            )
+        )
+    ).scalars()
+    return {int(item) for item in rows if item is not None}
+
+
+def list_product_catalog_code_mappings(
+    *,
+    db: Session,
+    platform: str = "all",
+    q: str = "",
+    status: str = "all",
+    page: int = 1,
+    limit: int = 50,
+    include_candidates: bool = True,
+) -> dict:
+    platforms = _product_catalog_platforms(platform)
+    status = status if status in {"all", "mapped", "review", "unmapped"} else "all"
+    page = max(1, int(page or 1))
+    limit = max(1, min(int(limit or 50), 200))
+
+    mapped_exists = exists(
+        select(1)
+        .select_from(CompetitorCodeMapping)
+        .where(CompetitorCodeMapping.status == "mapped")
+        .where(CompetitorCodeMapping.platform.in_(platforms))
+        .where(CompetitorCodeMapping.our_product_id == Product.id)
+    )
+
+    external_product_ids = _product_catalog_search_external_product_ids(db, platforms=platforms, q=q)
+    search = q.strip()
+    product_filter = None
+    if search:
+        like = f"%{search}%"
+        product_filter = or_(
+            Product.code.ilike(like),
+            Product.name.ilike(like),
+            ProductExtra.manufacturer.ilike(like),
+            Product.id.in_(external_product_ids) if external_product_ids else literal(False),
+        )
+
+    base_count_stmt = select(func.count(Product.id)).select_from(Product).outerjoin(ProductExtra, ProductExtra.product_id == Product.id)
+    mapped_count_stmt = base_count_stmt.where(mapped_exists)
+    total_products = int(db.scalar(base_count_stmt) or 0)
+    mapped_products = int(db.scalar(mapped_count_stmt) or 0)
+
+    product_stmt = (
+        select(Product, ProductExtra)
+        .outerjoin(ProductExtra, ProductExtra.product_id == Product.id)
+        .order_by(Product.code.asc())
+    )
+    count_stmt = base_count_stmt
+    if product_filter is not None:
+        product_stmt = product_stmt.where(product_filter)
+        count_stmt = count_stmt.where(product_filter)
+    if status == "mapped":
+        product_stmt = product_stmt.where(mapped_exists)
+        count_stmt = count_stmt.where(mapped_exists)
+    elif status in {"review", "unmapped"}:
+        product_stmt = product_stmt.where(~mapped_exists)
+        count_stmt = count_stmt.where(~mapped_exists)
+
+    filtered_total = int(db.scalar(count_stmt) or 0)
+    page_count = (filtered_total + limit - 1) // limit if filtered_total else 0
+    if page_count and page > page_count:
+        page = page_count
+    product_rows = db.execute(product_stmt.limit(limit).offset((page - 1) * limit)).all()
+    product_ids = [int(product.id) for product, _extra in product_rows]
+
+    mappings_by_product: dict[int, list[dict]] = {product_id: [] for product_id in product_ids}
+    if product_ids:
+        for row in db.execute(
+            select(CompetitorCodeMapping)
+            .where(CompetitorCodeMapping.platform.in_(platforms))
+            .where(CompetitorCodeMapping.status == "mapped")
+            .where(CompetitorCodeMapping.our_product_id.in_(product_ids))
+            .order_by(CompetitorCodeMapping.platform.asc(), CompetitorCodeMapping.source_external_key.asc())
+        ).scalars():
+            mappings_by_product.setdefault(int(row.our_product_id), []).append(_product_catalog_mapping_payload(row))
+
+    candidates_by_product = (
+        _product_catalog_source_candidates_for_products(db, products=product_rows, platforms=platforms)
+        if include_candidates or status == "review"
+        else {int(product.id): [] for product, _extra in product_rows}
+    )
+
+    rows: list[dict] = []
+    for product, extra in product_rows:
+        product_id = int(product.id)
+        mappings = mappings_by_product.get(product_id, [])
+        candidates = [] if mappings else candidates_by_product.get(product_id, [])
+        row_status = "mapped" if mappings else "review" if candidates else "unmapped"
+        if status == "review" and row_status != "review":
+            continue
+        if status == "unmapped" and row_status != "unmapped":
+            continue
+        rows.append(
+            {
+                "productId": product_id,
+                "sku": product.code,
+                "name": product.name,
+                "manufacturer": (extra.manufacturer if extra else "") or "",
+                "platform": "all" if len(platforms) > 1 else platforms[0],
+                "mappings": mappings,
+                "mappingCount": len(mappings),
+                "status": row_status,
+                "reviewCandidates": candidates,
+                "candidates": candidates,
+                "bestCandidate": candidates[0] if candidates else None,
+            }
+        )
+
+    if status in {"review", "unmapped"} and (include_candidates or status == "review"):
+        filtered_total = len(rows) if not search else len(rows)
+        page_count = 1 if rows else 0
+        page = 1 if rows else page
+
+    review_on_page = sum(1 for row in rows if row["status"] == "review")
+    unmapped_on_page = sum(1 for row in rows if row["status"] == "unmapped")
+    metrics = {
+        "platform": "all" if len(platforms) > 1 else platforms[0],
+        "total": total_products,
+        "mapped": mapped_products,
+        "review": review_on_page,
+        "unmapped": max(0, total_products - mapped_products - review_on_page),
+        "rejected": 0,
+        "noCandidates": unmapped_on_page,
+        "coveragePercent": round((mapped_products / total_products) * 100, 2) if total_products else 0,
+        "mappingCoveragePercent": round((mapped_products / total_products) * 100, 2) if total_products else 0,
+    }
+    return {
+        "items": rows,
+        "metrics": [metrics],
+        "pagination": {"page": page, "pageSize": limit, "total": filtered_total, "pageCount": page_count},
+        "platforms": platforms,
+    }
+
+
+def auto_match_product_catalog_code_mappings(
+    *,
+    db: Session,
+    platform: str = "all",
+    limit: int = 100,
+    created_by: str = "",
+) -> dict:
+    platforms = _product_catalog_platforms(platform)
+    limit = max(1, min(int(limit or 100), 500))
+    product_rows = (
+        db.execute(
+            select(Product, ProductExtra)
+            .outerjoin(ProductExtra, ProductExtra.product_id == Product.id)
+            .where(
+                ~exists(
+                    select(1)
+                    .select_from(CompetitorCodeMapping)
+                    .where(CompetitorCodeMapping.status == "mapped")
+                    .where(CompetitorCodeMapping.platform.in_(platforms))
+                    .where(CompetitorCodeMapping.our_product_id == Product.id)
+                )
+            )
+            .order_by(Product.code.asc())
+            .limit(limit)
+        )
+        .all()
+    )
+    candidates_by_product = _product_catalog_source_candidates_for_products(db, products=product_rows, platforms=platforms, limit_per_product=1)
+    created = 0
+    reviewed = 0
+    for product, _extra in product_rows:
+        reviewed += 1
+        candidate = (candidates_by_product.get(int(product.id)) or [None])[0]
+        if not candidate or candidate.get("classification") != "auto_match":
+            continue
+        row = upsert_code_mapping(
+            db=db,
+            platform=str(candidate.get("platform") or platforms[0]),
+            product=product,
+            source_payload={
+                "source_external_key": candidate.get("sourceExternalKey"),
+                "source_match_key": candidate.get("sourceMatchKey"),
+                "source_name": candidate.get("sourceName"),
+                "source_manufacturer": candidate.get("sourceManufacturer"),
+                "source_dosage_form": candidate.get("sourceDosageForm"),
+                "source_normalized_name": candidate.get("sourceNormalizedName"),
+            },
+            status="mapped",
+            confidence=float(candidate.get("confidence") or 100),
+            created_by=created_by,
+        )
+        apply_mapping_to_matching_items(db=db, mapping=row, product=product, clear=False)
+        created += 1
+    db.commit()
+    return {"status": "ok", "reviewedProducts": reviewed, "createdMappings": created, "platforms": platforms}
 
 
 def list_code_mappings(
