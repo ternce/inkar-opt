@@ -9,6 +9,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from backend.app.db import Base
+from backend.app.deps import ROLE_ADMIN
 from backend.app.models import (
     CompetitorPrice,
     CompetitorPriceList,
@@ -62,6 +63,12 @@ def _session():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine)()
+
+
+def _override_admin(main):
+    user = lambda: main.AppUser(id=1, username="admin", role=ROLE_ADMIN, is_active=True)
+    main.app.dependency_overrides[main.get_current_user] = user
+    main.app.dependency_overrides[main.require_write_access] = user
 
 
 def _format(db, *, code: str = "FMT"):
@@ -205,6 +212,7 @@ def test_assignment_summary_counts_only_active_physical_plk_rows():
         db.commit()
 
     main.app.dependency_overrides[main.get_db] = lambda: Session()
+    _override_admin(main)
     try:
         response = TestClient(main.app).get("/api/price-formats/COUNT/competitor-assignments?include_summary=1")
     finally:
@@ -329,6 +337,7 @@ def test_emit_only_assignment_does_not_load_regular_percentile_sources():
     engine = Session.kw["bind"]
     event.listen(engine, "before_cursor_execute", count_regular_queries)
     main.app.dependency_overrides[main.get_db] = lambda: Session()
+    _override_admin(main)
     try:
         response = TestClient(main.app).get("/api/price-formats/EMIT-ONLY/competitor-assignments?include_summary=1")
     finally:
@@ -1132,6 +1141,7 @@ def test_assignment_visibility_keeps_stored_emit_percentile_sources_after_physic
         assert assignment_visible[0]["eligibleForPricing"] is False
 
     main.app.dependency_overrides[main.get_db] = lambda: Session()
+    _override_admin(main)
     try:
         response = TestClient(main.app).get("/api/price-formats/ASSIGN-PCT/competitor-assignments")
     finally:
@@ -1193,6 +1203,7 @@ def test_regular_percentile_assignment_missing_dataset_is_unavailable():
         db.commit()
 
     main.app.dependency_overrides[main.get_db] = lambda: Session()
+    _override_admin(main)
     try:
         response = TestClient(main.app).get("/api/price-formats/REG-MISSING/competitor-assignments")
     finally:

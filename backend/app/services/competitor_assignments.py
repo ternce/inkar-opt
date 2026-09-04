@@ -188,7 +188,7 @@ def list_global_competitor_price_lists_for_format(
         setattr(row, "_visible_for_format_branch", bool(meta["visibleForFormatBranch"]))
         setattr(row, "_branch_match_reason", str(meta["branchMatchReason"]))
         setattr(row, "_branch_mismatch_reason", str(meta["branchMismatchReason"]))
-    if branch_scoped or region:
+    if branch_scoped:
         rows = [row for row in rows if bool(getattr(row, "_visible_for_format_branch", False))]
     counts = visible_item_counts(db, rows)
     for row in rows:
@@ -300,6 +300,16 @@ def get_all_assigned_competitor_price_lists(*, db: Session) -> list[AssignedComp
     )
     rows = [(row, assignment) for row, assignment in rows if not is_legacy_untrusted_vidman_price_list(row)]
     return [AssignedCompetitorPriceList(price_list=row, assignment=assignment) for row, assignment in rows]
+
+
+def selected_price_format_ids_for_competitor_price_list(*, db: Session, competitor_price_list_id: int) -> list[int]:
+    rows = db.execute(
+        select(PriceFormatCompetitorAssignment.price_format_id)
+        .where(PriceFormatCompetitorAssignment.competitor_price_list_id == int(competitor_price_list_id))
+        .where(PriceFormatCompetitorAssignment.is_active.is_(True))
+        .order_by(PriceFormatCompetitorAssignment.price_format_id.asc())
+    ).scalars()
+    return [int(item) for item in rows if item is not None]
 
 
 def get_assignment(

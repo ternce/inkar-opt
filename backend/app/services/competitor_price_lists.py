@@ -44,6 +44,7 @@ from .competitor_assignments import (
     get_assigned_competitor_price_lists,
     get_assignment,
     list_global_competitor_price_lists_for_format,
+    selected_price_format_ids_for_competitor_price_list,
     set_competitor_assignments,
 )
 from .competitor_read_models import refresh_price_list_item_counters
@@ -234,6 +235,36 @@ def _as_int(value: object) -> int | None:
 
 def _source_name(row: CompetitorPriceList) -> str:
     return f"{row.source_type}:{row.source_key}"
+
+
+def _selected_price_format_ids_for_refreshed_source(db: Session, row: CompetitorPriceList) -> list[int]:
+    if row.id is None:
+        return []
+    return selected_price_format_ids_for_competitor_price_list(db=db, competitor_price_list_id=int(row.id))
+
+
+def _refresh_selected_price_formats_for_source(
+    *,
+    db: Session,
+    row: CompetitorPriceList,
+    rebuild: bool = True,
+) -> list[int]:
+    price_format_ids = _selected_price_format_ids_for_refreshed_source(db, row)
+    for price_format_id in price_format_ids:
+        sync_selected_competitor_configs(db=db, price_format_id=price_format_id)
+        if rebuild:
+            rebuild_competitor_prices_for_selected(db=db, price_format_id=price_format_id)
+    return price_format_ids
+
+
+def _enqueue_percentile_preparation_for_price_formats(
+    *,
+    db: Session,
+    price_format_ids: list[int],
+    reason: str,
+) -> None:
+    for price_format_id in sorted(set(int(item) for item in price_format_ids if int(item) > 0)):
+        enqueue_percentile_preparation(db=db, price_format_id=price_format_id, reason=reason)
 
 
 def _source_key_for_unified(price_list: UnifiedPriceList) -> str:
@@ -779,11 +810,16 @@ def upsert_provisor_price_list(
         rematch_price_list_items_by_product(db=db, price_list=row)
         refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
         _replace_legacy_price_rows_for_list(db=db, price_list=row)
-        sync_selected_competitor_configs(db=db, price_format_id=pf.id)
-        rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id)
+        affected_price_format_ids = _refresh_selected_price_formats_for_source(db=db, row=row)
+    else:
+        affected_price_format_ids = []
     db.commit()
     if run_matching:
-        enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="price_list_upserted")
+        _enqueue_percentile_preparation_for_price_formats(
+            db=db,
+            price_format_ids=affected_price_format_ids,
+            reason="price_list_upserted",
+        )
     return row
 
 
@@ -1165,14 +1201,18 @@ def upsert_unified_price_list(
         rematch_price_list_items_by_product(db=db, price_list=row)
         refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
         _replace_legacy_price_rows_for_list(db=db, price_list=row)
-        sync_selected_competitor_configs(db=db, price_format_id=pf.id)
-        rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id)
+        affected_price_format_ids = _refresh_selected_price_formats_for_source(db=db, row=row)
     else:
+        affected_price_format_ids = []
         refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
     stage_started_at = time.perf_counter()
     db.commit()
     if run_matching:
-        enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="price_list_upserted")
+        _enqueue_percentile_preparation_for_price_formats(
+            db=db,
+            price_format_ids=affected_price_format_ids,
+            reason="price_list_upserted",
+        )
     benchmark["commit_sec"] = round(time.perf_counter() - stage_started_at, 6)
     benchmark["total_sec"] = round(time.perf_counter() - total_started_at, 6)
     setattr(row, "_benchmark", benchmark)

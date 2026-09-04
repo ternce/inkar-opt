@@ -13,7 +13,6 @@ from sqlalchemy.orm import Session
 from ..models import (
     CompetitorPriceList,
     CompetitorPriceListItem,
-    PriceFormatCompetitorAssignment,
     VidmanAccount,
     VidmanCanonicalProduct,
     VidmanCompetitorPriceListSource,
@@ -27,6 +26,7 @@ from ..models import (
 from .competitor_matching import rebuild_competitor_prices_for_selected
 from .competitor_persist import _ensure_price_format
 from .competitor_price_lists import _replace_legacy_price_rows_for_list, sync_selected_competitor_configs
+from .competitor_assignments import selected_price_format_ids_for_competitor_price_list
 from .competitor_read_models import refresh_price_list_item_counters
 from .competitor_source_config import canonical_competitor_source_key
 from .percentile_preparation import enqueue_percentile_preparation
@@ -545,18 +545,14 @@ def build_vidman_competitor_price_list(
     summary.rows_written = len(mappings)
 
     _replace_legacy_price_rows_for_list(db=db, price_list=price_list)
-    active_assignments = int(
-        db.scalar(
-            select(func.count(PriceFormatCompetitorAssignment.id))
-            .where(PriceFormatCompetitorAssignment.competitor_price_list_id == price_list.id)
-            .where(PriceFormatCompetitorAssignment.is_active.is_(True))
-        )
-        or 0
+    affected_price_format_ids = selected_price_format_ids_for_competitor_price_list(
+        db=db,
+        competitor_price_list_id=int(price_list.id),
     )
-    if active_assignments:
-        sync_selected_competitor_configs(db=db, price_format_id=int(pf.id))
-        rebuild_competitor_prices_for_selected(db=db, price_format_id=int(pf.id))
-        enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="vidman_price_list_built")
+    for price_format_id in affected_price_format_ids:
+        sync_selected_competitor_configs(db=db, price_format_id=price_format_id)
+        rebuild_competitor_prices_for_selected(db=db, price_format_id=price_format_id)
+        enqueue_percentile_preparation(db=db, price_format_id=price_format_id, reason="vidman_price_list_built")
     db.commit()
     canonical_competitor_source_key(price_list)
     return summary

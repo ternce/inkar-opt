@@ -132,6 +132,7 @@ from .services.competitor_assignments import (
     get_assigned_competitor_price_lists,
     get_assignment,
     price_format_branch_matches,
+    selected_price_format_ids_for_competitor_price_list,
     set_competitor_assignments,
     upsert_assignment,
 )
@@ -9812,10 +9813,31 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
         if job is not None:
             update_job(db, job, status="running", progress=90, message="Пересобираем цены выбранных конкурентов", log_level="info")
         rebuild_started_at = time.perf_counter()
-        sync_selected_competitor_configs(db=db, price_format_id=pf_for_refresh.id)
-        rebuild_summary = rebuild_competitor_prices_for_selected(db=db, price_format_id=pf_for_refresh.id, commit_between_lists=True)
+        affected_price_format_ids = sorted(
+            {
+                price_format_id
+                for price_list_id in refreshed_price_list_ids
+                for price_format_id in selected_price_format_ids_for_competitor_price_list(
+                    db=db,
+                    competitor_price_list_id=int(price_list_id),
+                )
+            }
+        )
+        per_format_rebuilds = {}
+        for price_format_id in affected_price_format_ids:
+            sync_selected_competitor_configs(db=db, price_format_id=price_format_id)
+            per_format_rebuilds[str(price_format_id)] = rebuild_competitor_prices_for_selected(
+                db=db,
+                price_format_id=price_format_id,
+                commit_between_lists=True,
+            )
+        rebuild_summary = {
+            "affected_price_format_ids": affected_price_format_ids,
+            "per_format": per_format_rebuilds,
+        }
         db.commit()
-        enqueue_percentile_preparation(db=db, price_format_id=int(pf_for_refresh.id), reason="source_refresh_completed")
+        for price_format_id in affected_price_format_ids:
+            enqueue_percentile_preparation(db=db, price_format_id=int(price_format_id), reason="source_refresh_completed")
         _timing(operation, "rebuild_selected_competitor_prices", rebuild_started_at)
     else:
         logger.info(

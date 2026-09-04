@@ -571,7 +571,7 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
               <div>
                 <h3>Доступные источники цен</h3>
                 <p>Refresh, импорт и сопоставления находятся в разделе “Конкуренты”.</p>
-                <p>Показаны доступные ПЛК региона {branchScopeLabel}.</p>
+                <p>Показан глобальный пул активных источников; регион и аккаунт используются только как метаданные и фильтры отображения.</p>
               </div>
               <div className="flex flex-wrap gap-2">
                 <Button variant="outline" size="sm" onClick={() => onNavigate('competitor-domain')}>
@@ -590,7 +590,7 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
             </div>
             <CompactTable
               stickyLastColumn
-              empty="Для выбранного филиала нет доступных источников цен"
+              empty="Нет доступных источников цен"
               columns={['Источник', 'Регион', 'Конкурент', 'Клиент / логин', 'Тип', 'Дата цен', 'Последняя успешная проверка', 'Последняя замена данных', 'Позиций', 'Актуальность', 'Действие']}
               rows={filteredSources.map((row) => [
                 row.sourceName || row.name || '—',

@@ -32,6 +32,7 @@ from .competitor_read_models import refresh_price_list_item_counters
 from .percentile_preparation import enqueue_percentile_preparation
 from .sku import normalize_sku, normalize_sku_variants
 from ..timezone import now_kz_naive
+from .competitor_assignments import selected_price_format_ids_for_competitor_price_list
 
 
 MAX_MANUAL_PLK_FILE_SIZE_BYTES = 15 * 1024 * 1024
@@ -586,9 +587,15 @@ def import_manual_price_list(
             error_summary=row.last_refresh_message,
             metadata={"priceListId": int(row.id), "sourceKey": source_key},
         )
-        rebuild_competitor_prices_for_selected(db=db, price_format_id=int(pf.id))
+        affected_price_format_ids = selected_price_format_ids_for_competitor_price_list(
+            db=db,
+            competitor_price_list_id=int(row.id),
+        )
+        for price_format_id in affected_price_format_ids:
+            rebuild_competitor_prices_for_selected(db=db, price_format_id=price_format_id)
         db.commit()
-        enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="manual_price_list_imported")
+        for price_format_id in affected_price_format_ids:
+            enqueue_percentile_preparation(db=db, price_format_id=price_format_id, reason="manual_price_list_imported")
         inventory = {
             "mode": "apply",
             "price_list_id": int(row.id),
@@ -698,6 +705,10 @@ def deactivate_manual_price_list(*, db: Session, price_list_id: int) -> dict[str
     db.execute(
         select(PriceFormatCompetitorAssignment).where(PriceFormatCompetitorAssignment.competitor_price_list_id == row.id)
     )
+    affected_price_format_ids = selected_price_format_ids_for_competitor_price_list(
+        db=db,
+        competitor_price_list_id=int(row.id),
+    )
     for assignment in db.execute(
         select(PriceFormatCompetitorAssignment).where(PriceFormatCompetitorAssignment.competitor_price_list_id == row.id)
     ).scalars():
@@ -706,7 +717,8 @@ def deactivate_manual_price_list(*, db: Session, price_list_id: int) -> dict[str
     row.last_refresh_status = "inactive"
     row.last_refresh_message = "manual price list deactivated"
     row.updated_at = now_kz_naive()
-    rebuild_competitor_prices_for_selected(db=db, price_format_id=int(row.price_format_id))
+    for price_format_id in affected_price_format_ids:
+        rebuild_competitor_prices_for_selected(db=db, price_format_id=price_format_id)
     db.commit()
     return {"ok": True, "id": row.id, "status": "inactive"}
 
