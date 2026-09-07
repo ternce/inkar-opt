@@ -12,6 +12,11 @@ import {
   formatLocalDate,
   formatLocalDateTime,
 } from '../competitorTimestamps';
+import {
+  mergeAvailableCompetitorAssignmentSources,
+  normalizeCompetitorAssignmentSource,
+  type CompetitorAssignmentSourceRow,
+} from '../competitorAssignmentSources';
 import { parseRequiredDecimalInput } from '../decimalInput';
 
 type PriceFormat = {
@@ -21,41 +26,7 @@ type PriceFormat = {
   branch: string;
 };
 
-type SourceRow = {
-  id: string;
-  sourceId: string | number;
-  sourceType: string;
-  sourceKey?: string;
-  sourceName: string;
-  name?: string;
-  region: string;
-  branchName: string;
-  competitorName: string;
-  accountId?: string;
-  accountLogin: string;
-  priceDate: string;
-  updatedAt?: string;
-  sourceUpdatedAt?: string;
-  lastCheckedAt?: string;
-  lastSuccessAt?: string;
-  lastUpdatedAt?: string;
-  generatedAt?: string;
-  itemsCount: number;
-  skuCount?: number;
-  status?: string;
-  refreshStatus?: string;
-  lastRefreshStatus?: string;
-  coefficient?: number;
-  priceCoefficient?: number;
-  active?: boolean;
-  isSelected?: boolean;
-  isPercentile?: boolean;
-  eligibleForPricing?: boolean;
-  pricingEligibilityReason?: string;
-  rowType?: 'physical_plk' | 'percentile_config' | string;
-  assignmentKind?: 'physical' | 'percentile_config' | string;
-  percentile?: number;
-};
+type SourceRow = CompetitorAssignmentSourceRow;
 
 type AssignmentRow = SourceRow & {
   coefficient: number;
@@ -116,66 +87,7 @@ const formatAssignmentSummaryCount = (summary: FormatSummary) => {
 const branchKey = (value: any) => String(value || '').trim().toLocaleLowerCase('ru-RU');
 const isSameBranch = (left: any, right: any) => branchKey(left) === branchKey(right);
 
-const normalizeSource = (row: any): SourceRow => ({
-  id: String(row.id ?? row.sourceId ?? ''),
-  sourceId: row.sourceId ?? row.id ?? '',
-  sourceType: String(row.sourceType || 'manual'),
-  sourceKey: String(row.sourceKey || row.id || ''),
-  sourceName: String(row.sourceName || row.name || row.displayName || ''),
-  name: String(row.name || row.sourceName || ''),
-  region: String(row.region || row.branchName || ''),
-  branchName: String(row.branchName || row.region || ''),
-  competitorName: String(row.competitorName || row.competitor || row.supplier || ''),
-  accountId: String(row.accountId || ''),
-  accountLogin: String(row.accountLogin || row.accountId || ''),
-  priceDate: String(row.priceDate || row.generatedAt || ''),
-  updatedAt: String(row.updatedAt || ''),
-  sourceUpdatedAt: String(row.sourceUpdatedAt || ''),
-  lastCheckedAt: String(row.lastCheckedAt || ''),
-  lastSuccessAt: String(row.lastSuccessAt || ''),
-  lastUpdatedAt: String(row.lastUpdatedAt || ''),
-  generatedAt: String(row.generatedAt || ''),
-  itemsCount: Number(row.itemsCount ?? row.skuCount ?? 0),
-  skuCount: Number(row.skuCount ?? row.itemsCount ?? 0),
-  status: String(row.status || row.refreshStatus || row.lastRefreshStatus || row.last_refresh_status || ''),
-  refreshStatus: String(row.refreshStatus || row.status || row.lastRefreshStatus || row.last_refresh_status || ''),
-  lastRefreshStatus: String(row.lastRefreshStatus || row.last_refresh_status || row.refreshStatus || row.status || ''),
-  coefficient: Number(row.priceCoefficient ?? row.coefficient ?? 1),
-  priceCoefficient: Number(row.priceCoefficient ?? row.coefficient ?? 1),
-  active: Boolean(row.active ?? row.isSelected ?? true),
-  isSelected: Boolean(row.isSelected),
-  eligibleForPricing: row.eligibleForPricing !== false,
-  pricingEligibilityReason: String(row.pricingEligibilityReason || ''),
-  rowType: String(row.rowType || (row.sourceType === 'percentile' || row.isPercentile ? 'percentile_config' : 'physical_plk')),
-  assignmentKind: String(row.assignmentKind || (row.sourceType === 'percentile' || row.isPercentile ? 'percentile_config' : 'physical')),
-  isPercentile: row.sourceType === 'percentile' || Boolean(row.isPercentile),
-  percentile: row.percentile != null ? Number(row.percentile) : undefined,
-});
-
-const percentileToSource = (row: any): SourceRow =>
-  normalizeSource({
-    id: row.id,
-    sourceId: row.id,
-    sourceKey: row.sourceKey || row.id,
-    sourceType: 'percentile',
-    sourceName: row.name || `${row.region || 'Регион'} - Эмити - Персентиль ${row.percentile}`,
-    region: row.region,
-    branchName: row.region,
-    competitorName: row.competitor || 'Эмити',
-    accountLogin: `Персентиль ${row.percentile}`,
-    priceDate: row.generatedAt,
-    lastSuccessAt: row.generatedAt,
-    lastCheckedAt: row.generatedAt,
-    updatedAt: row.generatedAt,
-    sourceUpdatedAt: row.generatedAt,
-    generatedAt: row.generatedAt,
-    itemsCount: row.skuCount,
-    skuCount: row.skuCount,
-    eligibleForPricing: row.eligibleForPricing,
-    pricingEligibilityReason: row.pricingEligibilityReason,
-    percentile: row.percentile,
-    isPercentile: true,
-  });
+const normalizeSource = normalizeCompetitorAssignmentSource;
 
 const pricingEligibilityLabel = (row: SourceRow) => {
   if (!row.isPercentile || row.eligibleForPricing !== false) return '';
@@ -241,7 +153,7 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
       setError(null);
       try {
         const [sourcesRes, emitPercentileRes, competitorPercentileRes, assignmentRows] = await Promise.all([
-          fetch(`/api/competitors/price-lists?format_code=${encodeURIComponent(code)}`),
+          fetch(`/api/price-formats/${encodeURIComponent(code)}/competitor-price-lists`),
           fetch(`/api/competitors/percentiles?format_code=${encodeURIComponent(code)}&percentile_source=emit&visibility=assignment`),
           fetch(`/api/competitors/percentiles?format_code=${encodeURIComponent(code)}&percentile_source=competitor&visibility=assignment`),
           loadAssignments(code),
@@ -261,12 +173,11 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
         if (!sourcesRes.ok) throw new Error(sourcesData?.detail || sourcesText || 'Не удалось загрузить источники цен');
         if (!percentileRes.ok) throw new Error(percentileData?.detail || percentileText || 'Не удалось загрузить источники персентилей');
         if (!competitorPercentileRes.ok) throw new Error(competitorPercentileData?.detail || competitorPercentileText || 'percentile sources request failed');
-        const rows = [
-          ...(Array.isArray(sourcesData) ? sourcesData.map(normalizeSource) : []),
-          ...(Array.isArray(percentileData) ? percentileData.map(percentileToSource) : []),
-        ];
-        const assignedKeys = new Set(assignmentRows.map((row) => `${row.sourceType}:${row.sourceId}`));
-        setAvailableSources(rows.map((row) => ({ ...row, isSelected: assignedKeys.has(`${row.sourceType}:${row.sourceId}`) })));
+        setAvailableSources(mergeAvailableCompetitorAssignmentSources({
+          globalPriceLists: Array.isArray(sourcesData) ? sourcesData : [],
+          percentileSources: Array.isArray(percentileData) ? percentileData : [],
+          assignments: assignmentRows,
+        }));
         void loadFormatSummary(format, assignmentRows);
       } catch (e: any) {
         setError(e?.message || 'Ошибка загрузки раздела');
