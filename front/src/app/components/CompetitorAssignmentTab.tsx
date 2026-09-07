@@ -478,7 +478,7 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
             <CompactTable
               stickyLastColumn
               empty="Нет доступных источников цен"
-              columns={['Источник', 'Регион', 'Конкурент', 'Клиент / логин', 'Тип', 'Дата цен', 'Последняя успешная проверка', 'Последняя замена данных', 'Позиций', 'Актуальность', 'Действие']}
+              columns={['Источник', 'Регион', 'Конкурент', 'Клиент / логин', 'Тип', 'Дата прайса', 'Последняя проверка', 'Последняя замена данных', 'Позиций', 'Статус проверки', 'Действие']}
               rows={filteredSources.map((row) => [
                 row.sourceName || row.name || '—',
                 row.branchName || row.region || '—',
@@ -508,7 +508,7 @@ export function CompetitorAssignmentTab({ formatCode, branch, priceFormats, onFo
             <CompactTable
               stickyLastColumn
               empty="Нет назначенных ПЛК"
-              columns={['Источник', 'Конкурент', 'Регион', 'Клиент / логин', 'Коэффициент', 'Дата цен', 'Последняя успешная проверка', 'Последняя замена данных', 'Актуальность', 'Активен', 'Действия']}
+              columns={['Источник', 'Конкурент', 'Регион', 'Клиент / логин', 'Коэффициент', 'Дата прайса', 'Последняя проверка', 'Последняя замена данных', 'Статус проверки', 'Активен', 'Действия']}
               rows={assignments.map((row) => [
                 row.sourceName || row.name || '—',
                 row.competitorName || '—',

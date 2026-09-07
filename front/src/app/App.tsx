@@ -174,14 +174,6 @@ const freshnessClassName = (value: any) => {
   return '';
 };
 
-const priceDateFreshness = (value: any) => {
-  if (!value) return 'устарело';
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return 'актуально';
-  const ageDays = (Date.now() - parsed.getTime()) / 86400000;
-  return ageDays <= 2 ? 'актуально' : 'устарело';
-};
-
 export default function App() {
   const [priceFormats, setPriceFormats] = useState<PriceFormat[]>([]);
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
@@ -1136,7 +1128,7 @@ function HomeDashboard({
         </div>
         <CompactTable
           empty="Нет назначенных ПЛК"
-          columns={['Источник', 'Регион', 'Конкурент', 'Клиент / логин', 'Коэффициент', 'Дата цен', 'Последняя успешная проверка', 'Последняя замена данных', 'Актуальность']}
+          columns={['Источник', 'Регион', 'Конкурент', 'Клиент / логин', 'Коэффициент', 'Дата прайса', 'Последняя проверка', 'Последняя замена данных', 'Статус проверки']}
           rows={assignedSources.map((row) => {
             return [
               row.sourceName || row.name || '—',

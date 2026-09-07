@@ -374,31 +374,17 @@ const fmtNumber = (value: number | null | undefined) => {
 };
 
 const platformLabel = (platform: Platform) => (platform === 'all' ? 'Все источники' : platform === 'provisor' ? 'Provisor' : 'Vidman');
-const PRICE_LIST_FRESHNESS_MS = 2 * 60 * 60 * 1000;
-
-const parseTime = (value?: string) => {
-  const time = value ? Date.parse(value) : NaN;
-  return Number.isFinite(time) ? time : null;
-};
 
 const refreshStatusLabel = (row: CompetitorSource) => {
   const raw = String(row.refreshStatus || row.status || '').split(';', 1)[0].trim().toLowerCase();
-  if (raw === 'updated' || raw === 'ok' || raw === 'success') return 'Обновлено новыми данными';
-  if (raw === 'checked_unchanged') return 'Проверено, без изменений';
-  if (raw === 'success_zero_items') return 'Проверено, пустой ответ сохранен';
-  if (raw === 'timeout') return 'Тайм-аут';
   if (raw === 'auth_error') return 'Ошибка авторизации';
-  const lastSuccess = parseTime(row.lastSuccessAt || row.lastCheckedAt);
-  if (!lastSuccess || Date.now() - lastSuccess > PRICE_LIST_FRESHNESS_MS) return 'Устарело или давно не проверялось';
-  return raw || 'ok';
+  return competitorFreshnessLabel({ ...row, status: raw });
 };
 
 const refreshStatusClass = (row: CompetitorSource) => {
   const label = refreshStatusLabel(row);
-  if (label === 'Обновлено новыми данными' || label === 'Проверено, без изменений' || label === 'Проверено, пустой ответ сохранен') return 'ok';
-  if (label === 'Тайм-аут' || label === 'Устарело или давно не проверялось') return 'warn';
   if (label === 'Ошибка авторизации') return 'bad';
-  return '';
+  return competitorFreshnessClassName({ ...row, status: String(row.refreshStatus || row.status || '').split(';', 1)[0].trim().toLowerCase() });
 };
 
 const statusLabel = (status: MappingStatus) => {
@@ -2075,11 +2061,11 @@ export function CompetitorsTab({ formatCode }: Props) {
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Клиент / логин</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Тип</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Филиал ЦФ</th>
-                      <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Дата цен</th>
+                      <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Дата прайса</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Позиций</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Статус</th>
-                      <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Актуальность</th>
-                      <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Последняя успешная проверка</th>
+                      <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Статус проверки</th>
+                      <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Последняя проверка</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Последняя замена данных</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Время источника</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Ошибки / timeout</th>

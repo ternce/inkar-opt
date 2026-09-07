@@ -15,6 +15,18 @@ const parseTime = (value?: string | null) => {
   return Number.isFinite(time) ? time : null;
 };
 
+const SUCCESS_STATUSES = new Set(['updated', 'ok', 'success', 'success_zero_items']);
+const UNCHANGED_STATUSES = new Set(['checked_unchanged']);
+const ERROR_STATUSES = new Set(['failed', 'error', 'stale']);
+const RECENT_SUCCESS_MS = 2 * 86400000;
+
+const CHECK_CURRENT_LABEL = '\u0410\u043a\u0442\u0443\u0430\u043b\u044c\u043d\u043e';
+const CHECK_UNCHANGED_LABEL = '\u0410\u043a\u0442\u0443\u0430\u043b\u044c\u043d\u043e, \u0431\u0435\u0437 \u0438\u0437\u043c\u0435\u043d\u0435\u043d\u0438\u0439';
+const CHECK_TIMEOUT_LABEL = '\u0422\u0430\u0439\u043c-\u0430\u0443\u0442 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0438';
+const CHECK_ERROR_LABEL = '\u041e\u0448\u0438\u0431\u043a\u0430 \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u044f';
+const CHECK_EMPTY_LABEL = '\u041d\u0435\u0442 \u0434\u0430\u043d\u043d\u044b\u0445';
+const LAST_CHECK_PREFIX = '\u041f\u043e\u0441\u043b\u0435\u0434\u043d\u044f\u044f \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0430';
+
 export const competitorPriceDate = (row: CompetitorTimestampRow) => row.priceDate || '';
 
 export const competitorLastSuccessfulCheck = (row: CompetitorTimestampRow) =>
@@ -39,23 +51,24 @@ export const formatLocalDateTime = (value?: string | null) => {
 };
 
 export const competitorFreshnessLabel = (row: CompetitorTimestampRow) => {
-  const status = String(row.status || '').toLowerCase();
-  if (status === 'timeout' || status === 'stale') return '\u0443\u0441\u0442\u0430\u0440\u0435\u043b\u043e';
-  if (status === 'failed' || status === 'error') return '\u043e\u0448\u0438\u0431\u043a\u0430';
+  const status = String(row.status || '').split(';', 1)[0].trim().toLowerCase();
+  if (status === 'timeout') return CHECK_TIMEOUT_LABEL;
+  if (ERROR_STATUSES.has(status)) return CHECK_ERROR_LABEL;
 
   const marker = competitorLastSuccessfulCheck(row);
   const time = parseTime(marker);
-  if (time === null) return '\u043d\u0435\u0442 \u0434\u0430\u043d\u043d\u044b\u0445';
-  const ageDays = (Date.now() - time) / 86400000;
-  return ageDays <= 2 ? '\u0430\u043a\u0442\u0443\u0430\u043b\u044c\u043d\u043e' : '\u0443\u0441\u0442\u0430\u0440\u0435\u043b\u043e';
+  if (time === null) return CHECK_EMPTY_LABEL;
+  if (UNCHANGED_STATUSES.has(status) && Date.now() - time <= RECENT_SUCCESS_MS) return CHECK_UNCHANGED_LABEL;
+  if ((SUCCESS_STATUSES.has(status) || !status) && Date.now() - time <= RECENT_SUCCESS_MS) return CHECK_CURRENT_LABEL;
+  return `${LAST_CHECK_PREFIX}: ${formatLocalDate(marker)}`;
 };
 
 export const competitorFreshnessClassName = (row: CompetitorTimestampRow) => {
   const label = competitorFreshnessLabel(row);
-  if (label === '\u0430\u043a\u0442\u0443\u0430\u043b\u044c\u043d\u043e') return 'ok';
-  if (label === '\u043d\u0435\u0442 \u0434\u0430\u043d\u043d\u044b\u0445') return '';
-  if (label === '\u043e\u0448\u0438\u0431\u043a\u0430') return 'bad';
-  return 'warn';
+  if (label === CHECK_CURRENT_LABEL || label === CHECK_UNCHANGED_LABEL) return 'ok';
+  if (label === CHECK_TIMEOUT_LABEL) return 'warn';
+  if (label === CHECK_ERROR_LABEL) return 'bad';
+  return '';
 };
 
 export const usefulSourceTimestamp = (row: CompetitorTimestampRow) => {

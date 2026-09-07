@@ -868,7 +868,7 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
         </div>
         <div className="admin-table-card">
           <table className="admin-table">
-            <thead><tr><th>Источник / конкурент</th><th>Регион</th><th>Дата цен</th><th>Последняя успешная проверка</th><th>Последняя замена данных</th><th>Коэффициент</th><th>Актуальность</th></tr></thead>
+            <thead><tr><th>Источник / конкурент</th><th>Регион</th><th>Дата прайса</th><th>Последняя проверка</th><th>Последняя замена данных</th><th>Коэффициент</th><th>Статус проверки</th></tr></thead>
             <tbody>
               {activeAssignments.map((row) => (
                 <tr key={row.id}>
