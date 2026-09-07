@@ -43,6 +43,8 @@ type SourceRow = {
   itemsCount: number;
   skuCount?: number;
   status?: string;
+  refreshStatus?: string;
+  lastRefreshStatus?: string;
   coefficient?: number;
   priceCoefficient?: number;
   active?: boolean;
@@ -114,34 +116,6 @@ const formatAssignmentSummaryCount = (summary: FormatSummary) => {
 const branchKey = (value: any) => String(value || '').trim().toLocaleLowerCase('ru-RU');
 const isSameBranch = (left: any, right: any) => branchKey(left) === branchKey(right);
 
-const fmtDate = (value: any) => {
-  if (!value) return '—';
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return String(value);
-  return parsed.toLocaleDateString('ru-RU');
-};
-
-const freshness = (value: any) => {
-  if (!value) return 'нет данных';
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return 'актуально';
-  const today = new Date();
-  const startToday = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
-  const startValue = new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate()).getTime();
-  const ageDays = (startToday - startValue) / 86400000;
-  if (ageDays <= 0) return 'актуально';
-  if (ageDays > 1) return 'устарело';
-  return 'устарело';
-};
-
-const freshnessClassName = (value: any) => {
-  const label = freshness(value);
-  if (label === 'актуально') return 'ok';
-  if (label === 'нет данных') return '';
-  if (label === 'ошибка') return 'bad';
-  return 'warn';
-};
-
 const normalizeSource = (row: any): SourceRow => ({
   id: String(row.id ?? row.sourceId ?? ''),
   sourceId: row.sourceId ?? row.id ?? '',
@@ -163,7 +137,9 @@ const normalizeSource = (row: any): SourceRow => ({
   generatedAt: String(row.generatedAt || ''),
   itemsCount: Number(row.itemsCount ?? row.skuCount ?? 0),
   skuCount: Number(row.skuCount ?? row.itemsCount ?? 0),
-  status: String(row.status || ''),
+  status: String(row.status || row.refreshStatus || row.lastRefreshStatus || row.last_refresh_status || ''),
+  refreshStatus: String(row.refreshStatus || row.status || row.lastRefreshStatus || row.last_refresh_status || ''),
+  lastRefreshStatus: String(row.lastRefreshStatus || row.last_refresh_status || row.refreshStatus || row.status || ''),
   coefficient: Number(row.priceCoefficient ?? row.coefficient ?? 1),
   priceCoefficient: Number(row.priceCoefficient ?? row.coefficient ?? 1),
   active: Boolean(row.active ?? row.isSelected ?? true),
