@@ -138,6 +138,15 @@ def _seed_products(Session):
         db.close()
 
 
+def _seed_many_products(Session, count: int):
+    db = Session()
+    try:
+        db.add_all([Product(code=f"SKU-{idx:03d}", name=f"Product {idx:03d}", cost=1) for idx in range(count)])
+        db.commit()
+    finally:
+        db.close()
+
+
 def test_critical_list_with_one_zero_values():
     client, Session = _client()
     _seed_products(Session)
@@ -679,6 +688,108 @@ def test_lists_management_import_excel_adds_items_to_existing_list():
     assert card["itemsCount"] == 2
     values = {item["sku"]: item["value"] for item in card["items"]}
     assert values == {"12345": 20.0, "A-77": 30.0}
+
+
+def test_lists_management_import_excel_replaces_existing_items_100_old_50_new():
+    client, Session = _client()
+    _seed_many_products(Session, 120)
+    list_id = client.post(
+        "/api/lists-management",
+        json={"code": "REPLACE-100-50", "name": "Replace", "type": "fixed_price", "active": True},
+    ).json()["id"]
+    db = Session()
+    try:
+        products = db.execute(select(Product).order_by(Product.code)).scalars().all()
+        db.add_all([ListItem(universal_list_id=list_id, product_id=product.id, value=10) for product in products[:100]])
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={"file": ("fixed.xlsx", _xlsx([["SKU", "Value"], *[[f"SKU-{idx:03d}", 50 + idx] for idx in range(50, 100)]]), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["item_count"] == 50
+    card = client.get(f"/api/lists-management/{list_id}").json()
+    assert card["itemsCount"] == 50
+    assert {item["sku"] for item in card["items"]} == {f"SKU-{idx:03d}" for idx in range(50, 100)}
+
+
+def test_lists_management_failed_replacement_preserves_old_items():
+    client, Session = _client()
+    _seed_many_products(Session, 101)
+    list_id = client.post(
+        "/api/lists-management",
+        json={"code": "REPLACE-FAIL", "name": "Replace fail", "type": "fixed_price", "active": True},
+    ).json()["id"]
+    db = Session()
+    try:
+        products = db.execute(select(Product).order_by(Product.code)).scalars().all()
+        db.add_all([ListItem(universal_list_id=list_id, product_id=product.id, value=10) for product in products[:100]])
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={"file": ("fixed.xlsx", _xlsx([["SKU", "Value"], ["SKU-100", -1]]), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+
+    assert response.status_code == 400
+    assert client.get(f"/api/lists-management/{list_id}").json()["itemsCount"] == 100
+
+
+def test_lists_management_replacement_deduplicates_uploaded_sku_last_row_wins():
+    client, Session = _client()
+    _seed_products(Session)
+    list_id = client.post(
+        "/api/lists-management",
+        json={"code": "REPLACE-DUP", "name": "Replace dup", "type": "fixed_price", "active": True},
+    ).json()["id"]
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={"file": ("fixed.xlsx", _xlsx([["SKU", "Value"], ["12345", 10], ["12345", 25], ["A-77", 50]]), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["duplicateRows"] == 1
+    card = client.get(f"/api/lists-management/{list_id}").json()
+    assert card["itemsCount"] == 2
+    assert {item["sku"]: item["value"] for item in card["items"]} == {"12345": 25.0, "A-77": 50.0}
+
+
+def test_lists_management_replacement_preserves_price_format_scope():
+    client, Session = _client()
+    _seed_products(Session)
+    db = Session()
+    try:
+        pf = PriceFormat(code="PF-SCOPE", name="Scope", branch="Almaty")
+        db.add(pf)
+        db.flush()
+        ul = UniversalList(code="REPLACE-SCOPE", name="Scope list", type="fixed_price", status="active", price_format_id=pf.id)
+        db.add(ul)
+        db.flush()
+        list_id = ul.id
+        pf_id = pf.id
+        db.add(UniversalListPriceFormat(universal_list_id=ul.id, price_format_id=pf.id))
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        f"/api/lists-management/{list_id}/import-excel",
+        files={"file": ("fixed.xlsx", _xlsx([["SKU", "Value"], ["12345", 10]]), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+
+    assert response.status_code == 200, response.text
+    check = Session()
+    saved = check.get(UniversalList, list_id)
+    assert saved.price_format_id == pf_id
+    assert check.scalar(select(func.count(UniversalListPriceFormat.id)).where(UniversalListPriceFormat.universal_list_id == list_id)) == 1
 
 
 def test_memorandum_import_excel_accepts_business_headers_and_reports_row_errors():

@@ -240,6 +240,8 @@ from .services.price_formats import (
     cleanup_price_format_owned_rows,
     normalize_price_list_type,
     price_format_business_dependency_counts,
+    price_format_delete_preview,
+    repair_price_format_generated_code,
 )
 from .services.competitor_source_config import (
     canonical_competitor_source_key,
@@ -2059,18 +2061,20 @@ def delete_price_format(
     if pf is None:
         raise HTTPException(status_code=404, detail="price format not found")
     _ensure_price_format_access(pf, current_user)
+    preview = price_format_delete_preview(db, int(pf.id))
     dependencies = price_format_business_dependency_counts(db, int(pf.id))
     if dependencies:
         raise HTTPException(
             status_code=409,
             detail={
                 "code": "price_format_in_use",
-                "message": "ЦФ нельзя удалить: по нему уже выполнялись расчёты.",
+                "message": "ЦФ нельзя удалить: найдены зависимости, которые нельзя безопасно отвязать.",
                 "dependencies": dependencies,
+                "preview": preview,
             },
         )
     try:
-        cleanup_price_format_owned_rows(db, int(pf.id))
+        cleanup = cleanup_price_format_owned_rows(db, int(pf.id))
         db.delete(pf)
         db.commit()
     except IntegrityError as exc:
@@ -2082,9 +2086,23 @@ def delete_price_format(
                 "code": "price_format_in_use",
                 "message": "ЦФ нельзя удалить: найдены связанные данные, которые нельзя удалить автоматически.",
                 "dependencies": {"integrity": 1},
+                "preview": preview,
             },
         ) from exc
-    return {"status": "deleted", "code": format_code}
+    return {"status": "deleted", "code": format_code, "preview": preview, "cleanup": cleanup}
+
+
+@app.get("/api/price-formats/{format_code}/delete-preview")
+def preview_price_format_delete(
+    format_code: str,
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+):
+    pf = db.execute(select(PriceFormat).where(PriceFormat.code == format_code)).scalars().first()
+    if pf is None:
+        raise HTTPException(status_code=404, detail="price format not found")
+    _ensure_price_format_access(pf, current_user)
+    return price_format_delete_preview(db, int(pf.id))
 
 
 @app.get("/api/price-formats/{price_format_id}/percentile-preparation-status")
@@ -4116,57 +4134,22 @@ async def import_lists_management_items(list_id: int, file: UploadFile = File(..
     ul = db.execute(select(UniversalList).where(UniversalList.id == list_id)).scalars().first()
     if not ul:
         raise HTTPException(status_code=404, detail="list not found")
-    content = await file.read()
-    wb = load_workbook(io.BytesIO(content), data_only=True)
-    ws = wb.active
-    headers = [str(cell.value or "").strip().lower() for cell in next(ws.iter_rows(min_row=1, max_row=1))]
-    sku_idx = headers.index("sku") if "sku" in headers else 0
-    exclusion_by_presence = is_exclude_from_pricing_type(str(ul.type or ""))
-    value_idx = headers.index("value") if "value" in headers else (None if exclusion_by_presence else 1)
-    pending_items: list[tuple[Product, Decimal, str]] = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        sku = str(row[sku_idx] or "").strip()
-        if not sku:
-            continue
-        product = find_product_by_identifier(db, sku)
-        if not product:
-            continue
-        raw_value = row[value_idx] if value_idx is not None and value_idx < len(row) else None
-        if _list_type_code(ul.type) == "critical_markup" and str(raw_value or "").strip() == "-":
-            value, special_value = Decimal("0"), "-"
-        elif exclusion_by_presence:
-            value, _value_error = normalize_universal_list_value(str(ul.type or ""), raw_value)
-            special_value = ""
-        else:
-            value, special_value = parse_list_decimal(raw_value), ""
-        if value is None:
-            continue
-        if _list_type_code(ul.type) == "memorandum" and value <= 0:
-            continue
-        price_value_error = validate_universal_list_price_value(str(ul.type or ""), value, sku=sku)
-        if price_value_error:
-            raise HTTPException(status_code=400, detail=price_value_error)
-        pending_items.append((product, value, special_value))
-    imported = 0
-    for product, value, special_value in pending_items:
-        item = db.execute(
-            select(ListItem).where(ListItem.universal_list_id == ul.id).where(ListItem.product_id == product.id)
-        ).scalars().first()
-        if item:
-            item.value = value
-            item.special_value = special_value
-        else:
-            db.add(
-                ListItem(
-                    universal_list_id=ul.id,
-                    product_id=product.id,
-                    value=value,
-                    special_value=special_value,
-                )
-            )
-        imported += 1
-    db.commit()
-    return {"status": "ok", "imported": imported}
+    try:
+        content = await _read_upload_limited(file, max_bytes=max_upload_size_bytes())
+        payload = import_universal_list_excel(
+            db=db,
+            universal_list=ul,
+            content=content,
+            filename=file.filename or "upload.xlsx",
+        )
+        return {"status": "ok", "imported": payload["importedRows"], **payload}
+    except (ImportHeaderError, ImportRowLimitError) as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="database error during list import") from exc
 
 
 @app.post("/api/lists-management/{list_id}/import-excel")
@@ -10201,10 +10184,22 @@ def put_settings_for_format(
         raise HTTPException(status_code=404, detail="price format not found")
     _ensure_price_format_access(pf, current_user)
     percentile_relevant_change = False
+    repair_generated_code = bool(payload.get("repairGeneratedCode") or payload.get("repair_generated_code"))
 
     if "code" in payload and str(payload.get("code") or "").strip() not in {"", pf.code}:
         raise HTTPException(status_code=400, detail="code is immutable")
-    if "priceListType" in payload or "price_list_type" in payload:
+    if repair_generated_code:
+        try:
+            repair_price_format_generated_code(
+                db,
+                pf,
+                price_list_type=payload.get("priceListType", payload.get("price_list_type")),
+                branch=payload.get("branch"),
+                sequence_number=payload.get("sequenceNumber", payload.get("sequence_number")),
+            )
+        except ValueError as exc:
+            _raise_value_error(exc)
+    elif "priceListType" in payload or "price_list_type" in payload:
         raw_type = payload.get("priceListType", payload.get("price_list_type"))
         if raw_type not in (None, ""):
             try:
@@ -10213,11 +10208,11 @@ def put_settings_for_format(
                 _raise_value_error(exc)
             if next_type != (pf.price_list_type or ""):
                 raise HTTPException(status_code=400, detail="priceListType is immutable")
-    if "sapBranchCode" in payload or "sap_branch_code" in payload:
+    if not repair_generated_code and ("sapBranchCode" in payload or "sap_branch_code" in payload):
         next_sap_branch_code = str(payload.get("sapBranchCode", payload.get("sap_branch_code")) or "").strip()
         if next_sap_branch_code != (pf.sap_branch_code or ""):
             raise HTTPException(status_code=400, detail="sapBranchCode is immutable")
-    if "sequenceNumber" in payload or "sequence_number" in payload:
+    if not repair_generated_code and ("sequenceNumber" in payload or "sequence_number" in payload):
         next_sequence = payload.get("sequenceNumber", payload.get("sequence_number"))
         if next_sequence not in (None, ""):
             try:
@@ -10231,7 +10226,7 @@ def put_settings_for_format(
         if not next_name:
             raise HTTPException(status_code=400, detail="name is required")
         pf.name = next_name
-    if isinstance(payload.get("branch"), str):
+    if not repair_generated_code and isinstance(payload.get("branch"), str):
         raw_branch = str(payload["branch"]).strip()
         next_branch = raw_branch
         if pf.branch != raw_branch:
@@ -10256,8 +10251,8 @@ def put_settings_for_format(
             pass
     if payload.get("pricingRuleId") not in (None, ""):
         try:
-            apply_pricing_rule_to_format(db=db, format_code=format_code, rule_id=int(payload.get("pricingRuleId")))
-            return get_settings_for_format(format_code=format_code, db=db, current_user=current_user)
+            apply_pricing_rule_to_format(db=db, format_code=pf.code, rule_id=int(payload.get("pricingRuleId")))
+            return get_settings_for_format(format_code=pf.code, db=db, current_user=current_user)
         except Exception:
             db.rollback()
             raise
@@ -10356,10 +10351,13 @@ def put_settings_for_format(
                 )
             )
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        _raise_conflict_for_integrity_error(db, exc, "price format code already exists")
     if percentile_relevant_change:
         enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="price_format_settings_changed")
-    return get_settings_for_format(format_code=format_code, db=db, current_user=current_user)
+    return get_settings_for_format(format_code=pf.code, db=db, current_user=current_user)
 
 
 @app.post("/upload-excel", response_model=UploadExcelResponse)

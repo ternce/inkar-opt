@@ -32,9 +32,11 @@ from backend.app.models import (
     PricingWorkflowRun,
     Product,
     ProvisorGoodsMap,
+    RefreshJob,
     SourceGoodsMatch,
     UniversalList,
     UniversalListPriceFormat,
+    VidmanCompetitorPriceListSource,
 )
 from backend.app.services.price_formats import (
     allocate_price_format_code,
@@ -315,7 +317,7 @@ def test_settings_edit_persists_name_and_keeps_identity_immutable(monkeypatch):
     assert Session().scalar(select(PriceFormat.name).where(PriceFormat.code == "ИПЛ_1001_001")) == "New name"
 
 
-def test_delete_unused_format_and_reject_used_format(monkeypatch):
+def test_delete_unused_format_and_detaches_generated_price_lists(monkeypatch):
     Session = _session_factory()
     db = Session()
     unused = PriceFormat(code="UNUSED", name="Unused", branch="Алматы")
@@ -334,9 +336,12 @@ def test_delete_unused_format_and_reject_used_format(monkeypatch):
 
     assert deleted.status_code == 200, deleted.text
     assert Session().scalar(select(PriceFormat.id).where(PriceFormat.code == "UNUSED")) is None
-    assert blocked.status_code == 409
-    assert blocked.json()["detail"]["code"] == "price_format_in_use"
-    assert blocked.json()["detail"]["dependencies"] == {"price_lists": 1}
+    assert blocked.status_code == 200, blocked.text
+    check = Session()
+    kept = check.scalar(select(PriceList).where(PriceList.number == "PL-1"))
+    assert kept is not None
+    assert kept.price_format_id is None
+    assert check.scalar(select(PriceFormat.id).where(PriceFormat.code == "USED")) is None
 
 
 def test_delete_format_cleans_owned_configuration_and_technical_state(monkeypatch):
@@ -448,7 +453,7 @@ def test_delete_format_preserves_competitor_price_lists_and_items_by_unlinking(m
     assert check.query(PriceFormatCompetitorAssignment).count() == 0
 
 
-def test_delete_format_rejects_workflow_history(monkeypatch):
+def test_delete_format_detaches_workflow_history(monkeypatch):
     Session = _session_factory()
     db = Session()
     pf = PriceFormat(code="RUN-HISTORY", name="Run history", branch=ALMATY)
@@ -464,8 +469,12 @@ def test_delete_format_rejects_workflow_history(monkeypatch):
     finally:
         main.app.dependency_overrides.clear()
 
-    assert response.status_code == 409
-    assert response.json()["detail"]["dependencies"] == {"pricing_workflow_runs": 1}
+    assert response.status_code == 200, response.text
+    check = Session()
+    kept_run = check.scalar(select(PricingWorkflowRun).where(PricingWorkflowRun.status == "finished"))
+    assert kept_run is not None
+    assert kept_run.price_format_id is None
+    assert check.scalar(select(PriceFormat.id).where(PriceFormat.code == "RUN-HISTORY")) is None
 
 
 def test_delete_does_not_reuse_generated_sequence(monkeypatch):
@@ -503,6 +512,76 @@ def test_legacy_price_format_keeps_null_metadata(monkeypatch):
     assert legacy["priceListType"] is None
     assert legacy["sapBranchCode"] is None
     assert legacy["sequenceNumber"] is None
+
+
+def test_repair_legacy_generated_code_preserves_id_and_updates_code_references(monkeypatch):
+    Session = _session_factory()
+    db = Session()
+    seed_default_sap_branch_mappings(db)
+    pf = PriceFormat(code=f"{GPL}_008", name="Legacy GPL", branch=ESIK)
+    db.add(pf)
+    db.flush()
+    original_id = pf.id
+    db.add_all(
+        [
+            PriceList(number="PL-LEGACY", price_format_id=pf.id),
+            Job(id="job-legacy-code", type="refresh_price_lists", status="finished", format_code=pf.code, price_format_id=pf.id),
+            VidmanCompetitorPriceListSource(account_id=1, main_id=10, price_format_code=pf.code, is_active=True),
+            RefreshJob(source_type="provisor", mode="selected", status="success", metadata_json=f'{{"format_code": "{pf.code}"}}'),
+        ]
+    )
+    db.commit()
+
+    client = _client(Session, monkeypatch)
+    try:
+        response = client.put(
+            f"/api/price-formats/{GPL}_008/settings",
+            json={
+                "name": "Legacy GPL renamed",
+                "repairGeneratedCode": True,
+                "priceListType": GPL,
+                "branch": ESIK,
+                "sequenceNumber": 8,
+            },
+        )
+    finally:
+        main.app.dependency_overrides.clear()
+
+    assert response.status_code == 200, response.text
+    assert response.json()["code"] == f"{GPL}_1004_008"
+    check = Session()
+    repaired = check.get(PriceFormat, original_id)
+    assert repaired is not None
+    assert repaired.code == f"{GPL}_1004_008"
+    assert repaired.name == "Legacy GPL renamed"
+    assert check.scalar(select(PriceList.price_format_id).where(PriceList.number == "PL-LEGACY")) == original_id
+    assert check.scalar(select(Job.format_code).where(Job.id == "job-legacy-code")) == f"{GPL}_1004_008"
+    assert check.scalar(select(VidmanCompetitorPriceListSource.price_format_code)) == f"{GPL}_1004_008"
+    assert f"{GPL}_1004_008" in check.scalar(select(RefreshJob.metadata_json))
+
+
+def test_repair_generated_code_rejects_duplicate_sequence(monkeypatch):
+    Session = _session_factory()
+    db = Session()
+    seed_default_sap_branch_mappings(db)
+    db.add_all(
+        [
+            PriceFormat(code=f"{GPL}_008", name="Legacy GPL", branch=ESIK),
+            PriceFormat(code=f"{IPL}_1004_008", name="Existing", branch=ESIK, price_list_type=IPL, sap_branch_code="1004", sequence_number=8),
+        ]
+    )
+    db.commit()
+
+    client = _client(Session, monkeypatch)
+    try:
+        response = client.put(
+            f"/api/price-formats/{GPL}_008/settings",
+            json={"repairGeneratedCode": True, "priceListType": GPL, "branch": ESIK, "sequenceNumber": 8},
+        )
+    finally:
+        main.app.dependency_overrides.clear()
+
+    assert response.status_code == 409
 
 
 def test_sap_rows_use_price_format_code():

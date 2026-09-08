@@ -254,7 +254,7 @@ class PriceList(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     number: Mapped[str] = mapped_column(Text, unique=True, index=True)
 
-    price_format_id: Mapped[int] = mapped_column(ForeignKey("price_formats.id"), index=True)
+    price_format_id: Mapped[int | None] = mapped_column(ForeignKey("price_formats.id"), nullable=True, index=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
     activation_date: Mapped[date | None] = mapped_column(Date, nullable=True)
@@ -1441,7 +1441,7 @@ class PricingWorkflowRun(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     pricing_context_id: Mapped[int] = mapped_column(ForeignKey("pricing_contexts.id"), index=True)
-    price_format_id: Mapped[int] = mapped_column(ForeignKey("price_formats.id"), index=True)
+    price_format_id: Mapped[int | None] = mapped_column(ForeignKey("price_formats.id"), nullable=True, index=True)
     pricing_rule_id: Mapped[int | None] = mapped_column(ForeignKey("pricing_rules.id"), nullable=True, index=True)
     price_list_id: Mapped[int | None] = mapped_column(ForeignKey("price_lists.id"), nullable=True, index=True)
     price_list_number: Mapped[str] = mapped_column(Text, default="", index=True)

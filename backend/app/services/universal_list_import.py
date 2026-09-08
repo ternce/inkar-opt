@@ -10,7 +10,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from openpyxl import load_workbook
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -935,26 +935,19 @@ def import_universal_list_excel(
     summary["processed"] = len(items_by_product)
 
     try:
+        old_count = int(db.scalar(select(func.count(ListItem.id)).where(ListItem.universal_list_id == universal_list.id)) or 0)
+        db.execute(delete(ListItem).where(ListItem.universal_list_id == universal_list.id))
         for item in items_by_product.values():
-            existing = db.execute(
-                select(ListItem)
-                .where(ListItem.universal_list_id == universal_list.id)
-                .where(ListItem.product_id == item.product.id)
-            ).scalars().first()
-            if existing:
-                existing.value = item.value
-                existing.special_value = item.special_value
-                summary["updated"] += 1
-            else:
-                db.add(
-                    ListItem(
-                        universal_list_id=universal_list.id,
-                        product_id=item.product.id,
-                        value=item.value,
-                        special_value=item.special_value,
-                    )
+            db.add(
+                ListItem(
+                    universal_list_id=universal_list.id,
+                    product_id=item.product.id,
+                    value=item.value,
+                    special_value=item.special_value,
                 )
-                summary["imported"] += 1
+            )
+            summary["imported"] += 1
+        summary["replaced"] = old_count
         db.commit()
     except SQLAlchemyError:
         db.rollback()

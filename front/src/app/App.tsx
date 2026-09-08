@@ -47,6 +47,7 @@ import {
   formatLocalDate,
   formatLocalDateTime,
 } from './competitorTimestamps';
+import { previewGeneratedPriceFormatCode } from './priceFormatCodeRepair';
 
 interface PriceFormat {
   id: string;
@@ -683,6 +684,10 @@ function HomeDashboard({
   const [error, setError] = useState<string | null>(null);
   const [editingFormat, setEditingFormat] = useState<PriceFormat | null>(null);
   const [editingFormatName, setEditingFormatName] = useState('');
+  const [editingFormatRepairCode, setEditingFormatRepairCode] = useState(false);
+  const [editingFormatType, setEditingFormatType] = useState('ИПЛ');
+  const [editingFormatBranch, setEditingFormatBranch] = useState('');
+  const [editingFormatSequence, setEditingFormatSequence] = useState('');
 
   const load = async () => {
     setIsLoading(true);
@@ -839,6 +844,10 @@ function HomeDashboard({
     if (!next) return;
     setEditingFormat(next);
     setEditingFormatName(next.name || next.code);
+    setEditingFormatRepairCode(false);
+    setEditingFormatType(next.priceListType || 'ИПЛ');
+    setEditingFormatBranch(isSupportedCity(next.branch) ? next.branch : (branch || SUPPORTED_CITIES[0]));
+    setEditingFormatSequence(next.sequenceNumber ? String(next.sequenceNumber) : '');
   };
 
   const saveBasicEdit = async () => {
@@ -856,17 +865,34 @@ function HomeDashboard({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           name: nextName,
-          code: editingFormat.code,
-          branch: editingFormat.branch,
-          priceListType: editingFormat.priceListType ?? undefined,
-          sapBranchCode: editingFormat.sapBranchCode ?? undefined,
-          sequenceNumber: editingFormat.sequenceNumber ?? undefined,
+          ...(editingFormatRepairCode
+            ? {
+                repairGeneratedCode: true,
+                priceListType: editingFormatType,
+                branch: editingFormatBranch,
+                sequenceNumber: editingFormatSequence,
+              }
+            : {
+                code: editingFormat.code,
+                branch: editingFormat.branch,
+                priceListType: editingFormat.priceListType ?? undefined,
+                sapBranchCode: editingFormat.sapBranchCode ?? undefined,
+                sequenceNumber: editingFormat.sequenceNumber ?? undefined,
+              }),
         }),
       });
       const text = await res.text();
       const data = parseJsonOrNull(text);
       if (!res.ok) throw new Error(data?.detail || text || 'Не удалось сохранить ЦФ');
-      const updated = { ...editingFormat, name: String(data?.name ?? nextName) };
+      const updated = {
+        ...editingFormat,
+        code: String(data?.code ?? editingFormat.code),
+        name: String(data?.name ?? nextName),
+        branch: String(data?.branch ?? editingFormat.branch),
+        priceListType: data?.priceListType ?? editingFormat.priceListType,
+        sapBranchCode: data?.sapBranchCode ?? editingFormat.sapBranchCode,
+        sequenceNumber: data?.sequenceNumber ?? editingFormat.sequenceNumber,
+      };
       await onFormatUpdated(updated);
       setEditingFormat(null);
       setEditingFormatName('');
@@ -911,10 +937,25 @@ function HomeDashboard({
     if (open) return;
     setEditingFormat(null);
     setEditingFormatName('');
+    setEditingFormatRepairCode(false);
+    setEditingFormatSequence('');
   };
 
   const deletePriceFormat = async (row: FormatDashboardRow) => {
-    const confirmed = window.confirm(`Удалить ценовой формат ${row.code}?`);
+    let previewText = 'Будут удалены настройки ЦФ, назначения ПЛК и связанные служебные данные. Сформированные прайс-листы и история расчётов будут сохранены и отвязаны от ЦФ.';
+    try {
+      const previewRes = await fetch(`/api/price-formats/${encodeURIComponent(row.code)}/delete-preview`);
+      const preview = parseJsonOrNull(await previewRes.text());
+      const blockers = preview?.blockers && typeof preview.blockers === 'object'
+        ? Object.entries(preview.blockers).filter(([, value]) => Number(value) > 0)
+        : [];
+      if (blockers.length) {
+        previewText += `\n\nНельзя безопасно отвязать: ${blockers.map(([key, value]) => `${dependencyLabels[key] || key}: ${value}`).join(', ')}.`;
+      }
+    } catch {
+      // Preview is advisory; deletion endpoint still enforces the transaction.
+    }
+    const confirmed = window.confirm(`Удалить ценовой формат ${row.code}?\n\n${previewText}`);
     if (!confirmed) return;
     setIsLoading(true);
     setError(null);
@@ -1008,7 +1049,7 @@ function HomeDashboard({
             </label>
             <label>
               <span className="text-xs font-medium text-gray-500">Предварительный код</span>
-              <input className="mt-1 w-full rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-600" value={`${newFormatType}_${newFormatBranch ? 'SAP' : '---'}_XXX`} readOnly />
+              <input className="mt-1 w-full rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-600" value={previewGeneratedPriceFormatCode(newFormatType, newFormatBranch, '')} readOnly />
             </label>
             <label>
               <span className="text-xs font-medium text-gray-500">Правило ЦО</span>
@@ -1184,11 +1225,53 @@ function HomeDashboard({
                 <div><span className="text-gray-500">SAP-код</span><div className="font-medium">{editingFormat.sapBranchCode || '—'}</div></div>
                 <div><span className="text-gray-500">Номер</span><div className="font-medium">{editingFormat.sequenceNumber ?? '—'}</div></div>
               </div>
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={editingFormatRepairCode}
+                  onChange={(event) => setEditingFormatRepairCode(event.target.checked)}
+                />
+                <span>Исправить сгенерированный код ЦФ</span>
+              </label>
+              {editingFormatRepairCode ? (
+                <div className="grid grid-cols-1 gap-3 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm sm:grid-cols-3">
+                  <label>
+                    <span className="text-xs font-medium text-gray-500">Тип ПЛ</span>
+                    <select className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm" value={editingFormatType} onChange={(event) => setEditingFormatType(event.target.value)}>
+                      <option value="ИПЛ">ИПЛ</option>
+                      <option value="ГПЛ">ГПЛ</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span className="text-xs font-medium text-gray-500">Филиал</span>
+                    <select className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm" value={editingFormatBranch} onChange={(event) => setEditingFormatBranch(event.target.value)}>
+                      {SUPPORTED_CITIES.map((item) => (
+                        <option key={item} value={item}>{item}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    <span className="text-xs font-medium text-gray-500">Номер</span>
+                    <input
+                      className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm"
+                      inputMode="numeric"
+                      min="1"
+                      type="number"
+                      value={editingFormatSequence}
+                      onChange={(event) => setEditingFormatSequence(event.target.value)}
+                    />
+                  </label>
+                  <div className="sm:col-span-3">
+                    <span className="text-xs font-medium text-gray-500">Итоговый код будет собран автоматически</span>
+                    <div className="mt-1 font-medium">{previewGeneratedPriceFormatCode(editingFormatType, editingFormatBranch, editingFormatSequence)}</div>
+                  </div>
+                </div>
+              ) : null}
             </div>
           ) : null}
           <DialogFooter>
             <Button variant="outline" onClick={() => closeBasicEditModal(false)}>Отмена</Button>
-            <Button onClick={() => void saveBasicEdit()} disabled={isLoading || !editingFormatName.trim()} className="bg-blue-600 hover:bg-blue-700">
+            <Button onClick={() => void saveBasicEdit()} disabled={isLoading || !editingFormatName.trim() || (editingFormatRepairCode && !editingFormatSequence.trim())} className="bg-blue-600 hover:bg-blue-700">
               Сохранить
             </Button>
           </DialogFooter>

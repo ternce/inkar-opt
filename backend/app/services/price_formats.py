@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import re
 
 from sqlalchemy import delete, func, or_, select, text, update
@@ -24,9 +25,11 @@ from ..models import (
     PriceList,
     PricingWorkflowRun,
     ProvisorGoodsMap,
+    RefreshJob,
     SourceGoodsMatch,
     UniversalList,
     UniversalListPriceFormat,
+    VidmanCompetitorPriceListSource,
     VidmanLogicalCompetitor,
 )
 from ..timezone import now_kz_naive
@@ -226,9 +229,12 @@ def allocate_price_format_code(db: Session, *, branch: str, price_list_type: obj
 
 
 PRICE_FORMAT_BUSINESS_DEPENDENCIES: tuple[tuple[str, object], ...] = (
+    ("counterparty_price_formats", CounterpartyPriceFormat),
+)
+
+PRICE_FORMAT_PRESERVED_HISTORY_DEPENDENCIES: tuple[tuple[str, object], ...] = (
     ("price_lists", PriceList),
     ("pricing_workflow_runs", PricingWorkflowRun),
-    ("counterparty_price_formats", CounterpartyPriceFormat),
 )
 
 PRICE_FORMAT_OWNED_CONFIGURATION_DEPENDENCIES: tuple[tuple[str, object], ...] = (
@@ -257,6 +263,7 @@ PRICE_FORMAT_COMPETITOR_SOURCE_DEPENDENCIES: tuple[tuple[str, object], ...] = (
 
 PRICE_FORMAT_DEPENDENCIES: tuple[tuple[str, object], ...] = (
     PRICE_FORMAT_BUSINESS_DEPENDENCIES
+    + PRICE_FORMAT_PRESERVED_HISTORY_DEPENDENCIES
     + PRICE_FORMAT_COMPETITOR_SOURCE_DEPENDENCIES
     + PRICE_FORMAT_OWNED_CONFIGURATION_DEPENDENCIES
     + PRICE_FORMAT_TECHNICAL_DEPENDENCIES
@@ -295,6 +302,44 @@ def price_format_business_dependency_counts(db: Session, price_format_id: int) -
     return dependencies
 
 
+def price_format_delete_preview(db: Session, price_format_id: int) -> dict:
+    delete_counts: dict[str, int] = {}
+    unlink_counts: dict[str, int] = {}
+    blockers = price_format_business_dependency_counts(db, price_format_id)
+
+    for table_name, model in (
+        PRICE_FORMAT_OWNED_CONFIGURATION_DEPENDENCIES
+        + PRICE_FORMAT_TECHNICAL_DEPENDENCIES
+    ):
+        count = int(
+            db.scalar(select(func.count()).select_from(model).where(model.price_format_id == price_format_id))
+            or 0
+        )
+        if count:
+            if table_name in {"vidman_logical_competitors", "universal_lists"}:
+                unlink_counts[table_name] = count
+            else:
+                delete_counts[table_name] = count
+
+    for table_name, model in PRICE_FORMAT_PRESERVED_HISTORY_DEPENDENCIES + PRICE_FORMAT_COMPETITOR_SOURCE_DEPENDENCIES:
+        count = int(
+            db.scalar(select(func.count()).select_from(model).where(model.price_format_id == price_format_id))
+            or 0
+        )
+        if count:
+            unlink_counts[table_name] = count
+
+    return {
+        "delete": delete_counts,
+        "unlink": unlink_counts,
+        "blockers": blockers,
+        "warnings": [
+            "Будут удалены настройки ЦФ, назначения ПЛК и связанные служебные данные. "
+            "Сформированные прайс-листы и история расчётов будут сохранены и отвязаны от ЦФ."
+        ],
+    }
+
+
 def cleanup_price_format_owned_rows(db: Session, price_format_id: int) -> dict[str, int]:
     """Remove rows whose lifecycle belongs to the price format.
 
@@ -325,6 +370,22 @@ def cleanup_price_format_owned_rows(db: Session, price_format_id: int) -> dict[s
             deleted[table_name] = int(result.rowcount)
 
     result = db.execute(
+        update(PriceList)
+        .where(PriceList.price_format_id == price_format_id)
+        .values(price_format_id=None)
+    )
+    if result.rowcount:
+        deleted["price_lists_unlinked"] = int(result.rowcount)
+
+    result = db.execute(
+        update(PricingWorkflowRun)
+        .where(PricingWorkflowRun.price_format_id == price_format_id)
+        .values(price_format_id=None)
+    )
+    if result.rowcount:
+        deleted["pricing_workflow_runs_unlinked"] = int(result.rowcount)
+
+    result = db.execute(
         update(UniversalList)
         .where(UniversalList.price_format_id == price_format_id)
         .values(price_format_id=None)
@@ -349,3 +410,67 @@ def cleanup_price_format_owned_rows(db: Session, price_format_id: int) -> dict[s
         deleted["competitor_price_lists_unlinked"] = int(result.rowcount)
 
     return deleted
+
+
+def repair_price_format_generated_code(
+    db: Session,
+    pf: PriceFormat,
+    *,
+    price_list_type: object,
+    branch: object,
+    sequence_number: object,
+) -> str:
+    normalized_type = normalize_price_list_type(price_list_type)
+    canonical_branch = canonical_supported_city_name(branch)
+    if not canonical_branch:
+        raise ValueError("branch must be one of supported regions")
+    mapping = resolve_sap_branch_mapping(db, canonical_branch)
+    try:
+        sequence = int(sequence_number)
+    except Exception as exc:
+        raise ValueError("sequenceNumber must be a positive integer") from exc
+    if sequence <= 0:
+        raise ValueError("sequenceNumber must be a positive integer")
+
+    sap_branch_code = str(mapping.sap_branch_code)
+    next_code = f"{normalized_type}_{sap_branch_code}_{sequence:03d}"
+    conflict_id = db.scalar(select(PriceFormat.id).where(PriceFormat.code == next_code).where(PriceFormat.id != pf.id).limit(1))
+    if conflict_id is not None:
+        raise ValueError("price format code already exists")
+    metadata_conflict_id = db.scalar(
+        select(PriceFormat.id)
+        .where(PriceFormat.sap_branch_code == sap_branch_code)
+        .where(PriceFormat.sequence_number == sequence)
+        .where(PriceFormat.id != pf.id)
+        .limit(1)
+    )
+    if metadata_conflict_id is not None:
+        raise ValueError("price format sequence already exists for SAP branch")
+
+    old_code = str(pf.code or "")
+    pf.code = next_code
+    pf.branch = canonical_branch
+    pf.price_list_type = normalized_type
+    pf.sap_branch_code = sap_branch_code
+    pf.sequence_number = sequence
+
+    db.execute(update(Job).where(or_(Job.price_format_id == pf.id, Job.format_code == old_code)).values(format_code=next_code))
+    db.execute(
+        update(VidmanCompetitorPriceListSource)
+        .where(VidmanCompetitorPriceListSource.price_format_code == old_code)
+        .values(price_format_code=next_code)
+    )
+    for job in db.execute(select(RefreshJob).where(RefreshJob.metadata_json.like(f"%{old_code}%"))).scalars().all():
+        try:
+            metadata = json.loads(job.metadata_json or "{}")
+        except Exception:
+            continue
+        changed = False
+        for key in ("format_code", "price_format_code"):
+            if metadata.get(key) == old_code:
+                metadata[key] = next_code
+                changed = True
+        if changed:
+            job.metadata_json = json.dumps(metadata, ensure_ascii=False)
+    _reconcile_price_format_branch_counter(db, sap_branch_code)
+    return next_code
