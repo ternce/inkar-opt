@@ -29,7 +29,6 @@ from ...competitor_percentiles import (
     PERCENTILES,
     REGIONAL_SCOPE,
     REGULAR_COMPETITOR_SCOPE,
-    emit_percentile_group_keys,
     percentile_inc_linear,
     regular_competitor_identity,
 )
@@ -76,16 +75,11 @@ def list_percentile_sources(
             assigned_regular_identities=assigned_regular_identities,
         )
 
-    allowed_groups_by_format: dict[int, set[tuple[str, str, str]]] = {}
     stmt = select(CompetitorPricePercentileSourceSummary)
     if price_format_code:
         pf = db.execute(select(PriceFormat).where(PriceFormat.code == price_format_code.strip())).scalars().first()
         if pf is None:
             return []
-        allowed_groups = emit_percentile_group_keys(db=db, price_format_id=int(pf.id))
-        if not allowed_groups and not include_ineligible:
-            return []
-        allowed_groups_by_format[int(pf.id)] = allowed_groups
         stmt = stmt.where(CompetitorPricePercentileSourceSummary.price_format_id == pf.id)
 
     rows = db.execute(
@@ -97,17 +91,7 @@ def list_percentile_sources(
     requested_source_ids = {str(item or "").strip() for item in (source_ids or set()) if str(item or "").strip()}
     out: list[dict] = []
     for row in rows:
-        allowed_groups = allowed_groups_by_format.get(int(row.price_format_id))
-        if allowed_groups is None:
-            allowed_groups = emit_percentile_group_keys(db=db, price_format_id=int(row.price_format_id))
-            allowed_groups_by_format[int(row.price_format_id)] = allowed_groups
-        eligible_for_pricing = False
-        if row.percentile_scope == REGIONAL_SCOPE:
-            eligible_for_pricing = _group_key(row.branch_name, row.competitor_name, row.source_key) in allowed_groups
-        elif row.percentile_scope == KAZAKHSTAN_SCOPE:
-            eligible_for_pricing = any(competitor == str(row.competitor_name or "").strip() for _branch, competitor, _source_key in allowed_groups)
-        if not eligible_for_pricing and not include_ineligible:
-            continue
+        eligible_for_pricing = True
         generated_at = row.generated_at.isoformat() if row.generated_at else ""
         source_id = provider.source_id(
             price_format_id=row.price_format_id,
@@ -137,7 +121,7 @@ def list_percentile_sources(
                 "generatedAt": generated_at,
                 "sourceType": "percentile",
                 "eligibleForPricing": eligible_for_pricing,
-                "pricingEligibilityReason": "" if eligible_for_pricing else "no_active_physical_emit_assignment",
+                "pricingEligibilityReason": "",
             }
         )
     return out
@@ -481,9 +465,6 @@ def list_percentile_groups(
     provider = get_percentile_provider(percentile_source)
     if provider.key == PERCENTILE_SOURCE_COMPETITOR:
         return _list_competitor_percentile_groups(db=db, pf=pf)
-    allowed_groups = emit_percentile_group_keys(db=db, price_format_id=int(pf.id))
-    if not allowed_groups:
-        return []
     rows = (
         db.execute(
             select(
@@ -511,13 +492,7 @@ def list_percentile_groups(
     for row in rows:
         region, competitor, source_key = _group_key(row.branch_name, row.competitor_name, row.source_key)
         scope = str(row.percentile_scope or REGIONAL_SCOPE)
-        if scope == REGIONAL_SCOPE:
-            if (region, competitor, source_key) not in allowed_groups:
-                continue
-        elif scope == KAZAKHSTAN_SCOPE:
-            if not any(allowed_competitor == competitor for _branch, allowed_competitor, _source_key in allowed_groups):
-                continue
-        else:
+        if scope not in {REGIONAL_SCOPE, KAZAKHSTAN_SCOPE}:
             continue
         groups.append(
             {
@@ -888,13 +863,8 @@ def percentile_trace(
     product = db.execute(select(Product).where(Product.code == sku.strip())).scalars().first()
     if product is None:
         return {"found": False, "reason": "product_not_found"}
-    allowed_groups = emit_percentile_group_keys(db=db, price_format_id=int(pf.id))
-    if not allowed_groups:
-        return {"found": False, "reason": "no_emit_percentile_source_assigned"}
     requested_source_key = str(source_key or "").strip()
     if region == KAZAKHSTAN_REGION:
-        if not any(allowed_competitor == competitor for _branch, allowed_competitor, _source_key in allowed_groups):
-            return {"found": False, "reason": "not_emit_percentile_group"}
         rows = (
             db.execute(
                 select(CompetitorPricePercentile)

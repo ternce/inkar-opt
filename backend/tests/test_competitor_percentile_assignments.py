@@ -25,8 +25,10 @@ from backend.app.models import (
 from backend.app.services.competitor_percentiles import (
     MULTI_PRICE_PERCENTILE_MODE,
     REGULAR_COMPETITOR_SCOPE,
+    recalculate_emit_percentiles_globally,
     recalculate_percentiles_for_price_lists,
 )
+from backend.app.services.percentile_preparation import mark_percentile_preparation_ready_for_catalog, percentile_preparation_to_dict
 from backend.app.services.pricing import load_percentile_price_cache, resolve_percentile_prices_from_cache
 from backend.app.services.competitors.percentiles.read_models import (
     list_percentile_product_rows,
@@ -1125,11 +1127,14 @@ def test_assignment_visibility_keeps_stored_emit_percentile_sources_after_physic
         assert db.execute(
             select(CompetitorPrice).where(CompetitorPrice.source_name.like("percentile:%"))
         ).scalar_one_or_none() is not None
-        assert list_percentile_sources(
+        retained = list_percentile_sources(
             db=db,
             price_format_code=pf.code,
             percentile_source=PERCENTILE_SOURCE_EMIT,
-        ) == []
+        )
+        assert len(retained) == 1
+        assert retained[0]["eligibleForPricing"] is True
+        assert retained[0]["pricingEligibilityReason"] == ""
         assignment_visible = list_percentile_sources(
             db=db,
             price_format_code=pf.code,
@@ -1138,7 +1143,7 @@ def test_assignment_visibility_keeps_stored_emit_percentile_sources_after_physic
         )
         assert len(assignment_visible) == 1
         assert assignment_visible[0]["sourceKey"] == source_key
-        assert assignment_visible[0]["eligibleForPricing"] is False
+        assert assignment_visible[0]["eligibleForPricing"] is True
 
     main.app.dependency_overrides[main.get_db] = lambda: Session()
     _override_admin(main)
@@ -1152,7 +1157,7 @@ def test_assignment_visibility_keeps_stored_emit_percentile_sources_after_physic
     percentile_rows = [row for row in payload if row["assignmentKind"] == "percentile_config"]
     assert len(percentile_rows) == 1
     assert percentile_rows[0]["sourceKey"].startswith(f"{pf_id}:regional:{source_key}:")
-    assert percentile_rows[0]["eligibleForPricing"] is False
+    assert percentile_rows[0]["eligibleForPricing"] is True
 
 
 def test_regular_percentile_assignment_availability_uses_canonical_dataset_without_physical_assignment():
@@ -1217,7 +1222,7 @@ def test_regular_percentile_assignment_missing_dataset_is_unavailable():
     assert percentile_rows[0]["pricingEligibilityReason"] == "regular_percentile_dataset_missing"
 
 
-def test_emit_assignment_availability_still_requires_active_emit_assignment():
+def test_emit_assignment_availability_uses_global_catalog_without_physical_assignment():
     db = _session()
     pf = _format(db, code="EMIT-UNCHANGED")
     product = _product(db)
@@ -1260,6 +1265,64 @@ def test_emit_assignment_availability_still_requires_active_emit_assignment():
         include_ineligible=True,
     )
 
-    assert hidden == []
-    assert inactive[0]["eligibleForPricing"] is False
-    assert inactive[0]["pricingEligibilityReason"] == "no_active_physical_emit_assignment"
+    assert len(hidden) == 1
+    assert hidden[0]["eligibleForPricing"] is True
+    assert inactive[0]["eligibleForPricing"] is True
+    assert inactive[0]["pricingEligibilityReason"] == ""
+
+
+def test_emit_percentile_rebuild_materializes_global_catalog_for_all_formats_without_assignments():
+    db = _session()
+    pf_a = _format(db, code="EMIT-A")
+    pf_b = _format(db, code="EMIT-B")
+    product = _product(db, code="SKU-GLOBAL", goods_id=555)
+    price_list = _price_list(
+        db,
+        pf_a,
+        source_key="emit:302",
+        branch="Aktau",
+        competitor="Emiti",
+        external_price_list_id="302",
+    )
+    price_list.source_type = "emit"
+    price_list.price_format_id = None
+    db.add_all(
+        [
+            CompetitorPriceListItem(
+                price_list_id=price_list.id,
+                product_id=product.id,
+                provisor_goods_id=555,
+                distributor_goods_id="555",
+                distributor_price=Decimal("100"),
+            ),
+            CompetitorPriceListItem(
+                price_list_id=price_list.id,
+                product_id=product.id,
+                provisor_goods_id=555,
+                distributor_goods_id="555",
+                distributor_price=Decimal("200"),
+            ),
+        ]
+    )
+    db.commit()
+
+    result = recalculate_emit_percentiles_globally(db=db, source_price_list_ids=[price_list.id])
+    mark_percentile_preparation_ready_for_catalog(db=db, price_format_ids=result["target_price_format_ids"], reason="test")
+    db.commit()
+
+    assert sorted(result["target_price_format_ids"]) == sorted([pf_a.id, pf_b.id])
+    for pf in (pf_a, pf_b):
+        sources = list_percentile_sources(db=db, price_format_code=pf.code, percentile_source=PERCENTILE_SOURCE_EMIT)
+        assert {row["percentile"] for row in sources} == {10, 20, 30, 40, 60}
+        rows = list_percentile_product_rows(
+            db=db,
+            price_format_code=pf.code,
+            region="Aktau",
+            competitor="Emiti",
+            source_key="emit:302",
+            percentile_source=PERCENTILE_SOURCE_EMIT,
+        )
+        assert rows["items"][0]["percentiles"]["10"] == pytest.approx(110.0)
+        prep = percentile_preparation_to_dict(db, int(pf.id))
+        assert prep["status"] == "ready"
+        assert prep["rowsCount"] > 0

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 _WHITESPACE_RE = re.compile(r"\s+")
 _PUNCT_SPACE_RE = re.compile(r"\s*([(),])\s*")
 _LEGAL_SUFFIX_RE = re.compile(r"\s+(тоо|too|нпо|npo)\b.*$")
+_AVERAGE_PRICE_SUFFIX_RE = re.compile(r"^(средняя\s+цена|average\s+price)\s+(.+)$")
 
 
 def normalize_regular_competitor_text(value: object) -> str:
@@ -71,6 +72,13 @@ class RegularCompetitorAliasFamily:
             for base_name in self.base_names:
                 if identity.startswith(f"{base_name}(") and identity.endswith(")"):
                     return self.canonical
+                if identity.startswith(f"{base_name} "):
+                    suffix = identity[len(base_name) :].strip()
+                    if suffix in _REGIONS:
+                        return self.canonical
+                    average_suffix = _AVERAGE_PRICE_SUFFIX_RE.match(suffix)
+                    if average_suffix and average_suffix.group(2).strip() in _REGIONS:
+                        return self.canonical
         for prefix in self.legal_prefixes:
             if identity == prefix or identity.startswith(f"{prefix}(") or identity.startswith(f"{prefix} "):
                 without_legal = _LEGAL_SUFFIX_RE.sub("", identity).strip()

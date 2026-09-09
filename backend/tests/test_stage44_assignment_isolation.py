@@ -427,7 +427,7 @@ def test_account_region_does_not_limit_newly_parsed_plk_availability():
     assert by_id[int(price_list.id)]["branchMismatchReason"].startswith("branch_mismatch:")
 
 
-def test_emit_refresh_recalculates_only_existing_assignments_and_never_creates_new_ones():
+def test_emit_refresh_recalculates_global_catalog_and_never_creates_new_assignments():
     db = _session_factory()()
     seeded = _seed_pool(db)
     before_total = _assignment_count(db)
@@ -440,9 +440,9 @@ def test_emit_refresh_recalculates_only_existing_assignments_and_never_creates_n
     )
 
     assert _assignment_count(db) == before_total
-    assert result["assigned_price_format_ids"] == []
+    assert sorted(result["assigned_price_format_ids"]) == sorted([int(seeded["owner"].id), int(seeded["assigned_pf"].id)])
     assert result["assignment_propagation"] == {}
-    assert {row["code"] for row in result["warnings"]} == {"emit_no_active_format_assignment"}
+    assert result["warnings"] == []
 
 
 def test_explicit_assignment_and_unassignment_still_work(monkeypatch):

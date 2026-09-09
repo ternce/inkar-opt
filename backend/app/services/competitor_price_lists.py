@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import logging
@@ -231,6 +232,55 @@ def _as_int(value: object) -> int | None:
         return int(float(str(value).strip()))
     except Exception:
         return None
+
+
+def _canonical_fingerprint_price(value: object) -> str:
+    dec = _as_decimal(value)
+    if dec is None:
+        return ""
+    return format(dec.normalize(), "f")
+
+
+def _fingerprint_rows(rows: list[tuple[str, str]]) -> str:
+    payload = json.dumps(sorted(rows), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def fingerprint_unified_price_list_items(items: list[UnifiedPriceItem]) -> str:
+    rows: list[tuple[str, str]] = []
+    for item in items or []:
+        raw = item.raw if isinstance(item.raw, dict) else {}
+        goods_id = (
+            str(raw.get("goodsId") or "").strip()
+            or str(item.distributor_product_id or "").strip()
+            or str(raw.get("id") or "").strip()
+        )
+        if not goods_id:
+            continue
+        rows.append((goods_id, _canonical_fingerprint_price(item.distributor_price)))
+    return _fingerprint_rows(rows)
+
+
+def fingerprint_persisted_price_list_items(db: Session, price_list_id: int) -> str:
+    rows: list[tuple[str, str]] = []
+    persisted = (
+        db.execute(
+            select(
+                CompetitorPriceListItem.provisor_goods_id,
+                CompetitorPriceListItem.distributor_goods_id,
+                CompetitorPriceListItem.distributor_price,
+            )
+            .where(CompetitorPriceListItem.price_list_id == price_list_id)
+            .order_by(CompetitorPriceListItem.id.asc())
+        )
+        .all()
+    )
+    for goods_id, distributor_goods_id, price in persisted:
+        external_id = str(goods_id or "").strip() or str(distributor_goods_id or "").strip()
+        if not external_id:
+            continue
+        rows.append((external_id, _canonical_fingerprint_price(price)))
+    return _fingerprint_rows(rows)
 
 
 def _source_name(row: CompetitorPriceList) -> str:

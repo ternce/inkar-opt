@@ -30,9 +30,10 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session, object_session, sessionmaker
 
 from ..config import Settings
-from ..models import CompetitorPriceList, CompetitorPriceListItem, PriceFormat, PriceFormatCompetitorAssignment, RefreshJob, RefreshLock
+from ..models import CompetitorPriceList, CompetitorPriceListItem, PriceFormat, RefreshJob, RefreshLock
 from .db_time import db_now
-from .competitor_percentiles import fanout_emit_percentiles_from_price_format, recalculate_competitor_percentiles
+from .competitor_percentiles import recalculate_emit_percentiles_globally
+from .percentile_preparation import mark_percentile_preparation_ready_for_catalog
 from .competitor_read_models import refresh_price_list_item_counters
 from .competitor_source_config import canonical_competitor_source_key
 from .competitor_persist import _ensure_price_format
@@ -2273,7 +2274,6 @@ def replace_emit_price_list_from_staging(
     _add_elapsed(stats, "validation_pre_copy_elapsed", validation_started)
     if final_count < config.min_final_rows:
         raise RuntimeError(f"Emit staging produced suspiciously low row count: {final_count} < {config.min_final_rows}")
-    pf = _price_format_for_code(db, price_format_code)
     source_key = f"emit:{filial_id}"
     now = datetime.utcnow()
     row = (
@@ -2288,7 +2288,7 @@ def replace_emit_price_list_from_staging(
     )
     if row is None:
         row = CompetitorPriceList(
-            price_format_id=pf.id,
+            price_format_id=None,
             source_type=COMPAT_SOURCE_TYPE,
             source_key=source_key,
             coefficient=1.0,
@@ -2297,7 +2297,7 @@ def replace_emit_price_list_from_staging(
         db.add(row)
         db.flush()
     display_name = filial_name or f"Emit International {filial_id}"
-    row.price_format_id = pf.id
+    row.price_format_id = None
     row.display_name = display_name
     row.supplier = display_name
     row.region = f"branch:{display_name}; competitor:{display_name}; account:emit; accountLogin:emit; status:success"
@@ -2824,28 +2824,8 @@ def _recalculate_percentiles_for_emit_rows(
         for row in db.execute(select(CompetitorPriceList).where(CompetitorPriceList.id.in_(ids))).scalars().all()
     } if ids else {}
 
-    assignment_rows = list(
-        db.execute(
-            select(
-                PriceFormatCompetitorAssignment.competitor_price_list_id,
-                PriceFormatCompetitorAssignment.price_format_id,
-            )
-            .where(PriceFormatCompetitorAssignment.competitor_price_list_id.in_(ids))
-            .where(PriceFormatCompetitorAssignment.is_active.is_(True))
-        )
-    ) if ids else []
-    assigned_by_price_list: dict[int, list[int]] = {}
-    price_lists_by_format: dict[int, list[int]] = {}
-    for row in assignment_rows:
-        if row.price_format_id is None:
-            continue
-        competitor_price_list_id = int(row.competitor_price_list_id)
-        price_format_id = int(row.price_format_id)
-        assigned_by_price_list.setdefault(competitor_price_list_id, []).append(price_format_id)
-        price_lists_by_format.setdefault(price_format_id, []).append(competitor_price_list_id)
-
+    target_format_ids = [int(item) for item in db.execute(select(PriceFormat.id).order_by(PriceFormat.id.asc())).scalars().all()]
     for price_list_id in ids:
-        assigned_ids = sorted(set(assigned_by_price_list.get(price_list_id, [])))
         price_list = price_lists.get(price_list_id)
         filial_id = getattr(price_list, "branch_id", "") or getattr(price_list, "external_price_list_id", "") or ""
         logger.info(
@@ -2853,151 +2833,30 @@ def _recalculate_percentiles_for_emit_rows(
             filial_id or "unknown",
             requested_format or "null",
             price_list_id,
-            assigned_ids,
+            target_format_ids,
         )
-        if not assigned_ids:
-            warning = {
-                "code": "emit_no_active_format_assignment",
-                "message": "Emit refresh completed but no active PriceFormatCompetitorAssignment found; percentiles were not recalculated",
-                "filial_id": filial_id,
-                "price_list_id": price_list_id,
-                "requested_format_code": requested_format,
-            }
-            warnings.append(warning)
-            logger.warning(
-                "[EMIT_FORMAT_CONTEXT] filial_id=%s requested_format_code=%s price_list_id=%s assigned_price_format_ids=[] warning=%s",
-                filial_id or "unknown",
-                requested_format or "null",
-                price_list_id,
-                warning["message"],
-            )
 
-    touched_format_ids = {
-        format_id
-        for format_ids in assigned_by_price_list.values()
-        for format_id in format_ids
-    }
-    summaries: dict[str, Any] = {}
-    touched_format_id_list = sorted(touched_format_ids)
     scoped_ids = sorted(set(ids))
-    can_share_emit_calculation = (
-        scope_to_price_list_ids
-        and bool(scoped_ids)
-        and bool(touched_format_id_list)
-        and all(sorted(set(price_lists_by_format.get(format_id, []))) == scoped_ids for format_id in touched_format_id_list)
+    result = recalculate_emit_percentiles_globally(
+        db=db,
+        source_price_list_ids=scoped_ids if scope_to_price_list_ids else None,
     )
-    expensive_calculation_count = 0
-    shared_result_reuse_count = 0
-    compatibility_rows_created = 0
-    skipped_duplicate_rebuilds = 0
-    calculation_elapsed = 0.0
-    persistence_elapsed = 0.0
-
-    if can_share_emit_calculation and len(touched_format_id_list) > 1:
-        canonical_price_format_id = touched_format_id_list[0]
-        pf = db.get(PriceFormat, canonical_price_format_id)
-        if pf is not None:
-            format_started = time.perf_counter()
-            summary = recalculate_competitor_percentiles(
-                db=db,
-                price_format_id=canonical_price_format_id,
-                source_price_list_ids=scoped_ids,
-            )
-            elapsed = round(time.perf_counter() - format_started, 3)
-            expensive_calculation_count = 1
-            calculation_elapsed = elapsed
-            summary["percentile_total_elapsed"] = elapsed
-            summary["percentile_rebuild_scope"] = "emit_source_shared_canonical"
-            summary["cache_or_reuse_strategy"] = "canonical_calculation"
-            summaries[str(pf.code or canonical_price_format_id)] = {"price_format_id": canonical_price_format_id, **summary}
-            logger.info(
-                "[EMIT_PERCENTILE_REBUILD] requested_format_code=%s format_code=%s price_format_id=%s rows_created=%s products_with_competitors=%s strategy=%s",
-                requested_format,
-                pf.code,
-                canonical_price_format_id,
-                summary.get("rows_created"),
-                summary.get("products_with_competitors"),
-                "canonical_calculation",
-            )
-
-        for price_format_id in touched_format_id_list:
-            if price_format_id == canonical_price_format_id:
-                continue
-            pf = db.get(PriceFormat, price_format_id)
-            if pf is None:
-                continue
-            format_started = time.perf_counter()
-            summary = fanout_emit_percentiles_from_price_format(
-                db=db,
-                source_price_format_id=canonical_price_format_id,
-                target_price_format_id=price_format_id,
-                source_price_list_ids=scoped_ids,
-            )
-            elapsed = round(time.perf_counter() - format_started, 3)
-            shared_result_reuse_count += 1
-            skipped_duplicate_rebuilds += 1
-            compatibility_rows_created += int(summary.get("compatibility_rows_created") or summary.get("rows_created") or 0)
-            persistence_elapsed = round(persistence_elapsed + elapsed, 3)
-            summary["percentile_total_elapsed"] = elapsed
-            summary["percentile_rebuild_scope"] = "emit_source_shared_fanout"
-            summary["cache_or_reuse_strategy"] = "compatibility_fanout"
-            summaries[str(pf.code or price_format_id)] = {"price_format_id": price_format_id, **summary}
-            logger.info(
-                "[EMIT_PERCENTILE_REBUILD] requested_format_code=%s format_code=%s price_format_id=%s rows_created=%s products_with_competitors=%s strategy=%s",
-                requested_format,
-                pf.code,
-                price_format_id,
-                summary.get("rows_created"),
-                summary.get("products_with_competitors"),
-                "compatibility_fanout",
-            )
-    else:
-        if touched_format_id_list:
-            logger.info(
-                "[EMIT_PERCENTILE_REBUILD] strategy=per_format reason=%s price_list_ids=%s assigned_price_format_ids=%s",
-                "non_uniform_assignments_or_unscoped_rebuild",
-                scoped_ids,
-                touched_format_id_list,
-            )
-    for price_format_id in ([] if can_share_emit_calculation and len(touched_format_id_list) > 1 else touched_format_id_list):
-        pf = db.get(PriceFormat, price_format_id)
-        if pf is None:
-            continue
-        format_started = time.perf_counter()
-        summary = recalculate_competitor_percentiles(
-            db=db,
-            price_format_id=price_format_id,
-            source_price_list_ids=ids if scope_to_price_list_ids else None,
-        )
-        expensive_calculation_count += 1
-        elapsed = round(time.perf_counter() - format_started, 3)
-        calculation_elapsed = round(calculation_elapsed + elapsed, 3)
-        summary["percentile_total_elapsed"] = elapsed
-        summary["percentile_rebuild_scope"] = "emit_format"
-        summary["cache_or_reuse_strategy"] = "per_format_calculation"
-        summaries[str(pf.code or price_format_id)] = {"price_format_id": price_format_id, **summary}
-        logger.info(
-            "[EMIT_PERCENTILE_REBUILD] requested_format_code=%s format_code=%s price_format_id=%s rows_created=%s products_with_competitors=%s",
-            requested_format,
-            pf.code,
-            price_format_id,
-            summary.get("rows_created"),
-            summary.get("products_with_competitors"),
-        )
+    summaries = dict(result.get("summaries") or {})
+    target_format_ids = [int(item) for item in result.get("target_price_format_ids") or target_format_ids]
+    mark_percentile_preparation_ready_for_catalog(
+        db=db,
+        price_format_ids=target_format_ids,
+        reason="emit_refresh_completed",
+    )
     commit_started = time.perf_counter()
     db.commit()
     commit_elapsed = round(time.perf_counter() - commit_started, 3)
-    calculation_summaries = [
-        item
-        for item in summaries.values()
-        if item.get("cache_or_reuse_strategy") != "compatibility_fanout"
-    ]
-    return {
+    result.update({
         "summaries": summaries,
-        "warnings": warnings,
-        "assigned_price_format_ids": sorted(touched_format_ids),
+        "warnings": warnings + list(result.get("warnings") or []),
+        "assigned_price_format_ids": target_format_ids,
         "assignment_propagation": {},
-        "percentile_rebuild_scope": "emit_source_shared" if can_share_emit_calculation and len(touched_format_id_list) > 1 else "emit_format",
+        "percentile_rebuild_scope": "emit_global_catalog",
         "percentile_source_key": sorted(
             {
                 str(canonical_competitor_source_key(price_lists[price_list_id]) or "")
@@ -3007,21 +2866,10 @@ def _recalculate_percentiles_for_emit_rows(
         ),
         "competitor_price_list_id": scoped_ids[0] if len(scoped_ids) == 1 else None,
         "competitor_price_list_ids": scoped_ids,
-        "expensive_calculation_count": expensive_calculation_count,
-        "shared_result_reuse_count": shared_result_reuse_count,
-        "raw_price_rows_scanned": sum(int(item.get("raw_price_rows") or 0) for item in calculation_summaries),
-        "matched_product_count": sum(int(item.get("products_with_competitors") or 0) for item in calculation_summaries),
-        "percentile_rows_calculated": sum(int(item.get("rows_created") or 0) for item in calculation_summaries),
-        "percentile_rows_persisted": sum(int(item.get("rows_created") or 0) for item in summaries.values()),
-        "compatibility_rows_created": compatibility_rows_created,
-        "calculation_elapsed": calculation_elapsed,
-        "persistence_elapsed": persistence_elapsed,
-        "total_percentile_elapsed": round(time.perf_counter() - rebuild_started, 3),
-        "cache_or_reuse_strategy": "compatibility_fanout" if can_share_emit_calculation and len(touched_format_id_list) > 1 else "per_format_calculation",
-        "skipped_duplicate_rebuilds": skipped_duplicate_rebuilds,
         "percentile_commit_elapsed": commit_elapsed,
         "percentile_total_elapsed": round(time.perf_counter() - rebuild_started, 3),
-    }
+    })
+    return result
 
 
 def update_emit_job(db: Session, job: RefreshJob, *, status: str, message: str, metadata: dict[str, Any] | None = None) -> None:

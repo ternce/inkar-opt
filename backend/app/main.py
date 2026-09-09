@@ -117,6 +117,8 @@ from .services.widman_client import WidmanInvalidCredentialsError
 from .services.competitor_persist import persist_phcenter_report, persist_provisor_prices
 from .services.competitor_price_lists import (
     export_competitor_price_list,
+    fingerprint_persisted_price_list_items,
+    fingerprint_unified_price_list_items,
     get_competitor_price_list_items,
     import_manual_price_list_excel,
     list_competitor_price_lists,
@@ -8306,7 +8308,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                             "[PROVISOR_REFERENCE_SKIP] account_id=%s reason=reference_filial_not_available using_existing_product_provisor_goods_id=true",
                             account.id,
                         )
-                local_price_list_state: dict[str, tuple[str, int, datetime | None]] = {}
+                local_price_list_state: dict[str, tuple[str, int, datetime | None, int | None]] = {}
                 if pf_for_refresh is not None and price_lists:
                     if account.source_type == "provisor":
                         source_keys = []
@@ -8362,6 +8364,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                             str(row.source_updated_at or ""),
                             int(item_counts.get(row.id, 0)),
                             row.updated_at,
+                            int(row.id) if row.id is not None else None,
                         )
                         local_price_list_state[str(row.source_key or "")] = state
                         if account.source_type == "provisor":
@@ -8375,7 +8378,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                         price_id = str(getattr(row, "price_list_id", "") or "")
                         price_name = str(getattr(row, "price_list_name", "") or getattr(row, "distributor_name", "") or price_id)
                         new_date = str(getattr(row, "source_updated_at", "") or "")
-                        old_date = local_price_list_state.get(f"{account.id}:{price_id}", ("", 0, None))[0]
+                        old_date = local_price_list_state.get(f"{account.id}:{price_id}", ("", 0, None, None))[0]
                         logger.info(
                             "[VW_PRICE_LIST_FOUND] account_id=%s price_id=%s price_name=%s old_date=%s new_date=%s",
                             account.id,
@@ -8544,7 +8547,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                 if account.source_type == "provisor"
                                 else f"{account.id}:{price_list_id}"
                             )
-                            local_updated_at, local_items_count, local_row_updated_at = local_price_list_state.get(local_key, ("", 0, None))
+                            local_updated_at, local_items_count, local_row_updated_at, local_price_list_id = local_price_list_state.get(local_key, ("", 0, None, None))
                             price_list_name = str(getattr(price_list, "price_list_name", "") or getattr(price_list, "distributor_name", "") or price_list_id)
                             logger.info(
                                 "[PRICE_REFRESH_START] source=%s account_id=%s price_id=%s price_name=%s timeout_seconds=%s",
@@ -8694,37 +8697,6 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                     "elapsed_ms": elapsed_ms,
                                     "timeout_limit_seconds": price_list_timeout,
                                 }, outcome="unchanged", skip_reason="ttl_unchanged_cache")
-                            if (
-                                account.source_type == "provisor"
-                                and not force_refresh
-                                and local_items_count > 0
-                                and local_row_updated_at is not None
-                                and now_kz_naive() - local_row_updated_at < PRICE_LIST_REFRESH_TTL
-                            ):
-                                elapsed_ms = round((time.perf_counter() - fetch_items_started_at) * 1000, 2)
-                                logger.info("[REFRESH] source=%s price_list=%s action=skip_unchanged", account.source_type, price_list_id)
-                                logger.info(
-                                    "[PROVISOR] filial=%s action=skip_unchanged reason=ttl local_updated_at=%s",
-                                    price_list_id,
-                                    local_updated_at,
-                                )
-                                provisor_audit.result(
-                                    account_id=int(account.id),
-                                    filial_id=price_list_id,
-                                    outcome=PROVISOR_AUDIT_SKIPPED_BY_CONFIGURATION,
-                                    reason_code="ttl_unchanged_cache",
-                                    previous_rows=local_items_count,
-                                    download_elapsed_sec=round(elapsed_ms / 1000, 3),
-                                )
-                                return {
-                                    "ok": False,
-                                    "skipped_unchanged": True,
-                                    "priceList": price_list,
-                                    "items": [],
-                                    "localItemsCount": local_items_count,
-                                    "elapsed_ms": elapsed_ms,
-                                    "timeout_limit_seconds": price_list_timeout,
-                                }
                             if account.source_type == "vidman":
                                 timeout_stage = "login"
                                 logger.info(
@@ -8814,32 +8786,45 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                 if provisor_updated_at:
                                     price_list = replace(price_list, source_updated_at=provisor_updated_at)
                                     if local_updated_at == provisor_updated_at and local_items_count > 0:
-                                        logger.info("[REFRESH] source=%s price_list=%s action=skip_unchanged", account.source_type, price_list_id)
+                                        downloaded_fingerprint = fingerprint_unified_price_list_items(items or [])
+                                        persisted_fingerprint = (
+                                            fingerprint_persisted_price_list_items(db, int(local_price_list_id))
+                                            if local_price_list_id is not None
+                                            else ""
+                                        )
+                                        if downloaded_fingerprint == persisted_fingerprint:
+                                            logger.info("[REFRESH] source=%s price_list=%s action=skip_unchanged", account.source_type, price_list_id)
+                                            logger.info(
+                                                "[PROVISOR] filial=%s action=skip_unchanged reason=content_fingerprint_match updated_at=%s",
+                                                price_list_id,
+                                                provisor_updated_at,
+                                            )
+                                            provisor_audit.result(
+                                                account_id=int(account.id),
+                                                filial_id=price_list_id,
+                                                outcome=PROVISOR_AUDIT_SKIPPED_BY_CONFIGURATION,
+                                                reason_code="content_fingerprint_match",
+                                                raw_rows=len(items or []),
+                                                valid_rows=len(items or []),
+                                                positive_price_rows=sum(1 for item in (items or []) if getattr(item, "distributor_price", None) is not None and getattr(item, "distributor_price", None) > 0),
+                                                previous_rows=local_items_count,
+                                                download_elapsed_sec=round(elapsed_ms / 1000, 3),
+                                            )
+                                            return finish_result({
+                                                "ok": False,
+                                                "skipped_unchanged": True,
+                                                "priceList": price_list,
+                                                "items": [],
+                                                "localItemsCount": local_items_count,
+                                                "elapsed_ms": elapsed_ms,
+                                                "timeout_limit_seconds": price_list_timeout,
+                                            }, outcome="unchanged", skip_reason="content_fingerprint_match")
                                         logger.info(
-                                            "[PROVISOR] filial=%s action=skip_unchanged updated_at=%s",
+                                            "[PROVISOR] filial=%s action=fetch_changed reason=content_fingerprint_mismatch updated_at=%s local_updated_at=%s",
                                             price_list_id,
                                             provisor_updated_at,
+                                            local_updated_at,
                                         )
-                                        provisor_audit.result(
-                                            account_id=int(account.id),
-                                            filial_id=price_list_id,
-                                            outcome=PROVISOR_AUDIT_SKIPPED_BY_CONFIGURATION,
-                                            reason_code="source_updated_at_unchanged",
-                                            raw_rows=len(items or []),
-                                            valid_rows=len(items or []),
-                                            positive_price_rows=sum(1 for item in (items or []) if getattr(item, "distributor_price", None) is not None and getattr(item, "distributor_price", None) > 0),
-                                            previous_rows=local_items_count,
-                                            download_elapsed_sec=round(elapsed_ms / 1000, 3),
-                                        )
-                                        return finish_result({
-                                            "ok": False,
-                                            "skipped_unchanged": True,
-                                            "priceList": price_list,
-                                            "items": [],
-                                            "localItemsCount": local_items_count,
-                                            "elapsed_ms": elapsed_ms,
-                                            "timeout_limit_seconds": price_list_timeout,
-                                        }, outcome="unchanged", skip_reason="source_updated_at_unchanged")
                                     logger.info(
                                         "[PROVISOR] filial=%s action=fetch_changed updated_at=%s local_updated_at=%s",
                                         price_list_id,

@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from ..db import SessionLocal
 from ..models import (
+    CompetitorPrice,
     CompetitorPriceListItem,
     CompetitorPricePercentile,
     Job,
@@ -87,6 +88,10 @@ def percentile_configuration(db: Session, price_format_id: int) -> dict[str, Any
     sources.sort(key=lambda row: (row["sourceKey"], row["priceListId"], row["assignmentId"]))
     source_refreshed_at = max([item.price_list.last_success_at for item in selected if item.price_list.last_success_at], default=None)
     source_refresh_id = "|".join(sorted({str(item.price_list.sync_batch_id or "") for item in selected if item.price_list.sync_batch_id}))
+    catalog_sources = _selected_catalog_percentile_sources(db, price_format_id)
+    if catalog_sources:
+        sources.extend(catalog_sources)
+        sources.sort(key=lambda row: (row.get("sourceKey", ""), row.get("sourceName", "")))
     return {
         "configured": bool(sources),
         "sources": sources,
@@ -100,7 +105,7 @@ def has_raw_percentile_data(db: Session, price_format_id: int) -> bool:
     selected = eligible_percentile_assignments(db=db, price_format_id=price_format_id, require_matched_prices=False)
     ids = [int(item.price_list.id) for item in selected]
     if not ids:
-        return False
+        return _catalog_percentile_rows_count(db, price_format_id) > 0
     count = int(
         db.execute(
             select(func.count(CompetitorPriceListItem.id))
@@ -111,6 +116,74 @@ def has_raw_percentile_data(db: Session, price_format_id: int) -> bool:
         or 0
     )
     return count > 0
+
+
+def _selected_catalog_percentile_sources(db: Session, price_format_id: int) -> list[dict[str, Any]]:
+    rows = (
+        db.execute(
+            select(CompetitorPrice.source_name, CompetitorPrice.supplier, CompetitorPrice.coefficient)
+            .where(CompetitorPrice.price_format_id == price_format_id)
+            .where(CompetitorPrice.product_id.is_(None))
+            .where(CompetitorPrice.source_name.like("percentile:%"))
+            .order_by(CompetitorPrice.source_name.asc())
+        )
+        .all()
+    )
+    return [
+        {
+            "assignmentId": None,
+            "priceListId": None,
+            "sourceType": "percentile_catalog",
+            "sourceKey": str(source_name or ""),
+            "sourceName": str(source_name or ""),
+            "branchName": "",
+            "competitorName": str(supplier or ""),
+            "percentileMode": "catalog",
+            "coefficient": str(coefficient or ""),
+            "priceCoefficient": "",
+            "lastSuccessAt": "",
+            "syncBatchId": "",
+        }
+        for source_name, supplier, coefficient in rows
+        if str(source_name or "").strip()
+    ]
+
+
+def _catalog_percentile_rows_count(db: Session, price_format_id: int) -> int:
+    return int(
+        db.execute(
+            select(func.count(CompetitorPricePercentile.id)).where(CompetitorPricePercentile.price_format_id == price_format_id)
+        ).scalar()
+        or 0
+    )
+
+
+def mark_percentile_preparation_ready_for_catalog(
+    *,
+    db: Session,
+    price_format_ids: list[int],
+    reason: str = "",
+) -> int:
+    now = now_kz_naive()
+    ready = 0
+    for price_format_id in sorted({int(item) for item in price_format_ids if int(item) > 0}):
+        rows_count = _catalog_percentile_rows_count(db, price_format_id)
+        if rows_count <= 0:
+            continue
+        config = percentile_configuration(db, price_format_id)
+        row = _status_row(db, price_format_id)
+        row.status = "ready"
+        row.completed_at = now
+        row.failed_at = None
+        row.last_error = ""
+        row.rows_count = rows_count
+        row.configuration_fingerprint = config["fingerprint"]
+        row.source_refresh_id = config["sourceRefreshId"]
+        row.source_refreshed_at = config["sourceRefreshedAt"]
+        row.updated_at = now
+        ready += 1
+    logger.info("[PERCENTILE_PREP] catalog_ready price_format_count=%s reason=%s", ready, reason)
+    return ready
 
 
 def percentile_preparation_to_dict(db: Session, price_format_id: int) -> dict[str, Any]:
@@ -193,6 +266,10 @@ def enqueue_percentile_preparation(
     now = now_kz_naive()
 
     if not config["configured"]:
+        if _catalog_percentile_rows_count(db, price_format_id) > 0:
+            mark_percentile_preparation_ready_for_catalog(db=db, price_format_ids=[price_format_id], reason=reason)
+            db.commit()
+            return percentile_preparation_to_dict(db, price_format_id)
         row.status = "not_configured"
         row.last_error = ""
         row.configuration_fingerprint = config["fingerprint"]

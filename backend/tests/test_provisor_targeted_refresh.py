@@ -1019,7 +1019,7 @@ def test_full_provisor_refresh_keeps_same_external_plk_populated_for_all_account
     ]
 
 
-def test_provisor_unchanged_updates_checked_status_and_preserves_items(monkeypatch):
+def test_provisor_same_inserted_date_with_changed_content_refreshes_items(monkeypatch):
     import backend.app.main as main
 
     db = _session()
@@ -1061,6 +1061,80 @@ def test_provisor_unchanged_updates_checked_status_and_preserves_items(monkeypat
                 manufacturer="",
                 registration_number="",
                 distributor_product_name="New Item",
+                distributor_product_id="NEW",
+                distributor_price=Decimal("11"),
+                stock=Decimal("2"),
+                pack_quantity=None,
+                expiry_date=None,
+                raw={"id": 128, "goodsId": 1280, "insertedDate": "2026-05-01T10:00:00"},
+            )
+        ]
+
+    adapter.fetch_price_list_items = _unchanged_items
+    monkeypatch.setattr(main, "adapter_for_source", lambda source: adapter)
+    monkeypatch.setattr(main, "credentials_from_row", _fake_credentials)
+
+    result = asyncio.run(
+        main._run_refresh_price_lists_logic(
+            format_code="FMT",
+            payload={"source": "provisor", "accountId": 3, "provisorFilialIds": [128], "forceRefresh": True},
+            db=db,
+        )
+    )
+
+    row = db.execute(select(CompetitorPriceList).where(CompetitorPriceList.source_key == "account:3:plk:128")).scalar_one()
+    items = db.execute(select(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == row.id)).scalars().all()
+    assert result["skipped_unchanged"] == 0
+    assert row.last_refresh_status == "updated"
+    assert row.last_checked_at is not None
+    assert row.last_success_at is not None
+    assert [item.name for item in items] == ["New Item"]
+
+
+def test_provisor_same_inserted_date_with_matching_content_updates_checked_status(monkeypatch):
+    import backend.app.main as main
+
+    db = _session()
+    pf, _account = _seed(db)
+    existing = CompetitorPriceList(
+        price_format_id=pf.id,
+        source_type="provisor",
+        source_key="account:3:plk:128",
+        display_name="Existing",
+        account_id="3",
+        account_login="Aksai4/83",
+        external_price_list_id="128",
+        source_updated_at="2026-05-01T10:00:00",
+    )
+    db.add(existing)
+    db.flush()
+    db.add(
+        CompetitorPriceListItem(
+            price_list_id=existing.id,
+            name="Old Item",
+            provisor_goods_id=1280,
+            distributor_goods_id="NEW",
+            distributor_price=Decimal("11.0000"),
+        )
+    )
+    db.commit()
+
+    adapter = _FakeProvisorAdapter()
+
+    async def _unchanged_items(account, price_list):
+        adapter.fetched_item_ids.append(str(price_list.price_list_id))
+        adapter.fetched_account_item_ids.append(f"{account.id}:{price_list.price_list_id}")
+        return [
+            UnifiedPriceItem(
+                source="provisor",
+                account_id=str(account.id),
+                price_list_id=str(price_list.price_list_id),
+                price_list_name=price_list.price_list_name,
+                distributor_name=price_list.distributor_name,
+                product_name="Renamed Item",
+                manufacturer="",
+                registration_number="",
+                distributor_product_name="Renamed Item",
                 distributor_product_id="NEW",
                 distributor_price=Decimal("11"),
                 stock=Decimal("2"),

@@ -222,18 +222,21 @@ def recalculate_competitor_percentiles(
     db: Session,
     price_format_id: int,
     source_price_list_ids: list[int] | None = None,
+    require_assignment: bool = True,
 ) -> dict[str, Any]:
     if (db.get_bind().dialect.name or "").lower() == "postgresql":
         summary = _recalculate_competitor_percentiles_postgresql(
             db=db,
             price_format_id=price_format_id,
             source_price_list_ids=source_price_list_ids,
+            require_assignment=require_assignment,
         )
     else:
         summary = _recalculate_competitor_percentiles_python(
             db=db,
             price_format_id=price_format_id,
             source_price_list_ids=source_price_list_ids,
+            require_assignment=require_assignment,
         )
     refresh_emit_percentile_source_summaries(db=db, price_format_id=price_format_id)
     return summary
@@ -291,15 +294,32 @@ def _selected_source_rows(
     db: Session,
     price_format_id: int,
     source_price_list_ids: list[int] | None = None,
+    require_assignment: bool = True,
 ) -> list[dict[str, Any]]:
-    selected = eligible_percentile_assignments(db=db, price_format_id=price_format_id)
     scoped_ids = {int(item) for item in (source_price_list_ids or []) if int(item) > 0}
-    if scoped_ids:
-        selected = [item for item in selected if int(item.price_list.id) in scoped_ids]
+    if require_assignment:
+        selected_rows = [
+            item.price_list
+            for item in eligible_percentile_assignments(db=db, price_format_id=price_format_id)
+            if not scoped_ids or int(item.price_list.id) in scoped_ids
+        ]
+    else:
+        stmt = select(CompetitorPriceList)
+        if scoped_ids:
+            stmt = stmt.where(CompetitorPriceList.id.in_(scoped_ids))
+        candidates = db.execute(stmt.order_by(CompetitorPriceList.id.asc())).scalars().all()
+        counts = _matched_positive_counts_by_price_list(db=db, price_list_ids=[int(row.id) for row in candidates if row.id is not None])
+        selected_rows = [
+            row
+            for row in candidates
+            if row.id is not None
+            and _is_emit_price_list(row)
+            and _source_key(row)
+            and int(counts.get(int(row.id), 0)) > 0
+        ]
 
     rows_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
-    for item in selected:
-        price_list = item.price_list
+    for price_list in selected_rows:
         branch = _branch_name(price_list)
         competitor = _competitor_name(price_list)
         source_key = _source_key(price_list)
@@ -318,6 +338,67 @@ def _selected_source_rows(
             "source_type_raw": str(price_list.source_type or ""),
         }
     return sorted(rows_by_key.values(), key=lambda row: (row["branch_name"], row["competitor_name"], row["source_key"], row["price_list_id"]))
+
+
+def _all_price_format_ids(db: Session, target_price_format_ids: list[int] | None = None) -> list[int]:
+    stmt = select(PriceFormat.id).order_by(PriceFormat.id.asc())
+    scoped_ids = sorted({int(item) for item in (target_price_format_ids or []) if int(item) > 0})
+    if scoped_ids:
+        stmt = stmt.where(PriceFormat.id.in_(scoped_ids))
+    return [int(item) for item in db.execute(stmt).scalars().all()]
+
+
+def recalculate_emit_percentiles_globally(
+    *,
+    db: Session,
+    source_price_list_ids: list[int] | None = None,
+    target_price_format_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    summaries: dict[str, Any] = {}
+    target_ids = _all_price_format_ids(db, target_price_format_ids)
+    scoped_ids = sorted({int(item) for item in (source_price_list_ids or []) if int(item) > 0})
+    calculation_elapsed = 0.0
+    for price_format_id in target_ids:
+        pf = db.get(PriceFormat, price_format_id)
+        if pf is None:
+            continue
+        format_started = time.perf_counter()
+        summary = recalculate_competitor_percentiles(
+            db=db,
+            price_format_id=price_format_id,
+            source_price_list_ids=scoped_ids or None,
+            require_assignment=False,
+        )
+        elapsed = round(time.perf_counter() - format_started, 3)
+        calculation_elapsed = round(calculation_elapsed + elapsed, 3)
+        summary["percentile_total_elapsed"] = elapsed
+        summary["percentile_rebuild_scope"] = "emit_global_catalog"
+        summary["cache_or_reuse_strategy"] = "global_emit_catalog"
+        summaries[str(pf.code or price_format_id)] = {"price_format_id": price_format_id, **summary}
+    return {
+        "summaries": summaries,
+        "warnings": [],
+        "assigned_price_format_ids": target_ids,
+        "target_price_format_ids": target_ids,
+        "assignment_propagation": {},
+        "percentile_rebuild_scope": "emit_global_catalog",
+        "competitor_price_list_id": scoped_ids[0] if len(scoped_ids) == 1 else None,
+        "competitor_price_list_ids": scoped_ids,
+        "expensive_calculation_count": len(summaries),
+        "shared_result_reuse_count": 0,
+        "raw_price_rows_scanned": sum(int(item.get("raw_price_rows") or 0) for item in summaries.values()),
+        "matched_product_count": sum(int(item.get("products_with_competitors") or 0) for item in summaries.values()),
+        "percentile_rows_calculated": sum(int(item.get("rows_created") or 0) for item in summaries.values()),
+        "percentile_rows_persisted": sum(int(item.get("rows_created") or 0) for item in summaries.values()),
+        "compatibility_rows_created": sum(int(item.get("rows_created") or 0) for item in summaries.values()),
+        "calculation_elapsed": calculation_elapsed,
+        "persistence_elapsed": 0.0,
+        "total_percentile_elapsed": round(time.perf_counter() - started_at, 3),
+        "cache_or_reuse_strategy": "global_emit_catalog",
+        "skipped_duplicate_rebuilds": 0,
+        "percentile_total_elapsed": round(time.perf_counter() - started_at, 3),
+    }
 
 
 def _skip_summary(price_format_id: int) -> dict[str, Any]:
@@ -653,12 +734,14 @@ def _recalculate_competitor_percentiles_postgresql(
     db: Session,
     price_format_id: int,
     source_price_list_ids: list[int] | None = None,
+    require_assignment: bool = True,
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
     selected_sources = _selected_source_rows(
         db=db,
         price_format_id=price_format_id,
         source_price_list_ids=source_price_list_ids,
+        require_assignment=require_assignment,
     )
     if not selected_sources:
         return _skip_summary(price_format_id)
@@ -1307,56 +1390,34 @@ def _recalculate_competitor_percentiles_python(
     db: Session,
     price_format_id: int,
     source_price_list_ids: list[int] | None = None,
+    require_assignment: bool = True,
 ) -> dict[str, Any]:
-    selected = eligible_percentile_assignments(db=db, price_format_id=price_format_id)
-    scoped_ids = {
-        int(item)
-        for item in (source_price_list_ids or [])
-        if int(item) > 0
-    }
-    if scoped_ids:
-        selected = [item for item in selected if int(item.price_list.id) in scoped_ids]
-    if not selected:
-        logger.info(
-            "[PERCENTILE_MUTATION] action=skip reason=%s price_format_id=%s source_price_list_id=%s "
-            "source_type=%s percentile_mode=%s rows_before=%s rows_deleted=%s rows_inserted=%s",
-            "No eligible percentile source assigned; percentile rebuild skipped.",
-            price_format_id,
-            "",
-            "",
-            "",
-            0,
-            0,
-            0,
-        )
-        return {
-            "products_processed": 0,
-            "products_with_competitors": 0,
-            "products_without_competitors": 0,
-            "rows_created": 0,
-            "rows_updated": 0,
-            "rows_skipped": 1,
-            "rows_deleted": 0,
-            "message": "No eligible percentile source assigned; percentile rebuild skipped.",
-        }
+    selected_sources = _selected_source_rows(
+        db=db,
+        price_format_id=price_format_id,
+        source_price_list_ids=source_price_list_ids,
+        require_assignment=require_assignment,
+    )
+    if not selected_sources:
+        return _skip_summary(price_format_id)
 
     regional_group_filters = [
         (
             (
-                (func.coalesce(CompetitorPricePercentile.source_key, "") == _source_key(item.price_list))
-                | (
-                    (func.coalesce(CompetitorPricePercentile.source_key, "") == "")
-                    & (CompetitorPricePercentile.branch_name == _branch_name(item.price_list))
-                    & (CompetitorPricePercentile.competitor_name == _competitor_name(item.price_list))
+                    (func.coalesce(CompetitorPricePercentile.source_key, "") == str(source["source_key"] or ""))
+                    | (
+                        (func.coalesce(CompetitorPricePercentile.source_key, "") == "")
+                        & (CompetitorPricePercentile.branch_name == str(source["branch_name"] or ""))
+                        & (CompetitorPricePercentile.competitor_name == str(source["competitor_name"] or ""))
+                    )
                 )
+                & (CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
             )
-            & (CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
-        )
-        for item in selected
+        for source in selected_sources
     ]
     rows_before_by_source: dict[str, int] = {}
-    for item in selected:
-        source_key = _source_key(item.price_list)
+    for source in selected_sources:
+        source_key = str(source["source_key"] or "")
         rows_before_by_source[source_key] = int(
             db.execute(
                 select(func.count(CompetitorPricePercentile.id))
@@ -1366,7 +1427,7 @@ def _recalculate_competitor_percentiles_python(
             ).scalar_one()
             or 0
         )
-    kazakhstan_competitors = sorted({_competitor_name(item.price_list) for item in selected})
+    kazakhstan_competitors = sorted({str(source["competitor_name"] or "") for source in selected_sources})
     kazakhstan_group_filters = [
         (
             (CompetitorPricePercentile.branch_name == KAZAKHSTAN_REGION)
@@ -1390,21 +1451,21 @@ def _recalculate_competitor_percentiles_python(
         .where(scoped_filter)
     )
     deleted_rows = int(delete_result.rowcount or 0)
-    for item in selected:
+    for source in selected_sources:
         logger.info(
             "[PERCENTILE_MUTATION] action=delete reason=%s price_format_id=%s source_price_list_id=%s "
             "source_type=%s percentile_mode=%s rows_before=%s rows_deleted=%s rows_inserted=%s",
             "emit_percentile_rebuild_scoped",
             price_format_id,
-            int(item.price_list.id),
-            item.price_list.source_type,
+            int(source["price_list_id"]),
+            source["source_type_raw"],
             MULTI_PRICE_PERCENTILE_MODE,
             existing_rows,
             deleted_rows,
             0,
         )
 
-    selected_ids = [int(item.price_list.id) for item in selected]
+    selected_ids = [int(source["price_list_id"]) for source in selected_sources]
     product_rows = db.execute(select(Product.id, Product.code, Product.provisor_goods_id)).all()
     product_ids = [int(product_id) for product_id, _code, _goods_id in product_rows]
     product_id_by_goods_id: dict[int, int] = {}
@@ -1442,14 +1503,14 @@ def _recalculate_competitor_percentiles_python(
     matched_products_by_source: dict[str, set[int]] = defaultdict(set)
 
     source_groups: set[tuple[str, str, str, int, str]] = set()
-    for item in selected:
+    for source in selected_sources:
         source_groups.add(
             (
-                _branch_name(item.price_list),
-                _competitor_name(item.price_list),
-                _source_key(item.price_list),
-                int(item.price_list.id),
-                _percentile_source_type(item.price_list),
+                str(source["branch_name"] or ""),
+                str(source["competitor_name"] or ""),
+                str(source["source_key"] or ""),
+                int(source["price_list_id"]),
+                str(source["source_type"] or ""),
             )
         )
 
@@ -1578,9 +1639,8 @@ def _recalculate_competitor_percentiles_python(
         "rows_skipped": 0,
         "rows_deleted": deleted_rows,
     }
-    for item in selected:
-        price_list = item.price_list
-        source_key = _source_key(price_list)
+    for source in selected_sources:
+        source_key = str(source["source_key"] or "")
         rows_after = int(
             db.execute(
                 select(func.count(CompetitorPricePercentile.id))
@@ -1595,9 +1655,9 @@ def _recalculate_competitor_percentiles_python(
             price_format_id,
             json.dumps(
                 {
-                    "filial_id": price_list.branch_id or price_list.external_price_list_id or "",
+                    "filial_id": source["filial_id"] or "",
                     "source_key": source_key,
-                    "competitor_price_list_id": int(price_list.id),
+                    "competitor_price_list_id": int(source["price_list_id"]),
                     "raw_price_rows": int(raw_count_by_source.get(source_key, 0)),
                     "product_count": len(matched_products_by_source.get(source_key, set())),
                     "percentile_rows_before": int(rows_before_by_source.get(source_key, 0)),
@@ -1609,14 +1669,14 @@ def _recalculate_competitor_percentiles_python(
                 ensure_ascii=False,
             ),
         )
-    for item in selected:
+    for source in selected_sources:
         logger.info(
             "[PERCENTILE_MUTATION] action=insert reason=%s price_format_id=%s source_price_list_id=%s "
             "source_type=%s percentile_mode=%s rows_before=%s rows_deleted=%s rows_inserted=%s",
             "emit_percentile_rebuild_scoped",
             price_format_id,
-            int(item.price_list.id),
-            item.price_list.source_type,
+            int(source["price_list_id"]),
+            source["source_type_raw"],
             MULTI_PRICE_PERCENTILE_MODE,
             existing_rows,
             deleted_rows,

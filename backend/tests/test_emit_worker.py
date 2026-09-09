@@ -1276,12 +1276,12 @@ def test_emit_percentile_rebuild_uses_assigned_price_format_not_first_format(tmp
     result = _recalculate_percentiles_for_emit_rows(db, price_list_ids=[row.id], price_format_code=selected_pf.code)
     summary = result["summaries"]
 
-    assert row.price_format_id == selected_pf.id
-    assert result["assigned_price_format_ids"] == [selected_pf.id]
-    assert "FIRST" not in summary
+    assert row.price_format_id is None
+    assert result["assigned_price_format_ids"] == [first_pf.id, selected_pf.id]
+    assert "FIRST" in summary
     assert "SELECTED" in summary
     assert summary["SELECTED"]["products_with_competitors"] == 1
-    assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == first_pf.id).count() == 0
+    assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == first_pf.id).count() > 0
     rows = db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == selected_pf.id).all()
     by_percentile = {item.percentile: float(item.value) for item in rows if item.percentile_scope == "regional"}
     assert round(by_percentile[10], 3) == 8748.554
@@ -1333,12 +1333,12 @@ def test_emit_percentile_rebuild_explicit_format_does_not_create_assignment(tmp_
         .where(PriceFormatCompetitorAssignment.competitor_price_list_id == row.id)
     ).scalars().one_or_none()
     assert assignment is None
-    assert result["assigned_price_format_ids"] == []
-    assert result["summaries"] == {}
-    assert {row["code"] for row in result["warnings"]} == {"emit_no_active_format_assignment"}
+    assert result["assigned_price_format_ids"] == [pf.id]
+    assert set(result["summaries"]) == {"888"}
+    assert result["warnings"] == []
 
 
-def test_emit_percentile_rebuild_without_assignment_does_not_propagate_to_all_formats(tmp_path):
+def test_emit_percentile_rebuild_without_assignment_materializes_global_catalog(tmp_path):
     db = _session()
     pf = PriceFormat(code="003", name="Format 003")
     product = Product(code="SKU1", name="Product", cost=100, provisor_goods_id=1)
@@ -1374,12 +1374,12 @@ def test_emit_percentile_rebuild_without_assignment_does_not_propagate_to_all_fo
         .where(PriceFormatCompetitorAssignment.competitor_price_list_id == row.id)
     ).scalars().one_or_none()
     assert assignment is None
-    assert result["assigned_price_format_ids"] == []
-    assert result["summaries"] == {}
-    assert {row["code"] for row in result["warnings"]} == {"emit_no_active_format_assignment"}
+    assert result["assigned_price_format_ids"] == [pf.id]
+    assert set(result["summaries"]) == {"003"}
+    assert result["warnings"] == []
     sources = list_percentile_sources(db=db, price_format_code="003")
-    assert {source["region"] for source in sources if source["scope"] == "regional"} == set()
-    assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == pf.id).count() == 0
+    assert {source["region"] for source in sources if source["scope"] == "regional"} == {"Emit International 1108"}
+    assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == pf.id).count() > 0
 
 
 def test_scheduled_emit_percentile_rebuild_scopes_each_refreshed_region():
@@ -1494,19 +1494,19 @@ def test_emit_refresh_does_not_assign_new_region_to_existing_formats():
     second = propagate_emit_assignments_to_price_formats(db=db, emit_price_list_ids=[emit_8371.id])
     db.commit()
 
-    assert first["assigned_price_format_ids"] == []
+    assert first["assigned_price_format_ids"] == [pf003.id, pf004.id]
     assert first["assignment_propagation"] == {}
-    assert {row["code"] for row in first["warnings"]} == {"emit_no_active_format_assignment"}
+    assert first["warnings"] == []
     assert second.created_count == 0
     assert second.reused_count == 0
     assert db.scalar(
         select(func.count(PriceFormatCompetitorAssignment.id))
         .where(PriceFormatCompetitorAssignment.competitor_price_list_id == emit_8371.id)
     ) == 0
-    assert db.query(CompetitorPricePercentile).count() == 0
+    assert db.query(CompetitorPricePercentile).count() > 0
 
 
-def test_emit_percentile_rebuild_calculates_once_and_fans_out_to_assigned_formats():
+def test_emit_percentile_rebuild_recalculates_global_catalog_for_all_formats():
     db = _session()
     formats = [PriceFormat(code=f"PF{idx}", name=f"Format {idx}") for idx in range(1, 5)]
     product = Product(code="SKU-EMIT", name="Emit product", cost=100, provisor_goods_id=9001)
@@ -1560,13 +1560,13 @@ def test_emit_percentile_rebuild_calculates_once_and_fans_out_to_assigned_format
     )
 
     assert summary["assigned_price_format_ids"] == [pf.id for pf in formats]
-    assert summary["percentile_rebuild_scope"] == "emit_source_shared"
-    assert summary["expensive_calculation_count"] == 1
-    assert summary["shared_result_reuse_count"] == 3
-    assert summary["skipped_duplicate_rebuilds"] == 3
-    assert summary["raw_price_rows_scanned"] == 3
-    assert summary["matched_product_count"] == 1
-    assert summary["compatibility_rows_created"] == 30
+    assert summary["percentile_rebuild_scope"] == "emit_global_catalog"
+    assert summary["expensive_calculation_count"] == 4
+    assert summary["shared_result_reuse_count"] == 0
+    assert summary["skipped_duplicate_rebuilds"] == 0
+    assert summary["raw_price_rows_scanned"] == 12
+    assert summary["matched_product_count"] == 4
+    assert summary["compatibility_rows_created"] == 40
     assert summary["percentile_rows_persisted"] == 40
 
     by_format = {}
@@ -1993,11 +1993,11 @@ def test_new_price_format_does_not_get_active_emit_assignments_for_scheduler():
         scope_to_price_list_ids=True,
     )
 
-    assert int(new_pf.id) not in result["assigned_price_format_ids"]
-    assert "NEW" not in result["summaries"]
+    assert int(new_pf.id) in result["assigned_price_format_ids"]
+    assert "NEW" in result["summaries"]
     assert db.query(CompetitorPricePercentile).filter(
         CompetitorPricePercentile.price_format_id == new_pf.id
-    ).count() == 0
+    ).count() > 0
 
 
 def test_emit_fanout_refreshes_percentile_source_summaries_for_all_formats():
@@ -2076,8 +2076,8 @@ def test_emit_fanout_refreshes_percentile_source_summaries_for_all_formats():
         scope_to_price_list_ids=True,
     )
 
-    assert result["expensive_calculation_count"] == 1
-    assert result["shared_result_reuse_count"] == 5
+    assert result["expensive_calculation_count"] == 6
+    assert result["shared_result_reuse_count"] == 0
     assert result["assigned_price_format_ids"] == [1, 2, 3, 4, 5, 6]
 
     rows = (
@@ -2093,7 +2093,7 @@ def test_emit_fanout_refreshes_percentile_source_summaries_for_all_formats():
     )
 
     assert [int(row.price_format_id) for row in rows] == [1, 2, 3, 4, 5, 6]
-    assert {row.generated_at for row in rows} == {rows[0].generated_at}
+    assert all(row.generated_at and row.generated_at > stale_generated_at for row in rows)
     assert rows[0].generated_at is not None
     assert rows[0].generated_at > stale_generated_at
     assert {int(row.sku_count) for row in rows} == {2}
