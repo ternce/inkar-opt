@@ -2083,7 +2083,12 @@ def _cached_structure_from_item(item: CompetitorPriceListItem) -> DrugStructure:
     )
 
 
-def _source_goods_matches(*, db: Session, price_format_id: int, source_type: str) -> dict[str, SourceGoodsMatch]:
+def _source_goods_matches(
+    *,
+    db: Session,
+    price_format_id: int | None,
+    source_type: str,
+) -> dict[str, SourceGoodsMatch]:
     rows = (
         db.execute(
             select(SourceGoodsMatch)
@@ -2093,10 +2098,31 @@ def _source_goods_matches(*, db: Session, price_format_id: int, source_type: str
         .scalars()
         .all()
     )
-    return {normalize_external_sku(row.distributor_goods_id): row for row in rows if row.distributor_goods_id}
+
+    out: dict[str, SourceGoodsMatch] = {}
+
+    for row in rows:
+        goods_id = _to_int(row.goods_id)
+        sku = normalize_external_sku(row.distributor_goods_id)
+
+        # New global/provisor identity.
+        if goods_id:
+            out[f"goods:{goods_id}"] = row
+
+        # Preserve legacy lookup behavior.
+        if sku and sku != "0":
+            out[sku] = row
+
+    return out
 
 
-def _source_goods_matches_by_goods_id(*, db: Session, price_format_id: int, source_type: str) -> dict[int, SourceGoodsMatch]:
+
+def _source_goods_matches_by_goods_id(
+    *,
+    db: Session,
+    price_format_id: int | None,
+    source_type: str,
+) -> dict[int, SourceGoodsMatch]:
     rows = (
         db.execute(
             select(SourceGoodsMatch)
@@ -2107,11 +2133,18 @@ def _source_goods_matches_by_goods_id(*, db: Session, price_format_id: int, sour
         .scalars()
         .all()
     )
+
     out: dict[int, SourceGoodsMatch] = {}
+
     for row in rows:
         goods = _to_int(row.goods_id)
-        if goods and (goods not in out or str(row.match_method or "").startswith("manual")):
+
+        if goods and (
+            goods not in out
+            or str(row.match_method or "").startswith("manual")
+        ):
             out[goods] = row
+
     return out
 
 
@@ -2159,7 +2192,7 @@ def _upsert_source_goods_match(
     *,
     db: Session,
     match_cache: dict[str, SourceGoodsMatch] | None = None,
-    price_format_id: int,
+    price_format_id: int | None,
     source_type: str,
     distributor_goods_id: str,
     goods_id: object,
@@ -2170,35 +2203,63 @@ def _upsert_source_goods_match(
     match_method: str,
 ) -> None:
     sku = normalize_external_sku(distributor_goods_id)
-    if not sku:
+    normalized_goods_id = _to_int(goods_id)
+
+    # For Provisor, goods_id is the preferred stable identity.
+    # distributor_goods_id may legitimately be "0".
+    if normalized_goods_id:
+        cache_key = f"goods:{normalized_goods_id}"
+    elif sku and sku != "0":
+        # Keep compatibility with the legacy cache key format.
+        cache_key = sku
+    else:
         return
-    row = match_cache.get(sku) if match_cache is not None else None
-    if row is None and match_cache is None:
-        row = (
-            db.execute(
-                select(SourceGoodsMatch)
-                .where(SourceGoodsMatch.price_format_id == price_format_id)
-                .where(SourceGoodsMatch.source_type == source_type)
-                .where(SourceGoodsMatch.distributor_goods_id == sku)
-            )
-            .scalars()
-            .first()
+
+    row = match_cache.get(cache_key) if match_cache is not None else None
+
+    if row is None:
+        stmt = (
+            select(SourceGoodsMatch)
+            .where(SourceGoodsMatch.price_format_id == price_format_id)
+            .where(SourceGoodsMatch.source_type == source_type)
         )
+
+        if normalized_goods_id:
+            stmt = stmt.where(
+                SourceGoodsMatch.goods_id == normalized_goods_id
+            )
+        else:
+            stmt = stmt.where(
+                SourceGoodsMatch.distributor_goods_id == sku
+            )
+
+        row = db.execute(stmt).scalars().first()
+
     if row is None:
         row = SourceGoodsMatch(
             price_format_id=price_format_id,
             source_type=source_type,
-            distributor_goods_id=sku,
+            distributor_goods_id=sku or "",
+            goods_id=normalized_goods_id,
             product_id=product_id,
         )
         db.add(row)
+
         if match_cache is not None:
-            match_cache[sku] = row
-    row.goods_id = int(goods_id) if str(goods_id or "").isdigit() else None
+            match_cache[cache_key] = row
+
+    row.goods_id = normalized_goods_id
+    row.distributor_goods_id = sku or ""
     row.distributor_goods_name = distributor_goods_name[:512]
     row.distributor_producer = distributor_producer[:256]
     row.product_id = product_id
-    row.similarity_score = float(similarity_score) if similarity_score not in (None, "") else None
+
+    row.similarity_score = (
+        float(similarity_score)
+        if similarity_score not in (None, "")
+        else None
+    )
+
     row.match_method = match_method[:64]
     row.updated_at = datetime.utcnow()
 

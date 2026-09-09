@@ -220,7 +220,10 @@ class MarkupRange(Base):
     __tablename__ = "markup_ranges"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    price_format_id: Mapped[int] = mapped_column(ForeignKey("price_formats.id"), index=True)
+    price_format_id: Mapped[int] = mapped_column(
+        ForeignKey("price_formats.id"),
+        index=True,
+    )
 
     cost_from: Mapped[float] = mapped_column(Numeric(18, 4))
     cost_to: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
@@ -1228,7 +1231,13 @@ class SourceGoodsMatch(Base):
     __tablename__ = "source_goods_matches"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    price_format_id: Mapped[int] = mapped_column(ForeignKey("price_formats.id"), index=True)
+
+    price_format_id: Mapped[int | None] = mapped_column(
+        ForeignKey("price_formats.id"),
+        nullable=True,
+        index=True,
+    )
+
     source_type: Mapped[str] = mapped_column(String(64), index=True)
     distributor_goods_id: Mapped[str] = mapped_column(Text, index=True)
     goods_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
@@ -1247,7 +1256,13 @@ class SourceGoodsMatch(Base):
             "distributor_goods_id",
             name="uq_source_goods_match_pf_source_sku",
         ),
-        Index("ix_source_goods_match_lookup", "price_format_id", "source_type", "distributor_goods_id", "product_id"),
+        Index(
+            "ix_source_goods_match_lookup",
+            "price_format_id",
+            "source_type",
+            "distributor_goods_id",
+            "product_id",
+        ),
     )
 
 

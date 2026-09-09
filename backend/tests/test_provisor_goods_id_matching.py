@@ -15,6 +15,7 @@ from backend.app.services.competitor_matching import (
     PROVISOR_REFERENCE_FILIAL_ID,
     PROVISOR_REFERENCE_FILIAL_IDS,
     _sync_provisor_reference_mapping_from_items,
+    _upsert_source_goods_match,
     rematch_price_list_items,
     rematch_price_list_items_by_product,
 )
@@ -470,3 +471,45 @@ def test_manual_substitute_matches_only_when_primary_goods_price_missing():
     assert primary_item.product_id == product.id
     assert primary_item.match_type == "provisor_goods_id"
     assert target_item.product_id is None
+
+def test_global_source_goods_match_allows_null_price_format_id():
+    db = _session()
+
+    product = _product(
+        db,
+        code="GLOBAL120360",
+        name="МаксиГриппин для детей",
+    )
+
+    _upsert_source_goods_match(
+        db=db,
+        match_cache={},
+        price_format_id=None,
+        source_type="provisor",
+        distributor_goods_id="0",
+        goods_id=120360,
+        distributor_goods_name="МаксиГриппин для детей",
+        distributor_producer="NATUR PRODUKT",
+        product_id=product.id,
+        similarity_score=100.0,
+        match_method="provisor_goods_id",
+    )
+
+    db.flush()
+
+    row = (
+        db.execute(
+            select(SourceGoodsMatch)
+            .where(SourceGoodsMatch.price_format_id.is_(None))
+            .where(SourceGoodsMatch.source_type == "provisor")
+            .where(SourceGoodsMatch.goods_id == 120360)
+        )
+        .scalars()
+        .one()
+    )
+
+    assert row.price_format_id is None
+    assert row.goods_id == 120360
+    assert row.product_id == product.id
+    assert row.distributor_goods_id == "0"
+    assert row.match_method == "provisor_goods_id"
