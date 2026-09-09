@@ -605,6 +605,9 @@ def test_regular_competitor_alias_registry_is_controlled():
     assert canonical_regular_competitor_identity("Зерде ТОО НПО (Костанай)") == "зерде"
     assert canonical_regular_competitor_identity("Стофарм (Алматы)") == "стофарм"
     assert canonical_regular_competitor_identity("Стофарм средняя цена") == "стофарм средняя цена"
+    assert canonical_regular_competitor_identity("Стофарм средняя цена Актау") == "стофарм средняя цена"
+    assert canonical_regular_competitor_identity("Стофарм средняя цена Астана") == "стофарм средняя цена"
+    assert canonical_regular_competitor_identity("Стофарм средняя цена Костанай") == "стофарм средняя цена"
     assert canonical_regular_competitor_identity("Unknown (Brand)") == "unknown(brand)"
     assert canonical_regular_competitor_identity("Emit") == "emit"
 
@@ -856,6 +859,87 @@ def test_regular_competitor_percentiles_are_global_across_regions_and_lists():
     assert {int(row.source_count) for row in rows} == {10}
 
 
+def test_stofarm_average_price_percentiles_are_one_global_family_across_regional_plks():
+    db = _session()
+    pf_aktau = _format(db, code="STOF-AKTAU")
+    pf_astana = _format(db, code="STOF-ASTANA")
+    pf_kostanay = _format(db, code="STOF-KOST")
+    pf_unrelated = _format(db, code="STOF-OTHER")
+    pf_aktau.branch = "Актау"
+    pf_astana.branch = "Астана"
+    pf_kostanay.branch = "Костанай"
+    pf_unrelated.branch = "Павлодар"
+    product = _product(db, code="SKU-STOF", goods_id=777)
+    lists = [
+        _price_list(db, pf_aktau, source_key="account:1:plk:501", branch="Актау", competitor="Стофарм средняя цена Актау", account_id="1"),
+        _price_list(db, pf_astana, source_key="account:2:plk:502", branch="Астана", competitor="Стофарм средняя цена Астана", account_id="2"),
+        _price_list(db, pf_kostanay, source_key="account:3:plk:503", branch="Костанай", competitor="Стофарм средняя цена Костанай", account_id="3"),
+    ]
+    for price_list, price in zip(lists, [100, 200, 300], strict=True):
+        db.add(
+            CompetitorPriceListItem(
+                price_list_id=price_list.id,
+                product_id=product.id,
+                provisor_goods_id=777,
+                distributor_goods_id="777",
+                distributor_price=Decimal(price),
+            )
+        )
+    db.commit()
+
+    result = recalculate_percentiles_for_price_lists(db=db, competitor_price_list_ids=[lists[0].id])
+    db.commit()
+
+    canonical = "стофарм средняя цена"
+    stored = (
+        db.execute(
+            select(RegularCompetitorPricePercentile)
+            .where(RegularCompetitorPricePercentile.competitor_identity == canonical)
+            .where(RegularCompetitorPricePercentile.product_id == product.id)
+            .order_by(RegularCompetitorPricePercentile.percentile.asc())
+        )
+        .scalars()
+        .all()
+    )
+    assert result["regularPercentiles"]["regularCompetitorsProcessed"] == 1
+    assert {canonical_regular_competitor_identity(row.competitor_name) for row in lists} == {canonical}
+    assert len(stored) == 5
+    assert {int(row.sample_count) for row in stored} == {3}
+    assert {int(row.source_count) for row in stored} == {3}
+    assert float(next(row.value for row in stored if row.percentile == 10)) == pytest.approx(120.0)
+
+    for pf in (pf_aktau, pf_astana, pf_kostanay, pf_unrelated):
+        sources = list_percentile_sources(
+            db=db,
+            price_format_code=pf.code,
+            percentile_source=PERCENTILE_SOURCE_COMPETITOR,
+        )
+        assert {row["sourceKey"] for row in sources} == {canonical}
+        assert {row["percentile"] for row in sources} == {10, 20, 30, 40, 60}
+        assert all(row["eligibleForPricing"] is True for row in sources)
+
+    assert db.execute(select(PriceFormatCompetitorAssignment)).scalars().all() == []
+
+    empty_cache = load_percentile_price_cache(db, pf_unrelated.id)
+    assert resolve_percentile_prices_from_cache(empty_cache, product.id, percentile_number=10).prices == []
+
+    db.add(
+        CompetitorPrice(
+            price_format_id=pf_unrelated.id,
+            product_id=None,
+            source_name=_regular_percentile_config_name(pf_unrelated.id, canonical, "Стофарм средняя цена", 10),
+            supplier="Стофарм средняя цена - P10",
+            coefficient=1,
+        )
+    )
+    db.commit()
+
+    selected_cache = load_percentile_price_cache(db, pf_unrelated.id)
+    resolved = resolve_percentile_prices_from_cache(selected_cache, product.id, percentile_number=10)
+    assert len(resolved.prices) == 1
+    assert resolved.prices[0][0] == pytest.approx(120.0)
+
+
 def test_regular_percentile_calculation_does_not_require_price_format_assignment():
     db = _session()
     pf = _format(db, code="NOASSIGN")
@@ -1054,11 +1138,12 @@ def test_competitor_percentile_rows_survive_reload_only_for_active_matching_assi
     assignment.is_active = False
     db.commit()
 
-    assert list_percentile_sources(
+    retained = list_percentile_sources(
         db=db,
         price_format_code=pf.code,
         percentile_source=PERCENTILE_SOURCE_COMPETITOR,
-    ) == []
+    )
+    assert {row["sourceKey"] for row in retained} == {"amanat"}
     hidden = list_percentile_product_rows(
         db=db,
         price_format_code=pf.code,

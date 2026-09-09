@@ -176,9 +176,6 @@ def _list_competitor_percentile_sources(
         if _is_obsolete_regular_identity(source_key, stored_identities):
             continue
         price_format_id = int(pf.id) if pf is not None else 0
-        eligible_for_pricing = allowed_identities is None or source_key in allowed_identities
-        if not eligible_for_pricing and not include_ineligible:
-            continue
         generated_at = row.generated_at.isoformat() if row.generated_at else ""
         source_meta = metadata.get(source_key, {})
         # Regular competitor rows are global datasets stored in

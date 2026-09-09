@@ -107,6 +107,7 @@ REGULAR_COMPETITOR_ALIAS_FAMILIES: tuple[RegularCompetitorAliasFamily, ...] = (
     _family("медсервис", "Медсервис", base_names=("Медсервис",)),
     _family("атамирас", "Атамирас", base_names=("Атамирас",), legal_prefixes=("Атамирас ТОО",)),
     _family("зерде", "Зерде", base_names=("Зерде",), legal_prefixes=("Зерде ТОО НПО",)),
+    _family("стофарм средняя цена", "Стофарм средняя цена", base_names=("Стофарм средняя цена",)),
     _family("стофарм", "Стофарм", base_names=("Стофарм",)),
 )
 
