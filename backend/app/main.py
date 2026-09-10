@@ -301,7 +301,7 @@ from .services.references.ratings import RATING_DATA_TYPES, import_top_rating_ex
 from .services.references.sources import ReferenceFilePayload, make_reference_source
 from .services.references.statuses import import_job_to_dict, list_reference_imports, list_reference_statuses, reference_readiness_matrix
 from .services.references.templates import build_reference_template, reference_template_filename
-from .services.references.types import BRANCHES, REFERENCE_TYPES, USER_SELECTABLE_BRANCHES
+from .services.references.types import BRANCHES, REFERENCE_TYPES, USER_SELECTABLE_BRANCHES, branch_display_name, canonical_branch_id
 from .services.regions import canonical_supported_city_name
 from .services.pricing_workflow.analytics import analytics_for_run, build_workflow_analytics
 from .services.pricing_workflow.contexts import list_contexts
@@ -6968,6 +6968,24 @@ def download_reference_template(
     )
 
 
+def _ensure_reference_branch_access(current_user: AppUser, submitted_branch: object) -> str:
+    canonical_id = canonical_branch_id(submitted_branch)
+    display_name = branch_display_name(canonical_id)
+    if can_see_all_branches(current_user):
+        return canonical_id
+    if not user_can_access_branch(current_user, canonical_id, display_name):
+        raise HTTPException(status_code=403, detail="branch is not assigned to current user")
+    return canonical_id
+
+
+def _authorized_reference_branch_ids(current_user: AppUser, branch_ids: str) -> list[str]:
+    branches = [
+        _ensure_reference_branch_access(current_user, branch_id)
+        for branch_id in [x.strip() for x in branch_ids.split(",") if x.strip()]
+    ]
+    return list(dict.fromkeys(branch for branch in branches if branch))
+
+
 @app.post("/api/references/import")
 async def post_reference_import(
     data_type: str = Query(..., min_length=1),
@@ -6980,10 +6998,7 @@ async def post_reference_import(
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="empty file")
-    branches = [x.strip() for x in branch_ids.split(",") if x.strip()]
-    for branch_id in branches:
-        if not user_can_access_branch(current_user, branch_id, ""):
-            raise HTTPException(status_code=403, detail="branch is not assigned to current user")
+    branches = _authorized_reference_branch_ids(current_user, branch_ids)
     try:
         if data_type in RATING_DATA_TYPES:
             return import_top_rating_excel(
@@ -7018,10 +7033,7 @@ async def post_reference_batch_import(
     current_user: AppUser = Depends(require_write_access),
 ):
     selected_types = [x.strip() for x in data_types.split(",") if x.strip()]
-    branches = [x.strip() for x in branch_ids.split(",") if x.strip()]
-    for branch_id in branches:
-        if not user_can_access_branch(current_user, branch_id, ""):
-            raise HTTPException(status_code=403, detail="branch is not assigned to current user")
+    branches = _authorized_reference_branch_ids(current_user, branch_ids)
     if not selected_types:
         raise HTTPException(status_code=400, detail="data_types is required")
     if len(selected_types) != len(files):
