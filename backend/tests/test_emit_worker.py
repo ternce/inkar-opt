@@ -1506,7 +1506,7 @@ def test_emit_refresh_does_not_assign_new_region_to_existing_formats():
     assert db.query(CompetitorPricePercentile).count() > 0
 
 
-def test_emit_percentile_rebuild_recalculates_global_catalog_for_all_formats():
+def test_emit_percentile_rebuild_calculates_once_then_fans_out_to_all_formats():
     db = _session()
     formats = [PriceFormat(code=f"PF{idx}", name=f"Format {idx}") for idx in range(1, 5)]
     product = Product(code="SKU-EMIT", name="Emit product", cost=100, provisor_goods_id=9001)
@@ -1561,13 +1561,15 @@ def test_emit_percentile_rebuild_recalculates_global_catalog_for_all_formats():
 
     assert summary["assigned_price_format_ids"] == [pf.id for pf in formats]
     assert summary["percentile_rebuild_scope"] == "emit_global_catalog"
-    assert summary["expensive_calculation_count"] == 4
-    assert summary["shared_result_reuse_count"] == 0
-    assert summary["skipped_duplicate_rebuilds"] == 0
-    assert summary["raw_price_rows_scanned"] == 12
-    assert summary["matched_product_count"] == 4
+    assert summary["expensive_calculation_count"] == 1
+    assert summary["shared_result_reuse_count"] == 3
+    assert summary["skipped_duplicate_rebuilds"] == 3
+    assert summary["raw_price_rows_scanned"] == 3
+    assert summary["matched_product_count"] == 1
+    assert summary["percentile_rows_calculated"] == 10
     assert summary["compatibility_rows_created"] == 40
     assert summary["percentile_rows_persisted"] == 40
+    assert summary["canonical_price_format_id"] == formats[0].id
 
     by_format = {}
     for pf in formats:
@@ -1604,6 +1606,94 @@ def test_emit_percentile_rebuild_recalculates_global_catalog_for_all_formats():
     assert round(regional[-1][3], 3) == 136.0
     assert {row[4] for row in regional} == {3}
     assert {row[5] for row in regional} == {3}
+
+    repeated = _recalculate_percentiles_for_emit_rows(
+        db,
+        price_list_ids=[emit_row.id],
+        scope_to_price_list_ids=True,
+    )
+    assert repeated["expensive_calculation_count"] == 1
+    assert db.query(CompetitorPricePercentile).count() == 40
+
+
+def test_emit_percentile_rebuild_calculates_once_for_one_hundred_formats():
+    db = _session()
+    formats = [PriceFormat(code=f"PF{idx:03d}", name=f"Format {idx:03d}") for idx in range(1, 101)]
+    product = Product(code="SKU-EMIT-100", name="Emit product 100", cost=100, provisor_goods_id=9100)
+    db.add_all([*formats, product])
+    db.flush()
+    emit_row = CompetitorPriceList(
+        price_format_id=None,
+        source_type="emit",
+        source_key="emit:9100",
+        display_name="Emit International 9100",
+        supplier="Emit International 9100",
+        branch_id="9100",
+        branch_code="9100",
+        branch_name="Emit International 9100",
+        competitor_name="Emit International 9100",
+        external_price_list_id="9100",
+        account_login="emit",
+        last_refresh_status="success",
+    )
+    db.add(emit_row)
+    db.flush()
+    db.add_all(
+        [
+            CompetitorPriceListItem(
+                price_list_id=emit_row.id,
+                product_id=product.id,
+                provisor_goods_id=product.provisor_goods_id,
+                filial_id=9100,
+                name=product.name,
+                distributor_goods_name=product.name,
+                distributor_price=price,
+            )
+            for price in [100, 150, 200]
+        ]
+    )
+    db.commit()
+
+    summary = _recalculate_percentiles_for_emit_rows(
+        db,
+        price_list_ids=[emit_row.id],
+        scope_to_price_list_ids=True,
+    )
+
+    assert summary["expensive_calculation_count"] == 1
+    assert summary["shared_result_reuse_count"] == 99
+    assert summary["compatibility_rows_created"] == 1000
+    assert summary["percentile_rows_calculated"] == 10
+    assert db.query(CompetitorPricePercentile).count() == 1000
+    assert summary["assigned_price_format_ids"] == [pf.id for pf in formats]
+
+    first_rows = (
+        db.execute(
+            select(CompetitorPricePercentile)
+            .where(CompetitorPricePercentile.price_format_id == formats[0].id)
+            .where(CompetitorPricePercentile.product_id == product.id)
+            .order_by(CompetitorPricePercentile.percentile_scope, CompetitorPricePercentile.percentile)
+        )
+        .scalars()
+        .all()
+    )
+    last_rows = (
+        db.execute(
+            select(CompetitorPricePercentile)
+            .where(CompetitorPricePercentile.price_format_id == formats[-1].id)
+            .where(CompetitorPricePercentile.product_id == product.id)
+            .order_by(CompetitorPricePercentile.percentile_scope, CompetitorPricePercentile.percentile)
+        )
+        .scalars()
+        .all()
+    )
+    assert [
+        (row.percentile_scope, row.source_key, row.percentile, float(row.value) if row.value is not None else None)
+        for row in first_rows
+    ] == [
+        (row.percentile_scope, row.source_key, row.percentile, float(row.value) if row.value is not None else None)
+        for row in last_rows
+    ]
 
 
 def _seed_emit_region(
@@ -2076,8 +2166,9 @@ def test_emit_fanout_refreshes_percentile_source_summaries_for_all_formats():
         scope_to_price_list_ids=True,
     )
 
-    assert result["expensive_calculation_count"] == 6
-    assert result["shared_result_reuse_count"] == 0
+    assert result["expensive_calculation_count"] == 1
+    assert result["shared_result_reuse_count"] == 5
+    assert result["skipped_duplicate_rebuilds"] == 5
     assert result["assigned_price_format_ids"] == [1, 2, 3, 4, 5, 6]
 
     rows = (

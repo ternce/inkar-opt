@@ -248,6 +248,7 @@ def fanout_emit_percentiles_from_price_format(
     source_price_format_id: int,
     target_price_format_id: int,
     source_price_list_ids: list[int],
+    require_assignment: bool = False,
 ) -> dict[str, Any]:
     """Copy already-calculated Emit percentile rows to another assigned format.
 
@@ -260,6 +261,7 @@ def fanout_emit_percentiles_from_price_format(
         db=db,
         price_format_id=target_price_format_id,
         source_price_list_ids=source_price_list_ids,
+        require_assignment=require_assignment,
     )
     if not selected_sources:
         return _skip_summary(target_price_format_id) | {
@@ -358,24 +360,102 @@ def recalculate_emit_percentiles_globally(
     summaries: dict[str, Any] = {}
     target_ids = _all_price_format_ids(db, target_price_format_ids)
     scoped_ids = sorted({int(item) for item in (source_price_list_ids or []) if int(item) > 0})
-    calculation_elapsed = 0.0
-    for price_format_id in target_ids:
+    if not target_ids:
+        return {
+            "summaries": summaries,
+            "warnings": [],
+            "assigned_price_format_ids": [],
+            "target_price_format_ids": [],
+            "assignment_propagation": {},
+            "percentile_rebuild_scope": "emit_global_catalog",
+            "competitor_price_list_id": scoped_ids[0] if len(scoped_ids) == 1 else None,
+            "competitor_price_list_ids": scoped_ids,
+            "expensive_calculation_count": 0,
+            "shared_result_reuse_count": 0,
+            "raw_price_rows_scanned": 0,
+            "matched_product_count": 0,
+            "percentile_rows_calculated": 0,
+            "percentile_rows_persisted": 0,
+            "compatibility_rows_created": 0,
+            "calculation_elapsed": 0.0,
+            "persistence_elapsed": 0.0,
+            "total_percentile_elapsed": round(time.perf_counter() - started_at, 3),
+            "cache_or_reuse_strategy": "global_emit_catalog",
+            "skipped_duplicate_rebuilds": 0,
+            "canonical_price_format_id": None,
+            "percentile_total_elapsed": round(time.perf_counter() - started_at, 3),
+        }
+
+    canonical_price_format_id = target_ids[0]
+    calculation_started = time.perf_counter()
+    logger.info(
+        "[EMIT_PERCENTILE_GLOBAL_CALC_START] source_price_list_ids=%s canonical_price_format_id=%s",
+        scoped_ids,
+        canonical_price_format_id,
+    )
+    canonical_summary = recalculate_competitor_percentiles(
+        db=db,
+        price_format_id=canonical_price_format_id,
+        source_price_list_ids=scoped_ids or None,
+        require_assignment=False,
+    )
+    calculation_elapsed = round(time.perf_counter() - calculation_started, 3)
+    canonical_summary["percentile_total_elapsed"] = calculation_elapsed
+    canonical_summary["percentile_rebuild_scope"] = "emit_global_catalog"
+    canonical_summary["cache_or_reuse_strategy"] = "global_emit_canonical_calculation"
+    canonical_pf = db.get(PriceFormat, canonical_price_format_id)
+    summaries[str((canonical_pf.code if canonical_pf is not None else None) or canonical_price_format_id)] = {
+        "price_format_id": canonical_price_format_id,
+        **canonical_summary,
+    }
+    logger.info(
+        "[EMIT_PERCENTILE_GLOBAL_CALC_COMPLETE] source_price_list_ids=%s canonical_price_format_id=%s "
+        "raw_rows=%s products=%s rows_created=%s duration_sec=%s",
+        scoped_ids,
+        canonical_price_format_id,
+        int(canonical_summary.get("raw_price_rows") or 0),
+        int(canonical_summary.get("products_processed") or 0),
+        int(canonical_summary.get("rows_created") or 0),
+        calculation_elapsed,
+    )
+
+    fanout_started = time.perf_counter()
+    fanout_targets = [price_format_id for price_format_id in target_ids if price_format_id != canonical_price_format_id]
+    logger.info(
+        "[EMIT_PERCENTILE_COMPAT_FANOUT_START] source_price_format_id=%s target_price_format_count=%s",
+        canonical_price_format_id,
+        len(fanout_targets),
+    )
+    compatibility_rows_created = int(canonical_summary.get("rows_created") or 0)
+    persistence_elapsed = 0.0
+    for price_format_id in fanout_targets:
         pf = db.get(PriceFormat, price_format_id)
         if pf is None:
             continue
-        format_started = time.perf_counter()
-        summary = recalculate_competitor_percentiles(
+        target_started = time.perf_counter()
+        summary = fanout_emit_percentiles_from_price_format(
             db=db,
-            price_format_id=price_format_id,
-            source_price_list_ids=scoped_ids or None,
+            source_price_format_id=canonical_price_format_id,
+            target_price_format_id=price_format_id,
+            source_price_list_ids=scoped_ids,
             require_assignment=False,
         )
-        elapsed = round(time.perf_counter() - format_started, 3)
-        calculation_elapsed = round(calculation_elapsed + elapsed, 3)
+        elapsed = round(time.perf_counter() - target_started, 3)
+        persistence_elapsed = round(persistence_elapsed + elapsed, 3)
         summary["percentile_total_elapsed"] = elapsed
         summary["percentile_rebuild_scope"] = "emit_global_catalog"
-        summary["cache_or_reuse_strategy"] = "global_emit_catalog"
+        summary["cache_or_reuse_strategy"] = "compatibility_fanout"
+        compatibility_rows_created += int(summary.get("compatibility_rows_created") or summary.get("rows_created") or 0)
         summaries[str(pf.code or price_format_id)] = {"price_format_id": price_format_id, **summary}
+    fanout_elapsed = round(time.perf_counter() - fanout_started, 3)
+    logger.info(
+        "[EMIT_PERCENTILE_COMPAT_FANOUT_COMPLETE] source_price_format_id=%s target_price_format_count=%s "
+        "copied_rows=%s duration_sec=%s",
+        canonical_price_format_id,
+        len(fanout_targets),
+        max(0, compatibility_rows_created - int(canonical_summary.get("rows_created") or 0)),
+        fanout_elapsed,
+    )
     return {
         "summaries": summaries,
         "warnings": [],
@@ -385,18 +465,19 @@ def recalculate_emit_percentiles_globally(
         "percentile_rebuild_scope": "emit_global_catalog",
         "competitor_price_list_id": scoped_ids[0] if len(scoped_ids) == 1 else None,
         "competitor_price_list_ids": scoped_ids,
-        "expensive_calculation_count": len(summaries),
-        "shared_result_reuse_count": 0,
-        "raw_price_rows_scanned": sum(int(item.get("raw_price_rows") or 0) for item in summaries.values()),
-        "matched_product_count": sum(int(item.get("products_with_competitors") or 0) for item in summaries.values()),
-        "percentile_rows_calculated": sum(int(item.get("rows_created") or 0) for item in summaries.values()),
-        "percentile_rows_persisted": sum(int(item.get("rows_created") or 0) for item in summaries.values()),
-        "compatibility_rows_created": sum(int(item.get("rows_created") or 0) for item in summaries.values()),
+        "expensive_calculation_count": 1,
+        "shared_result_reuse_count": len(fanout_targets),
+        "raw_price_rows_scanned": int(canonical_summary.get("raw_price_rows") or 0),
+        "matched_product_count": int(canonical_summary.get("products_with_competitors") or 0),
+        "percentile_rows_calculated": int(canonical_summary.get("rows_created") or 0),
+        "percentile_rows_persisted": compatibility_rows_created,
+        "compatibility_rows_created": compatibility_rows_created,
         "calculation_elapsed": calculation_elapsed,
-        "persistence_elapsed": 0.0,
+        "persistence_elapsed": persistence_elapsed,
         "total_percentile_elapsed": round(time.perf_counter() - started_at, 3),
-        "cache_or_reuse_strategy": "global_emit_catalog",
-        "skipped_duplicate_rebuilds": 0,
+        "cache_or_reuse_strategy": "canonical_calculation_with_compatibility_fanout",
+        "skipped_duplicate_rebuilds": len(fanout_targets),
+        "canonical_price_format_id": canonical_price_format_id,
         "percentile_total_elapsed": round(time.perf_counter() - started_at, 3),
     }
 
