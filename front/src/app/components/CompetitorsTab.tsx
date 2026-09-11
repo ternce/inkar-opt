@@ -19,7 +19,7 @@ import {
   formatLocalDateTime,
   usefulSourceTimestamp,
 } from '../competitorTimestamps';
-import { buildProductCatalogMappingPayload, canConfirmProductCatalogMapping } from '../productCatalogMapping';
+import { buildProductCatalogCandidateUrl, buildProductCatalogMappingPayload, canConfirmProductCatalogMapping } from '../productCatalogMapping';
 import { SUPPORTED_CITIES } from '../supportedCities';
 
 type Platform = 'all' | 'provisor' | 'vidman';
@@ -847,7 +847,7 @@ export function CompetitorsTab({ formatCode }: Props) {
       status: mappingStatus,
       page: String(mappingPage),
       limit: '50',
-      include_candidates: mappingStatus === 'review' ? 'true' : 'false',
+      include_candidates: 'false',
     });
     if (mappingFormatScope === 'current') params.set('format_code', formatCode);
     const combinedQuery = [appliedProductQuery, appliedSourceQuery].filter(Boolean).join(' ').trim();
@@ -1203,25 +1203,23 @@ export function CompetitorsTab({ formatCode }: Props) {
 
   const loadCandidatesForRow = async (row: CodeMappingRow) => {
     if (row.candidates?.length || row.mappingStatus === 'mapped') return;
-    const params = new URLSearchParams({
-      platform: mappingPlatform,
-      status: 'all',
-      q: row.sku || row.ourSku || row.name || row.ourName || '',
-      page: '1',
-      limit: '1',
-      include_candidates: 'true',
-    });
-    if (mappingFormatScope === 'current') params.set('format_code', formatCode);
-    const res = await fetch(`/api/competitors/code-mappings/product-catalog?${params.toString()}`);
+    const productId = Number(row.productId || row.ourProductId);
+    if (!productId) return;
+    const res = await fetch(buildProductCatalogCandidateUrl(productId, mappingPlatform, formatCode, mappingFormatScope === 'current'));
     const text = await res.text();
     const data = parseJsonOrNull(text);
     if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить кандидатов');
-    const fresh = (Array.isArray(data?.items) ? data.items : []).find(
-      (item: CodeMappingRow) => Number(item.productId) === Number(row.productId),
-    );
-    if (!fresh) return;
+    const candidates = Array.isArray(data) ? data : [];
+    const fresh = {
+      candidates,
+      reviewCandidates: candidates,
+      bestCandidate: candidates[0] || null,
+      candidatesCount: candidates.length,
+      mappingStatus: candidates.length ? 'review' : row.mappingStatus,
+      status: candidates.length ? 'review' : row.status,
+    };
     setSelectedRow((current) => (Number(current?.productId) === Number(row.productId) ? { ...current, ...fresh } : current));
-    setSelectedCandidate(fresh.bestCandidate || fresh.reviewCandidates?.[0] || fresh.candidates?.[0] || null);
+    setSelectedCandidate(fresh.bestCandidate);
     setCodeRows((current) => current.map((item) => (Number(item.productId) === Number(row.productId) ? { ...item, ...fresh } : item)));
   };
 

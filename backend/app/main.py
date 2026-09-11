@@ -267,6 +267,7 @@ from .services.competitors.code_mappings import (
     mapping_source_payload,
     mapping_to_dict,
     platform_from_value,
+    product_catalog_candidates_for_product,
     provisor_goods_id_from_mapping_keys,
     upsert_code_mapping,
 )
@@ -6294,6 +6295,30 @@ def get_competitor_code_mappings_product_catalog(
             limit=limit,
             include_candidates=include_candidates,
             format_code=format_code or formatCode,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/competitors/code-mappings/product-catalog/{product_id}/candidates")
+def get_competitor_code_mappings_product_catalog_candidates(
+    product_id: int,
+    platform: str = Query("all"),
+    source: str | None = Query(None),
+    format_code: str = Query("", alias="format_code"),
+    formatCode: str = Query("", alias="formatCode"),
+    limit: int = Query(5, ge=1, le=50),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    _ = current_user
+    try:
+        return product_catalog_candidates_for_product(
+            db=db,
+            product_id=product_id,
+            platform=source or platform,
+            format_code=format_code or formatCode,
+            limit=limit,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

@@ -1781,6 +1781,16 @@ def _product_catalog_mapped_exists(platforms: list[str]):
     return mapped_exists
 
 
+def _product_catalog_review_exists(platforms: list[str]):
+    return exists(
+        select(1)
+        .select_from(CompetitorCodeMapping)
+        .where(CompetitorCodeMapping.status == "review")
+        .where(CompetitorCodeMapping.platform.in_(platforms))
+        .where(CompetitorCodeMapping.our_product_id == Product.id)
+    )
+
+
 def _product_catalog_format_product_exists(price_format_id: int | None):
     if price_format_id is None:
         return None
@@ -1844,6 +1854,7 @@ def list_product_catalog_code_mappings(
         else None
     )
     mapped_exists = _product_catalog_mapped_exists(platforms)
+    review_exists = _product_catalog_review_exists(platforms)
 
     external_product_ids = _product_catalog_search_external_product_ids(db, platforms=platforms, q=q)
     search = q.strip()
@@ -1861,8 +1872,11 @@ def list_product_catalog_code_mappings(
     if format_product_exists is not None:
         base_count_stmt = base_count_stmt.where(format_product_exists)
     mapped_count_stmt = base_count_stmt.where(mapped_exists)
+    review_count_stmt = base_count_stmt.where(~mapped_exists).where(review_exists)
     total_products = int(db.scalar(base_count_stmt) or 0)
     mapped_products = int(db.scalar(mapped_count_stmt) or 0)
+    review_products = int(db.scalar(review_count_stmt) or 0)
+    unmapped_products = max(0, total_products - mapped_products - review_products)
 
     product_stmt = (
         select(Product, ProductExtra)
@@ -1878,9 +1892,12 @@ def list_product_catalog_code_mappings(
     if status == "mapped":
         product_stmt = product_stmt.where(mapped_exists)
         count_stmt = count_stmt.where(mapped_exists)
-    elif status in {"review", "unmapped"}:
-        product_stmt = product_stmt.where(~mapped_exists)
-        count_stmt = count_stmt.where(~mapped_exists)
+    elif status == "review":
+        product_stmt = product_stmt.where(~mapped_exists).where(review_exists)
+        count_stmt = count_stmt.where(~mapped_exists).where(review_exists)
+    elif status == "unmapped":
+        product_stmt = product_stmt.where(~mapped_exists).where(~review_exists)
+        count_stmt = count_stmt.where(~mapped_exists).where(~review_exists)
 
     filtered_total = int(db.scalar(count_stmt) or 0)
     page_count = (filtered_total + limit - 1) // limit if filtered_total else 0
@@ -1900,26 +1917,18 @@ def list_product_catalog_code_mappings(
         ).scalars():
             mappings_by_product.setdefault(int(row.our_product_id), []).append(_product_catalog_mapping_payload(row))
 
-    mapped_product_ids = {
-        int(product.id)
-        for product, _extra in product_rows
-        if "provisor" in platforms and product.provisor_goods_id is not None
-    }
-    candidate_product_rows = [
-        (product, extra)
-        for product, extra in product_rows
-        if int(product.id) not in mapped_product_ids and not mappings_by_product.get(int(product.id))
-    ]
-    candidates_by_product = {int(product.id): [] for product, _extra in product_rows}
-    if include_candidates or status in {"review", "unmapped"}:
-        candidates_by_product.update(
-            _product_catalog_source_candidates_for_products(
-                db,
-                products=candidate_product_rows,
-                platforms=platforms,
-                assigned_ids=assigned_ids,
-            )
-        )
+    review_product_ids: set[int] = set()
+    if product_ids:
+        review_product_ids = {
+            int(item)
+            for item in db.execute(
+                select(CompetitorCodeMapping.our_product_id)
+                .where(CompetitorCodeMapping.platform.in_(platforms))
+                .where(CompetitorCodeMapping.status == "review")
+                .where(CompetitorCodeMapping.our_product_id.in_(product_ids))
+            ).scalars()
+            if item is not None
+        }
 
     rows: list[dict] = []
     for product, extra in product_rows:
@@ -1927,12 +1936,7 @@ def list_product_catalog_code_mappings(
         mappings = list(mappings_by_product.get(product_id, []))
         if "provisor" in platforms and product.provisor_goods_id is not None:
             mappings.insert(0, _product_catalog_provisor_goods_mapping_payload(product))
-        candidates = [] if mappings else candidates_by_product.get(product_id, [])
-        row_status = "mapped" if mappings else "review" if candidates else "unmapped"
-        if status == "review" and row_status != "review":
-            continue
-        if status == "unmapped" and row_status != "unmapped":
-            continue
+        row_status = "mapped" if mappings else "review" if product_id in review_product_ids else "unmapped"
         rows.append(
             {
                 "productId": product_id,
@@ -1943,27 +1947,20 @@ def list_product_catalog_code_mappings(
                 "mappings": mappings,
                 "mappingCount": len(mappings),
                 "status": row_status,
-                "reviewCandidates": candidates,
-                "candidates": candidates,
-                "bestCandidate": candidates[0] if candidates else None,
+                "reviewCandidates": [],
+                "candidates": [],
+                "bestCandidate": None,
             }
         )
 
-    if status in {"review", "unmapped"}:
-        filtered_total = len(rows) if not search else len(rows)
-        page_count = 1 if rows else 0
-        page = 1 if rows else page
-
-    review_on_page = sum(1 for row in rows if row["status"] == "review")
-    unmapped_on_page = sum(1 for row in rows if row["status"] == "unmapped")
     metrics = {
         "platform": "all" if len(platforms) > 1 else platforms[0],
         "total": total_products,
         "mapped": mapped_products,
-        "review": review_on_page,
-        "unmapped": max(0, total_products - mapped_products - review_on_page),
+        "review": review_products,
+        "unmapped": unmapped_products,
         "rejected": 0,
-        "noCandidates": unmapped_on_page,
+        "noCandidates": unmapped_products,
         "coveragePercent": round((mapped_products / total_products) * 100, 2) if total_products else 0,
         "mappingCoveragePercent": round((mapped_products / total_products) * 100, 2) if total_products else 0,
     }
@@ -1973,6 +1970,44 @@ def list_product_catalog_code_mappings(
         "pagination": {"page": page, "pageSize": limit, "total": filtered_total, "pageCount": page_count},
         "platforms": platforms,
     }
+
+
+def product_catalog_candidates_for_product(
+    *,
+    db: Session,
+    product_id: int,
+    platform: str = "all",
+    format_code: str = "",
+    limit: int = PRODUCT_CATALOG_CANDIDATE_LIMIT,
+) -> list[dict]:
+    platforms = _product_catalog_platforms(platform)
+    limit = max(1, min(int(limit or PRODUCT_CATALOG_CANDIDATE_LIMIT), 50))
+    price_format_id = _product_catalog_resolve_price_format_id(db, format_code)
+    format_product_exists = _product_catalog_format_product_exists(price_format_id)
+    assigned_ids = (
+        [int(item.price_list.id) for item in get_assigned_competitor_price_lists(db=db, price_format_id=price_format_id)]
+        if price_format_id is not None
+        else None
+    )
+    product_stmt = (
+        select(Product, ProductExtra)
+        .outerjoin(ProductExtra, ProductExtra.product_id == Product.id)
+        .where(Product.id == int(product_id))
+    )
+    if format_product_exists is not None:
+        product_stmt = product_stmt.where(format_product_exists)
+    row = db.execute(product_stmt).first()
+    if row is None:
+        return []
+    product, extra = row
+    candidates = _product_catalog_source_candidates_for_products(
+        db,
+        products=[(product, extra)],
+        platforms=platforms,
+        assigned_ids=assigned_ids,
+        limit_per_product=limit,
+    )
+    return candidates.get(int(product.id), [])
 
 
 def auto_match_product_catalog_code_mappings(

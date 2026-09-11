@@ -48,3 +48,17 @@ export const buildProductCatalogMappingPayload = (
     confidence: candidate.confidence || 100,
   };
 };
+
+export const buildProductCatalogCandidateUrl = (
+  productId: number,
+  platform: string,
+  formatCode = '',
+  useCurrentFormat = false,
+) => {
+  const params = new URLSearchParams({
+    platform,
+    limit: '5',
+  });
+  if (useCurrentFormat) params.set('format_code', formatCode);
+  return `/api/competitors/code-mappings/product-catalog/${productId}/candidates?${params.toString()}`;
+};

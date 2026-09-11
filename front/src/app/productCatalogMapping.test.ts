@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
+  buildProductCatalogCandidateUrl,
   buildProductCatalogMappingPayload,
   canConfirmProductCatalogMapping,
 } from './productCatalogMapping.ts';
@@ -51,4 +52,11 @@ test('product-catalog confirmation stays disabled without external source key', 
 
 test('rejected row cannot be confirmed', () => {
   assert.equal(canConfirmProductCatalogMapping({ ...row, status: 'rejected' }, candidate, false), false);
+});
+
+test('row candidate loading uses dedicated product-catalog candidate endpoint', () => {
+  assert.equal(
+    buildProductCatalogCandidateUrl(6177, 'provisor', 'INKAR', true),
+    '/api/competitors/code-mappings/product-catalog/6177/candidates?platform=provisor&limit=5&format_code=INKAR',
+  );
 });

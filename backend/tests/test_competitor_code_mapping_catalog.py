@@ -27,6 +27,7 @@ from backend.app.services.competitors.code_mappings import (
     auto_match_product_catalog_code_mappings,
     list_catalog_code_mappings,
     list_product_catalog_code_mappings,
+    product_catalog_candidates_for_product,
     source_match_key,
 )
 
@@ -895,18 +896,15 @@ def test_product_catalog_candidates_treat_manufacturer_as_soft_and_critical_fiel
     _item(db, price_list, 1005, name="Aspirin tab 500 mg N10 200 ml", manufacturer="Polpharma")
     db.commit()
 
-    row = list_product_catalog_code_mappings(db=db, platform="provisor", q=product.code, status="review", include_candidates=True)["items"][0]
+    candidates = product_catalog_candidates_for_product(db=db, product_id=product.id, platform="provisor")
 
-    assert row["status"] == "review"
-    assert [candidate["sourceExternalKey"] for candidate in row["reviewCandidates"]] == ["1001"]
-    assert row["reviewCandidates"][0]["manufacturerMismatch"] is True
+    assert [candidate["sourceExternalKey"] for candidate in candidates] == ["1001"]
+    assert candidates[0]["manufacturerMismatch"] is True
 
 
 def _product_catalog_candidates(db: Session, product: Product, *, platform: str = "provisor") -> list[dict]:
     db.commit()
-    result = list_product_catalog_code_mappings(db=db, platform=platform, q=product.code, status="review", include_candidates=True)
-    assert result["items"]
-    return result["items"][0]["reviewCandidates"]
+    return product_catalog_candidates_for_product(db=db, product_id=product.id, platform=platform)
 
 
 def test_product_catalog_provisor_goods_id_is_existing_mapping_without_code_mapping():
@@ -947,26 +945,23 @@ def test_product_catalog_provisor_goods_id_drives_mapped_and_unmapped_filters():
     assert mapped_result["metrics"][0]["unmapped"] == 1
 
 
-def test_product_catalog_skips_candidate_generation_for_provisor_goods_id_mapping(monkeypatch):
+def test_product_catalog_main_endpoint_does_not_generate_candidates(monkeypatch):
     db = _session()
     mapped = _product(db, "PROV-SKIP", "Mapped skip tab 5 mg N10", "Maker")
     mapped.provisor_goods_id = 555012
     needs_review = _product(db, "PROV-NEEDS", "Needscandidate tab 5 mg N10", "Maker")
-    seen_product_ids: list[int] = []
 
     def fake_candidates(db: Session, *, products: list[tuple[Product, ProductExtra | None]], platforms: list[str], assigned_ids=None, limit_per_product: int = 5):
-        seen_product_ids.extend(int(product.id) for product, _extra in products)
-        return {int(needs_review.id): [{"sourceMatchKey": "provisor:900", "confidence": 80, "matchLevel": "fuzzy"}]}
+        raise AssertionError("main product-catalog endpoint must not generate fuzzy candidates")
 
     monkeypatch.setattr(code_mappings_service, "_product_catalog_source_candidates_for_products", fake_candidates)
 
     result = code_mappings_service.list_product_catalog_code_mappings(db=db, platform="provisor", status="all", include_candidates=True)
 
     rows = {row["sku"]: row for row in result["items"]}
-    assert seen_product_ids == [needs_review.id]
     assert rows[mapped.code]["status"] == "mapped"
     assert rows[mapped.code]["reviewCandidates"] == []
-    assert rows[needs_review.code]["status"] == "review"
+    assert rows[needs_review.code]["status"] == "unmapped"
 
 
 def test_product_catalog_null_provisor_goods_id_with_exact_name_candidate_is_review():
@@ -976,10 +971,9 @@ def test_product_catalog_null_provisor_goods_id_with_exact_name_candidate_is_rev
     product = _product(db, "NULL-EXACT", "Exactdrug tab 5 mg N10", "Maker")
     _item(db, price_list, 555021, name="Exactdrug tab 5 mg N10", manufacturer="Maker")
 
-    result = list_product_catalog_code_mappings(db=db, platform="provisor", q=product.code, status="review", include_candidates=True)
+    candidates = product_catalog_candidates_for_product(db=db, product_id=product.id, platform="provisor")
 
-    assert result["items"][0]["status"] == "review"
-    assert result["items"][0]["reviewCandidates"][0]["sourceExternalKey"] == "555021"
+    assert candidates[0]["sourceExternalKey"] == "555021"
 
 
 def test_product_catalog_null_provisor_goods_id_without_candidates_is_unmapped():
@@ -988,9 +982,11 @@ def test_product_catalog_null_provisor_goods_id_without_candidates_is_unmapped()
     db.commit()
 
     result = list_product_catalog_code_mappings(db=db, platform="provisor", q=product.code, status="all", include_candidates=True)
+    candidates = product_catalog_candidates_for_product(db=db, product_id=product.id, platform="provisor")
 
     assert result["items"][0]["status"] == "unmapped"
     assert result["items"][0]["reviewCandidates"] == []
+    assert candidates == []
 
 
 def test_product_catalog_rejected_candidate_exclusion_does_not_mark_product_mapped():
@@ -1011,9 +1007,129 @@ def test_product_catalog_rejected_candidate_exclusion_does_not_mark_product_mapp
     )
 
     result = list_product_catalog_code_mappings(db=db, platform="provisor", q=product.code, status="all", include_candidates=True)
+    candidates = product_catalog_candidates_for_product(db=db, product_id=product.id, platform="provisor")
 
     assert result["items"][0]["status"] == "unmapped"
     assert result["items"][0]["reviewCandidates"] == []
+    assert candidates == []
+
+
+def test_product_catalog_main_statuses_do_not_call_candidate_generator(monkeypatch):
+    db = _session()
+    mapped = _product(db, "PERF-MAPPED", "Mapped perf tab 5 mg N10", "Maker")
+    mapped.provisor_goods_id = 700001
+    review = _product(db, "PERF-REVIEW", "Review perf tab 5 mg N10", "Maker")
+    unmapped = _product(db, "PERF-UNMAPPED", "Unmapped perf tab 5 mg N10", "Maker")
+    db.add(
+        CompetitorCodeMapping(
+            platform="provisor",
+            source_external_key="700002",
+            source_match_key=source_match_key(platform="provisor", source_external_key=700002),
+            source_name="Review source",
+            status="review",
+            our_product_id=review.id,
+            our_sku=review.code,
+        )
+    )
+    db.commit()
+
+    def fail_candidates(*_args, **_kwargs):
+        raise AssertionError("main product-catalog endpoint must not generate candidates")
+
+    monkeypatch.setattr(code_mappings_service, "_product_catalog_source_candidates_for_products", fail_candidates)
+
+    all_rows = list_product_catalog_code_mappings(db=db, platform="provisor", status="all", include_candidates=True)
+    review_rows = list_product_catalog_code_mappings(db=db, platform="provisor", status="review", include_candidates=True)
+    unmapped_rows = list_product_catalog_code_mappings(db=db, platform="provisor", status="unmapped", include_candidates=True)
+
+    assert {row["sku"]: row["status"] for row in all_rows["items"]} == {
+        mapped.code: "mapped",
+        review.code: "review",
+        unmapped.code: "unmapped",
+    }
+    assert [row["sku"] for row in review_rows["items"]] == [review.code]
+    assert [row["sku"] for row in unmapped_rows["items"]] == [unmapped.code]
+    assert all_rows["metrics"][0]["review"] == 1
+    assert all_rows["metrics"][0]["unmapped"] == 1
+
+
+def test_product_catalog_unmapped_query_count_is_bounded_without_candidate_searches():
+    db = _session()
+    for idx in range(80):
+        _product(db, f"BOUND-{idx:03d}", f"Bounded unique {idx} tab 5 mg N10", "Maker")
+    db.commit()
+    statements: list[str] = []
+
+    def before_execute(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    event.listen(db.get_bind(), "before_cursor_execute", before_execute)
+    try:
+        result = list_product_catalog_code_mappings(db=db, platform="provisor", status="unmapped", page=1, limit=50, include_candidates=True)
+    finally:
+        event.remove(db.get_bind(), "before_cursor_execute", before_execute)
+
+    token_source_queries = [
+        statement
+        for statement in statements
+        if "competitor_price_list_items" in statement and "LIKE" in statement.upper()
+    ]
+    assert len(result["items"]) == 50
+    assert len(statements) <= 8
+    assert token_source_queries == []
+
+
+def test_product_catalog_candidate_endpoint_generates_for_one_product(monkeypatch):
+    db = _session()
+    product = _product(db, "ONE-CAND", "Onecandidate tab 5 mg N10", "Maker")
+    other = _product(db, "OTHER-CAND", "Othercandidate tab 5 mg N10", "Maker")
+    db.commit()
+    seen: list[int] = []
+
+    def fake_candidates(db: Session, *, products: list[tuple[Product, ProductExtra | None]], platforms: list[str], assigned_ids=None, limit_per_product: int = 5):
+        seen.extend(int(product.id) for product, _extra in products)
+        product_id = int(products[0][0].id)
+        return {product_id: [{"platform": platforms[0], "sourceMatchKey": "provisor:1", "sourceExternalKey": "1", "sourceName": "One"}]}
+
+    monkeypatch.setattr(code_mappings_service, "_product_catalog_source_candidates_for_products", fake_candidates)
+
+    def override_db():
+        try:
+            yield db
+        finally:
+            pass
+
+    main.app.dependency_overrides[main.get_db] = override_db
+    main.app.dependency_overrides[get_current_user] = _admin
+    try:
+        client = TestClient(main.app)
+        response = client.get(f"/api/competitors/code-mappings/product-catalog/{product.id}/candidates?platform=provisor")
+    finally:
+        main.app.dependency_overrides.clear()
+
+    assert other.id not in seen
+    assert seen == [product.id]
+    assert response.status_code == 200
+    assert response.json()[0]["sourceMatchKey"] == "provisor:1"
+
+
+def test_product_catalog_candidate_endpoint_respects_platform_and_format_scope():
+    db = _session()
+    current = _price_format(db, "CAND-FMT")
+    other_pf = _price_format(db, "OTHER-FMT")
+    assigned = _price_list(db, current, source_key="assigned", price_date=date(2026, 1, 2))
+    other = _price_list(db, other_pf, source_key="other", price_date=date(2026, 1, 1))
+    product = _product(db, "FMT-CAND", "Formatdrug tab 5 mg N10", "Maker")
+    _generated_price_list(db, current, product, number="FMT-CAND-PL")
+    _item(db, assigned, 701001, name="Formatdrug tab 5 mg N10", manufacturer="Maker")
+    _item(db, other, 701002, name="Formatdrug tab 5 mg N10", manufacturer="Maker")
+    db.commit()
+
+    scoped = product_catalog_candidates_for_product(db=db, product_id=product.id, platform="provisor", format_code=current.code)
+    vidman = product_catalog_candidates_for_product(db=db, product_id=product.id, platform="vidman", format_code=current.code)
+
+    assert [candidate["sourceExternalKey"] for candidate in scoped] == ["701001"]
+    assert vidman == []
 
 
 def test_product_catalog_vidman_is_not_mapped_by_provisor_goods_id():
@@ -1127,11 +1243,9 @@ def test_product_catalog_candidate_outside_old_global_window_is_found():
         _item(db, price_list, 557000 + idx, name="Commonbrand tab 5 mg N10", manufacturer="Maker")
 
     db.commit()
-    result = list_product_catalog_code_mappings(db=db, platform="provisor", status="review", page=1, limit=50, include_candidates=True)
-    by_sku = {row["sku"]: row for row in result["items"]}
+    candidates = product_catalog_candidates_for_product(db=db, product_id=target.id, platform="provisor")
 
-    assert common.code in by_sku
-    assert by_sku[target.code]["reviewCandidates"][0]["sourceExternalKey"] == "556001"
+    assert candidates[0]["sourceExternalKey"] == "556001"
 
 
 def test_product_catalog_more_than_fifty_tokens_still_returns_later_candidate():
@@ -1147,11 +1261,9 @@ def test_product_catalog_more_than_fifty_tokens_still_returns_later_candidate():
     assert target is not None
 
     db.commit()
-    result = list_product_catalog_code_mappings(db=db, platform="provisor", status="review", page=1, limit=60, include_candidates=True)
-    by_sku = {row["sku"]: row for row in result["items"]}
+    candidates = product_catalog_candidates_for_product(db=db, product_id=target.id, platform="provisor")
 
-    assert len(by_sku) == 60
-    assert by_sku[target.code]["reviewCandidates"][0]["sourceExternalKey"] == "558059"
+    assert candidates[0]["sourceExternalKey"] == "558059"
 
 
 def test_product_catalog_form_conflict_is_not_returned_as_candidate():
@@ -1162,9 +1274,9 @@ def test_product_catalog_form_conflict_is_not_returned_as_candidate():
     _item(db, price_list, 558501, name="Samebrand caps 500 mg N10", manufacturer="Bayer")
 
     db.commit()
-    result = list_product_catalog_code_mappings(db=db, platform="provisor", q=product.code, status="all", include_candidates=True)
+    candidates = product_catalog_candidates_for_product(db=db, product_id=product.id, platform="provisor")
 
-    assert result["items"][0]["reviewCandidates"] == []
+    assert candidates == []
 
 
 def test_product_catalog_rejected_candidate_remains_excluded():
@@ -1184,9 +1296,9 @@ def test_product_catalog_rejected_candidate_remains_excluded():
         )
     )
 
-    result = list_product_catalog_code_mappings(db=db, platform="provisor", q=product.code, status="all", include_candidates=True)
+    candidates = product_catalog_candidates_for_product(db=db, product_id=product.id, platform="provisor")
 
-    assert result["items"][0]["reviewCandidates"] == []
+    assert candidates == []
 
 
 def test_product_catalog_auto_match_creates_global_mapping_for_exact_candidate():
