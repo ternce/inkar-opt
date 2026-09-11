@@ -24,6 +24,7 @@ PRODUCT_CATALOG_CANDIDATE_LIMIT = 5
 MANUAL_SUGGESTION_MIN_SCORE = 55.0
 MANUAL_CANDIDATE_POOL_LIMIT = 250
 MANUAL_CANDIDATE_LIMIT = 10
+PRODUCT_CATALOG_SOURCE_QUERY_LIMIT = 250
 
 
 STRUCTURED_MANUAL_FIELDS = (
@@ -181,6 +182,36 @@ def _manual_structured_match(source_structure, product_structure) -> tuple[bool,
     return True, None, matched
 
 
+def _manual_structural_evidence(source_structure, product_structure) -> dict:
+    matched_fields: list[str] = []
+    missing_on_source: list[str] = []
+    missing_on_product: list[str] = []
+    conflicts: list[str] = []
+    for field in STRUCTURED_MANUAL_FIELDS:
+        source_value = _manual_field_value(source_structure, field)
+        product_value = _manual_field_value(product_structure, field)
+        source_has = bool(source_value) if field == "form" else source_value is not None
+        product_has = bool(product_value) if field == "form" else product_value is not None
+        if source_has and product_has:
+            if _manual_values_match(source_value, product_value):
+                matched_fields.append(field)
+            else:
+                conflicts.append(field)
+        elif source_has:
+            if field in {"volume", "weight", "dimensions", "critical_tokens"}:
+                conflicts.append(field)
+            else:
+                missing_on_product.append(field)
+        elif product_has:
+            missing_on_source.append(field)
+    return {
+        "matchedFields": matched_fields,
+        "missingOnSource": missing_on_source,
+        "missingOnInternal": missing_on_product,
+        "conflicts": conflicts,
+    }
+
+
 def _manual_candidate_level(
     *,
     source_name: str,
@@ -195,12 +226,14 @@ def _manual_candidate_level(
     source_base = source_structure.base_name or normalize_mapping_text(source_name)
     product_base = product_structure.base_name or normalize_mapping_text(product_name)
     name_score = _base_name_similarity(source_base, product_base)
-    if name_score < 97:
+    if name_score < 72:
         return None
 
-    structured_ok, reject_reason, matched_fields = _manual_structured_match(source_structure, product_structure)
-    if not structured_ok:
+    structural = _manual_structural_evidence(source_structure, product_structure)
+    conflicts = set(structural["conflicts"])
+    if conflicts:
         return None
+    matched_fields = len(structural["matchedFields"])
 
     source_manufacturer_norm = normalize_manufacturer_text(source_manufacturer)
     product_manufacturer_norm = normalize_manufacturer_text(product_manufacturer)
@@ -210,23 +243,49 @@ def _manual_candidate_level(
         and _manufacturer_match(source_manufacturer_norm, product_manufacturer_norm)
     )
     manufacturer_mismatch = bool(source_manufacturer_norm and product_manufacturer_norm and not manufacturers_match)
-    if manufacturers_match:
+    manufacturer_missing = not source_manufacturer_norm or not product_manufacturer_norm
+
+    missing_count = len(structural["missingOnSource"]) + len(structural["missingOnInternal"])
+
+    if name_score >= 97 and matched_fields >= 2 and manufacturers_match and missing_count == 0:
         match_level = "exact"
         confidence = 100.0
-    elif manufacturer_mismatch:
+    elif name_score >= 94 and matched_fields >= 2 and missing_count == 0:
         match_level = "characteristics"
-        confidence = 92.0
+        confidence = 94.0
+    elif name_score >= 85 and matched_fields >= 1:
+        match_level = "medium"
+        confidence = 84.0
     else:
-        return None
+        match_level = "fuzzy"
+        confidence = 68.0 + max(0.0, min(10.0, (name_score - 72) / 2))
+
+    if manufacturers_match and match_level != "exact":
+        confidence += 3.0
+    elif manufacturer_mismatch:
+        confidence -= 2.0
+    elif manufacturer_missing:
+        confidence -= 4.0
+
+    confidence -= min(8.0, missing_count * 1.5)
+    confidence = round(max(55.0, min(100.0, confidence)), 2)
 
     return match_level, manufacturer_mismatch, confidence, {
         "nameScore": round(name_score, 2),
+        "dosageMatch": any(field in structural["matchedFields"] for field in ("dosage", "dosage_volume", "concentration", "percent_strength", "strength_signature", "iu_dosage")),
+        "quantityMatch": "quantity" in structural["matchedFields"],
+        "formMatch": "form" in structural["matchedFields"] or None,
         "matchedFields": matched_fields,
-        "rejectReason": reject_reason,
+        "sharedFields": structural["matchedFields"],
+        "missingOnSource": structural["missingOnSource"],
+        "missingOnInternal": structural["missingOnInternal"],
+        "conflicts": structural["conflicts"],
+        "rejectReason": None,
         "sourceCharacteristics": _manual_characteristic_values(source_structure),
         "internalCharacteristics": _manual_characteristic_values(product_structure),
         "sourceManufacturerNormalized": source_manufacturer_norm,
         "internalManufacturerNormalized": product_manufacturer_norm,
+        "manufacturerMissing": manufacturer_missing,
     }
 
 
@@ -1490,14 +1549,66 @@ def _product_catalog_source_candidates_for_products(
     platforms: list[str],
     limit_per_product: int = PRODUCT_CATALOG_CANDIDATE_LIMIT,
 ) -> dict[int, list[dict]]:
-    from ..competitor_matching import parse_drug_structure
+    from ..competitor_matching import _manufacturer_match, normalize_manufacturer_text, parse_drug_structure
 
     if not products:
         return {}
 
+    source_rows_by_product: dict[int, list[dict]] = {int(product.id): [] for product, _extra in products}
+    exact_goods_sources_by_product: dict[int, list[dict]] = {int(product.id): [] for product, _extra in products}
+    product_goods_ids = {
+        int(product.id): int(product.provisor_goods_id)
+        for product, _extra in products
+        if "provisor" in platforms and product.provisor_goods_id is not None
+    }
+    if product_goods_ids:
+        rows = (
+            db.execute(
+                select(CompetitorPriceListItem, CompetitorPriceList)
+                .join(CompetitorPriceList, CompetitorPriceList.id == CompetitorPriceListItem.price_list_id)
+                .where(CompetitorPriceList.source_type == "provisor")
+                .where(CompetitorPriceListItem.provisor_goods_id.in_(list(product_goods_ids.values())))
+                .order_by(desc(CompetitorPriceList.price_date), desc(CompetitorPriceListItem.id))
+            )
+            .all()
+        )
+        product_by_goods_id = {goods_id: product_id for product_id, goods_id in product_goods_ids.items()}
+        for item, price_list in rows:
+            product_id = product_by_goods_id.get(int(item.provisor_goods_id)) if item.provisor_goods_id is not None else None
+            if product_id is not None:
+                exact_goods_sources_by_product.setdefault(product_id, []).append(_source_item_to_payload(price_list.source_type, item, price_list))
+
+    source_cache_by_token: dict[str, list[dict]] = {}
     token_by_product: dict[int, str] = {}
-    tokens: list[str] = []
+
+    def source_rows_for_token(token: str) -> list[dict]:
+        if token in source_cache_by_token:
+            return source_cache_by_token[token]
+        like = f"%{token}%"
+        rows = (
+            db.execute(
+                select(CompetitorPriceListItem, CompetitorPriceList)
+                .join(CompetitorPriceList, CompetitorPriceList.id == CompetitorPriceListItem.price_list_id)
+                .where(CompetitorPriceList.source_type.in_(platforms))
+                .where(
+                    or_(
+                        CompetitorPriceListItem.name.ilike(like),
+                        CompetitorPriceListItem.raw_name.ilike(like),
+                        CompetitorPriceListItem.normalized_name.ilike(like),
+                        CompetitorPriceListItem.distributor_goods_name.ilike(like),
+                    )
+                )
+                .order_by(desc(CompetitorPriceList.price_date), desc(CompetitorPriceListItem.id))
+                .limit(PRODUCT_CATALOG_SOURCE_QUERY_LIMIT)
+            )
+            .all()
+        )
+        payloads = [_source_item_to_payload(price_list.source_type, item, price_list) for item, price_list in rows]
+        source_cache_by_token[token] = payloads
+        return payloads
+
     for product, _extra in products:
+        product_id = int(product.id)
         normalized_name = normalize_mapping_text(product.name)
         structure = parse_drug_structure(product.name)
         base_name = structure.base_name or normalize_mapping_text(product.name)
@@ -1506,45 +1617,29 @@ def _product_catalog_source_candidates_for_products(
         raw_token = str(product.name or "").split(" ", 1)[0].strip()
         if token and raw_normalized_token and token not in normalized_name:
             token = raw_normalized_token
-        if len(token) < 3 or token.isdigit():
-            continue
-        token_by_product[int(product.id)] = token
-        if token not in tokens:
-            tokens.append(token)
-        if raw_normalized_token and raw_normalized_token not in tokens:
-            tokens.append(raw_normalized_token)
-        if raw_token and raw_token not in tokens:
-            tokens.append(raw_token)
-    if not tokens:
-        return {int(product.id): [] for product, _extra in products}
+        candidate_tokens = [item for item in (token, raw_normalized_token, normalize_mapping_text(raw_token), raw_token) if item and len(item) >= 3 and not item.isdigit()]
+        normalized_token_set = {normalize_mapping_text(item) for item in candidate_tokens}
+        if normalized_token_set & {"ацц", "асс"}:
+            candidate_tokens.extend(["ACC", "acc"])
+        if normalized_token_set & {"лонг"}:
+            candidate_tokens.extend(["LONG", "long"])
+        candidate_tokens = list(dict.fromkeys(candidate_tokens))
+        token_by_product[product_id] = token
+        source_by_key: dict[str, dict] = {}
+        for search_token in candidate_tokens[:3]:
+            for source in source_rows_for_token(search_token):
+                key = str(source.get("sourceMatchKey") or "")
+                if key and key not in source_by_key:
+                    source_by_key[key] = source
+        source_rows_by_product[product_id] = list(source_by_key.values())
 
-    token_filter = None
-    for token in tokens[:50]:
-        condition = CompetitorPriceListItem.name.ilike(f"%{token}%") | CompetitorPriceListItem.raw_name.ilike(f"%{token}%")
-        token_filter = condition if token_filter is None else token_filter | condition
-
-    rows = (
-        db.execute(
-            select(CompetitorPriceListItem, CompetitorPriceList)
-            .join(CompetitorPriceList, CompetitorPriceList.id == CompetitorPriceListItem.price_list_id)
-            .where(CompetitorPriceList.source_type.in_(platforms))
-            .where(token_filter)
-            .order_by(desc(CompetitorPriceList.price_date), desc(CompetitorPriceListItem.id))
-            .limit(750)
-        )
-        .all()
-    )
-    if not rows:
-        return {int(product.id): [] for product, _extra in products}
-
-    source_by_key: dict[str, dict] = {}
-    for item, price_list in rows:
-        source = _source_item_to_payload(price_list.source_type, item, price_list)
-        key = str(source.get("sourceMatchKey") or "")
-        if key and key not in source_by_key:
-            source_by_key[key] = source
-
-    existing_keys = set(source_by_key)
+    existing_keys = {
+        str(source.get("sourceMatchKey") or "")
+        for sources in [*source_rows_by_product.values(), *exact_goods_sources_by_product.values()]
+        for source in sources
+        if source.get("sourceMatchKey")
+    }
+    excluded_keys: set[str] = set()
     if existing_keys:
         for row in db.execute(
             select(CompetitorCodeMapping)
@@ -1552,18 +1647,56 @@ def _product_catalog_source_candidates_for_products(
             .where(CompetitorCodeMapping.source_match_key.in_(existing_keys))
             .where(CompetitorCodeMapping.status.in_(["mapped", "rejected"]))
         ).scalars():
-            source_by_key.pop(row.source_match_key, None)
+            excluded_keys.add(row.source_match_key)
 
     out: dict[int, list[dict]] = {}
-    source_rows = list(source_by_key.values())
     for product, extra in products:
         product_id = int(product.id)
         token = token_by_product.get(product_id, "")
         candidates: dict[str, dict] = {}
-        for source in source_rows:
-            source_name = str(source.get("sourceName") or "")
-            if token and token not in normalize_mapping_text(source_name):
+        product_manufacturer = (extra.manufacturer if extra else "") or ""
+        for source in exact_goods_sources_by_product.get(product_id, []):
+            key = str(source.get("sourceMatchKey") or "")
+            if key in excluded_keys or key in candidates:
                 continue
+            source_manufacturer_norm = normalize_manufacturer_text(source.get("sourceManufacturer") or "")
+            product_manufacturer_norm = normalize_manufacturer_text(product_manufacturer)
+            manufacturers_match = bool(
+                source_manufacturer_norm
+                and product_manufacturer_norm
+                and _manufacturer_match(source_manufacturer_norm, product_manufacturer_norm)
+            )
+            manufacturer_mismatch = bool(source_manufacturer_norm and product_manufacturer_norm and not manufacturers_match)
+            candidate = _product_catalog_candidate_payload(
+                product,
+                extra,
+                source,
+                (
+                    "exact",
+                    manufacturer_mismatch,
+                    100.0,
+                    {
+                        "nameScore": 100,
+                        "matchedFields": 0,
+                        "sharedFields": [],
+                        "missingOnSource": [],
+                        "missingOnInternal": [],
+                        "conflicts": [],
+                        "sourceManufacturerNormalized": source_manufacturer_norm,
+                        "internalManufacturerNormalized": product_manufacturer_norm,
+                        "goodsIdExact": True,
+                    },
+                ),
+            )
+            candidate["matchType"] = "goods_id_candidate"
+            candidate["classification"] = "manual_review"
+            candidate["manualSuggestion"]["goodsIdExact"] = True
+            candidates[key] = candidate
+
+        for source in source_rows_by_product.get(product_id, []):
+            if str(source.get("sourceMatchKey") or "") in excluded_keys:
+                continue
+            source_name = str(source.get("sourceName") or "")
             level = _manual_candidate_level(
                 source_name=source_name,
                 source_manufacturer=str(source.get("sourceManufacturer") or ""),
@@ -1577,7 +1710,17 @@ def _product_catalog_source_candidates_for_products(
             previous = candidates.get(key)
             if previous is None or float(previous.get("confidence") or 0) < float(candidate.get("confidence") or 0):
                 candidates[key] = candidate
-        out[product_id] = sorted(candidates.values(), key=lambda item: float(item.get("confidence") or 0), reverse=True)[:limit_per_product]
+        tier_rank = {"exact": 0, "characteristics": 1, "medium": 2, "fuzzy": 3}
+        out[product_id] = sorted(
+            candidates.values(),
+            key=lambda item: (
+                0 if (item.get("manualSuggestion") or {}).get("goodsIdExact") else 1,
+                tier_rank.get(str(item.get("matchLevel") or ""), 9),
+                -float(item.get("confidence") or 0),
+                -float(((item.get("manualSuggestion") or {}).get("nameScore")) or 0),
+                str(item.get("sourceMatchKey") or ""),
+            ),
+        )[:limit_per_product]
     return out
 
 

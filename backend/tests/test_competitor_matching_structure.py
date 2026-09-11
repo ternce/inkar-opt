@@ -41,3 +41,29 @@ def test_unrelated_forms_still_reject():
     candidate = parse_drug_structure("Тест 100мг сироп 100мл")
 
     assert _strict_structure_decision(product, candidate) == ("reject", "form_conflict")
+
+
+def test_pack_quantity_parses_safe_common_representations():
+    cases = {
+        "\u211620": 20,
+        "N20": 20,
+        "20 \u0442\u0430\u0431": 20,
+        "20 \u0448\u0442": 20,
+        "2x10": 20,
+        "2\u00d710": 20,
+        "10x2": 20,
+    }
+
+    for raw, expected in cases.items():
+        assert parse_drug_structure(raw).quantity == expected
+
+
+def test_pack_quantity_does_not_multiply_volume_or_dosage_notation():
+    for raw in (
+        "2x5 \u043c\u043b",
+        "2\u00d75 ml",
+        "2x10 \u043c\u0433",
+        "3x2 \u0433",
+        "2x5 mg/ml",
+    ):
+        assert parse_drug_structure(raw).quantity is None

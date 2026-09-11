@@ -250,6 +250,10 @@ TOKEN_ALIASES = {
     "ФОРТЕ": {"FORTE"},
     "FORTE": {"ФОРТЕ"},
 }
+BRAND_TOKEN_ALIASES = {
+    "ACC": "АЦЦ",
+    "АСС": "АЦЦ",
+}
 MANUFACTURER_STOP_WORDS = {
     "АО",
     "ООО",
@@ -550,6 +554,8 @@ def _structures_match_strongly(left: DrugStructure, right: DrugStructure) -> boo
 
 def normalize_drug_text(value: object) -> str:
     s = str(value or "").upper().replace("\u0401", "\u0415")
+    s = re.sub(r"\bACC\b", "АЦЦ", s)
+    s = re.sub(r"\bАСС\b", "АЦЦ", s)
     s = re.sub(r"\bNEO\b", "НЕО", s)
     s = re.sub(r"\bEXTRA\b", "ЭКСТРА", s)
     s = re.sub(r"\bFORTE\b", "ФОРТЕ", s)
@@ -651,6 +657,8 @@ class DrugStructure:
 
 def parse_drug_structure(value: object) -> DrugStructure:
     raw = str(value or "").upper().replace("\u0401", "\u0415")
+    raw = re.sub(r"\bACC\b", "АЦЦ", raw)
+    raw = re.sub(r"\bАСС\b", "АЦЦ", raw)
     raw = re.sub(r"\bCAPS(?:ULES?)?\b", "\u041a\u0410\u041f\u0421", raw)
     raw = re.sub(r"\bTAB(?:L|LETS?)?\b", "\u0422\u0410\u0411", raw)
     raw = re.sub(r"\bSUPP(?:OSITOR(?:Y|IES))?\b", "\u0421\u0423\u041f\u041f", raw)
@@ -669,6 +677,21 @@ def parse_drug_structure(value: object) -> DrugStructure:
     normalized = normalize_drug_text(value)
 
     quantity_m = re.search(r"\bN\s*(\d+)\b", normalized)
+    quantity_value: int | None = int(quantity_m.group(1)) if quantity_m else None
+    if quantity_value is None:
+        multi_pack_m = re.search(r"\b(\d+)\s*[XХ×]\s*(\d+)\b", raw)
+        if multi_pack_m:
+            tail = raw[multi_pack_m.end() :]
+            has_unit_tail = bool(re.match(r"\s*(?:МЛ|ML|МГ|MG|МКГ|MCG|Г|G|МЕ|ME|IU|/)", tail))
+            if not has_unit_tail:
+                quantity_value = int(multi_pack_m.group(1)) * int(multi_pack_m.group(2))
+    if quantity_value is None:
+        unit_pack_m = re.search(
+            r"\b(\d+)\s*(?:ШТ|ШТУК|ТАБ|ТАБЛ|ТАБЛЕТКИ|КАПС|КАПСУЛЫ|CAPS|TAB|TABS)\b",
+            raw,
+        )
+        if unit_pack_m:
+            quantity_value = int(unit_pack_m.group(1))
     dimensions: tuple[str, ...] | None = None
     dimension_pair_m = re.search(r"\b(\d+(?:[\.,]\d+)?)\s*(?:СМ|CM)\s*[XХ]\s*(\d+(?:[\.,]\d+)?)\s*(?:М|M)\b", raw)
     if dimension_pair_m:
@@ -820,7 +843,7 @@ def parse_drug_structure(value: object) -> DrugStructure:
 
     structure = DrugStructure(
         base_name=base,
-        quantity=int(quantity_m.group(1)) if quantity_m else None,
+        quantity=quantity_value,
         volume=_clean_num(volume),
         weight=_clean_num(weight),
         dosage=_clean_num(dosage),
@@ -945,6 +968,9 @@ def _structure_values_for_reason(
 def _base_name_similarity(left: str, right: str) -> float:
     left = normalize_text(left)
     right = normalize_text(right)
+    for raw, canonical in BRAND_TOKEN_ALIASES.items():
+        left = re.sub(rf"\b{re.escape(normalize_text(raw))}\b", normalize_text(canonical), left)
+        right = re.sub(rf"\b{re.escape(normalize_text(raw))}\b", normalize_text(canonical), right)
     if not left or not right:
         return 0.0
     if left == right:

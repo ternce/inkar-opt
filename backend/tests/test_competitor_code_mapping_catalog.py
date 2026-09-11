@@ -745,6 +745,171 @@ def test_product_catalog_candidates_treat_manufacturer_as_soft_and_critical_fiel
     assert row["reviewCandidates"][0]["manufacturerMismatch"] is True
 
 
+def _product_catalog_candidates(db: Session, product: Product, *, platform: str = "provisor") -> list[dict]:
+    db.commit()
+    result = list_product_catalog_code_mappings(db=db, platform=platform, q=product.code, status="review", include_candidates=True)
+    assert result["items"]
+    return result["items"][0]["reviewCandidates"]
+
+
+def test_product_catalog_exact_goods_id_candidate_is_first_and_manual_review():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="goods-id", price_date=date(2026, 1, 1))
+    product = _product(db, "NURO-GID", "\u041d\u0443\u0440\u043e\u0444\u0435\u043d \u0442\u0430\u0431\u043b\u0435\u0442\u043a\u0438 200 \u043c\u0433 \u211620", "Reckitt")
+    product.provisor_goods_id = 555001
+    _item(db, price_list, 555001, name="\u041d\u0443\u0440\u043e\u0444\u0435\u043d 200 \u043c\u0433 \u0442\u0430\u0431. \u211620", manufacturer="Famar")
+    _item(db, price_list, 555002, name="\u041d\u0443\u0440\u043e\u0444\u0435\u043d 200 \u043c\u0433 \u0442\u0430\u0431. \u211620", manufacturer="Other")
+
+    candidates = _product_catalog_candidates(db, product)
+
+    assert candidates[0]["sourceExternalKey"] == "555001"
+    assert candidates[0]["matchLevel"] == "exact"
+    assert candidates[0]["confidence"] == 100
+    assert candidates[0]["classification"] == "manual_review"
+
+
+def test_product_catalog_same_structure_different_or_missing_manufacturer_returns_candidates():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="manufacturer-soft", price_date=date(2026, 1, 1))
+    product = _product(db, "NURO-MFR", "\u041d\u0443\u0440\u043e\u0444\u0435\u043d \u0442\u0430\u0431\u043b\u0435\u0442\u043a\u0438 200 \u043c\u0433 \u211620", "Reckitt")
+    _item(db, price_list, 555101, name="\u041d\u0443\u0440\u043e\u0444\u0435\u043d 200 \u043c\u0433 \u0442\u0430\u0431. \u211620", manufacturer="Famar")
+    _item(db, price_list, 555102, name="\u041d\u0443\u0440\u043e\u0444\u0435\u043d 200 \u043c\u0433 \u0442\u0430\u0431. \u211620", manufacturer="")
+
+    candidates = _product_catalog_candidates(db, product)
+
+    assert {candidate["sourceExternalKey"] for candidate in candidates} == {"555101", "555102"}
+    assert any(candidate["manufacturerMismatch"] is True for candidate in candidates)
+    assert all(candidate["confidence"] >= 80 for candidate in candidates)
+
+
+def test_product_catalog_acc_long_latin_cyrillic_variants_return_candidate():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="acc-long", price_date=date(2026, 1, 1))
+    product = _product(db, "ACC-LONG", "\u0410\u0426\u0426 \u041b\u043e\u043d\u0433 \u0442\u0430\u0431\u043b\u0435\u0442\u043a\u0438 \u0448\u0438\u043f\u0443\u0447\u0438\u0435 600 \u043c\u0433 N10", "Sandoz")
+    _item(db, price_list, 555201, name="ACC LONG 600 mg \u211610", manufacturer="Hexal")
+
+    candidates = _product_catalog_candidates(db, product)
+
+    assert [candidate["sourceExternalKey"] for candidate in candidates] == ["555201"]
+
+
+def test_product_catalog_true_dosage_conflict_rejected_but_missing_dosage_allowed():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="dosage-tiers", price_date=date(2026, 1, 1))
+    product = _product(db, "ASP-MISS-DOSE", "Aspirin tab 500 mg N10", "Bayer")
+    _item(db, price_list, 555301, name="Aspirin tab 1000 mg N10", manufacturer="Bayer")
+    _item(db, price_list, 555302, name="Aspirin tab N10", manufacturer="Bayer")
+
+    candidates = _product_catalog_candidates(db, product)
+
+    assert [candidate["sourceExternalKey"] for candidate in candidates] == ["555302"]
+    assert candidates[0]["matchLevel"] in {"medium", "fuzzy"}
+
+
+def test_product_catalog_pack_variants_and_missing_pack_are_allowed_when_safe():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="pack-tiers", price_date=date(2026, 1, 1))
+    product = _product(db, "PACK-20", "Aspirin tab 500 mg №20", "Bayer")
+    _item(db, price_list, 555401, name="Aspirin tab 500 mg 20 tabs", manufacturer="Bayer")
+    _item(db, price_list, 555402, name="Aspirin tab 500 mg 2x10", manufacturer="Bayer")
+    _item(db, price_list, 555403, name="Aspirin tab 500 mg", manufacturer="Bayer")
+
+    candidates = _product_catalog_candidates(db, product)
+
+    assert {candidate["sourceExternalKey"] for candidate in candidates} == {"555401", "555402", "555403"}
+    assert candidates[0]["sourceExternalKey"] in {"555401", "555402"}
+
+
+def test_product_catalog_missing_form_does_not_eliminate_candidate():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="missing-form", price_date=date(2026, 1, 1))
+    product = _product(db, "FORM-MISS", "Aspirin tab 500 mg N10", "Bayer")
+    _item(db, price_list, 555501, name="Aspirin 500 mg N10", manufacturer="Bayer")
+
+    candidates = _product_catalog_candidates(db, product)
+
+    assert [candidate["sourceExternalKey"] for candidate in candidates] == ["555501"]
+
+
+def test_product_catalog_candidate_outside_old_global_window_is_found():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="global-window", price_date=date(2026, 1, 1))
+    common = _product(db, "WINDOW-1", "Commonbrand tab 5 mg N10", "Maker")
+    target = _product(db, "WINDOW-2", "Windowdrug tab 5 mg N10", "Maker")
+    _item(db, price_list, 556001, name="Windowdrug tab 5 mg N10", manufacturer="Maker")
+    for idx in range(800):
+        _item(db, price_list, 557000 + idx, name="Commonbrand tab 5 mg N10", manufacturer="Maker")
+
+    db.commit()
+    result = list_product_catalog_code_mappings(db=db, platform="provisor", status="review", page=1, limit=50, include_candidates=True)
+    by_sku = {row["sku"]: row for row in result["items"]}
+
+    assert common.code in by_sku
+    assert by_sku[target.code]["reviewCandidates"][0]["sourceExternalKey"] == "556001"
+
+
+def test_product_catalog_more_than_fifty_tokens_still_returns_later_candidate():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="token-window", price_date=date(2026, 1, 1))
+    target = None
+    for idx in range(60):
+        product = _product(db, f"TOK-{idx:02d}", f"Tokenbrand{idx} tab 5 mg N10", "Maker")
+        _item(db, price_list, 558000 + idx, name=f"Tokenbrand{idx} tab 5 mg N10", manufacturer="Maker")
+        if idx == 59:
+            target = product
+    assert target is not None
+
+    db.commit()
+    result = list_product_catalog_code_mappings(db=db, platform="provisor", status="review", page=1, limit=60, include_candidates=True)
+    by_sku = {row["sku"]: row for row in result["items"]}
+
+    assert len(by_sku) == 60
+    assert by_sku[target.code]["reviewCandidates"][0]["sourceExternalKey"] == "558059"
+
+
+def test_product_catalog_form_conflict_is_not_returned_as_candidate():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="form-conflict", price_date=date(2026, 1, 1))
+    product = _product(db, "FORM-CONFLICT", "Samebrand tab 500 mg N10", "Bayer")
+    _item(db, price_list, 558501, name="Samebrand caps 500 mg N10", manufacturer="Bayer")
+
+    db.commit()
+    result = list_product_catalog_code_mappings(db=db, platform="provisor", q=product.code, status="all", include_candidates=True)
+
+    assert result["items"][0]["reviewCandidates"] == []
+
+
+def test_product_catalog_rejected_candidate_remains_excluded():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="rejected", price_date=date(2026, 1, 1))
+    product = _product(db, "REJ-1", "Rejectdrug tab 5 mg N10", "Maker")
+    source = _item(db, price_list, 559001, name="Rejectdrug tab 5 mg N10", manufacturer="Maker")
+    db.add(
+        CompetitorCodeMapping(
+            platform="provisor",
+            source_external_key=str(source.provisor_goods_id),
+            source_match_key=source_match_key(platform="provisor", source_external_key=source.provisor_goods_id),
+            source_name=source.raw_name,
+            source_manufacturer=source.raw_manufacturer,
+            status="rejected",
+        )
+    )
+
+    result = list_product_catalog_code_mappings(db=db, platform="provisor", q=product.code, status="all", include_candidates=True)
+
+    assert result["items"][0]["reviewCandidates"] == []
+
+
 def test_product_catalog_auto_match_creates_global_mapping_for_exact_candidate():
     db = _session()
     pf = _price_format(db)
