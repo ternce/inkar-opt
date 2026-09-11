@@ -375,6 +375,8 @@ const fmtNumber = (value: number | null | undefined) => {
 };
 
 const platformLabel = (platform: Platform) => (platform === 'all' ? 'Все источники' : platform === 'provisor' ? 'Provisor' : 'Vidman');
+const sourcePlatformLabel = (platform?: Platform | string | null) =>
+  platform === 'vidman' ? 'VIDMAN' : 'PROVISOR';
 
 const refreshStatusLabel = (row: CompetitorSource) => {
   const raw = String(row.refreshStatus || row.status || '').split(';', 1)[0].trim().toLowerCase();
@@ -1668,28 +1670,15 @@ export function CompetitorsTab({ formatCode }: Props) {
           {selectedRow ? (
             <div className="space-y-4">
               <div>
-                <div className="text-xs font-medium uppercase tracking-wide text-gray-500">Наш Product / SKU</div>
-                <h3 className="mt-1 text-base font-semibold text-gray-900">{selectedRow.sku || selectedRow.ourSku || '-'} - {selectedRow.name || selectedRow.ourName || '-'}</h3>
-                <div className="mt-1 text-sm text-gray-600">{selectedRow.manufacturer || selectedRow.ourManufacturer || '-'}</div>
-                <div className="mt-2 flex flex-wrap gap-2 text-xs">
-                  <span className={`status-pill ${catalogStatusClass(selectedRow)}`}>{catalogStatusLabel(selectedRow)}</span>
-                  <span className="status-pill">{platformLabel(selectedRow.platform)}</span>
-                  <span className="status-pill">{fmtNumber(selectedRow.mappingCount)} внешних ID</span>
+                <div className="rounded-md border border-blue-200 bg-blue-50 p-3">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-blue-800">НАШ ТОВАР</div>
+                  <div className="mt-2 text-sm text-blue-950">SKU: <span className="font-semibold">{selectedRow.sku || selectedRow.ourSku || '-'}</span></div>
+                  <h3 className="mt-1 text-base font-semibold text-gray-900">{selectedRow.name || selectedRow.ourName || '-'}</h3>
                 </div>
-                {selectedRow.mappings?.length ? (
-                  <div className="mt-3 space-y-1 rounded-md border border-gray-200 p-2 text-xs text-gray-700">
-                    {selectedRow.mappings.map((item) => (
-                      <div key={`${item.platform}-${item.sourceMatchKey || item.sourceKey}`} className="flex justify-between gap-3">
-                        <span>{platformLabel(item.platform)}: {item.externalId || item.sourceExternalKey || item.sourceMatchKey || item.sourceKey}</span>
-                        <span className="text-gray-500">{item.externalName || item.sourceName || '-'}</span>
-                      </div>
-                    ))}
-                  </div>
-                ) : null}
               </div>
 
               <div>
-                <div className="mb-2 text-sm font-semibold text-gray-900">Кандидаты из внешних источников</div>
+                <div className="mb-2 text-sm font-semibold text-gray-900">Кандидаты {platformLabel(rowPlatformForMapping(selectedRow))}</div>
                 <div className="thin-scrollbar max-h-64 overflow-auto rounded-md border border-gray-200">
                   {selectedRow.candidates?.length ? selectedRow.candidates.map((row) => (
                     <button
@@ -1700,11 +1689,18 @@ export function CompetitorsTab({ formatCode }: Props) {
                       }}
                       className={`block w-full border-b border-gray-100 px-3 py-2 text-left text-sm hover:bg-gray-50 ${selectedCandidate?.sourceMatchKey === row.sourceMatchKey ? 'bg-blue-50' : ''}`}
                     >
-                      <div className="flex items-center justify-between gap-3">
-                        <span className="font-semibold text-gray-900">{row.ourSku || '-'} - {row.ourName || '-'}</span>
-                        <span className="text-xs text-gray-500">Уверенность: {fmtNumber(row.confidence)}</span>
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2 text-xs font-semibold uppercase tracking-wide text-gray-600">
+                            <span>{sourcePlatformLabel(row.platform)}</span>
+                            <span className="font-medium normal-case tracking-normal text-gray-500">goodsId: {row.sourceExternalKey || row.sourceMatchKey || '-'}</span>
+                          </div>
+                          <div className="mt-1 font-semibold text-gray-900">{row.sourceName || '-'}</div>
+                        </div>
+                        <span className="shrink-0 text-xs text-gray-500">Уверенность: {fmtNumber(row.confidence)}%</span>
                       </div>
                       <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                        <span className="status-pill">{row.matchLevel || row.matchType || 'candidate'}</span>
                         <span className="status-pill">
                           {row.matchLevel === 'exact' ? 'Точное совпадение' : 'Совпадение по характеристикам'}
                         </span>
@@ -1718,7 +1714,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                           Our manufacturer: {row.ourManufacturer || row.internalManufacturer || 'не указан'}
                         </div>
                       ) : (
-                        <div className="mt-1 text-xs text-gray-500">{row.ourManufacturer || row.internalManufacturer || 'Производитель не указан'}</div>
+                        <div className="mt-1 text-xs text-gray-500">Производитель: {row.sourceManufacturer || 'не указан'}</div>
                       )}
                       {row.explanation?.length ? (
                         <div className="mt-2 grid gap-1 text-xs text-gray-600">
@@ -1744,7 +1740,7 @@ export function CompetitorsTab({ formatCode }: Props) {
               </div>
 
               <div className="rounded-md border border-gray-200 p-3">
-                <div className="mb-2 text-sm font-semibold text-gray-900">Найти внешний товар</div>
+                <div className="mb-2 text-sm font-semibold text-gray-900">Найти товар в {platformLabel(rowPlatformForMapping(selectedRow))}</div>
                 <div className="grid grid-cols-1 gap-2">
                   <Input
                     value={externalCandidateSearch}
@@ -1756,7 +1752,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                   />
                   <Button variant="outline" size="sm" onClick={() => searchExternalCandidates().catch((err: any) => setError(err?.message || 'External candidate search failed'))}>
                     <Search className="mr-2 h-4 w-4" />
-                    Найти внешний товар
+                    Найти товар в {platformLabel(rowPlatformForMapping(selectedRow))}
                   </Button>
                 </div>
                 <Button className="mt-2 w-full" onClick={mapSelected} disabled={!canConfirmProductCatalogMapping(selectedRow, selectedCandidate, isLoading)}>
@@ -1764,7 +1760,9 @@ export function CompetitorsTab({ formatCode }: Props) {
                 </Button>
                 {selectedCandidate ? (
                   <div className="mt-2 rounded-md bg-green-50 p-3 text-sm text-green-900">
-                    Selected source: <strong>{selectedCandidate.sourceExternalKey || selectedCandidate.sourceMatchKey}</strong> {selectedCandidate.sourceName}
+                    <div className="font-semibold">Выбран кандидат {platformLabel(rowPlatformForMapping(selectedRow))}</div>
+                    <div className="mt-1">goodsId: <strong>{selectedCandidate.sourceExternalKey || selectedCandidate.sourceMatchKey || '-'}</strong></div>
+                    <div>{selectedCandidate.sourceName || '-'}</div>
                   </div>
                 ) : null}
                 {externalCandidateResults.length ? (
@@ -1776,9 +1774,12 @@ export function CompetitorsTab({ formatCode }: Props) {
                         onClick={() => setSelectedCandidate(row)}
                         className={`block w-full border-b border-gray-100 px-3 py-2 text-left text-sm hover:bg-gray-50 ${selectedCandidate?.sourceMatchKey === row.sourceMatchKey ? 'bg-blue-50' : ''}`}
                       >
-                        <span className="font-medium text-gray-900">{row.sourceExternalKey || row.sourceMatchKey}</span>
-                        <span className="ml-2 text-gray-700">{row.sourceName}</span>
-                        <span className="ml-2 text-xs text-gray-500">{row.sourceManufacturer || platformLabel(row.platform)}</span>
+                        <div className="flex flex-wrap items-center gap-2 text-xs font-semibold uppercase tracking-wide text-gray-600">
+                          <span>{sourcePlatformLabel(row.platform)}</span>
+                          <span className="font-medium normal-case tracking-normal text-gray-500">goodsId: {row.sourceExternalKey || row.sourceMatchKey || '-'}</span>
+                        </div>
+                        <div className="mt-1 font-medium text-gray-900">{row.sourceName || '-'}</div>
+                        <div className="mt-1 text-xs text-gray-500">Производитель: {row.sourceManufacturer || 'не указан'}</div>
                       </button>
                     ))}
                   </div>
