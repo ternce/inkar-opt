@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime
 from decimal import Decimal
@@ -18,6 +19,8 @@ from ...models import (
 )
 from ..competitor_assignments import get_assigned_competitor_price_lists
 from ..competitor_read_models import refresh_price_list_item_counters
+
+logger = logging.getLogger(__name__)
 
 SUPPORTED_PLATFORMS = {"provisor", "vidman"}
 PRODUCT_CATALOG_CANDIDATE_LIMIT = 5
@@ -1554,6 +1557,26 @@ def _product_catalog_source_candidates_for_products(
     if not products:
         return {}
 
+    debug_source_match_key = "provisor:984"
+
+    def is_debug_product(product: Product) -> bool:
+        return (
+            int(product.id or 0) == 3
+            and str(product.code or "") == "000000000001000017"
+            and int(product.provisor_goods_id or 0) == 984
+        )
+
+    for product, _extra in products:
+        if is_debug_product(product):
+            logger.info(
+                "[PRODUCT_CANDIDATE_DEBUG] product entry product_id=%s code=%s name=%s provisor_goods_id=%s platforms=%s",
+                product.id,
+                product.code,
+                product.name,
+                product.provisor_goods_id,
+                platforms,
+            )
+
     source_rows_by_product: dict[int, list[dict]] = {int(product.id): [] for product, _extra in products}
     exact_goods_sources_by_product: dict[int, list[dict]] = {int(product.id): [] for product, _extra in products}
     product_goods_ids = {
@@ -1561,6 +1584,13 @@ def _product_catalog_source_candidates_for_products(
         for product, _extra in products
         if "provisor" in platforms and product.provisor_goods_id is not None
     }
+    debug_product_present = 3 in product_goods_ids
+    if debug_product_present or any(is_debug_product(product) for product, _extra in products):
+        logger.info(
+            "[PRODUCT_CANDIDATE_DEBUG] product_goods_ids product_id_3_present=%s goods_id=%s",
+            debug_product_present,
+            product_goods_ids.get(3),
+        )
     if product_goods_ids:
         rows = (
             db.execute(
@@ -1572,11 +1602,38 @@ def _product_catalog_source_candidates_for_products(
             )
             .all()
         )
+        debug_exact_rows = [
+            (item, price_list)
+            for item, price_list in rows
+            if int(item.provisor_goods_id or 0) == 984
+        ]
+        if debug_product_present:
+            logger.info(
+                "[PRODUCT_CANDIDATE_DEBUG] exact_goods_query goods_id=984 row_count=%s",
+                len(debug_exact_rows),
+            )
+            for item, price_list in debug_exact_rows[:5]:
+                logger.info(
+                    "[PRODUCT_CANDIDATE_DEBUG] exact_goods_query row item_id=%s price_list_id=%s provisor_goods_id=%s name=%s source_type=%s",
+                    item.id,
+                    item.price_list_id,
+                    item.provisor_goods_id,
+                    item.name,
+                    price_list.source_type,
+                )
         product_by_goods_id = {goods_id: product_id for product_id, goods_id in product_goods_ids.items()}
         for item, price_list in rows:
             product_id = product_by_goods_id.get(int(item.provisor_goods_id)) if item.provisor_goods_id is not None else None
             if product_id is not None:
-                exact_goods_sources_by_product.setdefault(product_id, []).append(_source_item_to_payload(price_list.source_type, item, price_list))
+                source_payload = _source_item_to_payload(price_list.source_type, item, price_list)
+                exact_goods_sources_by_product.setdefault(product_id, []).append(source_payload)
+                if product_id == 3 and int(item.provisor_goods_id or 0) == 984:
+                    logger.info(
+                        "[PRODUCT_CANDIDATE_DEBUG] exact_source_payload sourceExternalKey=%s sourceMatchKey=%s sourceName=%s",
+                        source_payload.get("sourceExternalKey"),
+                        source_payload.get("sourceMatchKey"),
+                        source_payload.get("sourceName"),
+                    )
 
     source_cache_by_token: dict[str, list[dict]] = {}
     token_by_product: dict[int, str] = {}
@@ -1648,6 +1705,12 @@ def _product_catalog_source_candidates_for_products(
             .where(CompetitorCodeMapping.status.in_(["mapped", "rejected"]))
         ).scalars():
             excluded_keys.add(row.source_match_key)
+    if any(is_debug_product(product) for product, _extra in products):
+        logger.info(
+            "[PRODUCT_CANDIDATE_DEBUG] exclusion_state relevant_sourceMatchKeys=%s provisor_984_excluded=%s",
+            sorted(key for key in excluded_keys if key == debug_source_match_key),
+            debug_source_match_key in excluded_keys,
+        )
 
     out: dict[int, list[dict]] = {}
     for product, extra in products:
@@ -1658,6 +1721,13 @@ def _product_catalog_source_candidates_for_products(
         for source in exact_goods_sources_by_product.get(product_id, []):
             key = str(source.get("sourceMatchKey") or "")
             if key in excluded_keys or key in candidates:
+                if is_debug_product(product) and key == debug_source_match_key:
+                    logger.info(
+                        "[PRODUCT_CANDIDATE_DEBUG] exact_candidate_insertion inserted=%s key=%s reason=%s",
+                        False,
+                        key,
+                        "excluded" if key in excluded_keys else "duplicate",
+                    )
                 continue
             source_manufacturer_norm = normalize_manufacturer_text(source.get("sourceManufacturer") or "")
             product_manufacturer_norm = normalize_manufacturer_text(product_manufacturer)
@@ -1692,6 +1762,14 @@ def _product_catalog_source_candidates_for_products(
             candidate["classification"] = "manual_review"
             candidate["manualSuggestion"]["goodsIdExact"] = True
             candidates[key] = candidate
+            if is_debug_product(product) and key == debug_source_match_key:
+                logger.info(
+                    "[PRODUCT_CANDIDATE_DEBUG] exact_candidate_insertion inserted=%s key=%s confidence=%s matchLevel=%s",
+                    True,
+                    key,
+                    candidate.get("confidence"),
+                    candidate.get("matchLevel"),
+                )
 
         for source in source_rows_by_product.get(product_id, []):
             if str(source.get("sourceMatchKey") or "") in excluded_keys:
@@ -1721,6 +1799,13 @@ def _product_catalog_source_candidates_for_products(
                 str(item.get("sourceMatchKey") or ""),
             ),
         )[:limit_per_product]
+        if is_debug_product(product):
+            logger.info(
+                "[PRODUCT_CANDIDATE_DEBUG] final_product_result product_id=%s candidate_count=%s sourceMatchKeys=%s",
+                product_id,
+                len(out[product_id]),
+                [candidate.get("sourceMatchKey") for candidate in out[product_id]],
+            )
     return out
 
 
