@@ -843,6 +843,7 @@ export function CompetitorsTab({ formatCode }: Props) {
       limit: '50',
       include_candidates: mappingStatus === 'review' ? 'true' : 'false',
     });
+    if (mappingFormatScope === 'current') params.set('format_code', formatCode);
     const combinedQuery = [appliedProductQuery, appliedSourceQuery].filter(Boolean).join(' ').trim();
     if (combinedQuery) params.set('q', combinedQuery);
     const requestKey = params.toString();
@@ -1188,6 +1189,7 @@ export function CompetitorsTab({ formatCode }: Props) {
       limit: '1',
       include_candidates: 'true',
     });
+    if (mappingFormatScope === 'current') params.set('format_code', formatCode);
     const res = await fetch(`/api/competitors/code-mappings/product-catalog?${params.toString()}`);
     const text = await res.text();
     const data = parseJsonOrNull(text);

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import re
 from datetime import datetime
 from decimal import Decimal
@@ -14,13 +13,12 @@ from ...models import (
     CompetitorPriceListItem,
     CalculatedPrice,
     PriceList,
+    PriceFormat,
     Product,
     ProductExtra,
 )
 from ..competitor_assignments import get_assigned_competitor_price_lists
 from ..competitor_read_models import refresh_price_list_item_counters
-
-logger = logging.getLogger(__name__)
 
 SUPPORTED_PLATFORMS = {"provisor", "vidman"}
 PRODUCT_CATALOG_CANDIDATE_LIMIT = 5
@@ -1550,32 +1548,13 @@ def _product_catalog_source_candidates_for_products(
     *,
     products: list[tuple[Product, ProductExtra | None]],
     platforms: list[str],
+    assigned_ids: list[int] | None = None,
     limit_per_product: int = PRODUCT_CATALOG_CANDIDATE_LIMIT,
 ) -> dict[int, list[dict]]:
     from ..competitor_matching import _manufacturer_match, normalize_manufacturer_text, parse_drug_structure
 
     if not products:
         return {}
-
-    debug_source_match_key = "provisor:984"
-
-    def is_debug_product(product: Product) -> bool:
-        return (
-            int(product.id or 0) == 3
-            and str(product.code or "") == "000000000001000017"
-            and int(product.provisor_goods_id or 0) == 984
-        )
-
-    for product, _extra in products:
-        if is_debug_product(product):
-            logger.info(
-                "[PRODUCT_CANDIDATE_DEBUG] product entry product_id=%s code=%s name=%s provisor_goods_id=%s platforms=%s",
-                product.id,
-                product.code,
-                product.name,
-                product.provisor_goods_id,
-                platforms,
-            )
 
     source_rows_by_product: dict[int, list[dict]] = {int(product.id): [] for product, _extra in products}
     exact_goods_sources_by_product: dict[int, list[dict]] = {int(product.id): [] for product, _extra in products}
@@ -1584,56 +1563,23 @@ def _product_catalog_source_candidates_for_products(
         for product, _extra in products
         if "provisor" in platforms and product.provisor_goods_id is not None
     }
-    debug_product_present = 3 in product_goods_ids
-    if debug_product_present or any(is_debug_product(product) for product, _extra in products):
-        logger.info(
-            "[PRODUCT_CANDIDATE_DEBUG] product_goods_ids product_id_3_present=%s goods_id=%s",
-            debug_product_present,
-            product_goods_ids.get(3),
-        )
     if product_goods_ids:
-        rows = (
-            db.execute(
-                select(CompetitorPriceListItem, CompetitorPriceList)
-                .join(CompetitorPriceList, CompetitorPriceList.id == CompetitorPriceListItem.price_list_id)
-                .where(CompetitorPriceList.source_type == "provisor")
-                .where(CompetitorPriceListItem.provisor_goods_id.in_(list(product_goods_ids.values())))
-                .order_by(desc(CompetitorPriceList.price_date), desc(CompetitorPriceListItem.id))
-            )
-            .all()
+        exact_stmt = (
+            select(CompetitorPriceListItem, CompetitorPriceList)
+            .join(CompetitorPriceList, CompetitorPriceList.id == CompetitorPriceListItem.price_list_id)
+            .where(CompetitorPriceList.source_type == "provisor")
+            .where(CompetitorPriceListItem.provisor_goods_id.in_(list(product_goods_ids.values())))
+            .order_by(desc(CompetitorPriceList.price_date), desc(CompetitorPriceListItem.id))
         )
-        debug_exact_rows = [
-            (item, price_list)
-            for item, price_list in rows
-            if int(item.provisor_goods_id or 0) == 984
-        ]
-        if debug_product_present:
-            logger.info(
-                "[PRODUCT_CANDIDATE_DEBUG] exact_goods_query goods_id=984 row_count=%s",
-                len(debug_exact_rows),
-            )
-            for item, price_list in debug_exact_rows[:5]:
-                logger.info(
-                    "[PRODUCT_CANDIDATE_DEBUG] exact_goods_query row item_id=%s price_list_id=%s provisor_goods_id=%s name=%s source_type=%s",
-                    item.id,
-                    item.price_list_id,
-                    item.provisor_goods_id,
-                    item.name,
-                    price_list.source_type,
-                )
+        if assigned_ids is not None:
+            exact_stmt = exact_stmt.where(CompetitorPriceList.id.in_(assigned_ids or [-1]))
+        rows = db.execute(exact_stmt).all()
         product_by_goods_id = {goods_id: product_id for product_id, goods_id in product_goods_ids.items()}
         for item, price_list in rows:
             product_id = product_by_goods_id.get(int(item.provisor_goods_id)) if item.provisor_goods_id is not None else None
             if product_id is not None:
                 source_payload = _source_item_to_payload(price_list.source_type, item, price_list)
                 exact_goods_sources_by_product.setdefault(product_id, []).append(source_payload)
-                if product_id == 3 and int(item.provisor_goods_id or 0) == 984:
-                    logger.info(
-                        "[PRODUCT_CANDIDATE_DEBUG] exact_source_payload sourceExternalKey=%s sourceMatchKey=%s sourceName=%s",
-                        source_payload.get("sourceExternalKey"),
-                        source_payload.get("sourceMatchKey"),
-                        source_payload.get("sourceName"),
-                    )
 
     source_cache_by_token: dict[str, list[dict]] = {}
     token_by_product: dict[int, str] = {}
@@ -1642,24 +1588,24 @@ def _product_catalog_source_candidates_for_products(
         if token in source_cache_by_token:
             return source_cache_by_token[token]
         like = f"%{token}%"
-        rows = (
-            db.execute(
-                select(CompetitorPriceListItem, CompetitorPriceList)
-                .join(CompetitorPriceList, CompetitorPriceList.id == CompetitorPriceListItem.price_list_id)
-                .where(CompetitorPriceList.source_type.in_(platforms))
-                .where(
-                    or_(
-                        CompetitorPriceListItem.name.ilike(like),
-                        CompetitorPriceListItem.raw_name.ilike(like),
-                        CompetitorPriceListItem.normalized_name.ilike(like),
-                        CompetitorPriceListItem.distributor_goods_name.ilike(like),
-                    )
+        source_stmt = (
+            select(CompetitorPriceListItem, CompetitorPriceList)
+            .join(CompetitorPriceList, CompetitorPriceList.id == CompetitorPriceListItem.price_list_id)
+            .where(CompetitorPriceList.source_type.in_(platforms))
+            .where(
+                or_(
+                    CompetitorPriceListItem.name.ilike(like),
+                    CompetitorPriceListItem.raw_name.ilike(like),
+                    CompetitorPriceListItem.normalized_name.ilike(like),
+                    CompetitorPriceListItem.distributor_goods_name.ilike(like),
                 )
-                .order_by(desc(CompetitorPriceList.price_date), desc(CompetitorPriceListItem.id))
-                .limit(PRODUCT_CATALOG_SOURCE_QUERY_LIMIT)
             )
-            .all()
+            .order_by(desc(CompetitorPriceList.price_date), desc(CompetitorPriceListItem.id))
+            .limit(PRODUCT_CATALOG_SOURCE_QUERY_LIMIT)
         )
+        if assigned_ids is not None:
+            source_stmt = source_stmt.where(CompetitorPriceList.id.in_(assigned_ids or [-1]))
+        rows = db.execute(source_stmt).all()
         payloads = [_source_item_to_payload(price_list.source_type, item, price_list) for item, price_list in rows]
         source_cache_by_token[token] = payloads
         return payloads
@@ -1705,12 +1651,6 @@ def _product_catalog_source_candidates_for_products(
             .where(CompetitorCodeMapping.status.in_(["mapped", "rejected"]))
         ).scalars():
             excluded_keys.add(row.source_match_key)
-    if any(is_debug_product(product) for product, _extra in products):
-        logger.info(
-            "[PRODUCT_CANDIDATE_DEBUG] exclusion_state relevant_sourceMatchKeys=%s provisor_984_excluded=%s",
-            sorted(key for key in excluded_keys if key == debug_source_match_key),
-            debug_source_match_key in excluded_keys,
-        )
 
     out: dict[int, list[dict]] = {}
     for product, extra in products:
@@ -1721,13 +1661,6 @@ def _product_catalog_source_candidates_for_products(
         for source in exact_goods_sources_by_product.get(product_id, []):
             key = str(source.get("sourceMatchKey") or "")
             if key in excluded_keys or key in candidates:
-                if is_debug_product(product) and key == debug_source_match_key:
-                    logger.info(
-                        "[PRODUCT_CANDIDATE_DEBUG] exact_candidate_insertion inserted=%s key=%s reason=%s",
-                        False,
-                        key,
-                        "excluded" if key in excluded_keys else "duplicate",
-                    )
                 continue
             source_manufacturer_norm = normalize_manufacturer_text(source.get("sourceManufacturer") or "")
             product_manufacturer_norm = normalize_manufacturer_text(product_manufacturer)
@@ -1762,14 +1695,6 @@ def _product_catalog_source_candidates_for_products(
             candidate["classification"] = "manual_review"
             candidate["manualSuggestion"]["goodsIdExact"] = True
             candidates[key] = candidate
-            if is_debug_product(product) and key == debug_source_match_key:
-                logger.info(
-                    "[PRODUCT_CANDIDATE_DEBUG] exact_candidate_insertion inserted=%s key=%s confidence=%s matchLevel=%s",
-                    True,
-                    key,
-                    candidate.get("confidence"),
-                    candidate.get("matchLevel"),
-                )
 
         for source in source_rows_by_product.get(product_id, []):
             if str(source.get("sourceMatchKey") or "") in excluded_keys:
@@ -1799,13 +1724,6 @@ def _product_catalog_source_candidates_for_products(
                 str(item.get("sourceMatchKey") or ""),
             ),
         )[:limit_per_product]
-        if is_debug_product(product):
-            logger.info(
-                "[PRODUCT_CANDIDATE_DEBUG] final_product_result product_id=%s candidate_count=%s sourceMatchKeys=%s",
-                product_id,
-                len(out[product_id]),
-                [candidate.get("sourceMatchKey") for candidate in out[product_id]],
-            )
     return out
 
 
@@ -1831,6 +1749,59 @@ def _product_catalog_search_external_product_ids(db: Session, *, platforms: list
     return {int(item) for item in rows if item is not None}
 
 
+def _product_catalog_mapped_exists(platforms: list[str]):
+    mapped_exists = exists(
+        select(1)
+        .select_from(CompetitorCodeMapping)
+        .where(CompetitorCodeMapping.status == "mapped")
+        .where(CompetitorCodeMapping.platform.in_(platforms))
+        .where(CompetitorCodeMapping.our_product_id == Product.id)
+    )
+    if "provisor" in platforms:
+        return mapped_exists | Product.provisor_goods_id.is_not(None)
+    return mapped_exists
+
+
+def _product_catalog_format_product_exists(price_format_id: int | None):
+    if price_format_id is None:
+        return None
+    return exists(
+        select(1)
+        .select_from(CalculatedPrice)
+        .join(PriceList, PriceList.id == CalculatedPrice.price_list_id)
+        .where(PriceList.price_format_id == price_format_id)
+        .where(CalculatedPrice.product_id == Product.id)
+    )
+
+
+def _product_catalog_resolve_price_format_id(db: Session, format_code: str) -> int | None:
+    code = str(format_code or "").strip()
+    if not code:
+        return None
+    return db.scalar(select(PriceFormat.id).where(PriceFormat.code == code))
+
+
+def _product_catalog_provisor_goods_mapping_payload(product: Product) -> dict:
+    external = str(product.provisor_goods_id or "")
+    match_key = source_match_key(platform="provisor", source_external_key=external)
+    return {
+        "id": None,
+        "mappingId": None,
+        "platform": "provisor",
+        "sourceKey": match_key,
+        "sourceMatchKey": match_key,
+        "externalId": external,
+        "sourceExternalKey": external,
+        "externalName": "",
+        "sourceName": "",
+        "externalManufacturer": "",
+        "sourceManufacturer": "",
+        "status": "mapped",
+        "confidence": 100.0,
+        "matchType": "provisor_goods_id",
+    }
+
+
 def list_product_catalog_code_mappings(
     *,
     db: Session,
@@ -1840,19 +1811,20 @@ def list_product_catalog_code_mappings(
     page: int = 1,
     limit: int = 50,
     include_candidates: bool = True,
+    format_code: str = "",
 ) -> dict:
     platforms = _product_catalog_platforms(platform)
     status = status if status in {"all", "mapped", "review", "unmapped"} else "all"
     page = max(1, int(page or 1))
     limit = max(1, min(int(limit or 50), 200))
-
-    mapped_exists = exists(
-        select(1)
-        .select_from(CompetitorCodeMapping)
-        .where(CompetitorCodeMapping.status == "mapped")
-        .where(CompetitorCodeMapping.platform.in_(platforms))
-        .where(CompetitorCodeMapping.our_product_id == Product.id)
+    price_format_id = _product_catalog_resolve_price_format_id(db, format_code)
+    format_product_exists = _product_catalog_format_product_exists(price_format_id)
+    assigned_ids = (
+        [int(item.price_list.id) for item in get_assigned_competitor_price_lists(db=db, price_format_id=price_format_id)]
+        if price_format_id is not None
+        else None
     )
+    mapped_exists = _product_catalog_mapped_exists(platforms)
 
     external_product_ids = _product_catalog_search_external_product_ids(db, platforms=platforms, q=q)
     search = q.strip()
@@ -1867,6 +1839,8 @@ def list_product_catalog_code_mappings(
         )
 
     base_count_stmt = select(func.count(Product.id)).select_from(Product).outerjoin(ProductExtra, ProductExtra.product_id == Product.id)
+    if format_product_exists is not None:
+        base_count_stmt = base_count_stmt.where(format_product_exists)
     mapped_count_stmt = base_count_stmt.where(mapped_exists)
     total_products = int(db.scalar(base_count_stmt) or 0)
     mapped_products = int(db.scalar(mapped_count_stmt) or 0)
@@ -1877,6 +1851,8 @@ def list_product_catalog_code_mappings(
         .order_by(Product.code.asc())
     )
     count_stmt = base_count_stmt
+    if format_product_exists is not None:
+        product_stmt = product_stmt.where(format_product_exists)
     if product_filter is not None:
         product_stmt = product_stmt.where(product_filter)
         count_stmt = count_stmt.where(product_filter)
@@ -1905,16 +1881,33 @@ def list_product_catalog_code_mappings(
         ).scalars():
             mappings_by_product.setdefault(int(row.our_product_id), []).append(_product_catalog_mapping_payload(row))
 
-    candidates_by_product = (
-        _product_catalog_source_candidates_for_products(db, products=product_rows, platforms=platforms)
-        if include_candidates or status == "review"
-        else {int(product.id): [] for product, _extra in product_rows}
-    )
+    mapped_product_ids = {
+        int(product.id)
+        for product, _extra in product_rows
+        if "provisor" in platforms and product.provisor_goods_id is not None
+    }
+    candidate_product_rows = [
+        (product, extra)
+        for product, extra in product_rows
+        if int(product.id) not in mapped_product_ids and not mappings_by_product.get(int(product.id))
+    ]
+    candidates_by_product = {int(product.id): [] for product, _extra in product_rows}
+    if include_candidates or status in {"review", "unmapped"}:
+        candidates_by_product.update(
+            _product_catalog_source_candidates_for_products(
+                db,
+                products=candidate_product_rows,
+                platforms=platforms,
+                assigned_ids=assigned_ids,
+            )
+        )
 
     rows: list[dict] = []
     for product, extra in product_rows:
         product_id = int(product.id)
-        mappings = mappings_by_product.get(product_id, [])
+        mappings = list(mappings_by_product.get(product_id, []))
+        if "provisor" in platforms and product.provisor_goods_id is not None:
+            mappings.insert(0, _product_catalog_provisor_goods_mapping_payload(product))
         candidates = [] if mappings else candidates_by_product.get(product_id, [])
         row_status = "mapped" if mappings else "review" if candidates else "unmapped"
         if status == "review" and row_status != "review":
@@ -1937,7 +1930,7 @@ def list_product_catalog_code_mappings(
             }
         )
 
-    if status in {"review", "unmapped"} and (include_candidates or status == "review"):
+    if status in {"review", "unmapped"}:
         filtered_total = len(rows) if not search else len(rows)
         page_count = 1 if rows else 0
         page = 1 if rows else page
@@ -1972,19 +1965,12 @@ def auto_match_product_catalog_code_mappings(
 ) -> dict:
     platforms = _product_catalog_platforms(platform)
     limit = max(1, min(int(limit or 100), 500))
+    mapped_exists = _product_catalog_mapped_exists(platforms)
     product_rows = (
         db.execute(
             select(Product, ProductExtra)
             .outerjoin(ProductExtra, ProductExtra.product_id == Product.id)
-            .where(
-                ~exists(
-                    select(1)
-                    .select_from(CompetitorCodeMapping)
-                    .where(CompetitorCodeMapping.status == "mapped")
-                    .where(CompetitorCodeMapping.platform.in_(platforms))
-                    .where(CompetitorCodeMapping.our_product_id == Product.id)
-                )
-            )
+            .where(~mapped_exists)
             .order_by(Product.code.asc())
             .limit(limit)
         )

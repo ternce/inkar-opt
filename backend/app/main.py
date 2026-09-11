@@ -6272,6 +6272,8 @@ def get_competitor_code_mappings_catalog_view(
 def get_competitor_code_mappings_product_catalog(
     platform: str = Query("all"),
     source: str | None = Query(None),
+    format_code: str = Query("", alias="format_code"),
+    formatCode: str = Query("", alias="formatCode"),
     status: str = Query("all"),
     q: str = Query(""),
     page: int = Query(1, ge=1),
@@ -6290,6 +6292,7 @@ def get_competitor_code_mappings_product_catalog(
             page=page,
             limit=limit,
             include_candidates=include_candidates,
+            format_code=format_code or formatCode,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

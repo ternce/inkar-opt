@@ -11,14 +11,17 @@ from backend.app.deps import get_current_user
 from backend.app.models import (
     AppUser,
     Base,
+    CalculatedPrice,
     CompetitorCodeMapping,
     CompetitorPriceList,
     CompetitorPriceListItem,
     PriceFormat,
     PriceFormatCompetitorAssignment,
+    PriceList,
     Product,
     ProductExtra,
 )
+from backend.app.services.competitors import code_mappings as code_mappings_service
 from backend.app.main import create_competitor_code_mapping, unmap_competitor_code_mapping
 from backend.app.services.competitors.code_mappings import (
     auto_match_product_catalog_code_mappings,
@@ -65,6 +68,23 @@ def _price_list(db: Session, pf: PriceFormat, *, source_key: str, price_date: da
     db.add(row)
     db.flush()
     db.add(PriceFormatCompetitorAssignment(price_format_id=pf.id, competitor_price_list_id=row.id, is_active=True))
+    db.flush()
+    return row
+
+
+def _generated_price_list(db: Session, pf: PriceFormat, product: Product, *, number: str) -> PriceList:
+    row = PriceList(number=number, price_format_id=pf.id)
+    db.add(row)
+    db.flush()
+    db.add(
+        CalculatedPrice(
+            price_list_id=row.id,
+            product_id=product.id,
+            cost=1,
+            base_price=1,
+            final_price=1,
+        )
+    )
     db.flush()
     return row
 
@@ -752,7 +772,7 @@ def _product_catalog_candidates(db: Session, product: Product, *, platform: str 
     return result["items"][0]["reviewCandidates"]
 
 
-def test_product_catalog_exact_goods_id_candidate_is_first_and_manual_review():
+def test_product_catalog_provisor_goods_id_is_existing_mapping_without_code_mapping():
     db = _session()
     pf = _price_format(db)
     price_list = _price_list(db, pf, source_key="goods-id", price_date=date(2026, 1, 1))
@@ -761,12 +781,134 @@ def test_product_catalog_exact_goods_id_candidate_is_first_and_manual_review():
     _item(db, price_list, 555001, name="\u041d\u0443\u0440\u043e\u0444\u0435\u043d 200 \u043c\u0433 \u0442\u0430\u0431. \u211620", manufacturer="Famar")
     _item(db, price_list, 555002, name="\u041d\u0443\u0440\u043e\u0444\u0435\u043d 200 \u043c\u0433 \u0442\u0430\u0431. \u211620", manufacturer="Other")
 
-    candidates = _product_catalog_candidates(db, product)
+    result = list_product_catalog_code_mappings(db=db, platform="provisor", q=product.code, status="all", include_candidates=True)
+    row = result["items"][0]
 
-    assert candidates[0]["sourceExternalKey"] == "555001"
-    assert candidates[0]["matchLevel"] == "exact"
-    assert candidates[0]["confidence"] == 100
-    assert candidates[0]["classification"] == "manual_review"
+    assert row["status"] == "mapped"
+    assert row["mappingCount"] == 1
+    assert row["mappings"][0]["platform"] == "provisor"
+    assert row["mappings"][0]["sourceExternalKey"] == "555001"
+    assert row["mappings"][0]["sourceMatchKey"] == "provisor:555001"
+    assert row["reviewCandidates"] == []
+    assert result["metrics"][0]["mapped"] == 1
+
+
+def test_product_catalog_provisor_goods_id_drives_mapped_and_unmapped_filters():
+    db = _session()
+    mapped = _product(db, "PROV-MAPPED", "Mapped tab 5 mg N10", "Maker")
+    mapped.provisor_goods_id = 555011
+    unmapped = _product(db, "PROV-UNMAPPED", "Unmapped tab 5 mg N10", "Maker")
+    db.commit()
+
+    mapped_result = list_product_catalog_code_mappings(db=db, platform="provisor", status="mapped", include_candidates=False)
+    unmapped_result = list_product_catalog_code_mappings(db=db, platform="provisor", status="unmapped", include_candidates=False)
+
+    assert [row["sku"] for row in mapped_result["items"]] == [mapped.code]
+    assert [row["sku"] for row in unmapped_result["items"]] == [unmapped.code]
+    assert mapped_result["metrics"][0]["total"] == 2
+    assert mapped_result["metrics"][0]["mapped"] == 1
+    assert mapped_result["metrics"][0]["unmapped"] == 1
+
+
+def test_product_catalog_skips_candidate_generation_for_provisor_goods_id_mapping(monkeypatch):
+    db = _session()
+    mapped = _product(db, "PROV-SKIP", "Mapped skip tab 5 mg N10", "Maker")
+    mapped.provisor_goods_id = 555012
+    needs_review = _product(db, "PROV-NEEDS", "Needscandidate tab 5 mg N10", "Maker")
+    seen_product_ids: list[int] = []
+
+    def fake_candidates(db: Session, *, products: list[tuple[Product, ProductExtra | None]], platforms: list[str], assigned_ids=None, limit_per_product: int = 5):
+        seen_product_ids.extend(int(product.id) for product, _extra in products)
+        return {int(needs_review.id): [{"sourceMatchKey": "provisor:900", "confidence": 80, "matchLevel": "fuzzy"}]}
+
+    monkeypatch.setattr(code_mappings_service, "_product_catalog_source_candidates_for_products", fake_candidates)
+
+    result = code_mappings_service.list_product_catalog_code_mappings(db=db, platform="provisor", status="all", include_candidates=True)
+
+    rows = {row["sku"]: row for row in result["items"]}
+    assert seen_product_ids == [needs_review.id]
+    assert rows[mapped.code]["status"] == "mapped"
+    assert rows[mapped.code]["reviewCandidates"] == []
+    assert rows[needs_review.code]["status"] == "review"
+
+
+def test_product_catalog_null_provisor_goods_id_with_exact_name_candidate_is_review():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="null-exact", price_date=date(2026, 1, 1))
+    product = _product(db, "NULL-EXACT", "Exactdrug tab 5 mg N10", "Maker")
+    _item(db, price_list, 555021, name="Exactdrug tab 5 mg N10", manufacturer="Maker")
+
+    result = list_product_catalog_code_mappings(db=db, platform="provisor", q=product.code, status="review", include_candidates=True)
+
+    assert result["items"][0]["status"] == "review"
+    assert result["items"][0]["reviewCandidates"][0]["sourceExternalKey"] == "555021"
+
+
+def test_product_catalog_null_provisor_goods_id_without_candidates_is_unmapped():
+    db = _session()
+    product = _product(db, "NO-CAND", "No candidate unique tab 5 mg N10", "Maker")
+    db.commit()
+
+    result = list_product_catalog_code_mappings(db=db, platform="provisor", q=product.code, status="all", include_candidates=True)
+
+    assert result["items"][0]["status"] == "unmapped"
+    assert result["items"][0]["reviewCandidates"] == []
+
+
+def test_product_catalog_rejected_candidate_exclusion_does_not_mark_product_mapped():
+    db = _session()
+    pf = _price_format(db)
+    price_list = _price_list(db, pf, source_key="rejected-status", price_date=date(2026, 1, 1))
+    product = _product(db, "REJ-STATUS", "Rejectstatus tab 5 mg N10", "Maker")
+    source = _item(db, price_list, 555031, name="Rejectstatus tab 5 mg N10", manufacturer="Maker")
+    db.add(
+        CompetitorCodeMapping(
+            platform="provisor",
+            source_external_key=str(source.provisor_goods_id),
+            source_match_key=source_match_key(platform="provisor", source_external_key=source.provisor_goods_id),
+            source_name=source.raw_name,
+            source_manufacturer=source.raw_manufacturer,
+            status="rejected",
+        )
+    )
+
+    result = list_product_catalog_code_mappings(db=db, platform="provisor", q=product.code, status="all", include_candidates=True)
+
+    assert result["items"][0]["status"] == "unmapped"
+    assert result["items"][0]["reviewCandidates"] == []
+
+
+def test_product_catalog_vidman_is_not_mapped_by_provisor_goods_id():
+    db = _session()
+    product = _product(db, "VIDMAN-PROV", "Vidman product tab 5 mg N10", "Maker")
+    product.provisor_goods_id = 555041
+    db.commit()
+
+    result = list_product_catalog_code_mappings(db=db, platform="vidman", q=product.code, status="all", include_candidates=False)
+
+    assert result["items"][0]["status"] == "unmapped"
+    assert result["items"][0]["mappingCount"] == 0
+    assert result["metrics"][0]["mapped"] == 0
+
+
+def test_product_catalog_price_format_scope_limits_products_and_counts():
+    db = _session()
+    pf_a = _price_format(db, "PF-A")
+    pf_b = _price_format(db, "PF-B")
+    product_a = _product(db, "PF-A-SKU", "Format A tab 5 mg N10", "Maker")
+    product_b = _product(db, "PF-B-SKU", "Format B tab 5 mg N10", "Maker")
+    product_a.provisor_goods_id = 555051
+    _generated_price_list(db, pf_a, product_a, number="PL-A")
+    _generated_price_list(db, pf_b, product_b, number="PL-B")
+    db.commit()
+
+    result = list_product_catalog_code_mappings(db=db, platform="provisor", status="all", include_candidates=False, format_code="PF-A")
+
+    assert result["pagination"]["total"] == 1
+    assert [row["sku"] for row in result["items"]] == [product_a.code]
+    assert result["metrics"][0]["total"] == 1
+    assert result["metrics"][0]["mapped"] == 1
 
 
 def test_product_catalog_same_structure_different_or_missing_manufacturer_returns_candidates():
