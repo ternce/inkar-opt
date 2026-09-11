@@ -489,6 +489,42 @@ def test_no_candidate_row_still_supports_manual_product_search_endpoint():
         main.app.dependency_overrides.clear()
 
 
+def test_competitor_items_search_finds_provisor_goods_id_and_deduplicates():
+    db = _session()
+    pf = _price_format(db, "SEARCH-EXT")
+    first_list = _price_list(db, pf, source_key="external-a", price_date=date(2026, 1, 1))
+    second_list = _price_list(db, pf, source_key="external-b", price_date=date(2026, 1, 2))
+    _item(db, first_list, 123456, name="Manual external older", manufacturer="Maker")
+    _item(db, second_list, 123456, name="Manual external newer", manufacturer="Maker")
+    for idx in range(35):
+        _item(db, second_list, 200000 + idx, name=f"Bounded external {idx}", manufacturer="Maker")
+    db.commit()
+
+    def override_db():
+        try:
+            yield db
+        finally:
+            pass
+
+    main.app.dependency_overrides[main.get_db] = override_db
+    main.app.dependency_overrides[get_current_user] = _admin
+    try:
+        client = TestClient(main.app)
+        by_goods = client.get("/api/competitor-items/search?platform=provisor&q=123456&format_code=SEARCH-EXT&limit=30")
+        assert by_goods.status_code == 200
+        rows = by_goods.json()
+        assert len(rows) == 1
+        assert rows[0]["sourceExternalKey"] == "123456"
+        assert rows[0]["sourceMatchKey"] == "provisor:123456"
+        assert rows[0]["sourceName"] == "Manual external newer"
+
+        bounded = client.get("/api/competitor-items/search?platform=provisor&q=Bounded&format_code=SEARCH-EXT&limit=30")
+        assert bounded.status_code == 200
+        assert len(bounded.json()) == 30
+    finally:
+        main.app.dependency_overrides.clear()
+
+
 def test_provisor_catalog_paginates_distinct_goods_with_stable_ordering():
     db = _session()
     pf = _price_format(db)

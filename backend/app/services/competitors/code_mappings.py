@@ -2031,12 +2031,17 @@ def list_code_mappings(
         stmt = stmt.where(CompetitorPriceList.id.in_(assigned_ids))
     source_like = f"%{source_q.strip()}%" if source_q.strip() else ""
     if source_like:
+        source_conditions = [
+            CompetitorPriceListItem.name.ilike(source_like),
+            CompetitorPriceListItem.raw_name.ilike(source_like),
+            CompetitorPriceListItem.distributor_goods_name.ilike(source_like),
+            CompetitorPriceListItem.raw_manufacturer.ilike(source_like),
+            CompetitorPriceListItem.distributor_goods_id.ilike(source_like),
+        ]
+        if platform == "provisor" and source_q.strip().isdigit():
+            source_conditions.append(CompetitorPriceListItem.provisor_goods_id == int(source_q.strip()))
         stmt = stmt.where(
-            (CompetitorPriceListItem.name.ilike(source_like))
-            | (CompetitorPriceListItem.raw_name.ilike(source_like))
-            | (CompetitorPriceListItem.distributor_goods_name.ilike(source_like))
-            | (CompetitorPriceListItem.raw_manufacturer.ilike(source_like))
-            | (CompetitorPriceListItem.distributor_goods_id.ilike(source_like))
+            or_(*source_conditions)
         )
     item_rows = db.execute(stmt).all()
     keys = [source_match_key_for_item(platform, item) for item, _ in item_rows]

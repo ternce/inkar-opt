@@ -19,6 +19,7 @@ import {
   formatLocalDateTime,
   usefulSourceTimestamp,
 } from '../competitorTimestamps';
+import { buildProductCatalogMappingPayload, canConfirmProductCatalogMapping } from '../productCatalogMapping';
 import { SUPPORTED_CITIES } from '../supportedCities';
 
 type Platform = 'all' | 'provisor' | 'vidman';
@@ -435,6 +436,9 @@ const mappingSummary = (row: CodeMappingRow) => {
 
 const primaryMapping = (row: CodeMappingRow) => row.mappings?.[0] || null;
 
+const isProductCatalogMappingRow = (row?: CodeMappingRow | null) =>
+  Boolean(row && (row.sku || row.name || row.reviewCandidates || row.candidates || row.mappings));
+
 function PercentileBrowser({
   rows,
   summary,
@@ -743,6 +747,8 @@ export function CompetitorsTab({ formatCode }: Props) {
   const [productSearch, setProductSearch] = useState('');
   const [productResults, setProductResults] = useState<ProductSearchRow[]>([]);
   const [selectedProduct, setSelectedProduct] = useState<ProductSearchRow | null>(null);
+  const [externalCandidateSearch, setExternalCandidateSearch] = useState('');
+  const [externalCandidateResults, setExternalCandidateResults] = useState<CodeMappingCandidate[]>([]);
 
   const [activeJob, setActiveJob] = useState<JobState | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -1179,6 +1185,22 @@ export function CompetitorsTab({ formatCode }: Props) {
     setProductResults(Array.isArray(data) ? data : []);
   };
 
+  const searchExternalCandidates = async (queryOverride?: string) => {
+    const query = (queryOverride ?? externalCandidateSearch).trim();
+    if (!query) return;
+    const params = new URLSearchParams({
+      platform: rowPlatformForMapping(selectedRow),
+      q: query,
+      limit: '30',
+    });
+    if (mappingFormatScope === 'current') params.set('format_code', formatCode);
+    const res = await fetch(`/api/competitor-items/search?${params.toString()}`);
+    const text = await res.text();
+    const data = parseJsonOrNull(text);
+    if (!res.ok) throw new Error(data?.detail || text || 'External candidate search failed');
+    setExternalCandidateResults(Array.isArray(data) ? data : []);
+  };
+
   const loadCandidatesForRow = async (row: CodeMappingRow) => {
     if (row.candidates?.length || row.mappingStatus === 'mapped') return;
     const params = new URLSearchParams({
@@ -1209,14 +1231,21 @@ export function CompetitorsTab({ formatCode }: Props) {
     setSelectedProduct(null);
     const query = candidateQueryForRow(row);
     setProductSearch(query);
+    setExternalCandidateSearch(query);
     setProductResults([]);
+    setExternalCandidateResults([]);
     void loadCandidatesForRow(row).catch((err: any) => setError(err?.message || 'Ошибка загрузки кандидатов'));
   };
 
   const mapSelected = async () => {
-    const productId = selectedProduct?.productId || selectedRow?.productId || selectedRow?.ourProductId;
+    const isProductCatalogSelection = isProductCatalogMappingRow(selectedRow);
+    const productCatalogPayload =
+      isProductCatalogSelection && selectedRow && selectedCandidate
+        ? buildProductCatalogMappingPayload(selectedRow, selectedCandidate, rowPlatformForMapping(selectedRow))
+        : null;
+    const productId = productCatalogPayload ? productCatalogPayload.ourProductId : selectedProduct?.productId || selectedRow?.productId || selectedRow?.ourProductId;
     const candidate = selectedCandidate || selectedRow;
-    if (!selectedRow || !productId || !candidate?.sourceMatchKey) {
+    if (!selectedRow || !productId || !candidate?.sourceMatchKey || (!productCatalogPayload && !selectedProduct)) {
       setError('Выберите наш товар и конкурентский товар-кандидат');
       return;
     }
@@ -1226,19 +1255,21 @@ export function CompetitorsTab({ formatCode }: Props) {
       const res = await fetch('/api/competitors/code-mappings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          platform: candidate.platform === 'vidman' || candidate.platform === 'provisor' ? candidate.platform : rowPlatformForMapping(selectedRow),
-          status: 'mapped',
-          itemId: candidate.itemId,
-          sourceExternalKey: candidate.sourceExternalKey,
-          sourceMatchKey: candidate.sourceMatchKey,
-          sourceName: candidate.sourceName,
-          sourceManufacturer: candidate.sourceManufacturer,
-          sourceDosageForm: candidate.sourceDosageForm,
-          sourceNormalizedName: candidate.sourceNormalizedName,
-          ourProductId: productId,
-          confidence: candidate.confidence || 100,
-        }),
+        body: JSON.stringify(
+          productCatalogPayload || {
+            platform: candidate.platform === 'vidman' || candidate.platform === 'provisor' ? candidate.platform : rowPlatformForMapping(selectedRow),
+            status: 'mapped',
+            itemId: candidate.itemId,
+            sourceExternalKey: candidate.sourceExternalKey,
+            sourceMatchKey: candidate.sourceMatchKey,
+            sourceName: candidate.sourceName,
+            sourceManufacturer: candidate.sourceManufacturer,
+            sourceDosageForm: candidate.sourceDosageForm,
+            sourceNormalizedName: candidate.sourceNormalizedName,
+            ourProductId: productId,
+            confidence: candidate.confidence || 100,
+          },
+        ),
       });
       const text = await res.text();
       const data = parseJsonOrNull(text);
@@ -1246,6 +1277,7 @@ export function CompetitorsTab({ formatCode }: Props) {
       setSelectedRow(null);
       setSelectedCandidate(null);
       setSelectedProduct(null);
+      setExternalCandidateResults([]);
       await loadCodeMappings();
       toast.success('Сопоставление сохранено');
     } catch (e: any) {
@@ -1493,6 +1525,8 @@ export function CompetitorsTab({ formatCode }: Props) {
                   setSelectedRow(null);
                   setSelectedProduct(null);
                   setProductResults([]);
+                  setSelectedCandidate(null);
+                  setExternalCandidateResults([]);
                 }}
               >
                 {label}
@@ -1510,6 +1544,8 @@ export function CompetitorsTab({ formatCode }: Props) {
                   setSelectedRow(null);
                   setSelectedProduct(null);
                   setProductResults([]);
+                  setSelectedCandidate(null);
+                  setExternalCandidateResults([]);
                 }}
               >
                 {platformLabel(platform)}
@@ -1549,6 +1585,8 @@ export function CompetitorsTab({ formatCode }: Props) {
                   setSelectedRow(null);
                   setSelectedProduct(null);
                   setProductResults([]);
+                  setSelectedCandidate(null);
+                  setExternalCandidateResults([]);
                 }}
               >
                 {statusLabel(status)}
@@ -1661,16 +1699,8 @@ export function CompetitorsTab({ formatCode }: Props) {
                       type="button"
                       onClick={() => {
                         setSelectedCandidate(row);
-                        if (row.ourProductId || row.productId) {
-                          setSelectedProduct({
-                            productId: Number(row.ourProductId || row.productId),
-                            sku: row.ourSku || '',
-                            name: row.ourName || '',
-                            manufacturer: row.ourManufacturer || row.internalManufacturer || '',
-                          });
-                        }
                       }}
-                      className={`block w-full border-b border-gray-100 px-3 py-2 text-left text-sm hover:bg-gray-50 ${selectedProduct?.productId === (row.ourProductId || row.productId) ? 'bg-blue-50' : ''}`}
+                      className={`block w-full border-b border-gray-100 px-3 py-2 text-left text-sm hover:bg-gray-50 ${selectedCandidate?.sourceMatchKey === row.sourceMatchKey ? 'bg-blue-50' : ''}`}
                     >
                       <div className="flex items-center justify-between gap-3">
                         <span className="font-semibold text-gray-900">{row.ourSku || '-'} - {row.ourName || '-'}</span>
@@ -1705,52 +1735,52 @@ export function CompetitorsTab({ formatCode }: Props) {
                   )) : (
                     <div className="px-3 py-6 text-center text-sm text-gray-500">
                       Подходящие совпадения автоматически не найдены.<br />
-                      Используйте поиск по нашей базе ниже.
+                      Используйте поиск по внешним источникам ниже.
                     </div>
                   )}
                 </div>
-                <Button className="mt-3 w-full bg-blue-600 hover:bg-blue-700" onClick={mapSelected} disabled={isLoading || !selectedProduct || selectedRow.status === 'rejected'}>
+                <Button className="mt-3 w-full bg-blue-600 hover:bg-blue-700" onClick={mapSelected} disabled={!canConfirmProductCatalogMapping(selectedRow, selectedCandidate, isLoading)}>
                   <Link2 className="mr-2 h-4 w-4" />
                   Подтвердить сопоставление
                 </Button>
               </div>
 
               <div className="rounded-md border border-gray-200 p-3">
-                <div className="mb-2 text-sm font-semibold text-gray-900">Найти наш товар</div>
+                <div className="mb-2 text-sm font-semibold text-gray-900">Найти внешний товар</div>
                 <div className="grid grid-cols-1 gap-2">
                   <Input
-                    value={productSearch}
-                    onChange={(e) => setProductSearch(e.target.value)}
-                    placeholder="SKU, наименование или производитель"
+                    value={externalCandidateSearch}
+                    onChange={(e) => setExternalCandidateSearch(e.target.value)}
+                    placeholder="Provisor product, goodsId, manufacturer"
                     onKeyDown={(e) => {
-                      if (e.key === 'Enter') void searchProducts().catch((err: any) => setError(err?.message || 'Ошибка поиска'));
+                      if (e.key === 'Enter') void searchExternalCandidates().catch((err: any) => setError(err?.message || 'External candidate search failed'));
                     }}
                   />
-                  <Button variant="outline" size="sm" onClick={() => searchProducts().catch((err: any) => setError(err?.message || 'Ошибка поиска'))}>
+                  <Button variant="outline" size="sm" onClick={() => searchExternalCandidates().catch((err: any) => setError(err?.message || 'External candidate search failed'))}>
                     <Search className="mr-2 h-4 w-4" />
-                    Найти товар
+                    Найти внешний товар
                   </Button>
                 </div>
-                <Button className="mt-2 w-full" onClick={mapSelected} disabled={isLoading || !selectedProduct || selectedRow.status === 'rejected'}>
+                <Button className="mt-2 w-full" onClick={mapSelected} disabled={!canConfirmProductCatalogMapping(selectedRow, selectedCandidate, isLoading)}>
                   Сопоставить вручную
                 </Button>
-                {selectedProduct ? (
+                {selectedCandidate ? (
                   <div className="mt-2 rounded-md bg-green-50 p-3 text-sm text-green-900">
-                    Selected product: <strong>{selectedProduct.sku}</strong> {selectedProduct.name}
+                    Selected source: <strong>{selectedCandidate.sourceExternalKey || selectedCandidate.sourceMatchKey}</strong> {selectedCandidate.sourceName}
                   </div>
                 ) : null}
-                {productResults.length ? (
+                {externalCandidateResults.length ? (
                   <div className="mt-3 max-h-56 overflow-auto rounded-md border border-gray-200">
-                    {productResults.map((row) => (
+                    {externalCandidateResults.map((row) => (
                       <button
-                        key={`${row.productId}-${row.sku}`}
+                        key={`${row.platform}-${row.sourceMatchKey}`}
                         type="button"
-                        onClick={() => setSelectedProduct(row)}
-                        className={`block w-full border-b border-gray-100 px-3 py-2 text-left text-sm hover:bg-gray-50 ${selectedProduct?.productId === row.productId ? 'bg-blue-50' : ''}`}
+                        onClick={() => setSelectedCandidate(row)}
+                        className={`block w-full border-b border-gray-100 px-3 py-2 text-left text-sm hover:bg-gray-50 ${selectedCandidate?.sourceMatchKey === row.sourceMatchKey ? 'bg-blue-50' : ''}`}
                       >
-                        <span className="font-medium text-gray-900">{row.sku}</span>
-                        <span className="ml-2 text-gray-700">{row.name}</span>
-                        <span className="ml-2 text-xs text-gray-500">{row.manufacturer}</span>
+                        <span className="font-medium text-gray-900">{row.sourceExternalKey || row.sourceMatchKey}</span>
+                        <span className="ml-2 text-gray-700">{row.sourceName}</span>
+                        <span className="ml-2 text-xs text-gray-500">{row.sourceManufacturer || platformLabel(row.platform)}</span>
                       </button>
                     ))}
                   </div>
@@ -2057,7 +2087,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                 <table className="admin-table">
                   <thead className="sticky top-0 z-10">
                     <tr>
-                      <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">РСЃС‚РѕС‡РЅРёРє</th>
+                      <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Источник</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Регион / филиал</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Конкурент</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Клиент / логин</th>
@@ -2275,7 +2305,7 @@ export function CompetitorsTab({ formatCode }: Props) {
               <table className="admin-table">
                 <thead>
                   <tr>
-                    <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">РСЃС‚РѕС‡РЅРёРє</th>
+                    <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Источник</th>
                     <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Регион</th>
                     <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Конкурент</th>
                     <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Персентиль</th>
@@ -2422,7 +2452,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Производитель конкурента</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Наш SKU</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Наш товар</th>
-                      <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">РСЃС‚РѕС‡РЅРёРє</th>
+                      <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Источник</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Тип сопоставления</th>
                       <th className="sticky-action-col px-4 py-3 text-right text-sm font-medium text-gray-700">Действия</th>
                     </tr>
