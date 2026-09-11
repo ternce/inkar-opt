@@ -526,6 +526,82 @@ def test_competitor_items_search_finds_provisor_goods_id_and_deduplicates():
         main.app.dependency_overrides.clear()
 
 
+def test_competitor_items_numeric_goods_id_search_uses_exact_path_without_text_like():
+    db = _session()
+    pf = _price_format(db, "SEARCH-NUMERIC")
+    price_list = _price_list(db, pf, source_key="numeric", price_date=date(2026, 1, 1))
+    _item(db, price_list, 114239, name="Алопель 100мл", manufacturer="Maker")
+    for idx in range(20):
+        _item(db, price_list, 900000 + idx, name=f"114239 text decoy {idx}", manufacturer="Maker")
+    db.commit()
+    statements: list[str] = []
+
+    def before_execute(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    event.listen(db.get_bind(), "before_cursor_execute", before_execute)
+    try:
+        rows = code_mappings_service.search_competitor_items_for_mapping(
+            db=db,
+            platform="provisor",
+            price_format_id=pf.id,
+            q="114239",
+            limit=30,
+        )
+    finally:
+        event.remove(db.get_bind(), "before_cursor_execute", before_execute)
+
+    search_sql = "\n".join(statement for statement in statements if "competitor_price_list_items" in statement)
+    assert [row["sourceExternalKey"] for row in rows] == ["114239"]
+    assert "LIKE" not in search_sql.upper()
+    assert "provisor_goods_id" in search_sql
+
+
+def test_competitor_items_text_search_is_bounded_deduped_and_platform_scoped(monkeypatch):
+    db = _session()
+    pf = _price_format(db, "SEARCH-TEXT")
+    newer = _price_list(db, pf, source_key="text-newer", price_date=date(2026, 1, 2))
+    older = _price_list(db, pf, source_key="text-older", price_date=date(2026, 1, 1))
+    _item(db, older, 220001, name="Левоксимед 500мг 100мл раствор д/ин", manufacturer="Older")
+    for idx in range(40):
+        _item(db, newer, 220100 + idx, name=f"Левоксимед bounded {idx}", manufacturer="Maker")
+    _item(db, newer, 220001, name="Левоксимед 500мг 100мл раствор д/ин", manufacturer="Newer")
+    vidman = CompetitorPriceList(source_type="vidman", source_key="vidman", supplier="vidman", display_name="vidman")
+    db.add(vidman)
+    db.flush()
+    db.add(
+        CompetitorPriceListItem(
+            price_list_id=vidman.id,
+            distributor_goods_id="VID-LEV",
+            name="Левоксимед vidman",
+            raw_name="Левоксимед vidman",
+            match_type="unmatched",
+            matched_sku="",
+        )
+    )
+    db.commit()
+    monkeypatch.setattr(
+        code_mappings_service,
+        "source_match_key_for_item",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("optimized search must not load ORM items for keying")),
+    )
+
+    rows = code_mappings_service.search_competitor_items_for_mapping(
+        db=db,
+        platform="provisor",
+        price_format_id=pf.id,
+        q="Левоксимед",
+        limit=30,
+    )
+
+    assert len(rows) == 30
+    assert len({row["sourceMatchKey"] for row in rows}) == 30
+    assert all(row["platform"] == "provisor" for row in rows)
+    assert "provisor:220001" in {row["sourceMatchKey"] for row in rows}
+    assert next(row for row in rows if row["sourceMatchKey"] == "provisor:220001")["sourceManufacturer"] == "Newer"
+    assert "VID-LEV" not in {row["sourceExternalKey"] for row in rows}
+
+
 def test_provisor_catalog_paginates_distinct_goods_with_stable_ordering():
     db = _session()
     pf = _price_format(db)

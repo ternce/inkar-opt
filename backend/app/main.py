@@ -269,6 +269,7 @@ from .services.competitors.code_mappings import (
     platform_from_value,
     product_catalog_candidates_for_product,
     provisor_goods_id_from_mapping_keys,
+    search_competitor_items_for_mapping as search_competitor_items_for_mapping_service,
     upsert_code_mapping,
 )
 from .services.vidman_review_api import (
@@ -6606,16 +6607,13 @@ def search_competitor_items_for_mapping(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     pf = _price_format_for_mapping_request(db, format_code, current_user)
-    result = list_code_mappings(
+    return search_competitor_items_for_mapping_service(
         db=db,
         platform=normalized_platform,
         price_format_id=int(pf.id) if pf is not None else None,
-        status="all",
-        source_q=q,
-        product_q="",
+        q=q,
         limit=limit,
     )
-    return result.get("items", [])
 
 
 @app.post("/api/competitors/code-mappings")

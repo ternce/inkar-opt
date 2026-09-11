@@ -751,12 +751,18 @@ export function CompetitorsTab({ formatCode }: Props) {
   const [selectedProduct, setSelectedProduct] = useState<ProductSearchRow | null>(null);
   const [externalCandidateSearch, setExternalCandidateSearch] = useState('');
   const [externalCandidateResults, setExternalCandidateResults] = useState<CodeMappingCandidate[]>([]);
+  const [isLoadingCandidates, setIsLoadingCandidates] = useState(false);
+  const [isSearchingExternal, setIsSearchingExternal] = useState(false);
+  const [externalSearchState, setExternalSearchState] = useState<'idle' | 'success' | 'empty' | 'error' | 'timeout'>('idle');
+  const [externalSearchMessage, setExternalSearchMessage] = useState('');
 
   const [activeJob, setActiveJob] = useState<JobState | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const mappingRequestRef = useRef<AbortController | null>(null);
   const mappingRequestKeyRef = useRef('');
+  const candidateRequestRef = useRef<AbortController | null>(null);
+  const externalSearchRequestRef = useRef<AbortController | null>(null);
 
   const loadSources = async () => {
     const res = await fetch(`/api/competitors/price-lists?format_code=${encodeURIComponent(formatCode)}`);
@@ -952,6 +958,11 @@ export function CompetitorsTab({ formatCode }: Props) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, mappingPlatform, mappingStatus, mappingFormatScope, appliedSourceQuery, appliedProductQuery, mappingPage, formatCode]);
+
+  useEffect(() => () => {
+    candidateRequestRef.current?.abort();
+    externalSearchRequestRef.current?.abort();
+  }, []);
 
   const submitMappingSearch = () => {
     setAppliedSourceQuery(sourceQuery.trim());
@@ -1189,43 +1200,103 @@ export function CompetitorsTab({ formatCode }: Props) {
 
   const searchExternalCandidates = async (queryOverride?: string) => {
     const query = (queryOverride ?? externalCandidateSearch).trim();
-    if (!query) return;
+    if (!query) {
+      setExternalSearchState('idle');
+      setExternalSearchMessage('');
+      setExternalCandidateResults([]);
+      return;
+    }
+    externalSearchRequestRef.current?.abort();
+    const controller = new AbortController();
+    externalSearchRequestRef.current = controller;
+    let timedOut = false;
+    const timeoutId = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 40000);
+    const searchPlatformLabel = platformLabel(rowPlatformForMapping(selectedRow));
+    setIsSearchingExternal(true);
+    setExternalSearchState('idle');
+    setExternalSearchMessage(`Ищем в ${searchPlatformLabel}...`);
+    setExternalCandidateResults([]);
     const params = new URLSearchParams({
       platform: rowPlatformForMapping(selectedRow),
       q: query,
       limit: '30',
     });
     if (mappingFormatScope === 'current') params.set('format_code', formatCode);
-    const res = await fetch(`/api/competitor-items/search?${params.toString()}`);
-    const text = await res.text();
-    const data = parseJsonOrNull(text);
-    if (!res.ok) throw new Error(data?.detail || text || 'External candidate search failed');
-    setExternalCandidateResults(Array.isArray(data) ? data : []);
+    try {
+      const res = await fetch(`/api/competitor-items/search?${params.toString()}`, { signal: controller.signal });
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) {
+        setExternalSearchState('error');
+        setExternalSearchMessage(data?.detail || text || 'Не удалось выполнить поиск в Provisor');
+        return;
+      }
+      const rows = Array.isArray(data) ? data : [];
+      setExternalCandidateResults(rows);
+      setExternalSearchState(rows.length ? 'success' : 'empty');
+      setExternalSearchMessage(rows.length ? `Найдено: ${rows.length}` : 'По вашему запросу товары не найдены');
+    } catch (err: any) {
+      if (err?.name === 'AbortError') {
+        if (timedOut) {
+          setExternalSearchState('timeout');
+          setExternalSearchMessage('Поиск занял слишком много времени. Попробуйте уточнить запрос.');
+        }
+        return;
+      }
+      setExternalSearchState('error');
+      setExternalSearchMessage(err?.message || 'Не удалось выполнить поиск в Provisor');
+    } finally {
+      window.clearTimeout(timeoutId);
+      if (externalSearchRequestRef.current === controller) {
+        externalSearchRequestRef.current = null;
+        setIsSearchingExternal(false);
+      }
+    }
   };
 
   const loadCandidatesForRow = async (row: CodeMappingRow) => {
     if (row.candidates?.length || row.mappingStatus === 'mapped') return;
     const productId = Number(row.productId || row.ourProductId);
     if (!productId) return;
-    const res = await fetch(buildProductCatalogCandidateUrl(productId, mappingPlatform, formatCode, mappingFormatScope === 'current'));
-    const text = await res.text();
-    const data = parseJsonOrNull(text);
-    if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить кандидатов');
-    const candidates = Array.isArray(data) ? data : [];
-    const fresh = {
-      candidates,
-      reviewCandidates: candidates,
-      bestCandidate: candidates[0] || null,
-      candidatesCount: candidates.length,
-      mappingStatus: candidates.length ? 'review' : row.mappingStatus,
-      status: candidates.length ? 'review' : row.status,
-    };
-    setSelectedRow((current) => (Number(current?.productId) === Number(row.productId) ? { ...current, ...fresh } : current));
-    setSelectedCandidate(fresh.bestCandidate);
-    setCodeRows((current) => current.map((item) => (Number(item.productId) === Number(row.productId) ? { ...item, ...fresh } : item)));
+    candidateRequestRef.current?.abort();
+    const controller = new AbortController();
+    candidateRequestRef.current = controller;
+    setIsLoadingCandidates(true);
+    setSelectedCandidate(null);
+    try {
+      const res = await fetch(buildProductCatalogCandidateUrl(productId, mappingPlatform, formatCode, mappingFormatScope === 'current'), { signal: controller.signal });
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить кандидатов');
+      const candidates = Array.isArray(data) ? data : [];
+      const fresh = {
+        candidates,
+        reviewCandidates: candidates,
+        bestCandidate: candidates[0] || null,
+        candidatesCount: candidates.length,
+        mappingStatus: candidates.length ? 'review' : row.mappingStatus,
+        status: candidates.length ? 'review' : row.status,
+      };
+      setSelectedRow((current) => (Number(current?.productId) === productId ? { ...current, ...fresh } : current));
+      setSelectedCandidate(fresh.bestCandidate);
+      setCodeRows((current) => current.map((item) => (Number(item.productId) === productId ? { ...item, ...fresh } : item)));
+    } catch (err: any) {
+      if (err?.name !== 'AbortError') throw err;
+    } finally {
+      if (candidateRequestRef.current === controller) {
+        candidateRequestRef.current = null;
+        setIsLoadingCandidates(false);
+      }
+    }
   };
 
   const selectMappingRow = (row: CodeMappingRow) => {
+    candidateRequestRef.current?.abort();
+    externalSearchRequestRef.current?.abort();
+    setIsLoadingCandidates(false);
     setSelectedRow(row);
     setSelectedCandidate(row.bestCandidate || row.reviewCandidates?.[0] || row.candidates?.[0] || null);
     setSelectedProduct(null);
@@ -1234,6 +1305,9 @@ export function CompetitorsTab({ formatCode }: Props) {
     setExternalCandidateSearch(query);
     setProductResults([]);
     setExternalCandidateResults([]);
+    setExternalSearchState('idle');
+    setExternalSearchMessage('');
+    setIsSearchingExternal(false);
     void loadCandidatesForRow(row).catch((err: any) => setError(err?.message || 'Ошибка загрузки кандидатов'));
   };
 
@@ -1520,6 +1594,9 @@ export function CompetitorsTab({ formatCode }: Props) {
                 variant={mappingFormatScope === scope ? 'default' : 'outline'}
                 size="sm"
                 onClick={() => {
+                  candidateRequestRef.current?.abort();
+                  externalSearchRequestRef.current?.abort();
+                  setIsLoadingCandidates(false);
                   setMappingFormatScope(scope as 'global' | 'current');
                   setMappingPage(1);
                   setSelectedRow(null);
@@ -1527,6 +1604,9 @@ export function CompetitorsTab({ formatCode }: Props) {
                   setProductResults([]);
                   setSelectedCandidate(null);
                   setExternalCandidateResults([]);
+                  setExternalSearchState('idle');
+                  setExternalSearchMessage('');
+                  setIsSearchingExternal(false);
                 }}
               >
                 {label}
@@ -1539,6 +1619,9 @@ export function CompetitorsTab({ formatCode }: Props) {
                 variant={mappingPlatform === platform ? 'default' : 'outline'}
                 size="sm"
                 onClick={() => {
+                  candidateRequestRef.current?.abort();
+                  externalSearchRequestRef.current?.abort();
+                  setIsLoadingCandidates(false);
                   setMappingPlatform(platform);
                   setMappingPage(1);
                   setSelectedRow(null);
@@ -1546,6 +1629,9 @@ export function CompetitorsTab({ formatCode }: Props) {
                   setProductResults([]);
                   setSelectedCandidate(null);
                   setExternalCandidateResults([]);
+                  setExternalSearchState('idle');
+                  setExternalSearchMessage('');
+                  setIsSearchingExternal(false);
                 }}
               >
                 {platformLabel(platform)}
@@ -1580,6 +1666,9 @@ export function CompetitorsTab({ formatCode }: Props) {
                 variant={mappingStatus === status ? 'default' : 'outline'}
                 size="sm"
                 onClick={() => {
+                  candidateRequestRef.current?.abort();
+                  externalSearchRequestRef.current?.abort();
+                  setIsLoadingCandidates(false);
                   setMappingStatus(status);
                   setMappingPage(1);
                   setSelectedRow(null);
@@ -1587,6 +1676,9 @@ export function CompetitorsTab({ formatCode }: Props) {
                   setProductResults([]);
                   setSelectedCandidate(null);
                   setExternalCandidateResults([]);
+                  setExternalSearchState('idle');
+                  setExternalSearchMessage('');
+                  setIsSearchingExternal(false);
                 }}
               >
                 {statusLabel(status)}
@@ -1680,7 +1772,15 @@ export function CompetitorsTab({ formatCode }: Props) {
               <div>
                 <div className="mb-2 text-sm font-semibold text-gray-900">Кандидаты {platformLabel(rowPlatformForMapping(selectedRow))}</div>
                 <div className="thin-scrollbar max-h-64 overflow-auto rounded-md border border-gray-200">
-                  {selectedRow.candidates?.length ? selectedRow.candidates.map((row) => (
+                  {isLoadingCandidates ? (
+                    <div className="px-3 py-6 text-sm text-gray-600">
+                      <div className="h-1 w-full overflow-hidden rounded bg-blue-100">
+                        <div className="h-full w-1/2 animate-pulse rounded bg-blue-500" />
+                      </div>
+                      <div className="mt-3 font-medium text-gray-900">Ищем подходящие товары в {platformLabel(rowPlatformForMapping(selectedRow))}...</div>
+                      <div className="mt-1 text-xs text-gray-500">Сравниваем название, форму, дозировку и другие характеристики</div>
+                    </div>
+                  ) : selectedRow.candidates?.length ? selectedRow.candidates.map((row) => (
                     <button
                       key={`${row.ourProductId || row.productId}-${row.sourceMatchKey}`}
                       type="button"
@@ -1733,7 +1833,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                     </div>
                   )}
                 </div>
-                <Button className="mt-3 w-full bg-blue-600 hover:bg-blue-700" onClick={mapSelected} disabled={!canConfirmProductCatalogMapping(selectedRow, selectedCandidate, isLoading)}>
+                <Button className="mt-3 w-full bg-blue-600 hover:bg-blue-700" onClick={mapSelected} disabled={isLoadingCandidates || !canConfirmProductCatalogMapping(selectedRow, selectedCandidate, isLoading)}>
                   <Link2 className="mr-2 h-4 w-4" />
                   Подтвердить сопоставление
                 </Button>
@@ -1747,14 +1847,26 @@ export function CompetitorsTab({ formatCode }: Props) {
                     onChange={(e) => setExternalCandidateSearch(e.target.value)}
                     placeholder="Provisor product, goodsId, manufacturer"
                     onKeyDown={(e) => {
-                      if (e.key === 'Enter') void searchExternalCandidates().catch((err: any) => setError(err?.message || 'External candidate search failed'));
+                      if (e.key === 'Enter' && !isSearchingExternal) void searchExternalCandidates();
                     }}
                   />
-                  <Button variant="outline" size="sm" onClick={() => searchExternalCandidates().catch((err: any) => setError(err?.message || 'External candidate search failed'))}>
+                  <Button variant="outline" size="sm" disabled={isSearchingExternal} onClick={() => searchExternalCandidates()}>
                     <Search className="mr-2 h-4 w-4" />
-                    Найти товар в {platformLabel(rowPlatformForMapping(selectedRow))}
+                    {isSearchingExternal ? `Ищем в ${platformLabel(rowPlatformForMapping(selectedRow))}...` : `Найти товар в ${platformLabel(rowPlatformForMapping(selectedRow))}`}
                   </Button>
                 </div>
+                {isSearchingExternal ? (
+                  <div className="mt-2 text-sm text-gray-600">
+                    <div className="h-1 w-full overflow-hidden rounded bg-blue-100">
+                      <div className="h-full w-1/2 animate-pulse rounded bg-blue-500" />
+                    </div>
+                    <div className="mt-2">Поиск по товарам {platformLabel(rowPlatformForMapping(selectedRow))}...</div>
+                  </div>
+                ) : externalSearchState !== 'idle' && externalSearchMessage ? (
+                  <div className={`mt-2 text-sm ${externalSearchState === 'error' || externalSearchState === 'timeout' ? 'text-red-700' : 'text-gray-600'}`}>
+                    {externalSearchMessage}
+                  </div>
+                ) : null}
                 <Button className="mt-2 w-full" onClick={mapSelected} disabled={!canConfirmProductCatalogMapping(selectedRow, selectedCandidate, isLoading)}>
                   Сопоставить вручную
                 </Button>

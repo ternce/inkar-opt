@@ -2170,6 +2170,156 @@ def list_code_mappings(
     return {"items": out, "metrics": metrics}
 
 
+def search_competitor_items_for_mapping(
+    *,
+    db: Session,
+    platform: str,
+    price_format_id: int | None = None,
+    q: str,
+    limit: int = 30,
+) -> list[dict]:
+    platform = platform_from_value(platform)
+    query = str(q or "").strip()
+    if not query:
+        return []
+    limit = max(1, min(int(limit or 30), 100))
+    assigned_ids = (
+        [int(item.price_list.id) for item in get_assigned_competitor_price_lists(db=db, price_format_id=price_format_id)]
+        if price_format_id is not None
+        else None
+    )
+    if assigned_ids == []:
+        return []
+
+    item = CompetitorPriceListItem
+    price_list = CompetitorPriceList
+    identity_expr = (
+        func.coalesce(cast(item.provisor_goods_id, String), item.distributor_goods_id, cast(item.id, String))
+        if platform == "provisor"
+        else func.coalesce(item.distributor_goods_id, cast(item.id, String))
+    )
+    external_expr = (
+        func.coalesce(cast(item.provisor_goods_id, String), item.distributor_goods_id)
+        if platform == "provisor"
+        else item.distributor_goods_id
+    )
+
+    def run_stage(condition) -> list[dict]:
+        row_number = func.row_number().over(
+            partition_by=identity_expr,
+            order_by=(desc(price_list.price_date), desc(item.id)),
+        ).label("rn")
+        stmt = (
+            select(
+                item.id.label("item_id"),
+                item.price_list_id.label("price_list_id"),
+                item.provisor_goods_id.label("provisor_goods_id"),
+                item.distributor_goods_id.label("distributor_goods_id"),
+                item.name.label("name"),
+                item.raw_name.label("raw_name"),
+                item.distributor_goods_name.label("distributor_goods_name"),
+                item.raw_manufacturer.label("raw_manufacturer"),
+                item.parsed_form.label("parsed_form"),
+                item.normalized_name.label("normalized_name"),
+                item.distributor_price.label("distributor_price"),
+                item.match_type.label("match_type"),
+                item.matched_sku.label("matched_sku"),
+                item.product_id.label("product_id"),
+                price_list.id.label("pl_id"),
+                price_list.display_name.label("pl_display_name"),
+                price_list.supplier.label("pl_supplier"),
+                price_list.source_key.label("pl_source_key"),
+                external_expr.label("source_external_key"),
+                row_number,
+            )
+            .select_from(item)
+            .join(price_list, price_list.id == item.price_list_id)
+            .where(price_list.source_type == platform)
+            .where(condition)
+        )
+        if assigned_ids is not None:
+            stmt = stmt.where(price_list.id.in_(assigned_ids))
+        ranked = stmt.subquery()
+        rows = db.execute(
+            select(ranked)
+            .where(ranked.c.rn == 1)
+            .order_by(desc(ranked.c.item_id))
+            .limit(limit)
+        ).mappings().all()
+        return [_search_row_to_code_mapping_payload(platform, row) for row in rows]
+
+    if platform == "provisor" and query.isdigit():
+        return run_stage(item.provisor_goods_id == int(query))
+
+    normalized_query = normalize_mapping_text(query)
+    prefix = f"{query}%"
+    normalized_prefix = f"{normalized_query}%"
+    contains = f"%{query}%"
+    normalized_contains = f"%{normalized_query}%"
+    stages = [
+        or_(
+            item.name.ilike(prefix),
+            item.raw_name.ilike(prefix),
+            item.distributor_goods_name.ilike(prefix),
+            item.normalized_name.ilike(normalized_prefix) if normalized_query else literal(False),
+        ),
+        or_(
+            item.name.ilike(contains),
+            item.raw_name.ilike(contains),
+            item.distributor_goods_name.ilike(contains),
+            item.raw_manufacturer.ilike(contains),
+            item.distributor_goods_id.ilike(contains),
+            item.normalized_name.ilike(normalized_contains) if normalized_query else literal(False),
+        ),
+    ]
+    for condition in stages:
+        results = run_stage(condition)
+        if results:
+            return results
+    return []
+
+
+def _search_row_to_code_mapping_payload(platform: str, row) -> dict:
+    source_external_key = str(row["source_external_key"] or "").strip() or None
+    source_name = row["raw_name"] or row["name"] or row["distributor_goods_name"] or ""
+    source_manufacturer = row["raw_manufacturer"] or ""
+    source_payload = {
+        "source_external_key": source_external_key,
+        "source_match_key": source_match_key(
+            platform=platform,
+            source_external_key=source_external_key,
+            source_name=source_name,
+            source_manufacturer=source_manufacturer,
+        ),
+        "source_name": source_name,
+        "source_manufacturer": source_manufacturer,
+        "source_dosage_form": row["parsed_form"] or "",
+        "source_normalized_name": row["normalized_name"] or normalize_mapping_text(source_name),
+    }
+    return {
+        "itemId": int(row["item_id"]),
+        "priceListId": int(row["price_list_id"]),
+        "priceListName": row["pl_display_name"] or row["pl_supplier"] or row["pl_source_key"] or "",
+        "platform": platform,
+        "status": "mapped" if row["product_id"] else "unmapped",
+        "mappingId": None,
+        "matchType": row["match_type"] or "",
+        "matchedSku": row["matched_sku"] or "",
+        "sourcePrice": float(row["distributor_price"]) if row["distributor_price"] is not None else None,
+        "sourceExternalKey": source_payload["source_external_key"],
+        "sourceMatchKey": source_payload["source_match_key"],
+        "sourceName": source_payload["source_name"],
+        "sourceManufacturer": source_payload["source_manufacturer"],
+        "sourceDosageForm": source_payload["source_dosage_form"],
+        "sourceNormalizedName": source_payload["source_normalized_name"],
+        "productId": int(row["product_id"]) if row["product_id"] else None,
+        "ourProductId": int(row["product_id"]) if row["product_id"] else None,
+        "ourSku": "",
+        "ourName": "",
+        "ourManufacturer": "",
+    }
+
+
 def upsert_code_mapping(
     *,
     db: Session,
