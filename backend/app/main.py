@@ -267,6 +267,7 @@ from .services.competitors.code_mappings import (
     mapping_source_payload,
     mapping_to_dict,
     platform_from_value,
+    provisor_goods_id_from_mapping_keys,
     upsert_code_mapping,
 )
 from .services.vidman_review_api import (
@@ -6634,10 +6635,17 @@ def create_competitor_code_mapping(
         ),
     )
     if platform == "provisor" and status == "mapped" and product is not None:
-        item_id = payload.get("itemId") or payload.get("item_id")
-        source_item = db.get(CompetitorPriceListItem, int(item_id)) if item_id not in (None, "") else None
-        if source_item is not None and source_item.provisor_goods_id is not None:
-            product.provisor_goods_id = int(source_item.provisor_goods_id)
+        goods_id = provisor_goods_id_from_mapping_keys(
+            source_external_key=source_payload.get("source_external_key"),
+            source_match_key_value=source_payload.get("source_match_key"),
+        )
+        if goods_id is not None:
+            product.provisor_goods_id = goods_id
+        else:
+            item_id = payload.get("itemId") or payload.get("item_id")
+            source_item = db.get(CompetitorPriceListItem, int(item_id)) if item_id not in (None, "") else None
+            if source_item is not None and source_item.provisor_goods_id is not None:
+                product.provisor_goods_id = int(source_item.provisor_goods_id)
     db.flush()
     touched = apply_mapping_to_matching_items(db=db, mapping=row, product=product, clear=status == "unmapped")
     db.commit()

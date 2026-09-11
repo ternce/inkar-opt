@@ -673,12 +673,113 @@ def test_mapping_save_uses_selected_product_and_row_disappears_from_unmapped_lis
     assert correct.provisor_goods_id == 777
     assert wrong.provisor_goods_id is None
     assert source.product_id == correct.id
-    assert source.match_type == "manual_code_mapping"
+    assert source.match_type == "provisor_goods_id"
+    assert source.matched_sku == source_match_key(platform="provisor", source_external_key=777)
 
     after = list_catalog_code_mappings(db=db, platform="provisor", price_format_id=pf.id, status="unmapped")
     assert after["pagination"]["total"] == 0
 
     unmap_competitor_code_mapping(saved["id"], db, _admin())
+
+
+def test_provisor_manual_mapping_bulk_updates_by_goods_id_without_loading_items(monkeypatch):
+    db = _session()
+    pf = _price_format(db, "BULK")
+    price_list = _price_list(db, pf, source_key="bulk", price_date=date(2026, 1, 1))
+    product = _product(db, "BULK-P", "Bulk mapped product")
+    key = source_match_key(platform="provisor", source_external_key=424242)
+    for idx in range(1000):
+        _item(db, price_list, 424242, name=f"Bulk source {idx}")
+    already_correct = _item(db, price_list, 424242, name="Already correct", product_id=product.id)
+    already_correct.match_key = key
+    already_correct.match_type = "provisor_goods_id"
+    already_correct.matched_sku = key
+    already_correct.match_score = 100
+    other = _item(db, price_list, 999999, name="Other goods")
+    db.commit()
+
+    item_update_statements: list[str] = []
+
+    def count_item_updates(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if statement.lower().lstrip().startswith("update competitor_price_list_items"):
+            item_update_statements.append(statement)
+
+    event.listen(db.get_bind(), "before_cursor_execute", count_item_updates)
+    monkeypatch.setattr(
+        code_mappings_service,
+        "source_match_key_for_item",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("fast path must not inspect ORM items")),
+    )
+    try:
+        saved = create_competitor_code_mapping(
+            {
+                "platform": "provisor",
+                "status": "mapped",
+                "sourceExternalKey": "424242",
+                "sourceMatchKey": key,
+                "sourceName": "Bulk source",
+                "ourProductId": product.id,
+            },
+            db,
+            _admin(),
+        )
+    finally:
+        event.remove(db.get_bind(), "before_cursor_execute", count_item_updates)
+
+    db.refresh(product)
+    db.refresh(other)
+    updated_rows = db.query(CompetitorPriceListItem).filter_by(provisor_goods_id=424242).all()
+    mapping = db.query(CompetitorCodeMapping).filter_by(source_match_key=key).one()
+
+    assert saved["touchedItems"] == 1000
+    assert len(item_update_statements) == 1
+    assert product.provisor_goods_id == 424242
+    assert mapping.our_product_id == product.id
+    assert mapping.status == "mapped"
+    assert all(row.product_id == product.id for row in updated_rows)
+    assert all(row.match_key == key for row in updated_rows)
+    assert all(row.match_type == "provisor_goods_id" for row in updated_rows)
+    assert all(row.matched_sku == key for row in updated_rows)
+    assert other.product_id is None
+    assert other.match_key == ""
+    assert other.match_type == "unmatched"
+
+
+def test_non_provisor_manual_mapping_keeps_existing_item_update_semantics():
+    db = _session()
+    product = _product(db, "VID-P", "Vidman mapped product")
+    price_list = CompetitorPriceList(source_type="vidman", source_key="vidman", supplier="vidman", display_name="vidman")
+    db.add(price_list)
+    db.flush()
+    item = CompetitorPriceListItem(
+        price_list_id=price_list.id,
+        distributor_goods_id="VID-1",
+        name="Vidman source",
+        raw_name="Vidman source",
+        match_type="unmatched",
+        matched_sku="",
+    )
+    db.add(item)
+    db.commit()
+
+    saved = create_competitor_code_mapping(
+        {
+            "platform": "vidman",
+            "status": "mapped",
+            "sourceExternalKey": "VID-1",
+            "sourceMatchKey": source_match_key(platform="vidman", source_external_key="VID-1"),
+            "sourceName": "Vidman source",
+            "ourProductId": product.id,
+        },
+        db,
+        _admin(),
+    )
+
+    db.refresh(item)
+    assert saved["touchedItems"] == 1
+    assert item.product_id == product.id
+    assert item.match_type == "manual_code_mapping"
+    assert item.matched_sku == product.code
 
 
 def test_product_catalog_returns_product_rows_and_existing_mappings():
@@ -1104,7 +1205,8 @@ def test_product_catalog_auto_match_creates_global_mapping_for_exact_candidate()
     assert mapping.our_product_id == product.id
     assert mapping.status == "mapped"
     assert source.product_id == product.id
-    assert source.match_type == "manual_code_mapping"
+    assert source.match_type == "provisor_goods_id"
+    assert source.matched_sku == source_match_key(platform="provisor", source_external_key=7777)
 
 
 def test_manual_confirm_reuses_global_source_key_and_reject_is_source_specific():

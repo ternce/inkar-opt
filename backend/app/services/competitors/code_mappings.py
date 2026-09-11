@@ -4,7 +4,7 @@ import re
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import String, case, cast, desc, exists, func, literal, or_, select
+from sqlalchemy import String, case, cast, desc, exists, func, literal, or_, select, update
 from sqlalchemy.orm import Session
 
 from ...models import (
@@ -399,6 +399,25 @@ def source_match_key(
     if external:
         return f"{platform}:{external}"
     return f"{platform}:name:{name_norm}|manufacturer:{manufacturer_norm}"
+
+
+def provisor_goods_id_from_mapping_keys(
+    *,
+    source_external_key: object = None,
+    source_match_key_value: object = None,
+) -> int | None:
+    external = str(source_external_key or "").strip()
+    match_key = str(source_match_key_value or "").strip()
+    goods_id: int | None = None
+    if external.isdigit():
+        goods_id = int(external)
+    match = re.fullmatch(r"provisor:(\d+)", match_key)
+    if match:
+        match_goods_id = int(match.group(1))
+        if goods_id is not None and goods_id != match_goods_id:
+            return None
+        goods_id = match_goods_id
+    return goods_id
 
 
 def source_match_key_for_item(platform: str, item: CompetitorPriceListItem) -> str:
@@ -2169,6 +2188,51 @@ def apply_mapping_to_matching_items(
     product: Product | None,
     clear: bool = False,
 ) -> int:
+    if mapping.platform == "provisor" and not clear and product is not None and mapping.status == "mapped":
+        goods_id = provisor_goods_id_from_mapping_keys(
+            source_external_key=mapping.source_external_key,
+            source_match_key_value=mapping.source_match_key,
+        )
+        if goods_id is not None:
+            target_match_key = str(mapping.source_match_key or source_match_key(platform="provisor", source_external_key=goods_id))
+            target_match_score = mapping.confidence or 100
+            changed_condition = or_(
+                CompetitorPriceListItem.product_id.is_distinct_from(product.id),
+                CompetitorPriceListItem.match_key.is_distinct_from(target_match_key),
+                CompetitorPriceListItem.match_type.is_distinct_from("provisor_goods_id"),
+                CompetitorPriceListItem.matched_sku.is_distinct_from(target_match_key),
+                CompetitorPriceListItem.match_score.is_distinct_from(target_match_score),
+            )
+            price_list_ids = {
+                int(price_list_id)
+                for price_list_id in db.execute(
+                    select(CompetitorPriceListItem.price_list_id)
+                    .join(CompetitorPriceList, CompetitorPriceList.id == CompetitorPriceListItem.price_list_id)
+                    .where(CompetitorPriceList.source_type == "provisor")
+                    .where(CompetitorPriceListItem.provisor_goods_id == goods_id)
+                    .where(changed_condition)
+                    .distinct()
+                ).scalars()
+            }
+            if not price_list_ids:
+                return 0
+            result = db.execute(
+                update(CompetitorPriceListItem)
+                .where(CompetitorPriceListItem.price_list_id.in_(price_list_ids))
+                .where(CompetitorPriceListItem.provisor_goods_id == goods_id)
+                .where(changed_condition)
+                .values(
+                    product_id=product.id,
+                    match_key=target_match_key,
+                    match_type="provisor_goods_id",
+                    matched_sku=target_match_key,
+                    match_score=target_match_score,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            refresh_price_list_item_counters(db=db, price_list_ids=price_list_ids)
+            return int(result.rowcount or 0)
+
     stmt = (
         select(CompetitorPriceListItem)
         .join(CompetitorPriceList, CompetitorPriceList.id == CompetitorPriceListItem.price_list_id)
