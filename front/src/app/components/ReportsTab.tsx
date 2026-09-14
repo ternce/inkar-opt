@@ -1,15 +1,16 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Download, Search } from 'lucide-react';
+import { CheckSquare, Download, Search, Square, X } from 'lucide-react';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './ui/tabs';
 
 type PriceFormat = {
-  id: string;
+  id: string | number;
   name: string;
   code: string;
   branch: string;
+  sapCategory?: string;
 };
 
 type ReportType = 'rank-1' | 'decreases';
@@ -25,6 +26,17 @@ type ReportPriceList = {
   skuCount: number;
 };
 
+type ReportContextOption = {
+  priceFormat: PriceFormat;
+  priceLists: ReportPriceList[];
+  latestPriceList?: ReportPriceList | null;
+};
+
+type AppliedContext = {
+  priceFormatId: number | string;
+  priceListId: number | string;
+};
+
 type ReportPayload = {
   items: any[];
   total: number;
@@ -32,11 +44,17 @@ type ReportPayload = {
   limit: number;
   context?: {
     branch: string;
-    priceFormatCode: string;
-    priceFormatName: string;
-    priceListNumber: string;
-    calculatedAtDisplay: string;
-    totalCalculated: number;
+    selectedFormatCount: number;
+    contexts: Array<{
+      priceFormatId: number | string;
+      priceFormatCode: string;
+      priceFormatName: string;
+      priceListNumber: string;
+      customerCategory: string;
+      calculatedAtDisplay: string;
+      totalCalculated: number;
+      previousPriceListNumber?: string;
+    }>;
   };
   summary?: Record<string, number>;
 };
@@ -71,16 +89,32 @@ const fmtPercent = (value: unknown) => {
 
 const endpointFor = (reportType: ReportType) => (reportType === 'rank-1' ? 'rank-1' : 'decreases');
 
+const requestBody = (branchFilter: string, contexts: AppliedContext[], q: string, page: number, limit: number) => ({
+  branch: branchFilter,
+  contexts,
+  q: q.trim(),
+  page,
+  limit,
+});
+
+const downloadNameFromDisposition = (value: string | null, fallback: string) => {
+  if (!value) return fallback;
+  const match = value.match(/filename\*=UTF-8''([^;]+)/i);
+  return match ? decodeURIComponent(match[1]) : fallback;
+};
+
 export function ReportsTab({ branch, selectedFormatCode, priceFormats }: ReportsTabProps) {
   const [activeTab, setActiveTab] = useState<ReportType>('rank-1');
-  const [branchFilter, setBranchFilter] = useState(branch || '__all__');
-  const [formatFilter, setFormatFilter] = useState(selectedFormatCode || '__all__');
-  const [priceLists, setPriceLists] = useState<ReportPriceList[]>([]);
-  const [priceListId, setPriceListId] = useState('');
+  const [branchFilter, setBranchFilter] = useState(branch || priceFormats[0]?.branch || '');
+  const [contextOptions, setContextOptions] = useState<ReportContextOption[]>([]);
+  const [selectedFormatIds, setSelectedFormatIds] = useState<string[]>([]);
+  const [priceListByFormat, setPriceListByFormat] = useState<Record<string, string>>({});
+  const [appliedContexts, setAppliedContexts] = useState<AppliedContext[]>([]);
   const [payload, setPayload] = useState<ReportPayload | null>(null);
   const [q, setQ] = useState('');
   const [page, setPage] = useState(1);
   const [isLoading, setIsLoading] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
   const [error, setError] = useState('');
   const limit = 100;
 
@@ -89,38 +123,52 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
     [priceFormats]
   );
 
-  const formatOptions = useMemo(
-    () => priceFormats.filter((format) => branchFilter === '__all__' || format.branch === branchFilter),
-    [branchFilter, priceFormats]
+  const availableContextOptions = useMemo(() => contextOptions.filter((item) => item.priceLists.length > 0), [contextOptions]);
+
+  const selectedContexts = useMemo(
+    () =>
+      selectedFormatIds
+        .map((formatId) => {
+          const priceListId = priceListByFormat[formatId];
+          return priceListId ? { priceFormatId: formatId, priceListId } : null;
+        })
+        .filter((item): item is AppliedContext => Boolean(item)),
+    [priceListByFormat, selectedFormatIds]
   );
 
   useEffect(() => {
-    setBranchFilter(branch || '__all__');
+    if (branch) setBranchFilter(branch);
   }, [branch]);
 
   useEffect(() => {
-    setFormatFilter(selectedFormatCode || '__all__');
-  }, [selectedFormatCode]);
-
-  useEffect(() => {
-    const loadPriceLists = async () => {
+    if (!branchFilter) return;
+    const loadContexts = async () => {
       setError('');
-      const params = new URLSearchParams();
-      if (branchFilter !== '__all__') params.set('branch', branchFilter);
-      if (formatFilter !== '__all__') params.set('format_code', formatFilter);
-      const res = await fetch(`/api/reports/price-lists?${params.toString()}`);
+      setPayload(null);
+      const res = await fetch(`/api/reports/contexts?branch=${encodeURIComponent(branchFilter)}`);
       const text = await res.text();
       const data = parseJsonOrNull(text);
-      if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить расчёты');
-      const rows = Array.isArray(data) ? data : [];
-      setPriceLists(rows);
-      setPriceListId((current) => (current && rows.some((row: ReportPriceList) => row.number === current || String(row.id) === current) ? current : rows[0]?.number || ''));
+      if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить параметры отчёта');
+      const rows: ReportContextOption[] = Array.isArray(data) ? data : [];
+      setContextOptions(rows);
+
+      const idsWithLists = rows.filter((row) => row.latestPriceList).map((row) => String(row.priceFormat.id));
+      const preferred = rows.find((row) => row.priceFormat.code === selectedFormatCode && row.latestPriceList);
+      const defaultIds = preferred ? [String(preferred.priceFormat.id), ...idsWithLists.filter((id) => id !== String(preferred.priceFormat.id))] : idsWithLists;
+      const nextPriceLists: Record<string, string> = {};
+      rows.forEach((row) => {
+        if (row.latestPriceList) nextPriceLists[String(row.priceFormat.id)] = String(row.latestPriceList.id);
+      });
+      setSelectedFormatIds(defaultIds);
+      setPriceListByFormat(nextPriceLists);
+      setAppliedContexts(defaultIds.map((id) => ({ priceFormatId: id, priceListId: nextPriceLists[id] })).filter((item) => item.priceListId));
+      setPage(1);
     };
-    loadPriceLists().catch((err) => setError(err?.message || 'Не удалось загрузить расчёты'));
-  }, [branchFilter, formatFilter]);
+    loadContexts().catch((err) => setError(err?.message || 'Не удалось загрузить параметры отчёта'));
+  }, [branchFilter, selectedFormatCode]);
 
   useEffect(() => {
-    if (!priceListId) {
+    if (!branchFilter || !appliedContexts.length) {
       setPayload(null);
       return;
     }
@@ -130,13 +178,12 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
         setIsLoading(true);
         setError('');
         try {
-          const params = new URLSearchParams({
-            price_list_id: priceListId,
-            page: String(page),
-            limit: String(limit),
+          const res = await fetch(`/api/reports/${endpointFor(activeTab)}/query`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(requestBody(branchFilter, appliedContexts, q, page, limit)),
+            signal: controller.signal,
           });
-          if (q.trim()) params.set('q', q.trim());
-          const res = await fetch(`/api/reports/${endpointFor(activeTab)}?${params.toString()}`, { signal: controller.signal });
           const text = await res.text();
           const data = parseJsonOrNull(text);
           if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить отчёт');
@@ -153,66 +200,156 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [activeTab, page, priceListId, q]);
+  }, [activeTab, appliedContexts, branchFilter, page, q]);
 
   useEffect(() => {
     setPage(1);
-  }, [activeTab, priceListId, q]);
+  }, [activeTab, appliedContexts, q]);
 
-  const exportExcel = () => {
-    if (!priceListId) return;
-    const params = new URLSearchParams({ price_list_id: priceListId });
-    if (q.trim()) params.set('q', q.trim());
-    window.location.href = `/api/reports/${endpointFor(activeTab)}/export.xlsx?${params.toString()}`;
+  const toggleFormat = (formatId: string) => {
+    setSelectedFormatIds((current) => (current.includes(formatId) ? current.filter((id) => id !== formatId) : [...current, formatId]));
+  };
+
+  const selectAll = () => setSelectedFormatIds(availableContextOptions.map((item) => String(item.priceFormat.id)));
+  const clearAll = () => setSelectedFormatIds([]);
+
+  const applySelection = () => {
+    setAppliedContexts(selectedContexts);
+    setPage(1);
+  };
+
+  const exportExcel = async () => {
+    if (!branchFilter || !appliedContexts.length) return;
+    setIsExporting(true);
+    setError('');
+    try {
+      const res = await fetch(`/api/reports/${endpointFor(activeTab)}/export.xlsx`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody(branchFilter, appliedContexts, q, 1, limit)),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        const data = parseJsonOrNull(text);
+        throw new Error(data?.detail || text || 'Не удалось выгрузить Excel');
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = downloadNameFromDisposition(res.headers.get('Content-Disposition'), activeTab === 'rank-1' ? 'rank-1.xlsx' : 'decreases.xlsx');
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err: any) {
+      setError(err?.message || 'Не удалось выгрузить Excel');
+    } finally {
+      setIsExporting(false);
+    }
   };
 
   const totalPages = Math.max(1, Math.ceil((payload?.total || 0) / limit));
-  const context = payload?.context;
   const isRank = activeTab === 'rank-1';
-  const emptyText = isRank
-    ? 'Для выбранного расчёта позиций Ранг 1 не найдено.'
-    : 'Для выбранного расчёта снижений от 0,5% не найдено.';
+  const emptyText = !appliedContexts.length
+    ? 'Выберите ценовые форматы и примените параметры отчёта.'
+    : isRank
+      ? 'Для выбранных расчётов позиций Ранг 1 не найдено.'
+      : 'Для выбранных расчётов снижений не найдено.';
 
   return (
-    <div className="generated-workspace">
-      <section className="generated-toolbar">
-        <div>
-          <div className="eyebrow">Отчёты</div>
-          <h3>Аналитические отчёты по результатам расчёта цен</h3>
+    <div className="generated-workspace reports-workspace">
+      <section className="generated-panel reports-params-panel">
+        <div className="card-title-row">
+          <div>
+            <div className="eyebrow">Отчёты</div>
+            <h3>Параметры отчёта</h3>
+          </div>
+          <Button onClick={applySelection} disabled={!selectedContexts.length}>
+            Применить
+          </Button>
         </div>
-        <Select value={branchFilter} onValueChange={setBranchFilter}>
-          <SelectTrigger><SelectValue placeholder="Филиал" /></SelectTrigger>
-          <SelectContent>
-            <SelectItem value="__all__">Все филиалы</SelectItem>
-            {branchOptions.map((item) => <SelectItem key={item} value={item}>{item}</SelectItem>)}
-          </SelectContent>
-        </Select>
-        <Select value={formatFilter} onValueChange={setFormatFilter}>
-          <SelectTrigger><SelectValue placeholder="Ценовой формат" /></SelectTrigger>
-          <SelectContent>
-            <SelectItem value="__all__">Все форматы</SelectItem>
-            {formatOptions.map((item) => <SelectItem key={item.code} value={item.code}>{item.code}</SelectItem>)}
-          </SelectContent>
-        </Select>
-        <Select value={priceListId} onValueChange={setPriceListId}>
-          <SelectTrigger><SelectValue placeholder="Расчёт / дата" /></SelectTrigger>
-          <SelectContent>
-            {priceLists.map((item) => (
-              <SelectItem key={item.number} value={item.number}>
-                {item.number} · {item.date || item.createdAt}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+
+        <div className="reports-params-grid">
+          <label className="reports-field">
+            <span>Филиал</span>
+            <Select value={branchFilter} onValueChange={setBranchFilter}>
+              <SelectTrigger><SelectValue placeholder="Филиал" /></SelectTrigger>
+              <SelectContent>
+                {branchOptions.map((item) => <SelectItem key={item} value={item}>{item}</SelectItem>)}
+              </SelectContent>
+            </Select>
+          </label>
+
+          <div className="reports-format-picker">
+            <div className="reports-field-label">
+              <span>Ценовые форматы</span>
+              <div className="reports-inline-actions">
+                <Button type="button" variant="ghost" size="sm" onClick={selectAll}><CheckSquare className="mr-1 h-4 w-4" />Все</Button>
+                <Button type="button" variant="ghost" size="sm" onClick={clearAll}><Square className="mr-1 h-4 w-4" />Снять</Button>
+              </div>
+            </div>
+            <div className="reports-format-list">
+              {contextOptions.map((item) => {
+                const id = String(item.priceFormat.id);
+                const disabled = !item.priceLists.length;
+                return (
+                  <label key={id} className={`reports-format-row ${disabled ? 'disabled' : ''}`}>
+                    <input type="checkbox" checked={selectedFormatIds.includes(id)} disabled={disabled} onChange={() => toggleFormat(id)} />
+                    <span>
+                      <strong>{item.priceFormat.name || item.priceFormat.code}</strong>
+                      <em>{item.priceFormat.code} · {item.priceFormat.sapCategory || 'без SAP категории'} · {item.latestPriceList?.number || 'нет расчётов'}</em>
+                    </span>
+                  </label>
+                );
+              })}
+              {!contextOptions.length ? <div className="dashboard-empty">Для филиала нет доступных ценовых форматов.</div> : null}
+            </div>
+          </div>
+        </div>
+
+        <div className="reports-calculation-list">
+          {selectedFormatIds.map((formatId) => {
+            const option = contextOptions.find((item) => String(item.priceFormat.id) === formatId);
+            if (!option) return null;
+            return (
+              <label key={formatId} className="reports-calculation-row">
+                <span>{option.priceFormat.code}</span>
+                <Select
+                  value={priceListByFormat[formatId] || ''}
+                  onValueChange={(value) => setPriceListByFormat((current) => ({ ...current, [formatId]: value }))}
+                >
+                  <SelectTrigger><SelectValue placeholder="Расчёт" /></SelectTrigger>
+                  <SelectContent>
+                    {option.priceLists.map((item) => (
+                      <SelectItem key={item.id} value={String(item.id)}>
+                        {item.number} · {item.date || item.createdAt} · {fmtNumber(item.skuCount, 0)} SKU
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </label>
+            );
+          })}
+        </div>
       </section>
 
-      {context ? (
-        <section className="generated-panel">
-          <div className="generated-summary">
-            <Metric label="Филиал" value={context.branch || '—'} />
-            <Metric label="Ценовой формат" value={context.priceFormatCode || '—'} />
-            <Metric label="Расчёт" value={context.priceListNumber || '—'} />
-            <Metric label="Дата расчёта" value={context.calculatedAtDisplay || '—'} />
+      {payload?.context ? (
+        <section className="generated-panel reports-context-panel">
+          <div className="generated-summary reports-summary">
+            <Metric label="Филиал" value={payload.context.branch || '—'} />
+            <Metric label="Форматов" value={fmtNumber(payload.context.selectedFormatCount || 0, 0)} />
+            <Metric label={isRank ? 'Ранг 1' : 'Снижений'} value={fmtNumber(isRank ? payload.summary?.totalRank1 ?? 0 : payload.summary?.totalDecreases ?? 0, 0)} />
+            <Metric label={isRank ? 'Доля' : 'Среднее снижение'} value={isRank ? fmtPercent(payload.summary?.sharePercent ?? 0) : fmtPercent(payload.summary?.averageDecreasePercent ?? 0)} />
+          </div>
+          <div className="reports-context-list">
+            {payload.context.contexts.map((item) => (
+              <div key={`${item.priceFormatId}-${item.priceListNumber}`} className="reports-context-card">
+                <strong>{item.priceFormatName || item.priceFormatCode}</strong>
+                <span>{item.customerCategory || '—'} · {item.priceListNumber} · {item.calculatedAtDisplay || '—'}</span>
+                {item.previousPriceListNumber ? <em>Предыдущий расчёт: {item.previousPriceListNumber}</em> : null}
+              </div>
+            ))}
           </div>
         </section>
       ) : null}
@@ -232,39 +369,27 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
                 <Search className="h-4 w-4" />
                 <Input value={q} onChange={(event) => setQ(event.target.value)} placeholder="Поиск по материалу, названию, производителю" />
               </div>
-              <Button variant="outline" onClick={exportExcel} disabled={!priceListId}>
-                <Download className="mr-2 h-4 w-4" />Скачать Excel
-              </Button>
-            </div>
-
-            <div className="generated-summary">
-              {isRank ? (
-                <>
-                  <Metric label="Всего позиций Ранг 1" value={fmtNumber(payload?.summary?.totalRank1 ?? 0, 0)} />
-                  <Metric label="Доля от выбранного расчёта" value={fmtPercent(payload?.summary?.sharePercent ?? 0)} />
-                </>
-              ) : (
-                <>
-                  <Metric label="Всего сниженных позиций" value={fmtNumber(payload?.summary?.totalDecreases ?? 0, 0)} />
-                  <Metric label="Общая сумма снижения" value={fmtNumber(payload?.summary?.totalDecreaseKzt ?? 0)} />
-              <Metric label="Среднее снижение" value={fmtPercent(payload?.summary?.averageDecreasePercent ?? 0)} />
-                </>
-              )}
+              <div className="reports-inline-actions">
+                {q ? <Button variant="ghost" onClick={() => setQ('')}><X className="mr-2 h-4 w-4" />Очистить</Button> : null}
+                <Button variant="outline" onClick={exportExcel} disabled={!appliedContexts.length || isExporting}>
+                  <Download className="mr-2 h-4 w-4" />Excel
+                </Button>
+              </div>
             </div>
 
             {isLoading ? (
-              <div className="dashboard-empty">Загрузка отчёта...</div>
+              <div className="dashboard-empty">Формируем отчёт...</div>
             ) : !payload?.items?.length ? (
               <div className="dashboard-empty">{emptyText}</div>
             ) : isRank ? (
               <ReportTable
-                columns={['Категория клиента', 'Материал', 'Наименование', 'Производитель', 'ТОП-1500', 'Новая цена', 'Ранг 1']}
-                rows={payload.items.map((row) => [row.customerCategory || '—', row.material, row.materialName, row.manufacturer || '—', fmtNumber(row.top1500, 0), fmtNumber(row.newPrice), row.rank])}
+                columns={['Ценовой формат', 'Категория клиента', 'Материал', 'Наименование', 'Производитель', 'ТОП-1500', 'Новая цена', 'Ранг 1']}
+                rows={payload.items.map((row) => [row.priceFormatName || row.priceFormatCode || '—', row.customerCategory || '—', row.material, row.materialName, row.manufacturer || '—', fmtNumber(row.top1500, 0), fmtNumber(row.newPrice), row.rank])}
               />
             ) : (
               <ReportTable
-                columns={['Регион', 'Категория клиента', 'Материал', 'Наименование', 'TOP-1500', 'Новая цена', 'Старая цена', 'Снижение, ₸', 'Снижение, %', 'Производитель']}
-                rows={payload.items.map((row) => [row.region || '—', row.customerCategory || '—', row.material, row.name, fmtNumber(row.top1500, 0), fmtNumber(row.newPrice), fmtNumber(row.oldPrice), fmtNumber(row.decreaseKzt), fmtPercent(row.decreasePercent), row.manufacturer || '—'])}
+                columns={['Ценовой формат', 'Регион', 'Категория клиента', 'Материал', 'Наименование', 'ТОП-1500', 'Новая цена', 'Старая цена', 'Снижение, ₸', 'Снижение, %', 'Производитель']}
+                rows={payload.items.map((row) => [row.priceFormatName || row.priceFormatCode || '—', row.region || '—', row.customerCategory || '—', row.material, row.name, fmtNumber(row.top1500, 0), fmtNumber(row.newPrice), fmtNumber(row.oldPrice), fmtNumber(row.decreaseKzt), fmtPercent(row.decreasePercent), row.manufacturer || '—'])}
               />
             )}
 
@@ -282,7 +407,7 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
 
 function Metric({ label, value }: { label: string; value: string | number }) {
   return (
-    <div className="metric-card">
+    <div className="metric-card generated-metric">
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
@@ -291,7 +416,7 @@ function Metric({ label, value }: { label: string; value: string | number }) {
 
 function ReportTable({ columns, rows }: { columns: string[]; rows: Array<Array<string | number>> }) {
   return (
-    <div className="table-scroll">
+    <div className="compact-table-wrap">
       <table className="compact-table">
         <thead>
           <tr>{columns.map((column) => <th key={column}>{column}</th>)}</tr>

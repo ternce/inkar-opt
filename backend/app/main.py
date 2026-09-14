@@ -1939,6 +1939,7 @@ def _price_format_to_dict(db: Session, pf: PriceFormat) -> dict:
         "code": pf.code,
         "branch": pf.branch,
         "priceListType": pf.price_list_type,
+        "sapCategory": pf.sap_category,
         "sapBranchCode": pf.sap_branch_code,
         "sequenceNumber": pf.sequence_number,
         "percentilePreparation": percentile_preparation_to_dict(db, int(pf.id)),
@@ -2664,6 +2665,8 @@ REPORT_DECREASE_HEADERS = [
 
 REPORT_CURRENCY_FORMAT = '_-* #,##0.00\\ [$₸-43F]_-;\\-* #,##0.00\\ [$₸-43F]_-;_-* "-"??\\ [$₸-43F]_-;_-@_-'
 REPORT_PERCENT_FORMAT = "0.0%"
+REPORT_MAX_CONTEXTS = 24
+REPORT_INVALID_SHEET_CHARS = re.compile(r"[\\/\?\*\[\]:]")
 
 
 def _rank_sheet_title(category: str) -> str:
@@ -2688,6 +2691,28 @@ def _decrease_sheet_title(category: str) -> str:
     return mapping.get(normalized, normalized or "Снижение")
 
 
+def _safe_excel_sheet_name(raw: object, used: set[str] | None = None) -> str:
+    used = used if used is not None else set()
+    base = REPORT_INVALID_SHEET_CHARS.sub(" ", str(raw or "").strip())
+    base = re.sub(r"\s+", " ", base).strip("' ").strip() or "Report"
+    candidate = base[:31]
+    index = 2
+    while candidate in used:
+        suffix = f" ({index})"
+        candidate = f"{base[:31 - len(suffix)]}{suffix}"
+        index += 1
+    used.add(candidate)
+    return candidate
+
+
+def _report_sheet_title_for_format(pf: PriceFormat, used: set[str] | None = None) -> str:
+    label = str(pf.name or "").strip() or str(pf.code or "").strip() or f"Format {pf.id}"
+    code = str(pf.code or "").strip()
+    if code and code not in label:
+        label = f"{label} {code}"
+    return _safe_excel_sheet_name(label, used)
+
+
 def _report_price_list_context(db: Session, price_list_id: str, current_user: AppUser) -> tuple[PriceList, PriceFormat, dict]:
     pl, pf = _price_list_by_identifier(db, price_list_id)
     _ensure_price_format_access(pf, current_user)
@@ -2704,6 +2729,79 @@ def _report_price_list_context(db: Session, price_list_id: str, current_user: Ap
         "calculatedAtDisplay": _fmt_dt(pl.created_at),
         "totalCalculated": summary["skuCount"],
     }
+
+
+def _latest_report_price_list_for_format(db: Session, price_format_id: int) -> PriceList | None:
+    return (
+        db.execute(
+            select(PriceList)
+            .where(PriceList.price_format_id == price_format_id)
+            .order_by(PriceList.created_at.desc(), PriceList.id.desc())
+            .limit(1)
+        )
+        .scalars()
+        .first()
+    )
+
+
+def _report_context_dict(db: Session, pl: PriceList, pf: PriceFormat) -> dict:
+    summary = _generated_price_list_summary(db, pl, pf)
+    return {
+        "priceListId": pl.id,
+        "priceListNumber": pl.number,
+        "branch": pf.branch,
+        "priceFormatId": pf.id,
+        "priceFormatCode": pf.code,
+        "priceFormatName": pf.name,
+        "customerCategory": pf.sap_category or "",
+        "calculatedAt": local_iso(pl.created_at) if pl.created_at else "",
+        "calculatedAtDisplay": _fmt_dt(pl.created_at),
+        "totalCalculated": summary["skuCount"],
+    }
+
+
+def _parse_report_contexts_payload(db: Session, payload: dict, current_user: AppUser) -> tuple[str, list[tuple[PriceList, PriceFormat, dict]]]:
+    branch = _canonical_user_selected_branch(payload.get("branch"), field_name="branch")
+    if not branch:
+        raise HTTPException(status_code=400, detail="branch is required")
+    contexts_in = payload.get("contexts")
+    if not isinstance(contexts_in, list) or not contexts_in:
+        raise HTTPException(status_code=400, detail="contexts are required")
+    if len(contexts_in) > REPORT_MAX_CONTEXTS:
+        raise HTTPException(status_code=400, detail=f"too many contexts; max {REPORT_MAX_CONTEXTS}")
+
+    seen_formats: set[int] = set()
+    contexts: list[tuple[PriceList, PriceFormat, dict]] = []
+    for raw in contexts_in:
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=400, detail="invalid context")
+        try:
+            price_format_id = int(raw.get("priceFormatId"))
+        except Exception:
+            raise HTTPException(status_code=400, detail="priceFormatId is required")
+        if price_format_id in seen_formats:
+            raise HTTPException(status_code=400, detail="duplicate price format")
+        seen_formats.add(price_format_id)
+
+        pf = db.get(PriceFormat, price_format_id)
+        if pf is None:
+            raise HTTPException(status_code=404, detail="price format not found")
+        _ensure_price_format_access(pf, current_user)
+        if pf.branch != branch:
+            raise HTTPException(status_code=400, detail="all selected formats must belong to requested branch")
+
+        price_list_id = raw.get("priceListId")
+        if price_list_id in (None, ""):
+            pl = _latest_report_price_list_for_format(db, pf.id)
+            if pl is None:
+                raise HTTPException(status_code=400, detail="selected price format has no generated price lists")
+        else:
+            pl, pl_pf = _price_list_by_identifier(db, str(price_list_id))
+            _ensure_price_format_access(pl_pf, current_user)
+            if pl_pf.id != pf.id or pl.price_format_id != pf.id:
+                raise HTTPException(status_code=400, detail="price list does not belong to selected price format")
+        contexts.append((pl, pf, _report_context_dict(db, pl, pf)))
+    return branch, contexts
 
 
 def _report_base_stmt(price_list_id: int):
@@ -2748,6 +2846,9 @@ def _report_top1500_value(cp: CalculatedPrice, product: Product) -> int:
 
 def _rank_1_row(cp: CalculatedPrice, product: Product, extra: ProductExtra | None, pf: PriceFormat) -> dict:
     return {
+        "priceFormatId": pf.id,
+        "priceFormatCode": pf.code,
+        "priceFormatName": pf.name,
         "customerCategory": pf.sap_category or "",
         "material": product.code,
         "materialName": product.name,
@@ -2765,6 +2866,9 @@ def _decrease_row(cp: CalculatedPrice, previous_cp: CalculatedPrice, product: Pr
     decrease_kzt = new_price - old_price if old_price is not None and new_price is not None else None
     decrease_percent = (new_price - old_price) / old_price if old_price and new_price is not None else None
     return {
+        "priceFormatId": pf.id,
+        "priceFormatCode": pf.code,
+        "priceFormatName": pf.name,
         "region": pf.branch or "",
         "customerCategory": pf.sap_category or "",
         "material": product.code,
@@ -2799,6 +2903,96 @@ def _paginated_report_response(
     }
 
 
+def _paginate_rows(rows: list[dict], page: int, limit: int) -> list[dict]:
+    start = (page - 1) * limit
+    return rows[start : start + limit]
+
+
+def _rank_rows_for_context(db: Session, pl: PriceList, pf: PriceFormat, q: str | None = None) -> list[dict]:
+    stmt = _apply_report_search(_report_base_stmt(pl.id).where(CalculatedPrice.zone == "left"), q)
+    stmt = stmt.order_by(Product.name.asc(), Product.code.asc())
+    return [_rank_1_row(cp, product, extra, pf) for cp, product, extra in db.execute(stmt).all()]
+
+
+def _decrease_rows_for_context(db: Session, pl: PriceList, pf: PriceFormat, q: str | None = None) -> tuple[list[dict], str]:
+    previous_pl = _previous_price_list_for_report(db, pl)
+    if previous_pl is None:
+        return [], ""
+    PreviousCalculatedPrice = aliased(CalculatedPrice)
+    decrease_fraction = (CalculatedPrice.final_price - PreviousCalculatedPrice.final_price) / PreviousCalculatedPrice.final_price
+    conditions = (
+        PreviousCalculatedPrice.final_price.is_not(None),
+        CalculatedPrice.final_price.is_not(None),
+        PreviousCalculatedPrice.final_price > 0,
+        CalculatedPrice.final_price < PreviousCalculatedPrice.final_price,
+    )
+    stmt = (
+        select(CalculatedPrice, PreviousCalculatedPrice, Product, ProductExtra)
+        .join(Product, Product.id == CalculatedPrice.product_id)
+        .outerjoin(ProductExtra, ProductExtra.product_id == Product.id)
+        .join(
+            PreviousCalculatedPrice,
+            (PreviousCalculatedPrice.product_id == CalculatedPrice.product_id)
+            & (PreviousCalculatedPrice.price_list_id == previous_pl.id),
+        )
+        .where(CalculatedPrice.price_list_id == pl.id)
+        .where(*conditions)
+    )
+    stmt = _apply_report_search(stmt, q)
+    stmt = stmt.order_by(decrease_fraction.asc(), Product.name.asc(), Product.code.asc())
+    rows = [_decrease_row(cp, previous_cp, product, extra, pf) for cp, previous_cp, product, extra in db.execute(stmt).all()]
+    return rows, previous_pl.number
+
+
+def _combined_report_context(branch: str, contexts: list[tuple[PriceList, PriceFormat, dict]]) -> dict:
+    return {
+        "branch": branch,
+        "selectedFormatCount": len(contexts),
+        "contexts": [context for _pl, _pf, context in contexts],
+    }
+
+
+def _combined_report_filename(report_name: str, branch: str, fmt: str) -> str:
+    return f"{report_name} {branch} {datetime.now().strftime('%d.%m.%Y')}.{fmt}"
+
+
+def _write_report_sheet(ws, rows: list[dict], headers: list[tuple[str, str]]) -> None:
+    ws.append([label for _, label in headers])
+    for row in rows:
+        ws.append([row.get(key, "") for key, _ in headers])
+    ws.auto_filter.ref = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
+    for column_index, (key, _label) in enumerate(headers, start=1):
+        column_letter = get_column_letter(column_index)
+        ws.column_dimensions[column_letter].width = 18
+        ws.cell(row=1, column=column_index).alignment = Alignment(wrap_text=True, vertical="top")
+        if key in {"oldPrice", "newPrice", "decreaseKzt"}:
+            for row_index in range(2, ws.max_row + 1):
+                ws.cell(row=row_index, column=column_index).number_format = REPORT_CURRENCY_FORMAT
+        if key == "decreasePercent":
+            for row_index in range(2, ws.max_row + 1):
+                ws.cell(row=row_index, column=column_index).number_format = REPORT_PERCENT_FORMAT
+    ws.freeze_panes = "A2"
+
+
+def _export_report_workbook_xlsx(*, sheets: list[tuple[PriceFormat, list[dict]]], headers: list[tuple[str, str]], filename: str):
+    wb = Workbook()
+    wb.remove(wb.active)
+    used_titles: set[str] = set()
+    for pf, rows in sheets:
+        ws = wb.create_sheet(_report_sheet_title_for_format(pf, used_titles))
+        _write_report_sheet(ws, rows, headers)
+    if not wb.worksheets:
+        ws = wb.create_sheet(_safe_excel_sheet_name("Report", used_titles))
+        _write_report_sheet(ws, [], headers)
+    bio = io.BytesIO()
+    wb.save(bio)
+    return StreamingResponse(
+        iter([bio.getvalue()]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+    )
+
+
 @app.get("/api/reports/price-lists")
 def get_report_price_lists(
     branch: str | None = Query(None),
@@ -2818,6 +3012,145 @@ def get_report_price_lists(
     rows = db.execute(stmt.limit(200)).all()
     rows = [(pl, pf) for pl, pf in rows if user_can_access_branch(current_user, _branch_id_for_name(pf.branch), pf.branch)]
     return [_generated_price_list_summary(db, pl, pf) for pl, pf in rows]
+
+
+@app.get("/api/reports/contexts")
+def get_report_contexts(
+    branch: str = Query(...),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    selected_branch = _canonical_user_selected_branch(branch, field_name="branch")
+    stmt = select(PriceFormat).where(PriceFormat.branch == selected_branch).order_by(PriceFormat.name.asc(), PriceFormat.code.asc())
+    formats = _filter_price_formats_for_user(list(db.execute(stmt).scalars().all()), current_user)
+    output = []
+    for pf in formats:
+        price_lists = list(
+            db.execute(
+                select(PriceList)
+                .where(PriceList.price_format_id == pf.id)
+                .order_by(PriceList.created_at.desc(), PriceList.id.desc())
+            )
+            .scalars()
+            .all()
+        )
+        summaries = [_generated_price_list_summary(db, pl, pf) for pl in price_lists]
+        output.append(
+            {
+                "priceFormat": _price_format_to_dict(db, pf),
+                "priceLists": summaries,
+                "latestPriceList": summaries[0] if summaries else None,
+            }
+        )
+    return output
+
+
+@app.post("/api/reports/rank-1/query")
+def query_rank_1_report(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    page = max(1, int(payload.get("page") or 1))
+    limit = min(500, max(1, int(payload.get("limit") or 100)))
+    q = str(payload.get("q") or "").strip() or None
+    branch, contexts = _parse_report_contexts_payload(db, payload, current_user)
+    rows: list[dict] = []
+    total_calculated = 0
+    for pl, pf, context in contexts:
+        context_rows = _rank_rows_for_context(db, pl, pf, q)
+        rows.extend(context_rows)
+        total_calculated += int(context.get("totalCalculated") or 0)
+    rows.sort(key=lambda row: (str(row.get("priceFormatName") or ""), str(row.get("materialName") or ""), str(row.get("material") or "")))
+    total = len(rows)
+    return {
+        "items": _paginate_rows(rows, page, limit),
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "context": _combined_report_context(branch, contexts),
+        "summary": {
+            "totalRank1": total,
+            "sharePercent": round(total / total_calculated, 6) if total_calculated else 0,
+            "totalFormats": len(contexts),
+        },
+    }
+
+
+@app.post("/api/reports/decreases/query")
+def query_decreases_report(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    page = max(1, int(payload.get("page") or 1))
+    limit = min(500, max(1, int(payload.get("limit") or 100)))
+    q = str(payload.get("q") or "").strip() or None
+    branch, contexts = _parse_report_contexts_payload(db, payload, current_user)
+    rows: list[dict] = []
+    context_payloads = []
+    for pl, pf, context in contexts:
+        context_rows, previous_number = _decrease_rows_for_context(db, pl, pf, q)
+        rows.extend(context_rows)
+        enriched = dict(context)
+        enriched["previousPriceListNumber"] = previous_number
+        context_payloads.append(enriched)
+    rows.sort(key=lambda row: (float(row.get("decreasePercent") or 0), str(row.get("priceFormatName") or ""), str(row.get("material") or "")))
+    total_decrease_amount = sum(float(row.get("decreaseKzt") or 0) for row in rows)
+    avg_percent = sum(float(row.get("decreasePercent") or 0) for row in rows) / len(rows) if rows else 0
+    total = len(rows)
+    return {
+        "items": _paginate_rows(rows, page, limit),
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "context": {
+            "branch": branch,
+            "selectedFormatCount": len(contexts),
+            "contexts": context_payloads,
+        },
+        "summary": {
+            "totalDecreases": total,
+            "totalDecreaseKzt": total_decrease_amount,
+            "averageDecreasePercent": round(avg_percent, 6),
+            "totalFormats": len(contexts),
+        },
+    }
+
+
+@app.post("/api/reports/rank-1/export.xlsx")
+def export_rank_1_report_combined(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    q = str(payload.get("q") or "").strip() or None
+    branch, contexts = _parse_report_contexts_payload(db, payload, current_user)
+    sheets = [(pf, _rank_rows_for_context(db, pl, pf, q)) for pl, pf, _context in contexts]
+    return _export_report_workbook_xlsx(
+        sheets=sheets,
+        headers=REPORT_RANK_1_HEADERS,
+        filename=_combined_report_filename("РАНГ 1", branch, "xlsx"),
+    )
+
+
+@app.post("/api/reports/decreases/export.xlsx")
+def export_decreases_report_combined(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    q = str(payload.get("q") or "").strip() or None
+    branch, contexts = _parse_report_contexts_payload(db, payload, current_user)
+    sheets = []
+    for pl, pf, _context in contexts:
+        rows, _previous_number = _decrease_rows_for_context(db, pl, pf, q)
+        sheets.append((pf, rows))
+    return _export_report_workbook_xlsx(
+        sheets=sheets,
+        headers=REPORT_DECREASE_HEADERS,
+        filename=_combined_report_filename("Снижение", branch, "xlsx"),
+    )
 
 
 @app.get("/api/reports/rank-1")
@@ -2962,21 +3295,7 @@ def _export_report_xlsx(*, rows: list[dict], headers: list[tuple[str, str]], she
     wb = Workbook()
     ws = wb.active
     ws.title = sheet_title[:31]
-    ws.append([label for _, label in headers])
-    for row in rows:
-        ws.append([row.get(key, "") for key, _ in headers])
-    ws.auto_filter.ref = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
-    for column_index, (key, _label) in enumerate(headers, start=1):
-        column_letter = get_column_letter(column_index)
-        ws.column_dimensions[column_letter].width = 18
-        ws.cell(row=1, column=column_index).alignment = Alignment(wrap_text=True, vertical="top")
-        if key in {"oldPrice", "newPrice", "decreaseKzt"}:
-            for row_index in range(2, ws.max_row + 1):
-                ws.cell(row=row_index, column=column_index).number_format = REPORT_CURRENCY_FORMAT
-        if key == "decreasePercent":
-            for row_index in range(2, ws.max_row + 1):
-                ws.cell(row=row_index, column=column_index).number_format = REPORT_PERCENT_FORMAT
-    ws.freeze_panes = "A2"
+    _write_report_sheet(ws, rows, headers)
     bio = io.BytesIO()
     wb.save(bio)
     return StreamingResponse(
@@ -2996,8 +3315,7 @@ def export_rank_1_report(
     pl, pf, context = _report_price_list_context(db, price_list_id, current_user)
     stmt = _apply_report_search(_report_base_stmt(pl.id).where(CalculatedPrice.zone == "left"), q)
     rows = [_rank_1_row(cp, product, extra, pf) for cp, product, extra in db.execute(stmt.order_by(Product.name.asc(), Product.code.asc())).all()]
-    category = str(context.get("customerCategory") or "").strip()
-    return _export_report_xlsx(rows=rows, headers=REPORT_RANK_1_HEADERS, sheet_title=_rank_sheet_title(category), filename=_report_filename("РАНГ 1", context, "xlsx"))
+    return _export_report_xlsx(rows=rows, headers=REPORT_RANK_1_HEADERS, sheet_title=_report_sheet_title_for_format(pf), filename=_report_filename("РАНГ 1", context, "xlsx"))
 
 
 @app.get("/api/reports/decreases/export.xlsx")
@@ -3010,9 +3328,7 @@ def export_decreases_report(
     pl, pf, context = _report_price_list_context(db, price_list_id, current_user)
     previous_pl = _previous_price_list_for_report(db, pl)
     if previous_pl is None:
-        category = str(context.get("customerCategory") or "").strip()
-        sheet_title = _decrease_sheet_title(category)
-        return _export_report_xlsx(rows=[], headers=REPORT_DECREASE_HEADERS, sheet_title=sheet_title, filename=_report_filename("Снижение", context, "xlsx"))
+        return _export_report_xlsx(rows=[], headers=REPORT_DECREASE_HEADERS, sheet_title=_report_sheet_title_for_format(pf), filename=_report_filename("Снижение", context, "xlsx"))
     PreviousCalculatedPrice = aliased(CalculatedPrice)
     decrease_fraction = (CalculatedPrice.final_price - PreviousCalculatedPrice.final_price) / PreviousCalculatedPrice.final_price
     conditions = (
@@ -3035,9 +3351,7 @@ def export_decreases_report(
     )
     stmt = _apply_report_search(stmt, q)
     rows = [_decrease_row(cp, previous_cp, product, extra, pf) for cp, previous_cp, product, extra in db.execute(stmt.order_by(decrease_fraction.asc(), Product.name.asc(), Product.code.asc())).all()]
-    category = str(context.get("customerCategory") or "").strip()
-    sheet_title = _decrease_sheet_title(category)
-    return _export_report_xlsx(rows=rows, headers=REPORT_DECREASE_HEADERS, sheet_title=sheet_title, filename=_report_filename("Снижение", context, "xlsx"))
+    return _export_report_xlsx(rows=rows, headers=REPORT_DECREASE_HEADERS, sheet_title=_report_sheet_title_for_format(pf), filename=_report_filename("Снижение", context, "xlsx"))
 
 
 @app.get("/api/generated-price-lists")
