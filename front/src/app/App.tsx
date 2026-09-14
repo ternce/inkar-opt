@@ -34,6 +34,7 @@ import { UniversalListsOverviewTab } from './components/UniversalListsOverviewTa
 import { ContractorsTab } from './components/ContractorsTab';
 import { PricingRulesTab } from './components/PricingRulesTab';
 import { AnalyticsTab } from './components/AnalyticsTab';
+import { ReportsTab } from './components/ReportsTab';
 import { UserGuideTab } from './components/UserGuideTab';
 import { VidmanMatchingReviewTab } from './components/VidmanMatchingReviewTab';
 import { VidmanInternalCoverageTab } from './components/VidmanInternalCoverageTab';
@@ -84,6 +85,7 @@ type NavigationKey =
   | 'vidman-review'
   | 'vidman-internal-coverage'
   | 'analytics'
+  | 'reports'
   | 'help';
 
 type NavigationItem = {
@@ -127,6 +129,7 @@ const navigationItems: NavigationItem[] = [
   { key: 'references', label: 'Справочники', description: 'Загрузка, статусы и история обновления справочников', icon: Database },
   { key: 'competitor-domain', label: 'Конкуренты', description: 'Прайс-листы конкурентов, персентили и соответствия кодов', icon: Users },
   { key: 'analytics', label: 'Итоги ЦО', description: 'Итоги переоценки, изменения цен и причины расчёта', icon: BarChart3 },
+  { key: 'reports', label: 'Отчёты', description: 'Аналитические отчёты по результатам расчёта цен', icon: BarChart3 },
 ];
 
 navigationItems.push({
@@ -474,6 +477,14 @@ export default function App() {
             selectedFormatCode={selectedFormat.code}
             initialPriceListNumber={focusedPriceListNumber}
             onNavigate={openSection}
+          />
+        );
+      case 'reports':
+        return (
+          <ReportsTab
+            branch={selectedBranch}
+            selectedFormatCode={selectedFormat.code}
+            priceFormats={priceFormats}
           />
         );
       case 'help':
