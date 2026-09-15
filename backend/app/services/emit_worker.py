@@ -155,6 +155,8 @@ class EmitStats:
     final_rows_saved: int = 0
     key_type_counts: dict[str, int] = field(default_factory=dict)
     suspicious_groups: list[dict[str, Any]] = field(default_factory=list)
+    parser_mode: str = "legacy"
+    staged_rows: int = 0
     downloaded_bytes: int = 0
     file_size_bytes: int = 0
     temp_file_path: str = ""
@@ -242,6 +244,8 @@ class EmitStats:
             "final_rows_saved": self.final_rows_saved,
             "key_type_counts": self.key_type_counts,
             "suspicious_groups": self.suspicious_groups,
+            "parser_mode": self.parser_mode,
+            "staged_rows": self.staged_rows,
             "downloaded_bytes": self.downloaded_bytes,
             "file_size_bytes": self.file_size_bytes,
             "temp_file_path": self.temp_file_path,
@@ -364,6 +368,10 @@ def is_emit_plk(*, filial_id: object = None, name: object = None, config: EmitCo
         return True
     text = str(name or "").casefold()
     return any(marker.casefold() in text for marker in EMIT_NAME_MARKERS)
+
+
+def emit_lightweight_parser_enabled() -> bool:
+    return str(os.getenv("EMIT_LIGHTWEIGHT_PARSER") or "").strip().casefold() in {"1", "true", "yes", "on"}
 
 
 def _free_disk_gb(path: Path) -> float:
@@ -806,6 +814,44 @@ def normalize_emit_item(row: dict[str, Any], *, filial_id: int, filial_name: str
     }
 
 
+def normalize_emit_item_lightweight(
+    row: dict[str, Any],
+    *,
+    filial_id: int,
+    filial_name: str = "",
+    stats: EmitStats | None = None,
+) -> dict[str, Any] | None:
+    goods = _nested_dict(row.get("goods"))
+    goods_id = _as_int(_first(row, "goodsId", "goods_id", "provisor_goods_id") or goods.get("id") or goods.get("goodsId"))
+    price, _reason = _emit_price(row, goods)
+    if price is None:
+        return None
+    name = str(
+        goods.get("fullName")
+        or _first(row, "goods_full_name", "fullName", "name")
+        or row.get("distributorGoodsName")
+        or goods.get("name")
+        or ""
+    ).strip()
+    if not name:
+        return None
+    producer_raw = row.get("distributorProducer") or _first(row, "manufacturer", "producer") or goods.get("producer")
+    manufacturer_started = time.perf_counter()
+    producer = resolve_manufacturer(producer_raw, name, default="")
+    if stats is not None:
+        _add_elapsed(stats, "manufacturer_elapsed", manufacturer_started)
+    return {
+        "provisor_id": _as_int(row.get("id")),
+        "provisor_goods_id": goods_id,
+        "distributor_goods_id": str(_first(row, "distributorGoodsId", "distributor_goods_id", "sku", "code") or "").strip(),
+        "distributor_price": float(price),
+        "name": name,
+        "raw_manufacturer": producer,
+        "filial_id": _as_int(_first(row, "filialId", "filial_id")) or filial_id,
+        "source_timestamp": str(_first(row, "insertedDate", "updatedAt", "updated_at", "source_updated_at", "timestamp") or "").strip(),
+    }
+
+
 def emit_skip_reason(row: dict[str, Any]) -> str:
     goods = _nested_dict(row.get("goods"))
     price, reason = _emit_price(row, goods)
@@ -1019,6 +1065,55 @@ def open_stage_db(path: Path) -> sqlite3.Connection:
         """
     )
     return conn
+
+
+def open_lightweight_stage_db(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.execute("PRAGMA page_size=32768")
+    conn.execute("PRAGMA journal_mode=OFF")
+    conn.execute("PRAGMA synchronous=OFF")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA locking_mode=EXCLUSIVE")
+    conn.execute("PRAGMA cache_size=-262144")
+    conn.execute("PRAGMA mmap_size=268435456")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS stage_items_lightweight (
+            provisor_id INTEGER,
+            provisor_goods_id INTEGER,
+            distributor_goods_id TEXT,
+            distributor_price REAL NOT NULL,
+            name TEXT NOT NULL,
+            raw_manufacturer TEXT,
+            filial_id INTEGER,
+            source_timestamp TEXT
+        )
+        """
+    )
+    return conn
+
+
+_LIGHTWEIGHT_STAGE_INSERT_SQL = """
+    INSERT INTO stage_items_lightweight (
+        provisor_id, provisor_goods_id, distributor_goods_id, distributor_price,
+        name, raw_manufacturer, filial_id, source_timestamp
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+
+def _lightweight_stage_values(item: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        item.get("provisor_id"),
+        item.get("provisor_goods_id"),
+        item.get("distributor_goods_id") or "",
+        item.get("distributor_price"),
+        item.get("name") or "",
+        item.get("raw_manufacturer") or "",
+        item.get("filial_id"),
+        item.get("source_timestamp") or "",
+    )
 
 
 def _stage_values(item: dict[str, Any]) -> tuple[Any, ...]:
@@ -1318,9 +1413,22 @@ def _stage_insert_many(
     return False
 
 
+def _sqlite_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _stage_is_lightweight(conn: sqlite3.Connection) -> bool:
+    return _sqlite_table_exists(conn, "stage_items_lightweight")
+
+
 def stage_row_count(stage_db_path: Path) -> int:
     with closing(sqlite3.connect(str(stage_db_path))) as conn:
-        return int(conn.execute("SELECT COUNT(*) FROM stage_items").fetchone()[0] or 0)
+        table = "stage_items_lightweight" if _stage_is_lightweight(conn) else "stage_items"
+        return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] or 0)
 
 
 def iter_stage_rows(stage_db_path: Path, *, batch_size: int) -> Iterable[list[dict[str, Any]]]:
@@ -1336,6 +1444,25 @@ def iter_stage_rows(stage_db_path: Path, *, batch_size: int) -> Iterable[list[di
 
 
 def _fetch_stage_row_batch(sqlite_conn: sqlite3.Connection, *, last_rowid: int, batch_size: int) -> list[sqlite3.Row]:
+    if _stage_is_lightweight(sqlite_conn):
+        cursor = sqlite_conn.execute(
+            """
+            SELECT rowid, provisor_id, provisor_goods_id, filial_id, name, '' AS reg_number,
+                   name AS distributor_goods_name, distributor_goods_id, distributor_price,
+                   NULL AS stock, NULL AS package_count, '' AS expiry_date,
+                   name AS raw_name, COALESCE(raw_manufacturer, '') AS raw_manufacturer,
+                   '{}' AS raw_json
+            FROM stage_items_lightweight
+            WHERE rowid > ?
+            ORDER BY rowid
+            LIMIT ?
+            """,
+            (last_rowid, batch_size),
+        )
+        try:
+            return cursor.fetchall()
+        finally:
+            cursor.close()
     cursor = sqlite_conn.execute(
         """
         SELECT rowid, provisor_id, provisor_goods_id, filial_id, name, reg_number,
@@ -1366,6 +1493,25 @@ def iter_stage_copy_rows(stage_db_path: Path, *, batch_size: int) -> Iterable[li
 
 
 def _fetch_stage_copy_batch(sqlite_conn: sqlite3.Connection, *, last_rowid: int, batch_size: int) -> list[tuple[Any, ...]]:
+    if _stage_is_lightweight(sqlite_conn):
+        cursor = sqlite_conn.execute(
+            """
+            SELECT rowid, provisor_id, provisor_goods_id, filial_id, name, '' AS reg_number,
+                   name AS distributor_goods_name, distributor_goods_id, distributor_price,
+                   NULL AS stock, NULL AS package_count, '' AS expiry_date,
+                   name AS raw_name, COALESCE(raw_manufacturer, '') AS raw_manufacturer,
+                   '{}' AS raw_json
+            FROM stage_items_lightweight
+            WHERE rowid > ?
+            ORDER BY rowid
+            LIMIT ?
+            """,
+            (last_rowid, batch_size),
+        )
+        try:
+            return cursor.fetchall()
+        finally:
+            cursor.close()
     cursor = sqlite_conn.execute(
         """
         SELECT rowid, provisor_id, provisor_goods_id, filial_id, name, reg_number,
@@ -1628,6 +1774,204 @@ def _next_row_batch(source_iter: Iterator[dict[str, Any]], batch_size: int) -> l
         except StopIteration:
             break
     return rows
+
+
+def parse_normalize_stage_lightweight(
+    *,
+    source_path: Path,
+    staging_path: Path | None = None,
+    stage_db_path: Path | None = None,
+    filial_id: int,
+    filial_name: str,
+    config: EmitConfig | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    progress_interval_seconds: float = PARSE_PROGRESS_INTERVAL_SECONDS,
+) -> EmitStats:
+    started = time.perf_counter()
+    cfg = config or EmitConfig(min_final_rows=MIN_FINAL_ROWS)
+    stage_path = stage_db_path or staging_path
+    if stage_path is None:
+        raise ValueError("stage_db_path is required")
+    if stage_path.exists():
+        stage_path.unlink()
+    stats = EmitStats(
+        parser_mode="lightweight",
+        temp_file_path=str(source_path),
+        staging_file_path=str(stage_path),
+        stage_db_path=str(stage_path),
+        file_size_bytes=source_path.stat().st_size,
+        source_file_size_gb=round(source_path.stat().st_size / (1024 ** 3), 4),
+        audit_mode="lightweight_no_dedupe",
+    )
+    _ensure_free_disk(Path(cfg.temp_dir), cfg.min_free_disk_gb)
+    conn = open_lightweight_stage_db(stage_path)
+    stats.rss_before_parse_mb = current_rss_mb()
+    if stats.rss_before_parse_mb is not None:
+        stats.max_rss_mb = max(float(stats.max_rss_mb or 0.0), stats.rss_before_parse_mb)
+    trace_goods_id = _trace_goods_id()
+    trace_raw_count = 0
+    trace_stage_count = 0
+    trace_prices_enabled = str(os.getenv("EMIT_TRACE_PRICES") or "").strip().casefold() in {"1", "true", "yes", "on"}
+    trace_raw_prices: list[float] = []
+    batch: list[tuple[Any, ...]] = []
+    batch_size = max(1, int(cfg.batch_insert_size or 1))
+    last_progress_at: float | None = None
+    cache_info_before = _cache_info_snapshot()
+
+    def flush_batch() -> None:
+        if not batch:
+            return
+        stage_insert_started = time.perf_counter()
+        conn.executemany(_LIGHTWEIGHT_STAGE_INSERT_SQL, batch)
+        _add_elapsed(stats, "stage_upsert_elapsed", stage_insert_started)
+        stats.staged_rows += len(batch)
+        batch.clear()
+
+    try:
+        source_iter = iter(iter_source_rows(source_path))
+        while True:
+            decode_started = time.perf_counter()
+            try:
+                row = next(source_iter)
+            except StopIteration:
+                _add_elapsed(stats, "decode_elapsed", decode_started)
+                break
+            _add_elapsed(stats, "decode_elapsed", decode_started)
+            stats.input_rows += 1
+            normalize_started = time.perf_counter()
+            try:
+                item = normalize_emit_item_lightweight(row, filial_id=filial_id, filial_name=filial_name, stats=stats)
+            except Exception:
+                _increment_skip(stats, "normalization_error")
+                logger.exception("[EMIT_LIGHTWEIGHT_NORMALIZE_ERROR] filial_id=%s row_index=%s", filial_id, stats.input_rows)
+                continue
+            _add_elapsed(stats, "normalize_elapsed", normalize_started)
+            if item is None:
+                if _row_has_negative_price_candidate(row):
+                    stats.negative_price_rows_skipped += 1
+                _increment_skip(stats, emit_skip_reason(row))
+                continue
+            stats.positive_price_rows += 1
+            stats.normalized_rows += 1
+            if not item.get("provisor_goods_id"):
+                stats.rows_without_goodsId += 1
+            if trace_goods_id is not None and item.get("provisor_goods_id") == trace_goods_id:
+                trace_raw_count += 1
+                trace_stage_count += 1
+                if trace_prices_enabled:
+                    trace_raw_prices.append(float(item.get("distributor_price") or 0))
+            batch.append(_lightweight_stage_values(item))
+            stats.max_batch_size = max(stats.max_batch_size, len(batch))
+            if len(batch) >= batch_size:
+                flush_batch()
+                stage_commit_started = time.perf_counter()
+                conn.commit()
+                _add_elapsed(stats, "stage_commit_elapsed", stage_commit_started)
+                _ensure_free_disk(Path(cfg.temp_dir), cfg.min_free_disk_gb)
+                _raise_if_memory_exceeded(cfg, stage="parse_normalize_stage_lightweight", stats=stats)
+                _update_max_rss(stats)
+                now = time.perf_counter()
+                interval = max(0.0, float(progress_interval_seconds))
+                if progress_callback is not None and (last_progress_at is None or now - last_progress_at >= interval):
+                    elapsed = max(now - started, 0.001)
+                    progress = {
+                        "current_stage": "parsing",
+                        "parser_mode": "lightweight",
+                        "filial_id": filial_id,
+                        "input_rows": stats.input_rows,
+                        "positive_price_rows": stats.positive_price_rows,
+                        "staged_rows": stats.staged_rows,
+                        "final_rows_saved": stats.staged_rows,
+                        "parse_elapsed_sec": round(elapsed, 3),
+                        "parse_rows_per_sec": round(float(stats.input_rows or 0) / elapsed, 3),
+                        "decode_elapsed_sec": stats.decode_elapsed,
+                        "normalize_elapsed_sec": stats.normalize_elapsed,
+                        "stage_insert_elapsed_sec": stats.stage_upsert_elapsed,
+                        "stage_commit_elapsed_sec": stats.stage_commit_elapsed,
+                        "stage_db_size_mb": _stage_total_size_mb(stage_path),
+                        "batch_size": batch_size,
+                    }
+                    logger.info("[EMIT_LIGHTWEIGHT_PARSE_PROGRESS] %s", progress)
+                    progress_callback(progress)
+                    last_progress_at = now
+        flush_batch()
+        stage_commit_started = time.perf_counter()
+        conn.commit()
+        _add_elapsed(stats, "stage_commit_elapsed", stage_commit_started)
+        stats.final_rows_saved = int(conn.execute("SELECT COUNT(*) FROM stage_items_lightweight").fetchone()[0] or 0)
+        if not (stats.positive_price_rows == stats.staged_rows == stats.final_rows_saved):
+            raise RuntimeError(
+                "Emit lightweight row count mismatch: "
+                f"filial_id={filial_id}, "
+                f"positive_price_rows={stats.positive_price_rows}, "
+                f"staged_rows={stats.staged_rows}, "
+                f"final_rows_saved={stats.final_rows_saved}"
+            )
+        if stats.final_rows_saved != stats.staged_rows:
+            raise RuntimeError(f"Emit lightweight staging row count mismatch: inserted={stats.staged_rows}, counted={stats.final_rows_saved}")
+        if trace_goods_id is not None:
+            stats.trace = {
+                "sku": _trace_sku(),
+                "raw_rows_found": trace_raw_count,
+                "items_saved_count": trace_stage_count,
+                "trace_prices_logged": trace_prices_enabled,
+            }
+            if trace_prices_enabled:
+                stats.trace["raw_prices"] = trace_raw_prices
+        elapsed = max(time.perf_counter() - started, 0.001)
+        final_progress = {
+            "current_stage": "parsing",
+            "parser_mode": "lightweight",
+            "filial_id": filial_id,
+            "input_rows": stats.input_rows,
+            "positive_price_rows": stats.positive_price_rows,
+            "staged_rows": stats.staged_rows,
+            "final_rows_saved": stats.final_rows_saved,
+            "parse_elapsed_sec": round(elapsed, 3),
+            "parse_rows_per_sec": round(float(stats.input_rows or 0) / elapsed, 3),
+            "decode_elapsed_sec": stats.decode_elapsed,
+            "normalize_elapsed_sec": stats.normalize_elapsed,
+            "stage_insert_elapsed_sec": stats.stage_upsert_elapsed,
+            "stage_commit_elapsed_sec": stats.stage_commit_elapsed,
+            "stage_db_size_mb": _stage_total_size_mb(stage_path),
+            "batch_size": batch_size,
+        }
+        logger.info("[EMIT_LIGHTWEIGHT_PARSE_PROGRESS] %s", final_progress)
+        if progress_callback is not None:
+            progress_callback(final_progress)
+    finally:
+        conn.close()
+    stats.stage_db_size_bytes = _stage_total_size_bytes(stage_path)
+    stats.stage_db_size_mb = round(stats.stage_db_size_bytes / (1024 * 1024), 3)
+    stats.stage_db_size_gb = round(stats.stage_db_size_bytes / (1024 ** 3), 4)
+    stats.parse_dedupe_elapsed_sec = round(time.perf_counter() - started, 3)
+    stats.rss_after_parse_mb = current_rss_mb()
+    if stats.rss_after_parse_mb is not None:
+        stats.max_rss_mb = max(float(stats.max_rss_mb or 0.0), stats.rss_after_parse_mb)
+    _update_max_rss(stats)
+    _apply_cache_info_delta(stats, cache_info_before, _cache_info_snapshot())
+    if stats.final_rows_saved < cfg.min_final_rows:
+        raise RuntimeError(
+            f"Emit lightweight parse produced suspiciously low row count: {stats.final_rows_saved} < EMIT_MIN_FINAL_ROWS={cfg.min_final_rows}"
+        )
+    logger.info(
+        "[EMIT_LIGHTWEIGHT_PARSE_PERFORMANCE] parser_mode=lightweight filial_id=%s input_rows=%s positive_price_rows=%s staged_rows=%s elapsed_sec=%s rows_per_sec=%s decode_elapsed_sec=%s normalize_elapsed_sec=%s stage_insert_elapsed_sec=%s stage_commit_elapsed_sec=%s stage_db_size_mb=%s batch_size=%s",
+        filial_id,
+        stats.input_rows,
+        stats.positive_price_rows,
+        stats.final_rows_saved,
+        stats.parse_dedupe_elapsed_sec,
+        round(float(stats.input_rows or 0) / max(stats.parse_dedupe_elapsed_sec, 0.001), 3),
+        stats.decode_elapsed,
+        stats.normalize_elapsed,
+        stats.stage_upsert_elapsed,
+        stats.stage_commit_elapsed,
+        stats.stage_db_size_mb,
+        batch_size,
+    )
+    if stats.trace:
+        logger.info("[EMIT_TRACE] stage=lightweight_parse filial_id=%s trace=%s", filial_id, stats.trace)
+    return stats
 
 
 async def download_emit_filial(*, config: EmitConfig, filial_id: int, filial_name: str, job_callback=None) -> Path:
@@ -3337,14 +3681,26 @@ class EmitWorker:
                 except Exception:
                     logger.exception("[EMIT_PARSE_PROGRESS_ERROR] job_id=%s filial_id=%s", job_id, filial_id)
 
-            stats = parse_normalize_stage(
-                source_path=temp_path,
-                stage_db_path=staging_path,
-                filial_id=filial_id,
-                filial_name=filial_name,
-                config=self.config,
-                progress_callback=_parse_progress,
-            )
+            parser_mode = "lightweight" if emit_lightweight_parser_enabled() else "legacy"
+            logger.info("[EMIT_STAGE] event=emit_parser_selected job_id=%s filial_id=%s parser_mode=%s", job_id, filial_id, parser_mode)
+            if parser_mode == "lightweight":
+                stats = parse_normalize_stage_lightweight(
+                    source_path=temp_path,
+                    stage_db_path=staging_path,
+                    filial_id=filial_id,
+                    filial_name=filial_name,
+                    config=self.config,
+                    progress_callback=_parse_progress,
+                )
+            else:
+                stats = parse_normalize_stage(
+                    source_path=temp_path,
+                    stage_db_path=staging_path,
+                    filial_id=filial_id,
+                    filial_name=filial_name,
+                    config=self.config,
+                    progress_callback=_parse_progress,
+                )
             logger.info(
                 "[EMIT_STAGE] event=emit_parse_completed job_id=%s filial_id=%s elapsed_sec=%s input_rows=%s final_rows=%s duplicates_removed=%s",
                 job_id,
