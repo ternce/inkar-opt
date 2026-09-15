@@ -428,25 +428,73 @@ def recalculate_emit_percentiles_globally(
     )
     compatibility_rows_created = int(canonical_summary.get("rows_created") or 0)
     persistence_elapsed = 0.0
-    for price_format_id in fanout_targets:
-        pf = db.get(PriceFormat, price_format_id)
-        if pf is None:
-            continue
-        target_started = time.perf_counter()
-        summary = fanout_emit_percentiles_from_price_format(
+    if fanout_targets and (db.get_bind().dialect.name or "").lower() == "postgresql":
+        selected_sources = _selected_source_rows(
             db=db,
-            source_price_format_id=canonical_price_format_id,
-            target_price_format_id=price_format_id,
+            price_format_id=canonical_price_format_id,
             source_price_list_ids=scoped_ids,
             require_assignment=False,
         )
-        elapsed = round(time.perf_counter() - target_started, 3)
-        persistence_elapsed = round(persistence_elapsed + elapsed, 3)
-        summary["percentile_total_elapsed"] = elapsed
-        summary["percentile_rebuild_scope"] = "emit_global_catalog"
-        summary["cache_or_reuse_strategy"] = "compatibility_fanout"
-        compatibility_rows_created += int(summary.get("compatibility_rows_created") or summary.get("rows_created") or 0)
-        summaries[str(pf.code or price_format_id)] = {"price_format_id": price_format_id, **summary}
+        multi_summary = _fanout_emit_percentiles_postgresql_multi_target(
+            db=db,
+            source_price_format_id=canonical_price_format_id,
+            target_price_format_ids=fanout_targets,
+            selected_sources=selected_sources,
+            started_at=fanout_started,
+        )
+        persistence_elapsed = float(multi_summary.get("execution_time_seconds") or 0)
+        rows_before_by_target = {
+            int(target_id): int(rows_before or 0)
+            for target_id, rows_before in (multi_summary.get("rows_before_by_target") or {}).items()
+        }
+        rows_deleted_by_target = {
+            int(target_id): int(rows_deleted or 0)
+            for target_id, rows_deleted in (multi_summary.get("rows_deleted_by_target") or {}).items()
+        }
+        rows_created_per_target = int(multi_summary.get("canonical_rows") or 0)
+        for price_format_id in multi_summary.get("target_price_format_ids") or []:
+            pf = db.get(PriceFormat, int(price_format_id))
+            if pf is None:
+                continue
+            summary = {
+                "products_processed": int(multi_summary.get("products_processed") or 0),
+                "products_with_competitors": int(multi_summary.get("products_with_competitors") or 0),
+                "products_without_competitors": int(multi_summary.get("products_without_competitors") or 0),
+                "rows_created": rows_created_per_target,
+                "rows_updated": 0,
+                "rows_skipped": int(multi_summary.get("rows_skipped") or 0),
+                "rows_deleted": rows_deleted_by_target.get(int(price_format_id), 0),
+                "execution_time_seconds": persistence_elapsed,
+                "engine": multi_summary.get("engine") or "fanout_postgresql_multi_target",
+                "source_price_format_id": canonical_price_format_id,
+                "rows_before": rows_before_by_target.get(int(price_format_id), 0),
+                "compatibility_rows_created": rows_created_per_target,
+                "percentile_total_elapsed": persistence_elapsed,
+                "percentile_rebuild_scope": "emit_global_catalog",
+                "cache_or_reuse_strategy": "compatibility_fanout",
+            }
+            compatibility_rows_created += rows_created_per_target
+            summaries[str(pf.code or price_format_id)] = {"price_format_id": int(price_format_id), **summary}
+    else:
+        for price_format_id in fanout_targets:
+            pf = db.get(PriceFormat, price_format_id)
+            if pf is None:
+                continue
+            target_started = time.perf_counter()
+            summary = fanout_emit_percentiles_from_price_format(
+                db=db,
+                source_price_format_id=canonical_price_format_id,
+                target_price_format_id=price_format_id,
+                source_price_list_ids=scoped_ids,
+                require_assignment=False,
+            )
+            elapsed = round(time.perf_counter() - target_started, 3)
+            persistence_elapsed = round(persistence_elapsed + elapsed, 3)
+            summary["percentile_total_elapsed"] = elapsed
+            summary["percentile_rebuild_scope"] = "emit_global_catalog"
+            summary["cache_or_reuse_strategy"] = "compatibility_fanout"
+            compatibility_rows_created += int(summary.get("compatibility_rows_created") or summary.get("rows_created") or 0)
+            summaries[str(pf.code or price_format_id)] = {"price_format_id": price_format_id, **summary}
     fanout_elapsed = round(time.perf_counter() - fanout_started, 3)
     logger.info(
         "[EMIT_PERCENTILE_COMPAT_FANOUT_COMPLETE] source_price_format_id=%s target_price_format_count=%s "
@@ -806,6 +854,429 @@ def _fanout_emit_percentiles_postgresql(
         "engine": "fanout_postgresql",
         "source_price_format_id": source_price_format_id,
         "rows_before": existing_rows,
+        "compatibility_rows_created": inserted,
+    }
+
+
+def _fanout_emit_percentiles_postgresql_multi_target(
+    *,
+    db: Session,
+    source_price_format_id: int,
+    target_price_format_ids: list[int],
+    selected_sources: list[dict[str, Any]],
+    started_at: float,
+) -> dict[str, Any]:
+    target_ids = sorted({int(item) for item in target_price_format_ids if int(item) > 0 and int(item) != int(source_price_format_id)})
+    if not target_ids:
+        return {
+            "engine": "fanout_postgresql_multi_target",
+            "source_price_format_id": source_price_format_id,
+            "target_price_format_ids": [],
+            "target_price_format_count": 0,
+            "canonical_rows": 0,
+            "expected_copied_rows": 0,
+            "actual_copied_rows": 0,
+            "rows_created": 0,
+            "rows_deleted": 0,
+            "rows_skipped": 0,
+            "rows_before_by_target": {},
+            "rows_deleted_by_target": {},
+            "summary_rows_refreshed": 0,
+            "setup_elapsed_sec": 0.0,
+            "delete_elapsed_sec": 0.0,
+            "insert_elapsed_sec": 0.0,
+            "summary_refresh_elapsed_sec": 0.0,
+            "validation_elapsed_sec": 0.0,
+            "execution_time_seconds": round(time.perf_counter() - started_at, 3),
+        }
+    if not selected_sources:
+        return {
+            "engine": "fanout_postgresql_multi_target",
+            "source_price_format_id": source_price_format_id,
+            "target_price_format_ids": target_ids,
+            "target_price_format_count": len(target_ids),
+            "canonical_rows": 0,
+            "expected_copied_rows": 0,
+            "actual_copied_rows": 0,
+            "rows_created": 0,
+            "rows_deleted": 0,
+            "rows_skipped": 1,
+            "rows_before_by_target": {},
+            "rows_deleted_by_target": {},
+            "summary_rows_refreshed": 0,
+            "setup_elapsed_sec": 0.0,
+            "delete_elapsed_sec": 0.0,
+            "insert_elapsed_sec": 0.0,
+            "summary_refresh_elapsed_sec": 0.0,
+            "validation_elapsed_sec": 0.0,
+            "execution_time_seconds": round(time.perf_counter() - started_at, 3),
+        }
+
+    setup_started = time.perf_counter()
+    db.execute(text("DROP TABLE IF EXISTS tmp_emit_percentile_fanout_sources"))
+    db.execute(text("DROP TABLE IF EXISTS tmp_emit_percentile_fanout_targets"))
+    db.execute(
+        text(
+            """
+            CREATE TEMP TABLE tmp_emit_percentile_fanout_sources (
+                price_list_id BIGINT PRIMARY KEY,
+                branch_name TEXT NOT NULL,
+                competitor_name TEXT NOT NULL,
+                source_key TEXT NOT NULL
+            ) ON COMMIT DROP
+            """
+        )
+    )
+    db.execute(
+        text(
+            """
+            CREATE TEMP TABLE tmp_emit_percentile_fanout_targets (
+                target_price_format_id INTEGER PRIMARY KEY
+            ) ON COMMIT DROP
+            """
+        )
+    )
+    db.execute(
+        text(
+            """
+            INSERT INTO tmp_emit_percentile_fanout_sources (
+                price_list_id,
+                branch_name,
+                competitor_name,
+                source_key
+            )
+            VALUES (
+                :price_list_id,
+                :branch_name,
+                :competitor_name,
+                :source_key
+            )
+            """
+        ),
+        [
+            {
+                "price_list_id": source["price_list_id"],
+                "branch_name": source["branch_name"],
+                "competitor_name": source["competitor_name"],
+                "source_key": source["source_key"],
+            }
+            for source in selected_sources
+        ],
+    )
+    db.execute(
+        text(
+            """
+            INSERT INTO tmp_emit_percentile_fanout_targets (target_price_format_id)
+            VALUES (:target_price_format_id)
+            """
+        ),
+        [{"target_price_format_id": target_id} for target_id in target_ids],
+    )
+    setup_elapsed = round(time.perf_counter() - setup_started, 3)
+
+    scope_sql = """
+        (
+          cpp.percentile_scope = :regional_scope
+          AND EXISTS (
+            SELECT 1
+            FROM tmp_emit_percentile_fanout_sources s
+            WHERE (
+                cpp.source_key = s.source_key
+                OR (
+                    coalesce(cpp.source_key, '') = ''
+                    AND cpp.branch_name = s.branch_name
+                    AND cpp.competitor_name = s.competitor_name
+                )
+            )
+          )
+        )
+        OR (
+          cpp.percentile_scope = :kazakhstan_scope
+          AND cpp.branch_name = :kazakhstan_region
+          AND EXISTS (
+            SELECT 1
+            FROM tmp_emit_percentile_fanout_sources s
+            WHERE cpp.competitor_name = s.competitor_name
+          )
+        )
+    """
+    params = {
+        "source_price_format_id": source_price_format_id,
+        "regional_scope": REGIONAL_SCOPE,
+        "kazakhstan_scope": KAZAKHSTAN_SCOPE,
+        "kazakhstan_region": KAZAKHSTAN_REGION,
+    }
+    rows_before_by_target = {
+        int(row["price_format_id"]): int(row["rows_before"] or 0)
+        for row in db.execute(
+            text(
+                f"""
+                SELECT cpp.price_format_id, count(cpp.id) AS rows_before
+                FROM competitor_price_percentiles cpp
+                JOIN tmp_emit_percentile_fanout_targets t
+                  ON t.target_price_format_id = cpp.price_format_id
+                WHERE {scope_sql}
+                GROUP BY cpp.price_format_id
+                """
+            ),
+            params,
+        ).mappings()
+    }
+    canonical_rows = int(
+        db.execute(
+            text(
+                f"""
+                SELECT count(cpp.id)
+                FROM competitor_price_percentiles cpp
+                WHERE cpp.price_format_id = :source_price_format_id
+                  AND ({scope_sql})
+                """
+            ),
+            params,
+        ).scalar()
+        or 0
+    )
+
+    delete_started = time.perf_counter()
+    rows_deleted_by_target = {
+        int(row["price_format_id"]): int(row["rows_deleted"] or 0)
+        for row in db.execute(
+            text(
+                f"""
+                WITH deleted AS (
+                    DELETE FROM competitor_price_percentiles cpp
+                    USING tmp_emit_percentile_fanout_targets t
+                    WHERE cpp.price_format_id = t.target_price_format_id
+                      AND ({scope_sql})
+                    RETURNING cpp.price_format_id
+                )
+                SELECT price_format_id, count(*) AS rows_deleted
+                FROM deleted
+                GROUP BY price_format_id
+                """
+            ),
+            params,
+        ).mappings()
+    }
+    delete_elapsed = round(time.perf_counter() - delete_started, 3)
+    deleted_rows = sum(rows_deleted_by_target.values())
+
+    insert_started = time.perf_counter()
+    insert_result = db.execute(
+        text(
+            f"""
+            INSERT INTO competitor_price_percentiles (
+                price_format_id,
+                product_id,
+                competitor_price_list_id,
+                source_type,
+                source_key,
+                branch_name,
+                competitor_name,
+                percentile_scope,
+                percentile,
+                value,
+                source_count,
+                price_count,
+                used_price_count,
+                status,
+                updated_at
+            )
+            SELECT
+                t.target_price_format_id AS price_format_id,
+                cpp.product_id,
+                cpp.competitor_price_list_id,
+                cpp.source_type,
+                cpp.source_key,
+                cpp.branch_name,
+                cpp.competitor_name,
+                cpp.percentile_scope,
+                cpp.percentile,
+                cpp.value,
+                cpp.source_count,
+                cpp.price_count,
+                cpp.used_price_count,
+                cpp.status,
+                cpp.updated_at
+            FROM competitor_price_percentiles cpp
+            CROSS JOIN tmp_emit_percentile_fanout_targets t
+            WHERE cpp.price_format_id = :source_price_format_id
+              AND ({scope_sql})
+            """
+        ),
+        params,
+    )
+    inserted = int(insert_result.rowcount or 0)
+    insert_elapsed = round(time.perf_counter() - insert_started, 3)
+
+    summary_started = time.perf_counter()
+    db.execute(
+        text(
+            """
+            DELETE FROM competitor_price_percentile_source_summaries s
+            USING tmp_emit_percentile_fanout_targets t
+            WHERE s.price_format_id = t.target_price_format_id
+            """
+        )
+    )
+    summary_result = db.execute(
+        text(
+            """
+            INSERT INTO competitor_price_percentile_source_summaries (
+                price_format_id,
+                source_type,
+                source_key,
+                competitor_price_list_id,
+                branch_name,
+                competitor_name,
+                percentile_scope,
+                percentile,
+                sku_count,
+                source_count,
+                generated_at,
+                updated_at
+            )
+            SELECT
+                cpp.price_format_id,
+                cpp.source_type,
+                cpp.source_key,
+                cpp.competitor_price_list_id,
+                cpp.branch_name,
+                cpp.competitor_name,
+                cpp.percentile_scope,
+                cpp.percentile,
+                count(DISTINCT cpp.product_id)::integer AS sku_count,
+                coalesce(sum(cpp.source_count), 0)::integer AS source_count,
+                max(cpp.updated_at) AS generated_at,
+                :updated_at AS updated_at
+            FROM competitor_price_percentiles cpp
+            JOIN tmp_emit_percentile_fanout_targets t
+              ON t.target_price_format_id = cpp.price_format_id
+            GROUP BY
+                cpp.price_format_id,
+                cpp.source_type,
+                cpp.source_key,
+                cpp.competitor_price_list_id,
+                cpp.branch_name,
+                cpp.competitor_name,
+                cpp.percentile_scope,
+                cpp.percentile
+            """
+        ),
+        {"updated_at": now_kz_naive()},
+    )
+    summary_rows_refreshed = int(summary_result.rowcount or 0)
+    summary_elapsed = round(time.perf_counter() - summary_started, 3)
+
+    validation_started = time.perf_counter()
+    expected_fanout_rows = canonical_rows * len(target_ids)
+    actual_copied_rows = int(
+        db.execute(
+            text(
+                f"""
+                SELECT count(cpp.id)
+                FROM competitor_price_percentiles cpp
+                JOIN tmp_emit_percentile_fanout_targets t
+                  ON t.target_price_format_id = cpp.price_format_id
+                WHERE {scope_sql}
+                """
+            ),
+            params,
+        ).scalar()
+        or 0
+    )
+    rows_after_by_target = {
+        int(row["price_format_id"]): int(row["rows_after"] or 0)
+        for row in db.execute(
+            text(
+                f"""
+                SELECT t.target_price_format_id AS price_format_id, count(cpp.id) AS rows_after
+                FROM tmp_emit_percentile_fanout_targets t
+                LEFT JOIN competitor_price_percentiles cpp
+                  ON cpp.price_format_id = t.target_price_format_id
+                 AND ({scope_sql})
+                GROUP BY t.target_price_format_id
+                """
+            ),
+            params,
+        ).mappings()
+    }
+    incomplete_targets = {
+        target_id: rows_after_by_target.get(target_id, 0)
+        for target_id in target_ids
+        if rows_after_by_target.get(target_id, 0) != canonical_rows
+    }
+    validation_elapsed = round(time.perf_counter() - validation_started, 3)
+    if actual_copied_rows != expected_fanout_rows or incomplete_targets:
+        raise RuntimeError(
+            "Emit percentile fanout row-count mismatch: "
+            f"source_price_format_id={source_price_format_id} "
+            f"target_count={len(target_ids)} "
+            f"canonical_rows={canonical_rows} "
+            f"expected_rows={expected_fanout_rows} "
+            f"actual_rows={actual_copied_rows} "
+            f"incomplete_targets={incomplete_targets}"
+        )
+
+    stats = db.execute(
+        text(
+            f"""
+            SELECT
+                (SELECT count(*) FROM products) AS products_processed,
+                count(DISTINCT cpp.product_id) FILTER (
+                    WHERE cpp.percentile_scope = :regional_scope AND cpp.value IS NOT NULL
+                ) AS products_with_competitors
+            FROM competitor_price_percentiles cpp
+            WHERE cpp.price_format_id = :source_price_format_id
+              AND ({scope_sql})
+            """
+        ),
+        params,
+    ).mappings().one()
+    products_processed = int(stats["products_processed"] or 0)
+    products_with_competitors = int(stats["products_with_competitors"] or 0)
+    total_elapsed = round(time.perf_counter() - started_at, 3)
+    logger.info(
+        "[EMIT_PERCENTILE_COMPAT_FANOUT_PERFORMANCE] source_price_format_id=%s target_price_format_count=%s "
+        "canonical_rows=%s expected_copied_rows=%s actual_copied_rows=%s setup_elapsed_sec=%s "
+        "delete_elapsed_sec=%s insert_elapsed_sec=%s summary_refresh_elapsed_sec=%s "
+        "validation_elapsed_sec=%s total_elapsed_sec=%s",
+        source_price_format_id,
+        len(target_ids),
+        canonical_rows,
+        expected_fanout_rows,
+        actual_copied_rows,
+        setup_elapsed,
+        delete_elapsed,
+        insert_elapsed,
+        summary_elapsed,
+        validation_elapsed,
+        total_elapsed,
+    )
+    return {
+        "products_processed": products_processed,
+        "products_with_competitors": products_with_competitors,
+        "products_without_competitors": max(0, products_processed - products_with_competitors),
+        "rows_created": inserted,
+        "rows_updated": 0,
+                "rows_skipped": 0,
+        "rows_deleted": deleted_rows,
+        "execution_time_seconds": total_elapsed,
+        "engine": "fanout_postgresql_multi_target",
+        "source_price_format_id": source_price_format_id,
+        "target_price_format_ids": target_ids,
+        "target_price_format_count": len(target_ids),
+        "canonical_rows": canonical_rows,
+        "expected_copied_rows": expected_fanout_rows,
+        "actual_copied_rows": actual_copied_rows,
+        "rows_before_by_target": rows_before_by_target,
+        "rows_deleted_by_target": rows_deleted_by_target,
+        "summary_rows_refreshed": summary_rows_refreshed,
+        "setup_elapsed_sec": setup_elapsed,
+        "delete_elapsed_sec": delete_elapsed,
+        "insert_elapsed_sec": insert_elapsed,
+        "summary_refresh_elapsed_sec": summary_elapsed,
+        "validation_elapsed_sec": validation_elapsed,
         "compatibility_rows_created": inserted,
     }
 

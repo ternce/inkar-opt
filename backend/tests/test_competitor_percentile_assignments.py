@@ -8,6 +8,7 @@ from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+import backend.app.services.competitor_percentiles as competitor_percentiles_module
 from backend.app.db import Base
 from backend.app.deps import ROLE_ADMIN
 from backend.app.models import (
@@ -25,6 +26,7 @@ from backend.app.models import (
 from backend.app.services.competitor_percentiles import (
     MULTI_PRICE_PERCENTILE_MODE,
     REGULAR_COMPETITOR_SCOPE,
+    _fanout_emit_percentiles_postgresql_multi_target,
     recalculate_emit_percentiles_globally,
     recalculate_percentiles_for_price_lists,
 )
@@ -163,6 +165,75 @@ def _emit_percentile_config_name(pf_id: int, source_key: str, region: str, compe
         percentile=pct,
     )
     return f"percentile:{source_id}"
+
+
+class _FakeDialect:
+    name = "postgresql"
+
+
+class _FakeBind:
+    dialect = _FakeDialect()
+
+
+class _FakeResult:
+    def __init__(self, *, rows=None, scalar_value=None, rowcount=0):
+        self._rows = rows or []
+        self._scalar_value = scalar_value
+        self.rowcount = rowcount
+
+    def mappings(self):
+        return self
+
+    def __iter__(self):
+        return iter(self._rows)
+
+    def one(self):
+        return self._rows[0]
+
+    def scalar(self):
+        return self._scalar_value
+
+
+class _FakePostgresFanoutSession:
+    def __init__(self, *, canonical_rows=2, targets=(5, 6), actual_rows=None):
+        self.bind = _FakeBind()
+        self.canonical_rows = canonical_rows
+        self.targets = list(targets)
+        self.actual_rows = canonical_rows * len(self.targets) if actual_rows is None else actual_rows
+        self.statements: list[str] = []
+        self.target_rows: list[dict] = []
+        self.source_rows: list[dict] = []
+
+    def get_bind(self):
+        return self.bind
+
+    def execute(self, statement, params=None):
+        sql = str(statement)
+        normalized = " ".join(sql.split()).lower()
+        self.statements.append(sql)
+        if "insert into tmp_emit_percentile_fanout_targets" in normalized:
+            self.target_rows.extend(params or [])
+            return _FakeResult(rowcount=len(params or []))
+        if "insert into tmp_emit_percentile_fanout_sources" in normalized:
+            self.source_rows.extend(params or [])
+            return _FakeResult(rowcount=len(params or []))
+        if "select cpp.price_format_id, count(cpp.id) as rows_before" in normalized:
+            return _FakeResult(rows=[{"price_format_id": target_id, "rows_before": 1} for target_id in self.targets])
+        if "with deleted as" in normalized:
+            return _FakeResult(rows=[{"price_format_id": target_id, "rows_deleted": 1} for target_id in self.targets])
+        if "insert into competitor_price_percentiles" in normalized and "cross join tmp_emit_percentile_fanout_targets" in normalized:
+            return _FakeResult(rowcount=self.canonical_rows * len(self.targets))
+        if "insert into competitor_price_percentile_source_summaries" in normalized:
+            return _FakeResult(rowcount=len(self.targets))
+        if "select count(cpp.id)" in normalized and "cpp.price_format_id = :source_price_format_id" in normalized:
+            return _FakeResult(scalar_value=self.canonical_rows)
+        if "select count(cpp.id)" in normalized and "join tmp_emit_percentile_fanout_targets" in normalized:
+            return _FakeResult(scalar_value=self.actual_rows)
+        if "select t.target_price_format_id as price_format_id, count(cpp.id) as rows_after" in normalized:
+            return _FakeResult(rows=[{"price_format_id": target_id, "rows_after": self.canonical_rows} for target_id in self.targets])
+        if "(select count(*) from products) as products_processed" in normalized:
+            return _FakeResult(rows=[{"products_processed": 6340, "products_with_competitors": 1888}])
+        return _FakeResult()
 
 
 def test_assignment_summary_counts_only_active_physical_plk_rows():
@@ -1095,6 +1166,180 @@ def test_old_regional_regular_percentile_rows_are_not_selected_for_pricing():
 
     cache = load_percentile_price_cache(db, pf.id)
     assert resolve_percentile_prices_from_cache(cache, product.id, percentile_number=10).prices == []
+
+
+def test_postgresql_emit_fanout_multi_target_uses_one_set_based_copy():
+    fake_db = _FakePostgresFanoutSession(canonical_rows=4, targets=(5, 6, 7))
+    selected_sources = [
+        {"price_list_id": 101, "branch_name": "Aktau", "competitor_name": "Emit", "source_key": "emit:1106"},
+        {"price_list_id": 102, "branch_name": "Astana", "competitor_name": "Emit", "source_key": "emit:1107"},
+    ]
+
+    summary = _fanout_emit_percentiles_postgresql_multi_target(
+        db=fake_db,
+        source_price_format_id=4,
+        target_price_format_ids=[4, 5, 5, 6, 6, 7],
+        selected_sources=selected_sources,
+        started_at=0,
+    )
+
+    percentile_inserts = [
+        sql
+        for sql in fake_db.statements
+        if "INSERT INTO competitor_price_percentiles" in sql and "CROSS JOIN tmp_emit_percentile_fanout_targets" in sql
+    ]
+    percentile_deletes = [sql for sql in fake_db.statements if "WITH deleted AS" in sql]
+    assert len(percentile_inserts) == 1
+    assert len(percentile_deletes) == 1
+    assert [row["target_price_format_id"] for row in fake_db.target_rows] == [5, 6, 7]
+    assert fake_db.source_rows == selected_sources
+    assert "cpp.source_key = s.source_key" in percentile_inserts[0]
+    assert "cpp.percentile_scope = :regional_scope" in percentile_inserts[0]
+    assert "cpp.percentile_scope = :kazakhstan_scope" in percentile_inserts[0]
+    assert summary["canonical_rows"] == 4
+    assert summary["expected_copied_rows"] == 12
+    assert summary["actual_copied_rows"] == 12
+    assert summary["rows_created"] == 12
+    assert summary["rows_deleted"] == 3
+    assert summary["summary_rows_refreshed"] == 3
+    assert summary["target_price_format_ids"] == [5, 6, 7]
+
+
+def test_postgresql_emit_fanout_multi_target_empty_after_source_exclusion_is_noop():
+    fake_db = _FakePostgresFanoutSession(canonical_rows=4, targets=())
+
+    summary = _fanout_emit_percentiles_postgresql_multi_target(
+        db=fake_db,
+        source_price_format_id=4,
+        target_price_format_ids=[4, 4],
+        selected_sources=[{"price_list_id": 101, "branch_name": "Aktau", "competitor_name": "Emit", "source_key": "emit:1106"}],
+        started_at=0,
+    )
+
+    assert summary["target_price_format_ids"] == []
+    assert summary["rows_created"] == 0
+    assert fake_db.statements == []
+
+
+def test_postgresql_emit_fanout_multi_target_validates_total_and_per_target_counts():
+    fake_db = _FakePostgresFanoutSession(canonical_rows=4, targets=(5, 6), actual_rows=7)
+
+    with pytest.raises(RuntimeError, match="Emit percentile fanout row-count mismatch"):
+        _fanout_emit_percentiles_postgresql_multi_target(
+            db=fake_db,
+            source_price_format_id=4,
+            target_price_format_ids=[5, 6],
+            selected_sources=[{"price_list_id": 101, "branch_name": "Aktau", "competitor_name": "Emit", "source_key": "emit:1106"}],
+            started_at=0,
+        )
+
+
+def test_global_emit_percentile_postgresql_dispatch_uses_multi_target_fanout(monkeypatch):
+    class FakeDb:
+        class Bind:
+            class Dialect:
+                name = "postgresql"
+            dialect = Dialect()
+
+        def get_bind(self):
+            return self.Bind()
+
+        def get(self, model, item_id):
+            return PriceFormat(id=item_id, code=f"PF-{item_id}", name=f"PF-{item_id}", branch="Aktau")
+
+    multi_calls = []
+
+    monkeypatch.setattr(competitor_percentiles_module, "_all_price_format_ids", lambda db, target_price_format_ids=None: [4, 5, 6])
+    monkeypatch.setattr(
+        competitor_percentiles_module,
+        "recalculate_competitor_percentiles",
+        lambda **kwargs: {
+            "rows_created": 4,
+            "raw_price_rows": 10,
+            "products_processed": 2,
+            "products_with_competitors": 2,
+        },
+    )
+    monkeypatch.setattr(
+        competitor_percentiles_module,
+        "_selected_source_rows",
+        lambda **kwargs: [{"price_list_id": 101, "branch_name": "Aktau", "competitor_name": "Emit", "source_key": "emit:1106"}],
+    )
+
+    def fake_multi(**kwargs):
+        multi_calls.append(kwargs)
+        return {
+            "engine": "fanout_postgresql_multi_target",
+            "target_price_format_ids": [5, 6],
+            "canonical_rows": 4,
+            "products_processed": 2,
+            "products_with_competitors": 2,
+            "products_without_competitors": 0,
+            "rows_before_by_target": {5: 1, 6: 1},
+            "rows_deleted_by_target": {5: 1, 6: 1},
+            "execution_time_seconds": 1.25,
+        }
+
+    monkeypatch.setattr(competitor_percentiles_module, "_fanout_emit_percentiles_postgresql_multi_target", fake_multi)
+    monkeypatch.setattr(
+        competitor_percentiles_module,
+        "fanout_emit_percentiles_from_price_format",
+        lambda **kwargs: pytest.fail("single-target fanout should not run for PostgreSQL global Emit fanout"),
+    )
+
+    result = recalculate_emit_percentiles_globally(db=FakeDb(), source_price_list_ids=[101])
+
+    assert len(multi_calls) == 1
+    assert multi_calls[0]["source_price_format_id"] == 4
+    assert multi_calls[0]["target_price_format_ids"] == [5, 6]
+    assert result["compatibility_rows_created"] == 12
+    assert result["shared_result_reuse_count"] == 2
+    assert result["summaries"]["PF-5"]["rows_created"] == 4
+    assert result["summaries"]["PF-6"]["rows_deleted"] == 1
+
+
+def test_global_emit_percentile_non_postgresql_keeps_single_target_fallback(monkeypatch):
+    class FakeDb:
+        class Bind:
+            class Dialect:
+                name = "sqlite"
+            dialect = Dialect()
+
+        def get_bind(self):
+            return self.Bind()
+
+        def get(self, model, item_id):
+            return PriceFormat(id=item_id, code=f"PF-{item_id}", name=f"PF-{item_id}", branch="Aktau")
+
+    single_calls = []
+
+    monkeypatch.setattr(competitor_percentiles_module, "_all_price_format_ids", lambda db, target_price_format_ids=None: [4, 5, 6])
+    monkeypatch.setattr(
+        competitor_percentiles_module,
+        "recalculate_competitor_percentiles",
+        lambda **kwargs: {
+            "rows_created": 4,
+            "raw_price_rows": 10,
+            "products_processed": 2,
+            "products_with_competitors": 2,
+        },
+    )
+    monkeypatch.setattr(
+        competitor_percentiles_module,
+        "fanout_emit_percentiles_from_price_format",
+        lambda **kwargs: single_calls.append(kwargs)
+        or {
+            "rows_created": 4,
+            "rows_deleted": 1,
+            "rows_before": 1,
+            "compatibility_rows_created": 4,
+        },
+    )
+
+    result = recalculate_emit_percentiles_globally(db=FakeDb(), source_price_list_ids=[101])
+
+    assert [call["target_price_format_id"] for call in single_calls] == [5, 6]
+    assert result["compatibility_rows_created"] == 12
 
 
 def test_competitor_percentile_rows_survive_reload_only_for_active_matching_assignment():
