@@ -14,6 +14,11 @@ from .competitors.percentiles.sources import (
     PERCENTILE_SOURCE_EMIT,
     percentile_source_id,
 )
+from .emit_percentile_resolver import (
+    assigned_emit_percentile_group_keys,
+    emit_row_matches_assigned_group,
+    load_global_emit_percentile_rows,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +32,13 @@ class RegularPercentileExportConfig:
     percentile: int
 
 
-def percentile_export_source_names(row: CompetitorPricePercentile) -> tuple[str, str]:
+def percentile_export_source_names(row: CompetitorPricePercentile, *, target_price_format_id: int | None = None) -> tuple[str, str]:
     """Return the selectable export identities represented by a percentile row."""
 
+    price_format_id = int(target_price_format_id or row.price_format_id)
     emit_source = percentile_source_id(
         percentile_source=PERCENTILE_SOURCE_EMIT,
-        price_format_id=row.price_format_id,
+        price_format_id=price_format_id,
         scope=row.percentile_scope,
         source_key=row.source_key,
         region=row.branch_name,
@@ -41,7 +47,7 @@ def percentile_export_source_names(row: CompetitorPricePercentile) -> tuple[str,
     )
     competitor_source = percentile_source_id(
         percentile_source=PERCENTILE_SOURCE_COMPETITOR,
-        price_format_id=row.price_format_id,
+        price_format_id=price_format_id,
         scope="global",
         source_key=row.source_key,
         region="",
@@ -107,7 +113,8 @@ def load_percentile_export_price_cells(
     rows_loaded = 0
     values_written = 0
 
-    rows = (
+    active_emit_groups = assigned_emit_percentile_group_keys(db=db, target_price_format_id=price_format_id)
+    target_rows = (
         db.execute(
             select(CompetitorPricePercentile)
             .where(CompetitorPricePercentile.price_format_id == price_format_id)
@@ -124,13 +131,21 @@ def load_percentile_export_price_cells(
         .scalars()
         .all()
     )
+    global_emit_rows = load_global_emit_percentile_rows(
+        db=db,
+        target_price_format_id=price_format_id,
+        product_ids=product_id_set,
+        require_value=True,
+    )
+    rows = [row for row in target_rows if not global_emit_rows or not emit_row_matches_assigned_group(row, active_emit_groups)]
+    rows.extend(global_emit_rows)
     rows_loaded += len(rows)
 
     for row in rows:
         value = _decimal_or_none(row.value)
         if value is None:
             continue
-        for source_name in percentile_export_source_names(row):
+        for source_name in percentile_export_source_names(row, target_price_format_id=price_format_id):
             if source_name not in selected_names:
                 continue
             out.setdefault(int(row.product_id), {})[source_name] = {

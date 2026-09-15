@@ -37,11 +37,16 @@ from ..models import (
 from .. import data
 from ..timezone import local_iso
 from .competitor_matching import rebuild_competitor_prices_for_selected
-from .competitor_percentiles import emit_percentile_group_keys
 from .competitor_percentiles import REGIONAL_SCOPE, REGULAR_COMPETITOR_SCOPE
 from .competitors.identity import canonical_regular_competitor_identity
 from .competitors.percentiles.sources import PERCENTILE_SOURCE_COMPETITOR, PERCENTILE_SOURCE_EMIT, is_emit_source_key, percentile_source_id
 from .competitor_assignments import get_assigned_competitor_price_lists
+from .emit_percentile_resolver import (
+    assigned_emit_percentile_group_keys,
+    emit_row_matches_assigned_group,
+    has_global_emit_percentile_rows,
+    load_global_emit_percentile_rows,
+)
 from .references.types import branch_display_name, canonical_branch_id
 from .regions import allowed_provisor_source_names_for_city_id, city_id_from_branch
 
@@ -1058,11 +1063,11 @@ def _resolve_percentile_prices_from_rows(
     *,
     percentile_number: int,
 ) -> CompetitorResolvedMany:
-    active_groups = emit_percentile_group_keys(db=db, price_format_id=price_format_id)
+    active_groups = assigned_emit_percentile_group_keys(db=db, target_price_format_id=price_format_id)
     assigned_configs = _assigned_percentile_configs(db=db, price_format_id=price_format_id)
     if not active_groups and not assigned_configs:
         return CompetitorResolvedMany([])
-    rows = (
+    target_rows = (
         db.execute(
             select(CompetitorPricePercentile)
             .where(CompetitorPricePercentile.price_format_id == price_format_id)
@@ -1073,6 +1078,15 @@ def _resolve_percentile_prices_from_rows(
         .scalars()
         .all()
     )
+    global_emit_rows = load_global_emit_percentile_rows(
+        db=db,
+        target_price_format_id=price_format_id,
+        product_id=product_id,
+        percentile=percentile_number,
+        require_value=True,
+    )
+    rows = [row for row in target_rows if not global_emit_rows or not emit_row_matches_assigned_group(row, active_groups)]
+    rows.extend(global_emit_rows)
     return _resolve_percentile_rows(
         rows=rows,
         price_format_id=price_format_id,
@@ -1144,11 +1158,11 @@ def _regular_selected_percentile_configs(
 
 
 def load_percentile_price_cache(db: Session, price_format_id: int) -> PercentilePriceCache:
-    active_groups = emit_percentile_group_keys(db=db, price_format_id=price_format_id)
+    active_groups = assigned_emit_percentile_group_keys(db=db, target_price_format_id=price_format_id)
     assigned_configs = _assigned_percentile_configs(db=db, price_format_id=price_format_id)
     if not active_groups and not assigned_configs:
         return {}
-    rows = (
+    target_rows = (
         db.execute(
             select(CompetitorPricePercentile)
             .where(CompetitorPricePercentile.price_format_id == price_format_id)
@@ -1162,6 +1176,13 @@ def load_percentile_price_cache(db: Session, price_format_id: int) -> Percentile
         .scalars()
         .all()
     )
+    global_emit_rows = load_global_emit_percentile_rows(
+        db=db,
+        target_price_format_id=price_format_id,
+        require_value=True,
+    )
+    rows = [row for row in target_rows if not global_emit_rows or not emit_row_matches_assigned_group(row, active_groups)]
+    rows.extend(global_emit_rows)
     cache: PercentilePriceCache = {}
     for row in rows:
         resolved = _resolve_percentile_rows(
@@ -2911,7 +2932,10 @@ def calculate_prices(
             .scalars()
             .first()
         )
-        if existing_percentile_rows is None:
+        if existing_percentile_rows is None and not has_global_emit_percentile_rows(
+            db=db,
+            target_price_format_id=int(pf.id),
+        ):
             raise ValueError("Percentile rows are required before price generation. Refresh/recalculate competitors first.")
     if physical_mode:
         existing_competitor_rows = (

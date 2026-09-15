@@ -22,6 +22,7 @@ from ..models import (
 )
 from ..timezone import local_iso, now_kz_naive
 from .competitor_percentiles import eligible_percentile_assignments, recalculate_competitor_percentiles
+from .emit_percentile_resolver import global_emit_percentile_rows_count
 from .jobs import job_to_dict, update_job
 
 
@@ -150,11 +151,18 @@ def _selected_catalog_percentile_sources(db: Session, price_format_id: int) -> l
 
 
 def _catalog_percentile_rows_count(db: Session, price_format_id: int) -> int:
-    return int(
+    physical_count = int(
         db.execute(
             select(func.count(CompetitorPricePercentile.id)).where(CompetitorPricePercentile.price_format_id == price_format_id)
         ).scalar()
         or 0
+    )
+    if physical_count > 0:
+        return physical_count
+    return global_emit_percentile_rows_count(
+        db=db,
+        target_price_format_id=price_format_id,
+        require_value=True,
     )
 
 
@@ -188,12 +196,7 @@ def mark_percentile_preparation_ready_for_catalog(
 
 def percentile_preparation_to_dict(db: Session, price_format_id: int) -> dict[str, Any]:
     row = _status_row(db, price_format_id)
-    rows_count = int(
-        db.execute(
-            select(func.count(CompetitorPricePercentile.id)).where(CompetitorPricePercentile.price_format_id == price_format_id)
-        ).scalar()
-        or 0
-    )
+    rows_count = _catalog_percentile_rows_count(db, price_format_id)
     return {
         "priceFormatId": price_format_id,
         "status": row.status or "not_configured",
@@ -372,12 +375,7 @@ def run_percentile_preparation_job(job_id: str) -> dict[str, Any] | None:
             enqueue_percentile_preparation(db=db, price_format_id=price_format_id, reason="configuration_changed_during_preparation")
             return job_to_dict(job) if job is not None else None
 
-        rows_count = int(
-            db.execute(
-                select(func.count(CompetitorPricePercentile.id)).where(CompetitorPricePercentile.price_format_id == price_format_id)
-            ).scalar()
-            or 0
-        )
+        rows_count = _catalog_percentile_rows_count(db, price_format_id)
         job = db.get(Job, job_id)
         row = _status_row(db, price_format_id)
         now = now_kz_naive()

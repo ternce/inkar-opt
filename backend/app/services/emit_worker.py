@@ -3186,7 +3186,8 @@ def _recalculate_percentiles_for_emit_rows(
         source_price_list_ids=scoped_ids if scope_to_price_list_ids else None,
     )
     summaries = dict(result.get("summaries") or {})
-    target_format_ids = [int(item) for item in result.get("target_price_format_ids") or target_format_ids]
+    if "target_price_format_ids" in result:
+        target_format_ids = [int(item) for item in result.get("target_price_format_ids") or []]
     mark_percentile_preparation_ready_for_catalog(
         db=db,
         price_format_ids=target_format_ids,

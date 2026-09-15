@@ -14,6 +14,10 @@ from ..models import (
     RegularCompetitorPricePercentileSourceSummary,
 )
 from ..timezone import now_kz_naive
+from .emit_percentile_resolver import (
+    global_emit_percentile_base_stmt,
+    is_global_emit_percentile_storage_price_format,
+)
 
 
 def _ids(values: Iterable[int | None]) -> list[int]:
@@ -84,36 +88,46 @@ def backfill_price_list_item_counters(*, db: Session, batch_size: int = 500) -> 
 
 
 def live_emit_percentile_source_summary_rows(*, db: Session, price_format_id: int | None = None) -> list[dict]:
+    base_stmt = None
+    if price_format_id is not None and not is_global_emit_percentile_storage_price_format(int(price_format_id)):
+        base_stmt = global_emit_percentile_base_stmt(
+            db=db,
+            target_price_format_id=int(price_format_id),
+            require_value=False,
+        )
+        if base_stmt is not None and int(db.scalar(select(func.count()).select_from(base_stmt.subquery())) or 0) <= 0:
+            base_stmt = None
+    percentile_rows = base_stmt.subquery() if base_stmt is not None else CompetitorPricePercentile
     stmt = (
         select(
-            CompetitorPricePercentile.price_format_id,
-            CompetitorPricePercentile.source_type,
-            CompetitorPricePercentile.source_key,
-            CompetitorPricePercentile.competitor_price_list_id,
-            CompetitorPricePercentile.branch_name,
-            CompetitorPricePercentile.competitor_name,
-            CompetitorPricePercentile.percentile_scope,
-            CompetitorPricePercentile.percentile,
-            func.count(func.distinct(CompetitorPricePercentile.product_id)).label("sku_count"),
-            func.sum(CompetitorPricePercentile.source_count).label("source_count"),
-            func.max(CompetitorPricePercentile.updated_at).label("generated_at"),
+            percentile_rows.c.price_format_id if base_stmt is not None else CompetitorPricePercentile.price_format_id,
+            percentile_rows.c.source_type if base_stmt is not None else CompetitorPricePercentile.source_type,
+            percentile_rows.c.source_key if base_stmt is not None else CompetitorPricePercentile.source_key,
+            percentile_rows.c.competitor_price_list_id if base_stmt is not None else CompetitorPricePercentile.competitor_price_list_id,
+            percentile_rows.c.branch_name if base_stmt is not None else CompetitorPricePercentile.branch_name,
+            percentile_rows.c.competitor_name if base_stmt is not None else CompetitorPricePercentile.competitor_name,
+            percentile_rows.c.percentile_scope if base_stmt is not None else CompetitorPricePercentile.percentile_scope,
+            percentile_rows.c.percentile if base_stmt is not None else CompetitorPricePercentile.percentile,
+            func.count(func.distinct(percentile_rows.c.product_id if base_stmt is not None else CompetitorPricePercentile.product_id)).label("sku_count"),
+            func.sum(percentile_rows.c.source_count if base_stmt is not None else CompetitorPricePercentile.source_count).label("source_count"),
+            func.max(percentile_rows.c.updated_at if base_stmt is not None else CompetitorPricePercentile.updated_at).label("generated_at"),
         )
         .group_by(
-            CompetitorPricePercentile.price_format_id,
-            CompetitorPricePercentile.source_type,
-            CompetitorPricePercentile.source_key,
-            CompetitorPricePercentile.competitor_price_list_id,
-            CompetitorPricePercentile.branch_name,
-            CompetitorPricePercentile.competitor_name,
-            CompetitorPricePercentile.percentile_scope,
-            CompetitorPricePercentile.percentile,
+            percentile_rows.c.price_format_id if base_stmt is not None else CompetitorPricePercentile.price_format_id,
+            percentile_rows.c.source_type if base_stmt is not None else CompetitorPricePercentile.source_type,
+            percentile_rows.c.source_key if base_stmt is not None else CompetitorPricePercentile.source_key,
+            percentile_rows.c.competitor_price_list_id if base_stmt is not None else CompetitorPricePercentile.competitor_price_list_id,
+            percentile_rows.c.branch_name if base_stmt is not None else CompetitorPricePercentile.branch_name,
+            percentile_rows.c.competitor_name if base_stmt is not None else CompetitorPricePercentile.competitor_name,
+            percentile_rows.c.percentile_scope if base_stmt is not None else CompetitorPricePercentile.percentile_scope,
+            percentile_rows.c.percentile if base_stmt is not None else CompetitorPricePercentile.percentile,
         )
     )
-    if price_format_id is not None:
+    if price_format_id is not None and base_stmt is None:
         stmt = stmt.where(CompetitorPricePercentile.price_format_id == int(price_format_id))
     return [
         {
-            "price_format_id": int(row.price_format_id),
+            "price_format_id": int(price_format_id if base_stmt is not None and price_format_id is not None else row.price_format_id),
             "source_type": row.source_type or "",
             "source_key": row.source_key or "",
             "competitor_price_list_id": int(row.competitor_price_list_id) if row.competitor_price_list_id is not None else None,

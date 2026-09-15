@@ -29,6 +29,7 @@ from ...models import (
     UniversalListPriceFormat,
 )
 from ..competitor_assignments import get_assigned_competitor_price_lists
+from ..emit_percentile_resolver import global_emit_percentile_base_stmt
 from ...timezone import now_kz_naive
 
 
@@ -273,25 +274,29 @@ def _reference_versions_snapshot(db: Session, branch_id: str) -> dict:
 
 
 def _percentile_snapshot(db: Session, pf: PriceFormat) -> dict:
-    rows = (
-        db.execute(
-            select(
-                CompetitorPricePercentile.branch_name,
-                CompetitorPricePercentile.competitor_name,
-                CompetitorPricePercentile.percentile,
-                func.count(CompetitorPricePercentile.id),
-                func.max(CompetitorPricePercentile.updated_at),
+    base_stmt = global_emit_percentile_base_stmt(db=db, target_price_format_id=int(pf.id), require_value=False)
+    if base_stmt is None:
+        rows = []
+    else:
+        pct_rows = base_stmt.subquery()
+        rows = (
+            db.execute(
+                select(
+                    pct_rows.c.branch_name,
+                    pct_rows.c.competitor_name,
+                    pct_rows.c.percentile,
+                    func.count(pct_rows.c.id),
+                    func.max(pct_rows.c.updated_at),
+                )
+                .group_by(
+                    pct_rows.c.branch_name,
+                    pct_rows.c.competitor_name,
+                    pct_rows.c.percentile,
+                )
+                .order_by(pct_rows.c.branch_name.asc(), pct_rows.c.competitor_name.asc())
             )
-            .where(CompetitorPricePercentile.price_format_id == pf.id)
-            .group_by(
-                CompetitorPricePercentile.branch_name,
-                CompetitorPricePercentile.competitor_name,
-                CompetitorPricePercentile.percentile,
-            )
-            .order_by(CompetitorPricePercentile.branch_name.asc(), CompetitorPricePercentile.competitor_name.asc())
+            .all()
         )
-        .all()
-    )
     return {
         "mode": pf.competitor_price_mode,
         "defaultPercentile": pf.percentile_number,

@@ -51,6 +51,7 @@ from backend.app.services.competitor_read_models import (
     refresh_price_list_item_counters,
     refresh_regular_percentile_source_summaries,
 )
+from backend.app.services.emit_percentile_resolver import GLOBAL_EMIT_PERCENTILE_STORAGE_PRICE_FORMAT_ID, load_global_emit_percentile_rows
 
 
 def _session_factory_static():
@@ -152,6 +153,227 @@ def _regular_percentile_config_name(pf_id: int, competitor_identity: str, compet
         percentile=pct,
     )
     return f"percentile:{source_id}"
+
+
+def _global_emit_fixture(db):
+    canonical = PriceFormat(id=GLOBAL_EMIT_PERCENTILE_STORAGE_PRICE_FORMAT_ID, code="PF4", name="PF4", branch="Aktau")
+    target = PriceFormat(id=27, code="PF27", name="PF27", branch="Aktau", competitor_price_mode="percentile", percentile_number=40)
+    other = PriceFormat(id=28, code="PF28", name="PF28", branch="Aktau", competitor_price_mode="percentile", percentile_number=40)
+    product = Product(code="SKU-GLOBAL", name="Global Emit Product", provisor_goods_id=1106001, cost=100)
+    db.add_all([canonical, target, other, product])
+    db.flush()
+    price_list = CompetitorPriceList(
+        price_format_id=None,
+        source_type="provisor",
+        source_key="emit:1106",
+        display_name="Emit International 1106",
+        supplier="Emit International 1106",
+        branch_name="Emit International 1106",
+        competitor_name="Emit International 1106",
+        branch_id="1106",
+        external_price_list_id="1106",
+    )
+    db.add(price_list)
+    db.flush()
+    _assign(db, target, price_list, active=True, percentile_mode=MULTI_PRICE_PERCENTILE_MODE)
+    db.add(
+        CompetitorPrice(
+            price_format_id=target.id,
+            product_id=None,
+            source_name=_emit_percentile_config_name(
+                int(target.id),
+                "emit:1106",
+                "Emit International 1106",
+                "Emit International 1106",
+                40,
+            ),
+            supplier="Emit International 1106 P40",
+            coefficient=1.0,
+        )
+    )
+    for pct, value in [(10, 90), (20, 95), (30, 100), (40, 110), (60, 125)]:
+        db.add(
+            CompetitorPricePercentile(
+                price_format_id=canonical.id,
+                product_id=product.id,
+                competitor_price_list_id=price_list.id,
+                source_type="provisor",
+                source_key="emit:1106",
+                branch_name="Emit International 1106",
+                competitor_name="Emit International 1106",
+                percentile_scope="regional",
+                percentile=pct,
+                value=value,
+                source_count=7,
+                price_count=7,
+                used_price_count=7,
+                status="Calculated",
+            )
+        )
+    db.commit()
+    return canonical, target, other, product, price_list
+
+
+def test_global_emit_resolver_reads_pf4_rows_for_assigned_target_without_fanout():
+    db = _session()
+    _canonical, target, other, product, _price_list = _global_emit_fixture(db)
+
+    assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == target.id).count() == 0
+
+    cache = load_percentile_price_cache(db, int(target.id))
+    resolved = resolve_percentile_prices_from_cache(cache, int(product.id), percentile_number=40)
+
+    assert [(float(price), source) for price, source in resolved.prices] == [
+        (
+            110.0,
+            _emit_percentile_config_name(
+                int(target.id),
+                "emit:1106",
+                "Emit International 1106",
+                "Emit International 1106",
+                40,
+            ),
+        )
+    ]
+    assert load_percentile_price_cache(db, int(other.id)) == {}
+
+
+def test_global_emit_resolver_regional_rows_require_branch_and_competitor_with_source_key():
+    db = _session()
+    canonical, target, other, product, price_list = _global_emit_fixture(db)
+
+    def add_row(*, source_key: str | None, branch: str, competitor: str, scope: str, value: int) -> None:
+        db.add(
+            CompetitorPricePercentile(
+                price_format_id=canonical.id,
+                product_id=product.id,
+                competitor_price_list_id=price_list.id,
+                source_type="provisor",
+                source_key=source_key,
+                branch_name=branch,
+                competitor_name=competitor,
+                percentile_scope=scope,
+                percentile=40,
+                value=value,
+                source_count=1,
+                price_count=1,
+                used_price_count=1,
+                status="Calculated",
+            )
+        )
+
+    add_row(
+        source_key="emit:1106",
+        branch="Wrong Branch",
+        competitor="Emit International 1106",
+        scope="regional",
+        value=777,
+    )
+    add_row(
+        source_key="emit:1106",
+        branch="Emit International 1106",
+        competitor="Wrong Competitor",
+        scope="regional",
+        value=888,
+    )
+    add_row(
+        source_key="emit:1106",
+        branch="Wrong Branch",
+        competitor="Wrong Competitor",
+        scope="regional",
+        value=666,
+    )
+    add_row(
+        source_key="emit:1108",
+        branch="Emit International 1108",
+        competitor="Emit International 1108",
+        scope="regional",
+        value=999,
+    )
+    add_row(
+        source_key="",
+        branch="Emit International 1106",
+        competitor="Emit International 1106",
+        scope="regional",
+        value=115,
+    )
+    add_row(
+        source_key="emit:1106",
+        branch="Kazakhstan",
+        competitor="Emit International 1106",
+        scope="kazakhstan",
+        value=333,
+    )
+    db.commit()
+
+    rows = load_global_emit_percentile_rows(db=db, target_price_format_id=int(target.id), require_value=True)
+    regional_values = sorted(
+        int(row.value)
+        for row in rows
+        if row.percentile_scope == "regional"
+        and row.branch_name == "Emit International 1106"
+        and row.competitor_name == "Emit International 1106"
+    )
+    leaked_values = {
+        int(row.value)
+        for row in rows
+        if row.percentile_scope == "regional"
+        and (row.branch_name != "Emit International 1106" or row.competitor_name != "Emit International 1106")
+    }
+    kazakhstan_values = [
+        int(row.value)
+        for row in rows
+        if row.percentile_scope == "kazakhstan"
+    ]
+
+    assert regional_values == [90, 95, 100, 110, 115, 125]
+    assert leaked_values == set()
+    assert kazakhstan_values == [333]
+    assert load_global_emit_percentile_rows(db=db, target_price_format_id=int(other.id), require_value=True) == []
+
+
+def test_global_emit_read_models_use_target_pf_ids_and_do_not_leak_unassigned_sources():
+    db = _session()
+    _canonical, target, other, _product, _price_list = _global_emit_fixture(db)
+
+    sources = list_percentile_sources(db=db, price_format_code=str(target.code), percentile_source=PERCENTILE_SOURCE_EMIT)
+    source_ids = {row["id"] for row in sources}
+    assert _emit_percentile_config_name(
+        int(target.id),
+        "emit:1106",
+        "Emit International 1106",
+        "Emit International 1106",
+        40,
+    ).removeprefix("percentile:") in source_ids
+    assert {row["priceFormatId"] for row in sources} == {int(target.id)}
+    assert list_percentile_sources(db=db, price_format_code=str(other.code), percentile_source=PERCENTILE_SOURCE_EMIT) == []
+
+    rows = list_percentile_product_rows(
+        db=db,
+        price_format_code=str(target.code),
+        region="Emit International 1106",
+        competitor="Emit International 1106",
+        source_key="emit:1106",
+        percentile_source=PERCENTILE_SOURCE_EMIT,
+    )
+    assert rows["summary"]["productsWithPercentile"] == 1
+    assert rows["items"][0]["percentiles"]["40"] == 110.0
+
+
+def test_global_emit_percentile_preparation_counts_pf4_rows_for_target():
+    db = _session()
+    _canonical, target, _other, _product, _price_list = _global_emit_fixture(db)
+
+    ready = mark_percentile_preparation_ready_for_catalog(
+        db=db,
+        price_format_ids=[int(target.id)],
+        reason="global_emit_resolver_test",
+    )
+    status = percentile_preparation_to_dict(db, int(target.id))
+
+    assert ready == 1
+    assert status["status"] == "ready"
+    assert status["rowsCount"] == 5
 
 
 def _emit_percentile_config_name(pf_id: int, source_key: str, region: str, competitor: str, pct: int = 10) -> str:
@@ -1234,7 +1456,7 @@ def test_postgresql_emit_fanout_multi_target_validates_total_and_per_target_coun
         )
 
 
-def test_global_emit_percentile_postgresql_dispatch_uses_multi_target_fanout(monkeypatch):
+def test_global_emit_percentile_postgresql_dispatch_skips_physical_fanout_in_global_mode(monkeypatch):
     class FakeDb:
         class Bind:
             class Dialect:
@@ -1248,6 +1470,7 @@ def test_global_emit_percentile_postgresql_dispatch_uses_multi_target_fanout(mon
             return PriceFormat(id=item_id, code=f"PF-{item_id}", name=f"PF-{item_id}", branch="Aktau")
 
     multi_calls = []
+    single_calls = []
 
     monkeypatch.setattr(competitor_percentiles_module, "_all_price_format_ids", lambda db, target_price_format_ids=None: [4, 5, 6])
     monkeypatch.setattr(
@@ -1264,6 +1487,11 @@ def test_global_emit_percentile_postgresql_dispatch_uses_multi_target_fanout(mon
         competitor_percentiles_module,
         "_selected_source_rows",
         lambda **kwargs: [{"price_list_id": 101, "branch_name": "Aktau", "competitor_name": "Emit", "source_key": "emit:1106"}],
+    )
+    monkeypatch.setattr(
+        competitor_percentiles_module,
+        "_authorized_emit_target_price_format_ids",
+        lambda **kwargs: [5, 6],
     )
 
     def fake_multi(**kwargs):
@@ -1284,7 +1512,85 @@ def test_global_emit_percentile_postgresql_dispatch_uses_multi_target_fanout(mon
     monkeypatch.setattr(
         competitor_percentiles_module,
         "fanout_emit_percentiles_from_price_format",
-        lambda **kwargs: pytest.fail("single-target fanout should not run for PostgreSQL global Emit fanout"),
+        lambda **kwargs: single_calls.append(kwargs),
+    )
+
+    result = recalculate_emit_percentiles_globally(db=FakeDb(), source_price_list_ids=[101])
+
+    assert multi_calls == []
+    assert single_calls == []
+    assert result["compatibility_rows_created"] == 0
+    assert result["physical_fanout_target_count"] == 0
+    assert result["physical_fanout_target_ids"] == []
+    assert result["global_reuse_target_count"] == 2
+    assert result["global_reuse_target_ids"] == [5, 6]
+    assert result["shared_result_reuse_count"] == 2
+    assert result["percentile_rows_calculated"] == 4
+    assert result["canonical_rows_persisted"] == 4
+    assert result["percentile_rows_persisted"] == 4
+    assert result["cache_or_reuse_strategy"] == "global_emit_canonical_storage"
+    assert result["summaries"]["PF-5"]["compatibility_rows_created"] == 0
+    assert result["summaries"]["PF-5"]["canonical_rows_available"] == 4
+    assert result["summaries"]["PF-6"]["engine"] == "global_emit_canonical_storage"
+
+
+def test_global_emit_percentile_postgresql_dispatch_can_use_multi_target_fanout_when_global_mode_disabled(monkeypatch):
+    class FakeDb:
+        class Bind:
+            class Dialect:
+                name = "postgresql"
+            dialect = Dialect()
+
+        def get_bind(self):
+            return self.Bind()
+
+        def get(self, model, item_id):
+            return PriceFormat(id=item_id, code=f"PF-{item_id}", name=f"PF-{item_id}", branch="Aktau")
+
+    multi_calls = []
+
+    monkeypatch.setenv("GLOBAL_EMIT_PERCENTILES", "false")
+    monkeypatch.setattr(competitor_percentiles_module, "_all_price_format_ids", lambda db, target_price_format_ids=None: [4, 5, 6])
+    monkeypatch.setattr(
+        competitor_percentiles_module,
+        "recalculate_competitor_percentiles",
+        lambda **kwargs: {
+            "rows_created": 4,
+            "raw_price_rows": 10,
+            "products_processed": 2,
+            "products_with_competitors": 2,
+        },
+    )
+    monkeypatch.setattr(
+        competitor_percentiles_module,
+        "_selected_source_rows",
+        lambda **kwargs: [{"price_list_id": 101, "branch_name": "Aktau", "competitor_name": "Emit", "source_key": "emit:1106"}],
+    )
+    monkeypatch.setattr(
+        competitor_percentiles_module,
+        "_authorized_emit_target_price_format_ids",
+        lambda **kwargs: [5, 6],
+    )
+
+    def fake_multi(**kwargs):
+        multi_calls.append(kwargs)
+        return {
+            "engine": "fanout_postgresql_multi_target",
+            "target_price_format_ids": [5, 6],
+            "canonical_rows": 4,
+            "products_processed": 2,
+            "products_with_competitors": 2,
+            "products_without_competitors": 0,
+            "rows_before_by_target": {5: 1, 6: 1},
+            "rows_deleted_by_target": {5: 1, 6: 1},
+            "execution_time_seconds": 1.25,
+        }
+
+    monkeypatch.setattr(competitor_percentiles_module, "_fanout_emit_percentiles_postgresql_multi_target", fake_multi)
+    monkeypatch.setattr(
+        competitor_percentiles_module,
+        "fanout_emit_percentiles_from_price_format",
+        lambda **kwargs: pytest.fail("single-target fanout should not run for PostgreSQL global Emit fanout rollback mode"),
     )
 
     result = recalculate_emit_percentiles_globally(db=FakeDb(), source_price_list_ids=[101])
@@ -1313,7 +1619,18 @@ def test_global_emit_percentile_non_postgresql_keeps_single_target_fallback(monk
 
     single_calls = []
 
+    monkeypatch.setenv("GLOBAL_EMIT_PERCENTILES", "false")
     monkeypatch.setattr(competitor_percentiles_module, "_all_price_format_ids", lambda db, target_price_format_ids=None: [4, 5, 6])
+    monkeypatch.setattr(
+        competitor_percentiles_module,
+        "_selected_source_rows",
+        lambda **kwargs: [{"price_list_id": 101, "branch_name": "Aktau", "competitor_name": "Emit", "source_key": "emit:1106"}],
+    )
+    monkeypatch.setattr(
+        competitor_percentiles_module,
+        "_authorized_emit_target_price_format_ids",
+        lambda **kwargs: [5, 6],
+    )
     monkeypatch.setattr(
         competitor_percentiles_module,
         "recalculate_competitor_percentiles",
@@ -1601,7 +1918,7 @@ def test_emit_assignment_availability_uses_global_catalog_without_physical_assig
     assert inactive[0]["pricingEligibilityReason"] == ""
 
 
-def test_emit_percentile_rebuild_materializes_global_catalog_for_all_formats_without_assignments():
+def test_emit_percentile_rebuild_materializes_global_catalog_for_assigned_formats_without_copies():
     db = _session()
     pf_a = _format(db, code="EMIT-A")
     pf_b = _format(db, code="EMIT-B")
@@ -1616,6 +1933,17 @@ def test_emit_percentile_rebuild_materializes_global_catalog_for_all_formats_wit
     )
     price_list.source_type = "emit"
     price_list.price_format_id = None
+    db.add_all(
+        [
+            PriceFormatCompetitorAssignment(
+                price_format_id=pf.id,
+                competitor_price_list_id=price_list.id,
+                is_active=True,
+                percentile_mode=MULTI_PRICE_PERCENTILE_MODE,
+            )
+            for pf in (pf_a, pf_b)
+        ]
+    )
     db.add_all(
         [
             CompetitorPriceListItem(
@@ -1641,6 +1969,10 @@ def test_emit_percentile_rebuild_materializes_global_catalog_for_all_formats_wit
     db.commit()
 
     assert sorted(result["target_price_format_ids"]) == sorted([pf_a.id, pf_b.id])
+    assert result["compatibility_rows_created"] == 0
+    assert result["physical_fanout_target_count"] == 0
+    assert result["global_reuse_target_count"] == 2
+    assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id.in_([pf_a.id, pf_b.id])).count() == 0
     for pf in (pf_a, pf_b):
         sources = list_percentile_sources(db=db, price_format_code=pf.code, percentile_source=PERCENTILE_SOURCE_EMIT)
         assert {row["percentile"] for row in sources} == {10, 20, 30, 40, 60}

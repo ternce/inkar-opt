@@ -32,6 +32,7 @@ from .competitor_source_config import (
     default_percentile_mode_for_source,
     effective_percentile_mode,
 )
+from .emit_percentile_resolver import global_emit_percentile_storage_price_format_id
 from .competitors.identity import (
     canonical_regular_competitor_identity,
     normalize_regular_competitor_text,
@@ -55,6 +56,19 @@ STATUS_NO_DATA = "No data"
 DEFAULT_TRACE_SKU = "163571"
 REGULAR_PERCENTILE_ALGORITHM_VERSION = "percentile_inc_v1"
 INACTIVE_REFRESH_STATUSES = {"failed", "error", "stale"}
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().casefold() in {"1", "true", "yes", "y", "on"}
+
+
+def global_emit_percentiles_enabled() -> bool:
+    """Use PF4 canonical Emit rows directly instead of physical per-format fanout."""
+
+    return _env_flag("GLOBAL_EMIT_PERCENTILES", True)
 
 
 def _as_decimal(value: object) -> Decimal | None:
@@ -350,6 +364,27 @@ def _all_price_format_ids(db: Session, target_price_format_ids: list[int] | None
     return [int(item) for item in db.execute(stmt).scalars().all()]
 
 
+def _authorized_emit_target_price_format_ids(
+    *,
+    db: Session,
+    selected_sources: list[dict[str, Any]],
+    target_price_format_ids: list[int],
+) -> list[int]:
+    price_list_ids = sorted({int(row["price_list_id"]) for row in selected_sources if int(row.get("price_list_id") or 0) > 0})
+    if not price_list_ids:
+        return []
+    target_ids = sorted({int(item) for item in target_price_format_ids if int(item) > 0})
+    stmt = (
+        select(PriceFormatCompetitorAssignment.price_format_id)
+        .where(PriceFormatCompetitorAssignment.competitor_price_list_id.in_(price_list_ids))
+        .where(PriceFormatCompetitorAssignment.is_active.is_(True))
+        .order_by(PriceFormatCompetitorAssignment.price_format_id.asc())
+    )
+    if target_ids:
+        stmt = stmt.where(PriceFormatCompetitorAssignment.price_format_id.in_(target_ids))
+    return sorted({int(item) for item in db.execute(stmt).scalars().all() if item is not None})
+
+
 def recalculate_emit_percentiles_globally(
     *,
     db: Session,
@@ -386,7 +421,7 @@ def recalculate_emit_percentiles_globally(
             "percentile_total_elapsed": round(time.perf_counter() - started_at, 3),
         }
 
-    canonical_price_format_id = target_ids[0]
+    canonical_price_format_id = global_emit_percentile_storage_price_format_id()
     calculation_started = time.perf_counter()
     logger.info(
         "[EMIT_PERCENTILE_GLOBAL_CALC_START] source_price_list_ids=%s canonical_price_format_id=%s",
@@ -403,11 +438,12 @@ def recalculate_emit_percentiles_globally(
     canonical_summary["percentile_total_elapsed"] = calculation_elapsed
     canonical_summary["percentile_rebuild_scope"] = "emit_global_catalog"
     canonical_summary["cache_or_reuse_strategy"] = "global_emit_canonical_calculation"
-    canonical_pf = db.get(PriceFormat, canonical_price_format_id)
-    summaries[str((canonical_pf.code if canonical_pf is not None else None) or canonical_price_format_id)] = {
-        "price_format_id": canonical_price_format_id,
-        **canonical_summary,
-    }
+    if canonical_price_format_id in target_ids:
+        canonical_pf = db.get(PriceFormat, canonical_price_format_id)
+        summaries[str((canonical_pf.code if canonical_pf is not None else None) or canonical_price_format_id)] = {
+            "price_format_id": canonical_price_format_id,
+            **canonical_summary,
+        }
     logger.info(
         "[EMIT_PERCENTILE_GLOBAL_CALC_COMPLETE] source_price_list_ids=%s canonical_price_format_id=%s "
         "raw_rows=%s products=%s rows_created=%s duration_sec=%s",
@@ -421,20 +457,92 @@ def recalculate_emit_percentiles_globally(
 
     fanout_started = time.perf_counter()
     fanout_targets = [price_format_id for price_format_id in target_ids if price_format_id != canonical_price_format_id]
+    selected_sources = _selected_source_rows(
+        db=db,
+        price_format_id=canonical_price_format_id,
+        source_price_list_ids=scoped_ids,
+        require_assignment=False,
+    )
+    authorized_target_ids = _authorized_emit_target_price_format_ids(
+        db=db,
+        selected_sources=selected_sources,
+        target_price_format_ids=target_ids,
+    )
+    ready_target_ids = sorted({*authorized_target_ids, *([canonical_price_format_id] if canonical_price_format_id in target_ids else [])})
+    canonical_rows_created = int(canonical_summary.get("rows_created") or 0)
+    if global_emit_percentiles_enabled():
+        reuse_targets = [price_format_id for price_format_id in authorized_target_ids if price_format_id != canonical_price_format_id]
+        for price_format_id in reuse_targets:
+            pf = db.get(PriceFormat, int(price_format_id))
+            if pf is None:
+                continue
+            summaries[str(pf.code or price_format_id)] = {
+                "price_format_id": int(price_format_id),
+                "products_processed": int(canonical_summary.get("products_processed") or 0),
+                "products_with_competitors": int(canonical_summary.get("products_with_competitors") or 0),
+                "products_without_competitors": int(canonical_summary.get("products_without_competitors") or 0),
+                "rows_created": 0,
+                "rows_updated": 0,
+                "rows_skipped": 0,
+                "rows_deleted": 0,
+                "execution_time_seconds": 0.0,
+                "engine": "global_emit_canonical_storage",
+                "source_price_format_id": canonical_price_format_id,
+                "canonical_rows_available": canonical_rows_created,
+                "compatibility_rows_created": 0,
+                "physical_fanout_target_count": 0,
+                "global_reuse_target_count": len(reuse_targets),
+                "percentile_total_elapsed": 0.0,
+                "percentile_rebuild_scope": "emit_global_catalog",
+                "cache_or_reuse_strategy": "global_emit_canonical_storage",
+            }
+        logger.info(
+            "[EMIT_PERCENTILE_GLOBAL_REUSE_READY] source_price_format_id=%s global_reuse_target_count=%s "
+            "physical_fanout_target_count=%s canonical_rows=%s compatibility_rows_created=%s",
+            canonical_price_format_id,
+            len(reuse_targets),
+            0,
+            canonical_rows_created,
+            0,
+        )
+        return {
+            "summaries": summaries,
+            "warnings": [],
+            "assigned_price_format_ids": ready_target_ids,
+            "target_price_format_ids": ready_target_ids,
+            "assignment_propagation": {},
+            "percentile_rebuild_scope": "emit_global_catalog",
+            "competitor_price_list_id": scoped_ids[0] if len(scoped_ids) == 1 else None,
+            "competitor_price_list_ids": scoped_ids,
+            "expensive_calculation_count": 1,
+            "shared_result_reuse_count": len(reuse_targets),
+            "raw_price_rows_scanned": int(canonical_summary.get("raw_price_rows") or 0),
+            "matched_product_count": int(canonical_summary.get("products_with_competitors") or 0),
+            "percentile_rows_calculated": canonical_rows_created,
+            "canonical_rows_calculated": canonical_rows_created,
+            "canonical_rows_persisted": canonical_rows_created,
+            "percentile_rows_persisted": canonical_rows_created,
+            "compatibility_rows_created": 0,
+            "physical_fanout_target_count": 0,
+            "physical_fanout_target_ids": [],
+            "global_reuse_target_count": len(reuse_targets),
+            "global_reuse_target_ids": reuse_targets,
+            "calculation_elapsed": calculation_elapsed,
+            "persistence_elapsed": 0.0,
+            "total_percentile_elapsed": round(time.perf_counter() - started_at, 3),
+            "cache_or_reuse_strategy": "global_emit_canonical_storage",
+            "skipped_duplicate_rebuilds": len(reuse_targets),
+            "canonical_price_format_id": canonical_price_format_id,
+            "percentile_total_elapsed": round(time.perf_counter() - started_at, 3),
+        }
     logger.info(
         "[EMIT_PERCENTILE_COMPAT_FANOUT_START] source_price_format_id=%s target_price_format_count=%s",
         canonical_price_format_id,
         len(fanout_targets),
     )
-    compatibility_rows_created = int(canonical_summary.get("rows_created") or 0)
+    compatibility_rows_created = canonical_rows_created
     persistence_elapsed = 0.0
     if fanout_targets and (db.get_bind().dialect.name or "").lower() == "postgresql":
-        selected_sources = _selected_source_rows(
-            db=db,
-            price_format_id=canonical_price_format_id,
-            source_price_list_ids=scoped_ids,
-            require_assignment=False,
-        )
         multi_summary = _fanout_emit_percentiles_postgresql_multi_target(
             db=db,
             source_price_format_id=canonical_price_format_id,

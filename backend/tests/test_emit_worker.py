@@ -63,6 +63,7 @@ from backend.app.services.competitor_assignments import (
     propagate_emit_assignments_to_price_formats,
 )
 from backend.app.services.competitors.percentiles.read_models import list_percentile_product_rows, list_percentile_sources
+from backend.app.services.emit_percentile_resolver import load_global_emit_percentile_rows
 from backend.app.services import provisor_auto_refresh as refresh_svc
 from backend.app.services.price_sources import UnifiedPriceItem, UnifiedPriceList
 
@@ -1333,9 +1334,13 @@ def test_emit_percentile_rebuild_explicit_format_does_not_create_assignment(tmp_
         .where(PriceFormatCompetitorAssignment.competitor_price_list_id == row.id)
     ).scalars().one_or_none()
     assert assignment is None
-    assert result["assigned_price_format_ids"] == [pf.id]
-    assert set(result["summaries"]) == {"888"}
+    assert result["assigned_price_format_ids"] == []
+    assert set(result["summaries"]) == set()
+    assert result["compatibility_rows_created"] == 0
+    assert result["global_reuse_target_count"] == 0
     assert result["warnings"] == []
+    assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == 4).count() > 0
+    assert load_global_emit_percentile_rows(db=db, target_price_format_id=pf.id, require_value=True) == []
 
 
 def test_emit_percentile_rebuild_without_assignment_materializes_global_catalog(tmp_path):
@@ -1374,12 +1379,15 @@ def test_emit_percentile_rebuild_without_assignment_materializes_global_catalog(
         .where(PriceFormatCompetitorAssignment.competitor_price_list_id == row.id)
     ).scalars().one_or_none()
     assert assignment is None
-    assert result["assigned_price_format_ids"] == [pf.id]
-    assert set(result["summaries"]) == {"003"}
+    assert result["assigned_price_format_ids"] == []
+    assert set(result["summaries"]) == set()
+    assert result["compatibility_rows_created"] == 0
+    assert result["global_reuse_target_count"] == 0
     assert result["warnings"] == []
     sources = list_percentile_sources(db=db, price_format_code="003")
-    assert {source["region"] for source in sources if source["scope"] == "regional"} == {"Emit International 1108"}
-    assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == pf.id).count() > 0
+    assert sources == []
+    assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == pf.id).count() == 0
+    assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == 4).count() > 0
 
 
 def test_scheduled_emit_percentile_rebuild_scopes_each_refreshed_region():
@@ -1567,9 +1575,12 @@ def test_emit_percentile_rebuild_calculates_once_then_fans_out_to_all_formats():
     assert summary["raw_price_rows_scanned"] == 3
     assert summary["matched_product_count"] == 1
     assert summary["percentile_rows_calculated"] == 10
-    assert summary["compatibility_rows_created"] == 40
-    assert summary["percentile_rows_persisted"] == 40
-    assert summary["canonical_price_format_id"] == formats[0].id
+    assert summary["canonical_rows_persisted"] == 10
+    assert summary["compatibility_rows_created"] == 0
+    assert summary["percentile_rows_persisted"] == 10
+    assert summary["physical_fanout_target_count"] == 0
+    assert summary["global_reuse_target_count"] == 3
+    assert summary["canonical_price_format_id"] == 4
 
     by_format = {}
     for pf in formats:
@@ -1599,13 +1610,16 @@ def test_emit_percentile_rebuild_calculates_once_then_fans_out_to_all_formats():
         ]
 
     assert set(by_format) == {"PF1", "PF2", "PF3", "PF4"}
-    assert by_format["PF1"] == by_format["PF2"] == by_format["PF3"] == by_format["PF4"]
-    regional = [row for row in by_format["PF1"] if row[0] == "regional"]
+    assert by_format["PF1"] == []
+    assert by_format["PF2"] == []
+    assert by_format["PF3"] == []
+    regional = [row for row in by_format["PF4"] if row[0] == "regional"]
     assert [row[2] for row in regional] == [10, 20, 30, 40, 60]
     assert round(regional[0][3], 3) == 104.0
     assert round(regional[-1][3], 3) == 136.0
     assert {row[4] for row in regional} == {3}
     assert {row[5] for row in regional} == {3}
+    assert len(load_global_emit_percentile_rows(db=db, target_price_format_id=formats[0].id, require_value=True)) == 10
 
     repeated = _recalculate_percentiles_for_emit_rows(
         db,
@@ -1613,7 +1627,7 @@ def test_emit_percentile_rebuild_calculates_once_then_fans_out_to_all_formats():
         scope_to_price_list_ids=True,
     )
     assert repeated["expensive_calculation_count"] == 1
-    assert db.query(CompetitorPricePercentile).count() == 40
+    assert db.query(CompetitorPricePercentile).count() == 10
 
 
 def test_emit_percentile_rebuild_calculates_once_for_one_hundred_formats():
@@ -1640,6 +1654,17 @@ def test_emit_percentile_rebuild_calculates_once_for_one_hundred_formats():
     db.flush()
     db.add_all(
         [
+            PriceFormatCompetitorAssignment(
+                price_format_id=pf.id,
+                competitor_price_list_id=emit_row.id,
+                is_active=True,
+                percentile_mode="multi_price_per_sku",
+            )
+            for pf in formats
+        ]
+    )
+    db.add_all(
+        [
             CompetitorPriceListItem(
                 price_list_id=emit_row.id,
                 product_id=product.id,
@@ -1662,9 +1687,13 @@ def test_emit_percentile_rebuild_calculates_once_for_one_hundred_formats():
 
     assert summary["expensive_calculation_count"] == 1
     assert summary["shared_result_reuse_count"] == 99
-    assert summary["compatibility_rows_created"] == 1000
+    assert summary["compatibility_rows_created"] == 0
+    assert summary["physical_fanout_target_count"] == 0
+    assert summary["global_reuse_target_count"] == 99
     assert summary["percentile_rows_calculated"] == 10
-    assert db.query(CompetitorPricePercentile).count() == 1000
+    assert summary["canonical_rows_persisted"] == 10
+    assert summary["percentile_rows_persisted"] == 10
+    assert db.query(CompetitorPricePercentile).count() == 10
     assert summary["assigned_price_format_ids"] == [pf.id for pf in formats]
 
     first_rows = (
@@ -1687,13 +1716,35 @@ def test_emit_percentile_rebuild_calculates_once_for_one_hundred_formats():
         .scalars()
         .all()
     )
+    canonical_rows = (
+        db.execute(
+            select(CompetitorPricePercentile)
+            .where(CompetitorPricePercentile.price_format_id == 4)
+            .where(CompetitorPricePercentile.product_id == product.id)
+            .order_by(CompetitorPricePercentile.percentile_scope, CompetitorPricePercentile.percentile)
+        )
+        .scalars()
+        .all()
+    )
+    assert first_rows == []
+    assert last_rows == []
     assert [
         (row.percentile_scope, row.source_key, row.percentile, float(row.value) if row.value is not None else None)
-        for row in first_rows
+        for row in canonical_rows
     ] == [
-        (row.percentile_scope, row.source_key, row.percentile, float(row.value) if row.value is not None else None)
-        for row in last_rows
+        ("kazakhstan", "emit:kazakhstan:Emit International 9100", 10, 110.0),
+        ("kazakhstan", "emit:kazakhstan:Emit International 9100", 20, 120.0),
+        ("kazakhstan", "emit:kazakhstan:Emit International 9100", 30, 130.0),
+        ("kazakhstan", "emit:kazakhstan:Emit International 9100", 40, 140.0),
+        ("kazakhstan", "emit:kazakhstan:Emit International 9100", 60, 160.0),
+        ("regional", "emit:9100", 10, 110.0),
+        ("regional", "emit:9100", 20, 120.0),
+        ("regional", "emit:9100", 30, 130.0),
+        ("regional", "emit:9100", 40, 140.0),
+        ("regional", "emit:9100", 60, 160.0),
     ]
+    assert len(load_global_emit_percentile_rows(db=db, target_price_format_id=formats[0].id, require_value=True)) == 10
+    assert len(load_global_emit_percentile_rows(db=db, target_price_format_id=formats[-1].id, require_value=True)) == 10
 
 
 def _seed_emit_region(

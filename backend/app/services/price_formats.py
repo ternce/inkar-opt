@@ -33,6 +33,7 @@ from ..models import (
     VidmanLogicalCompetitor,
 )
 from ..timezone import now_kz_naive
+from .emit_percentile_resolver import is_global_emit_percentile_storage_price_format
 from .references.types import canonical_branch_id
 from .regions import canonical_supported_city_name
 
@@ -365,6 +366,11 @@ def cleanup_price_format_owned_rows(db: Session, price_format_id: int) -> dict[s
         ("universal_list_price_formats", UniversalListPriceFormat),
     )
     for table_name, model in delete_models:
+        if is_global_emit_percentile_storage_price_format(price_format_id) and table_name in {
+            "competitor_price_percentile_source_summaries",
+            "competitor_price_percentiles",
+        }:
+            continue
         result = db.execute(delete(model).where(model.price_format_id == price_format_id))
         if result.rowcount:
             deleted[table_name] = int(result.rowcount)

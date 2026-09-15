@@ -140,6 +140,7 @@ from .services.competitor_assignments import (
 )
 from .services.competitor_coefficients import effective_price_coefficient, validate_price_coefficient
 from .services.percentile_export import load_percentile_export_price_cells
+from .services.emit_percentile_resolver import global_emit_percentile_rows_count
 from .services.sap_export import (
     SAP_MEDIA_TYPE,
     SapExportError,
@@ -10784,6 +10785,12 @@ def _run_generate_price_job_sync(db: Session, job: Job, *, price_format_id: int,
             ).scalar_one()
             or 0
         )
+        if competitor_prices_loaded <= 0:
+            competitor_prices_loaded = global_emit_percentile_rows_count(
+                db=db,
+                target_price_format_id=price_format_id,
+                require_value=True,
+            )
         logger.info("[GENERATE] percentile_rows_loaded=%s", competitor_prices_loaded)
     coverage_values = [float(row.get("coverage") or row.get("matchRate") or 0) for row in summary.values() if isinstance(row, dict)]
     coverage = round(sum(coverage_values) / len(coverage_values), 2) if coverage_values else 0
