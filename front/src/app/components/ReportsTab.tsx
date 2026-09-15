@@ -97,6 +97,14 @@ const requestBody = (branchFilter: string, contexts: AppliedContext[], q: string
   limit,
 });
 
+const contextId = (item: ReportContextOption) => String(item.priceFormat.id);
+
+const contextBaseLabel = (item: ReportContextOption) => {
+  const category = String(item.priceFormat.sapCategory || '').trim();
+  if (category) return /^кат(?:\s|\.|$)/iu.test(category) ? category : `Кат ${category}`;
+  return item.priceFormat.name || item.priceFormat.code;
+};
+
 const downloadNameFromDisposition = (value: string | null, fallback: string) => {
   if (!value) return fallback;
   const match = value.match(/filename\*=UTF-8''([^;]+)/i);
@@ -110,9 +118,11 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
   const [selectedFormatIds, setSelectedFormatIds] = useState<string[]>([]);
   const [priceListByFormat, setPriceListByFormat] = useState<Record<string, string>>({});
   const [appliedContexts, setAppliedContexts] = useState<AppliedContext[]>([]);
+  const [contextsBranch, setContextsBranch] = useState('');
   const [payload, setPayload] = useState<ReportPayload | null>(null);
   const [q, setQ] = useState('');
   const [page, setPage] = useState(1);
+  const [isLoadingContexts, setIsLoadingContexts] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [error, setError] = useState('');
@@ -125,6 +135,8 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
 
   const availableContextOptions = useMemo(() => contextOptions.filter((item) => item.priceLists.length > 0), [contextOptions]);
 
+  const availableContextIds = useMemo(() => new Set(availableContextOptions.map(contextId)), [availableContextOptions]);
+
   const selectedContexts = useMemo(
     () =>
       selectedFormatIds
@@ -136,21 +148,68 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
     [priceListByFormat, selectedFormatIds]
   );
 
+  const contextsReady = useMemo(
+    () => contextsBranch === branchFilter && appliedContexts.every((item) => availableContextIds.has(String(item.priceFormatId))),
+    [appliedContexts, availableContextIds, branchFilter, contextsBranch]
+  );
+
+  const quickContextLabels = useMemo(() => {
+    const labels = new Map<string, string>();
+    const baseLabels = availableContextOptions.map((item) => [contextId(item), contextBaseLabel(item)] as const);
+    const counts = baseLabels.reduce<Record<string, number>>((acc, [, label]) => {
+      acc[label] = (acc[label] || 0) + 1;
+      return acc;
+    }, {});
+    availableContextOptions.forEach((item) => {
+      const id = contextId(item);
+      const base = contextBaseLabel(item);
+      labels.set(id, counts[base] > 1 ? `${base} (${item.priceFormat.code})` : base);
+    });
+    return labels;
+  }, [availableContextOptions]);
+
+  const toggleFormat = (formatId: string) => {
+    setSelectedFormatIds((current) => (current.includes(formatId) ? current.filter((id) => id !== formatId) : [...current, formatId]));
+  };
+
+  const selectAll = () => setSelectedFormatIds(availableContextOptions.map(contextId));
+  const clearAll = () => setSelectedFormatIds([]);
+
+  const togglePreviewContext = (item: ReportContextOption) => {
+    const id = contextId(item);
+    if (!item.priceLists.length) return;
+    toggleFormat(id);
+  };
+
   useEffect(() => {
     if (branch) setBranchFilter(branch);
   }, [branch]);
 
   useEffect(() => {
-    if (!branchFilter) return;
+    setContextOptions([]);
+    setSelectedFormatIds([]);
+    setPriceListByFormat({});
+    setAppliedContexts([]);
+    setContextsBranch('');
+    setPayload(null);
+    setPage(1);
+    if (!branchFilter) {
+      setIsLoadingContexts(false);
+      return;
+    }
+    const controller = new AbortController();
     const loadContexts = async () => {
       setError('');
+      setIsLoadingContexts(true);
       setPayload(null);
-      const res = await fetch(`/api/reports/contexts?branch=${encodeURIComponent(branchFilter)}`);
+      const res = await fetch(`/api/reports/contexts?branch=${encodeURIComponent(branchFilter)}`, { signal: controller.signal });
       const text = await res.text();
       const data = parseJsonOrNull(text);
       if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить параметры отчёта');
       const rows: ReportContextOption[] = Array.isArray(data) ? data : [];
+      if (controller.signal.aborted) return;
       setContextOptions(rows);
+      setContextsBranch(branchFilter);
 
       const idsWithLists = rows.filter((row) => row.latestPriceList).map((row) => String(row.priceFormat.id));
       const preferred = rows.find((row) => row.priceFormat.code === selectedFormatCode && row.latestPriceList);
@@ -164,11 +223,18 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
       setAppliedContexts(defaultIds.map((id) => ({ priceFormatId: id, priceListId: nextPriceLists[id] })).filter((item) => item.priceListId));
       setPage(1);
     };
-    loadContexts().catch((err) => setError(err?.message || 'Не удалось загрузить параметры отчёта'));
+    loadContexts()
+      .catch((err) => {
+        if (err?.name !== 'AbortError') setError(err?.message || 'Не удалось загрузить параметры отчёта');
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setIsLoadingContexts(false);
+      });
+    return () => controller.abort();
   }, [branchFilter, selectedFormatCode]);
 
   useEffect(() => {
-    if (!branchFilter || !appliedContexts.length) {
+    if (isLoadingContexts || !branchFilter || !appliedContexts.length || !contextsReady) {
       setPayload(null);
       return;
     }
@@ -200,18 +266,11 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [activeTab, appliedContexts, branchFilter, page, q]);
+  }, [activeTab, appliedContexts, branchFilter, contextsReady, isLoadingContexts, page, q]);
 
   useEffect(() => {
     setPage(1);
   }, [activeTab, appliedContexts, q]);
-
-  const toggleFormat = (formatId: string) => {
-    setSelectedFormatIds((current) => (current.includes(formatId) ? current.filter((id) => id !== formatId) : [...current, formatId]));
-  };
-
-  const selectAll = () => setSelectedFormatIds(availableContextOptions.map((item) => String(item.priceFormat.id)));
-  const clearAll = () => setSelectedFormatIds([]);
 
   const applySelection = () => {
     setAppliedContexts(selectedContexts);
@@ -219,7 +278,7 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
   };
 
   const exportExcel = async () => {
-    if (!branchFilter || !appliedContexts.length) return;
+    if (isLoadingContexts || !branchFilter || !appliedContexts.length || !contextsReady) return;
     setIsExporting(true);
     setError('');
     try {
@@ -251,7 +310,11 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
 
   const totalPages = Math.max(1, Math.ceil((payload?.total || 0) / limit));
   const isRank = activeTab === 'rank-1';
-  const emptyText = !appliedContexts.length
+  const emptyText = isLoadingContexts
+    ? 'Загружаем параметры отчёта...'
+    : !availableContextOptions.length
+      ? 'Для филиала нет доступных ценовых форматов с расчётами.'
+      : !appliedContexts.length
     ? 'Выберите ценовые форматы и примените параметры отчёта.'
     : isRank
       ? 'Для выбранных расчётов позиций Ранг 1 не найдено.'
@@ -283,10 +346,10 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
 
           <div className="reports-format-picker">
             <div className="reports-field-label">
-              <span>Ценовые форматы</span>
+              <span>Категория / ценовой формат</span>
               <div className="reports-inline-actions">
-                <Button type="button" variant="ghost" size="sm" onClick={selectAll}><CheckSquare className="mr-1 h-4 w-4" />Все</Button>
-                <Button type="button" variant="ghost" size="sm" onClick={clearAll}><Square className="mr-1 h-4 w-4" />Снять</Button>
+                <Button type="button" variant="ghost" size="sm" onClick={selectAll}><CheckSquare className="mr-1 h-4 w-4" />Выбрать все</Button>
+                <Button type="button" variant="ghost" size="sm" onClick={clearAll}><Square className="mr-1 h-4 w-4" />Очистить</Button>
               </div>
             </div>
             <div className="reports-format-list">
@@ -334,6 +397,20 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
         </div>
       </section>
 
+      {availableContextOptions.length ? (
+        <div className="reports-inline-actions">
+          {availableContextOptions.map((item) => {
+            const id = contextId(item);
+            const active = selectedFormatIds.includes(id);
+            return (
+              <Button key={id} type="button" size="sm" variant={active ? 'default' : 'outline'} onClick={() => togglePreviewContext(item)}>
+                {active ? '✓ ' : ''}{quickContextLabels.get(id) || contextBaseLabel(item)}
+              </Button>
+            );
+          })}
+        </div>
+      ) : null}
+
       {payload?.context ? (
         <section className="generated-panel reports-context-panel">
           <div className="generated-summary reports-summary">
@@ -371,7 +448,7 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
               </div>
               <div className="reports-inline-actions">
                 {q ? <Button variant="ghost" onClick={() => setQ('')}><X className="mr-2 h-4 w-4" />Очистить</Button> : null}
-                <Button variant="outline" onClick={exportExcel} disabled={!appliedContexts.length || isExporting}>
+                <Button variant="outline" onClick={exportExcel} disabled={isLoadingContexts || !appliedContexts.length || !contextsReady || isExporting}>
                   <Download className="mr-2 h-4 w-4" />Excel
                 </Button>
               </div>
