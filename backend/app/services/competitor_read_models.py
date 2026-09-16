@@ -154,6 +154,14 @@ def refresh_emit_percentile_source_summaries(*, db: Session, price_format_id: in
             )
         )
     rows = live_emit_percentile_source_summary_rows(db=db, price_format_id=price_format_id)
+    if price_format_id is not None and not is_global_emit_percentile_storage_price_format(int(price_format_id)):
+        base_stmt = global_emit_percentile_base_stmt(
+            db=db,
+            target_price_format_id=int(price_format_id),
+            require_value=False,
+        )
+        if base_stmt is not None and int(db.scalar(select(func.count()).select_from(base_stmt.subquery())) or 0) > 0:
+            return len(rows)
     if rows:
         db.bulk_insert_mappings(CompetitorPricePercentileSourceSummary, rows)
     return len(rows)

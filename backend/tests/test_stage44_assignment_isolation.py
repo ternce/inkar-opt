@@ -440,7 +440,7 @@ def test_emit_refresh_recalculates_global_catalog_and_never_creates_new_assignme
     )
 
     assert _assignment_count(db) == before_total
-    assert sorted(result["assigned_price_format_ids"]) == sorted([int(seeded["owner"].id), int(seeded["assigned_pf"].id)])
+    assert result["assigned_price_format_ids"] == []
     assert result["assignment_propagation"] == {}
     assert result["warnings"] == []
 

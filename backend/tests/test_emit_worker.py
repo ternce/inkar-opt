@@ -2260,11 +2260,11 @@ def test_new_price_format_does_not_get_active_emit_assignments_for_scheduler():
         scope_to_price_list_ids=True,
     )
 
-    assert int(new_pf.id) in result["assigned_price_format_ids"]
-    assert "NEW" in result["summaries"]
+    assert int(new_pf.id) not in result["assigned_price_format_ids"]
+    assert "NEW" not in result["summaries"]
     assert db.query(CompetitorPricePercentile).filter(
         CompetitorPricePercentile.price_format_id == new_pf.id
-    ).count() > 0
+    ).count() == 0
 
 
 def test_emit_fanout_refreshes_percentile_source_summaries_for_all_formats():

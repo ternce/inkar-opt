@@ -106,13 +106,29 @@ def list_percentile_sources(
                 CompetitorPricePercentileSourceSummary.competitor_name.asc(),
             )
         ).scalars().all()
-        rows = persisted_rows
-        if not rows:
-            rows = [
+        live_rows = (
+            [
                 SimpleNamespace(**row)
                 for row in live_emit_percentile_source_summary_rows(db=db, price_format_id=target_price_format_id)
             ]
-            rows.sort(key=lambda row: (row.branch_name or "", row.competitor_name or ""))
+            if not persisted_rows
+            else []
+        )
+        rows = []
+        seen_rows: set[tuple[str, str, str, str, int]] = set()
+        for row in [*live_rows, *persisted_rows]:
+            key = (
+                str(row.source_key or ""),
+                str(row.branch_name or ""),
+                str(row.competitor_name or ""),
+                str(row.percentile_scope or ""),
+                int(row.percentile),
+            )
+            if key in seen_rows:
+                continue
+            seen_rows.add(key)
+            rows.append(row)
+        rows.sort(key=lambda row: (row.branch_name or "", row.competitor_name or ""))
     else:
         rows = db.execute(
             stmt.order_by(

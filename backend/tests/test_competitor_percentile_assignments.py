@@ -2119,3 +2119,141 @@ def test_emit_percentile_rebuild_materializes_global_catalog_for_assigned_format
         prep = percentile_preparation_to_dict(db, int(pf.id))
         assert prep["status"] == "ready"
         assert prep["rowsCount"] > 0
+
+
+def test_global_emit_reuse_authorizes_duplicate_logical_cpl_rows_without_fanout():
+    db = _session()
+    display = emit_display_name(1106)
+    legacy_display = "Emit International 1106"
+    target_ids = [1, 2, 3, 4, 5, 6, 11, 13, 32]
+    formats = {
+        pf_id: PriceFormat(
+            id=pf_id,
+            code=f"PF{pf_id}",
+            name=f"PF{pf_id}",
+            branch="Aktau",
+            competitor_price_mode="percentile",
+            percentile_number=40,
+        )
+        for pf_id in [*target_ids, 40, 41, 42]
+    }
+    product = Product(code="SKU-EMIT-1106", name="Emit 1106 Product", provisor_goods_id=1106001, cost=100)
+    db.add_all([*formats.values(), product])
+    db.flush()
+
+    refreshed = CompetitorPriceList(
+        price_format_id=None,
+        source_type="emit",
+        source_key="emit:1106",
+        display_name=display,
+        supplier=display,
+        branch_name=display,
+        competitor_name=display,
+        branch_id="1106",
+        external_price_list_id="1106",
+    )
+    db.add(refreshed)
+    db.flush()
+
+    logical_rows = {4: refreshed}
+    for pf_id in [1, 2, 3, 5, 6, 11, 13, 32]:
+        name = legacy_display if pf_id in {1, 6, 32} else display
+        row = CompetitorPriceList(
+            price_format_id=None,
+            source_type="emit",
+            source_key="emit:1106",
+            display_name=name,
+            supplier=name,
+            branch_name=name,
+            competitor_name=name,
+            branch_id="1106",
+            external_price_list_id="1106",
+        )
+        db.add(row)
+        db.flush()
+        logical_rows[pf_id] = row
+
+    leak_rows = [
+        (40, "emit:1108", emit_display_name(1108), emit_display_name(1108), "1108"),
+        (41, "emit:1106", "Wrong Branch", "Wrong Branch Competitor", "1106"),
+        (42, "emit:1106", display, "Wrong Competitor", "1106"),
+    ]
+    for pf_id, source_key, branch, competitor, filial_id in leak_rows:
+        row = CompetitorPriceList(
+            price_format_id=None,
+            source_type="emit",
+            source_key=source_key,
+            display_name=competitor,
+            supplier=competitor,
+            branch_name=branch,
+            competitor_name=competitor,
+            branch_id=filial_id,
+            external_price_list_id=filial_id,
+        )
+        db.add(row)
+        db.flush()
+        logical_rows[pf_id] = row
+
+    for pf_id, row in logical_rows.items():
+        _assign(db, formats[pf_id], row, active=True, percentile_mode=MULTI_PRICE_PERCENTILE_MODE)
+
+    for value in (Decimal("100"), Decimal("200")):
+        db.add(
+            CompetitorPriceListItem(
+                price_list_id=refreshed.id,
+                product_id=product.id,
+                provisor_goods_id=1106001,
+                distributor_goods_id="1106001",
+                distributor_price=value,
+            )
+        )
+    db.add(
+        CompetitorPrice(
+            price_format_id=6,
+            product_id=None,
+            source_name=_emit_percentile_config_name(6, "emit:1106", legacy_display, legacy_display, 40),
+            supplier=f"{legacy_display} P40",
+            coefficient=1,
+        )
+    )
+    db.commit()
+
+    result = recalculate_emit_percentiles_globally(db=db, source_price_list_ids=[refreshed.id])
+    db.commit()
+
+    assert result["canonical_price_format_id"] == 4
+    assert result["physical_fanout_target_count"] == 0
+    assert result["physical_fanout_target_ids"] == []
+    assert result["compatibility_rows_created"] == 0
+    assert result["global_reuse_target_count"] == 8
+    assert result["global_reuse_target_ids"] == [1, 2, 3, 5, 6, 11, 13, 32]
+    assert sorted(result["assigned_price_format_ids"]) == target_ids
+    assert sorted(result["target_price_format_ids"]) == target_ids
+
+    physical_counts = {
+        pf_id: db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == pf_id).count()
+        for pf_id in [*target_ids, 40, 41, 42]
+    }
+    assert physical_counts[4] > 0
+    assert all(physical_counts[pf_id] == 0 for pf_id in [1, 2, 3, 5, 6, 11, 13, 32, 40, 41, 42])
+    assert db.query(CompetitorPricePercentileSourceSummary).filter(
+        CompetitorPricePercentileSourceSummary.price_format_id.in_([1, 2, 3, 5, 6, 11, 13, 32])
+    ).count() == 0
+    assert refresh_emit_percentile_source_summaries(db=db, price_format_id=1) > 0
+    assert db.query(CompetitorPricePercentileSourceSummary).filter(
+        CompetitorPricePercentileSourceSummary.price_format_id == 1
+    ).count() == 0
+
+    for pf_id in (1, 6, 32):
+        sources = list_percentile_sources(db=db, price_format_code=formats[pf_id].code, percentile_source=PERCENTILE_SOURCE_EMIT)
+        regional_sources = [row for row in sources if row["sourceKey"] == "emit:1106"]
+        assert {row["percentile"] for row in regional_sources} == {10, 20, 30, 40, 60}
+        assert {row["region"] for row in regional_sources} == {display}
+        cache = load_percentile_price_cache(db, pf_id)
+        resolved = resolve_percentile_prices_from_cache(cache, product.id, percentile_number=40)
+        assert resolved.prices
+        assert resolved.prices[0][0] == Decimal("140.0000000000")
+
+    for pf_id in (40, 41, 42):
+        assert list_percentile_sources(db=db, price_format_code=formats[pf_id].code, percentile_source=PERCENTILE_SOURCE_EMIT) == []
+        assert load_percentile_price_cache(db, pf_id) == {}

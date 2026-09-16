@@ -30,6 +30,7 @@ from .competitor_source_config import (
     MULTI_PRICE_PERCENTILE_MODE,
     canonical_competitor_source_key,
     default_percentile_mode_for_source,
+    emit_display_aliases_from_source_key,
     effective_percentile_mode,
 )
 from .emit_percentile_resolver import global_emit_percentile_storage_price_format_id
@@ -364,16 +365,69 @@ def _all_price_format_ids(db: Session, target_price_format_ids: list[int] | None
     return [int(item) for item in db.execute(stmt).scalars().all()]
 
 
+def _emit_identity_values_match(*, source_key: str, expected: object, actual: object) -> bool:
+    expected_text = str(expected or "").strip()
+    actual_text = str(actual or "").strip()
+    if not expected_text or not actual_text:
+        return expected_text == actual_text
+    if expected_text == actual_text:
+        return True
+    aliases = emit_display_aliases_from_source_key(source_key)
+    return actual_text in aliases and expected_text in aliases
+
+
+def _emit_source_matches_identity(row: CompetitorPriceList, identity: tuple[str, str, str]) -> bool:
+    source_key, branch_name, competitor_name = identity
+    if canonical_competitor_source_key(row) != source_key:
+        return False
+    row_branch = str(row.branch_name or row.region or "").strip()
+    row_competitor = str(row.competitor_name or row.supplier or row.display_name or "").strip()
+    return _emit_identity_values_match(source_key=source_key, expected=branch_name, actual=row_branch) and _emit_identity_values_match(
+        source_key=source_key,
+        expected=competitor_name,
+        actual=row_competitor,
+    )
+
+
 def _authorized_emit_target_price_format_ids(
     *,
     db: Session,
     selected_sources: list[dict[str, Any]],
     target_price_format_ids: list[int],
 ) -> list[int]:
-    price_list_ids = sorted({int(row["price_list_id"]) for row in selected_sources if int(row.get("price_list_id") or 0) > 0})
-    if not price_list_ids:
+    identities = sorted(
+        {
+            (
+                str(row.get("source_key") or "").strip(),
+                str(row.get("branch_name") or "").strip(),
+                str(row.get("competitor_name") or "").strip(),
+            )
+            for row in selected_sources
+            if str(row.get("source_key") or "").strip().startswith("emit:")
+        }
+    )
+    if not identities:
         return []
     target_ids = sorted({int(item) for item in target_price_format_ids if int(item) > 0})
+    source_keys = sorted({source_key for source_key, _branch, _competitor in identities})
+    candidate_price_lists = (
+        db.execute(
+            select(CompetitorPriceList)
+            .where(CompetitorPriceList.source_key.in_(source_keys))
+            .order_by(CompetitorPriceList.id.asc())
+        )
+        .scalars()
+        .all()
+    )
+    price_list_ids = sorted(
+        {
+            int(row.id)
+            for row in candidate_price_lists
+            if row.id is not None and any(_emit_source_matches_identity(row, identity) for identity in identities)
+        }
+    )
+    if not price_list_ids:
+        return []
     stmt = (
         select(PriceFormatCompetitorAssignment.price_format_id)
         .where(PriceFormatCompetitorAssignment.competitor_price_list_id.in_(price_list_ids))

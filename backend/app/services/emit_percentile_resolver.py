@@ -11,6 +11,7 @@ from ..models import CompetitorPriceList, CompetitorPricePercentile, PriceFormat
 from .competitor_source_config import (
     MULTI_PRICE_PERCENTILE_MODE,
     canonical_competitor_source_key,
+    emit_display_aliases_from_source_key,
     effective_percentile_mode,
 )
 
@@ -42,6 +43,23 @@ def is_global_emit_percentile_storage_price_format(price_format_id: int | None) 
 
 def is_emit_percentile_source_key(value: object) -> bool:
     return str(value or "").strip().startswith("emit:")
+
+
+def _emit_storage_value_aliases(source_key: str, value: object) -> set[str]:
+    text = str(value or "").strip()
+    if not text:
+        return {""}
+    aliases = emit_display_aliases_from_source_key(source_key)
+    if text in aliases:
+        return {text, *aliases}
+    return {text}
+
+
+def _emit_storage_value_filter(column, *, source_key: str, value: object):
+    values = sorted(_emit_storage_value_aliases(source_key, value))
+    if len(values) == 1:
+        return column == values[0]
+    return column.in_(values)
 
 
 def assigned_emit_percentile_groups(*, db: Session, target_price_format_id: int) -> list[EmitPercentileGroup]:
@@ -97,13 +115,29 @@ def emit_percentile_scope_filter(groups: list[EmitPercentileGroup] | tuple[EmitP
             (
                 (
                     (func.coalesce(CompetitorPricePercentile.source_key, "") == group.source_key)
-                    & (CompetitorPricePercentile.branch_name == group.branch_name)
-                    & (CompetitorPricePercentile.competitor_name == group.competitor_name)
+                    & _emit_storage_value_filter(
+                        CompetitorPricePercentile.branch_name,
+                        source_key=group.source_key,
+                        value=group.branch_name,
+                    )
+                    & _emit_storage_value_filter(
+                        CompetitorPricePercentile.competitor_name,
+                        source_key=group.source_key,
+                        value=group.competitor_name,
+                    )
                 )
                 | (
                     (func.coalesce(CompetitorPricePercentile.source_key, "") == "")
-                    & (CompetitorPricePercentile.branch_name == group.branch_name)
-                    & (CompetitorPricePercentile.competitor_name == group.competitor_name)
+                    & _emit_storage_value_filter(
+                        CompetitorPricePercentile.branch_name,
+                        source_key=group.source_key,
+                        value=group.branch_name,
+                    )
+                    & _emit_storage_value_filter(
+                        CompetitorPricePercentile.competitor_name,
+                        source_key=group.source_key,
+                        value=group.competitor_name,
+                    )
                 )
             )
             & (CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
@@ -201,9 +235,22 @@ def emit_row_matches_assigned_group(row: CompetitorPricePercentile, groups: set[
     branch = str(row.branch_name or "")
     competitor = str(row.competitor_name or "")
     if row.percentile_scope == KAZAKHSTAN_SCOPE:
-        return branch == KAZAKHSTAN_REGION and any(active_competitor == competitor for _branch, active_competitor, _source in groups)
-    return (branch, competitor, source_key) in groups or (
-        not source_key and any(active_branch == branch and active_competitor == competitor for active_branch, active_competitor, _source in groups)
+        return branch == KAZAKHSTAN_REGION and any(
+            competitor in _emit_storage_value_aliases(active_source, active_competitor)
+            for _branch, active_competitor, active_source in groups
+        )
+    return any(
+        active_source == source_key
+        and branch in _emit_storage_value_aliases(active_source, active_branch)
+        and competitor in _emit_storage_value_aliases(active_source, active_competitor)
+        for active_branch, active_competitor, active_source in groups
+    ) or (
+        not source_key
+        and any(
+            branch in _emit_storage_value_aliases(active_source, active_branch)
+            and competitor in _emit_storage_value_aliases(active_source, active_competitor)
+            for active_branch, active_competitor, active_source in groups
+        )
     )
 
 

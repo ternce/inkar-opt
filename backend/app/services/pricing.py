@@ -1032,10 +1032,7 @@ def _resolve_percentile_rows(
                 matched_source_name = candidate_source_name
                 break
         is_assigned_source = matched_source_name in assigned_source_names
-        is_active_emit_row = (branch, competitor, source_key) in active_groups or (
-            not source_key
-            and any(active_branch == branch and active_competitor == competitor for active_branch, active_competitor, _active_source_key in active_groups)
-        )
+        is_active_emit_row = emit_row_matches_assigned_group(row, active_groups)
 
         if is_emit_source_key(source_key) or is_active_emit_row:
             if row.percentile_scope != REGIONAL_SCOPE:
@@ -1043,9 +1040,7 @@ def _resolve_percentile_rows(
             if not is_assigned_source:
                 if legacy_percentile_number is None or int(row.percentile) != int(legacy_percentile_number):
                     continue
-                if (branch, competitor, source_key) not in active_groups and (
-                    source_key or not any(active_branch == branch and active_competitor == competitor for active_branch, active_competitor, _active_source_key in active_groups)
-                ):
+                if not is_active_emit_row:
                     continue
                 source_name = _legacy_emit_percentile_source_name(row)
                 coefficient = Decimal("1")
