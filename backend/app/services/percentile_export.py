@@ -12,6 +12,7 @@ from .competitors.identity import canonical_regular_competitor_identity
 from .competitors.percentiles.sources import (
     PERCENTILE_SOURCE_COMPETITOR,
     PERCENTILE_SOURCE_EMIT,
+    emit_percentile_source_id_aliases,
     percentile_source_id,
 )
 from .emit_percentile_resolver import (
@@ -54,7 +55,8 @@ def percentile_export_source_names(row: CompetitorPricePercentile, *, target_pri
         competitor=row.competitor_name,
         percentile=row.percentile,
     )
-    return f"percentile:{emit_source}", f"percentile:{competitor_source}"
+    emit_sources = tuple(f"percentile:{source_id}" for source_id in sorted(emit_percentile_source_id_aliases(emit_source)))
+    return (*emit_sources, f"percentile:{competitor_source}")
 
 
 def _parse_regular_percentile_source_name(

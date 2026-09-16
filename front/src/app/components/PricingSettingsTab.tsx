@@ -25,6 +25,7 @@ import {
   formatLocalDate,
   formatLocalDateTime,
 } from '../competitorTimestamps';
+import { emitDisplayFallback } from '../competitorAssignmentSources';
 
 type MarkupRow = {
   id: number;
@@ -93,8 +94,10 @@ type FormatPassport = {
 type AssignmentRow = {
   id: string;
   sourceType: string;
+  sourceKey?: string;
   sourceName: string;
   region: string;
+  branchName?: string;
   competitorName: string;
   coefficient: number;
   priceDate: string;
@@ -297,7 +300,12 @@ export function PricingSettingsTab({ formatCode, onNavigate }: PricingSettingsTa
       const row = formatsData.find((item: FormatPassport) => item.code === formatCode);
       setPassport(row || null);
     }
-    if (assignmentsRes.ok) setAssignments(Array.isArray(assignmentsData) ? assignmentsData : []);
+    if (assignmentsRes.ok) setAssignments(Array.isArray(assignmentsData) ? assignmentsData.map((row: AssignmentRow) => ({
+      ...row,
+      sourceName: emitDisplayFallback(row.sourceKey, row.sourceName),
+      branchName: emitDisplayFallback(row.sourceKey, row.branchName),
+      competitorName: emitDisplayFallback(row.sourceKey, row.competitorName),
+    })) : []);
     if (listsRes.ok) {
       const rows = Array.isArray(listsData) ? listsData : [];
       setUniversalLists(rows.filter((row: UniversalListRow) =>

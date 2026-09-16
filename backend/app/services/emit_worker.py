@@ -35,7 +35,7 @@ from .db_time import db_now
 from .competitor_percentiles import recalculate_emit_percentiles_globally
 from .percentile_preparation import mark_percentile_preparation_ready_for_catalog
 from .competitor_read_models import refresh_price_list_item_counters
-from .competitor_source_config import canonical_competitor_source_key
+from .competitor_source_config import canonical_competitor_source_key, emit_display_name
 from .competitor_persist import _ensure_price_format
 from .manufacturers import _clean_text, _extract_manufacturer_cleaned, _normalize_manufacturer_cleaned, resolve_manufacturer
 from .provisor import get_access_token
@@ -2640,11 +2640,11 @@ def replace_emit_price_list_from_staging(
         )
         db.add(row)
         db.flush()
-    display_name = filial_name or f"Emit International {filial_id}"
+    display_name = emit_display_name(filial_id, filial_name)
     row.price_format_id = None
     row.display_name = display_name
     row.supplier = display_name
-    row.region = f"branch:{display_name}; competitor:{display_name}; account:emit; accountLogin:emit; status:success"
+    row.region = display_name
     row.branch_id = str(filial_id)
     row.branch_code = str(filial_id)
     row.branch_name = display_name
@@ -3605,7 +3605,7 @@ class EmitWorker:
 
     async def refresh_filial(self, *, job_id: int, filial_id: int, owner_token: str | None = None) -> dict[str, Any]:
         filial_started = time.perf_counter()
-        filial_name = f"Emit International {filial_id}"
+        filial_name = emit_display_name(filial_id)
         temp_path: Path | None = None
         staging_path: Path | None = None
         stats = EmitStats()

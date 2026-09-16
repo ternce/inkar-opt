@@ -19,6 +19,7 @@ import {
   formatLocalDateTime,
   usefulSourceTimestamp,
 } from '../competitorTimestamps';
+import { emitDisplayFallback } from '../competitorAssignmentSources';
 import { buildProductCatalogCandidateUrl, buildProductCatalogMappingPayload, canConfirmProductCatalogMapping } from '../productCatalogMapping';
 import { SUPPORTED_CITIES } from '../supportedCities';
 
@@ -544,7 +545,9 @@ function PercentileBrowser({
             <SelectTrigger><SelectValue placeholder="Регион" /></SelectTrigger>
             <SelectContent>
               {groupOptions.length ? groupOptions.map((group) => (
-                <SelectItem key={group.id} value={group.sourceKey || group.id}>{group.name || group.region}</SelectItem>
+                <SelectItem key={group.id} value={group.sourceKey || group.id}>
+                  {emitDisplayFallback(group.sourceKey, group.name || group.region)}
+                </SelectItem>
               )) : <SelectItem value="__none__">Нет регионов</SelectItem>}
             </SelectContent>
           </Select>
@@ -769,7 +772,12 @@ export function CompetitorsTab({ formatCode }: Props) {
     const text = await res.text();
     const data = parseJsonOrNull(text);
     if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить прайс-листы конкурентов');
-    setSources(Array.isArray(data) ? data : []);
+    setSources(Array.isArray(data) ? data.map((row: CompetitorSource) => ({
+      ...row,
+      sourceName: emitDisplayFallback(row.sourceKey, row.sourceName),
+      branchName: emitDisplayFallback(row.sourceKey, row.branchName),
+      competitorName: emitDisplayFallback(row.sourceKey, row.competitorName),
+    })) : []);
   };
 
   const loadPercentiles = async () => {
@@ -2087,7 +2095,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                     <div className="mt-2 max-h-32 space-y-1 overflow-auto text-sm text-gray-700">
                       {provisorDiagnostics.coverage.activeProvisorPriceLists.length ? provisorDiagnostics.coverage.activeProvisorPriceLists.map((row) => (
                         <div key={row.id} className="flex justify-between gap-3">
-                          <span className="truncate">{row.branchName || row.sourceKey}</span>
+                          <span className="truncate">{emitDisplayFallback(row.sourceKey, row.branchName || row.sourceKey)}</span>
                           <strong className="tabular-nums">{fmtNumber(row.itemsCount)}</strong>
                         </div>
                       )) : <span>Нет активных ПЛК Provisor</span>}
@@ -2218,7 +2226,7 @@ export function CompetitorsTab({ formatCode }: Props) {
                   <tbody>
                     {filteredSources.map((row) => (
                       <tr key={row.id} className={activeListId === row.id ? 'bg-blue-50' : ''}>
-                        <td className="px-4 py-3 text-sm font-medium text-gray-900 min-w-64">{row.sourceName || row.name}</td>
+                        <td className="px-4 py-3 text-sm font-medium text-gray-900 min-w-64">{emitDisplayFallback(row.sourceKey, row.sourceName || row.name)}</td>
                         <td className="px-4 py-3 text-sm text-gray-700 whitespace-nowrap">{row.branchName || 'Без филиала'}</td>
                         <td className="px-4 py-3 text-sm text-gray-700">{row.competitorName || '—'}</td>
                         <td className="px-4 py-3 text-sm text-gray-700 whitespace-nowrap">{row.accountLogin || row.accountId || '—'}</td>

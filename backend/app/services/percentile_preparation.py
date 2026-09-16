@@ -22,6 +22,7 @@ from ..models import (
 )
 from ..timezone import local_iso, now_kz_naive
 from .competitor_percentiles import eligible_percentile_assignments, recalculate_competitor_percentiles
+from .competitor_source_config import emit_display_name_from_source_key
 from .emit_percentile_resolver import global_emit_percentile_rows_count
 from .jobs import job_to_dict, update_job
 
@@ -71,14 +72,18 @@ def percentile_configuration(db: Session, price_format_id: int) -> dict[str, Any
     for item in selected:
         price_list = item.price_list
         assignment = item.assignment
+        display_name = emit_display_name_from_source_key(
+            price_list.source_key,
+            price_list.branch_name or price_list.competitor_name or price_list.supplier or price_list.display_name,
+        )
         sources.append(
             {
                 "assignmentId": int(assignment.id),
                 "priceListId": int(price_list.id),
                 "sourceType": str(price_list.source_type or ""),
                 "sourceKey": str(price_list.source_key or ""),
-                "branchName": str(price_list.branch_name or price_list.region or ""),
-                "competitorName": str(price_list.competitor_name or price_list.supplier or ""),
+                "branchName": str(display_name or price_list.branch_name or price_list.region or ""),
+                "competitorName": str(display_name or price_list.competitor_name or price_list.supplier or ""),
                 "percentileMode": str(assignment.percentile_mode or ""),
                 "coefficient": str(assignment.coefficient or ""),
                 "priceCoefficient": str(price_list.price_coefficient or ""),

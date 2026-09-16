@@ -29,6 +29,7 @@ from ...models import (
     UniversalListPriceFormat,
 )
 from ..competitor_assignments import get_assigned_competitor_price_lists
+from ..competitor_source_config import emit_display_name_from_source_key
 from ..emit_percentile_resolver import global_emit_percentile_base_stmt
 from ...timezone import now_kz_naive
 
@@ -176,11 +177,11 @@ def _sources_snapshot(db: Session, pf: PriceFormat, requested_sources: list[dict
                 "id": row.id,
                 "sourceType": row.source_type,
                 "sourceKey": row.source_key,
-                "displayName": row.display_name,
-                "supplier": row.supplier,
+                "displayName": emit_display_name_from_source_key(row.source_key, row.display_name) or row.display_name,
+                "supplier": emit_display_name_from_source_key(row.source_key, row.supplier) or row.supplier,
                 "branchId": row.branch_id,
-                "branchName": row.branch_name,
-                "competitorName": row.competitor_name,
+                "branchName": emit_display_name_from_source_key(row.source_key, row.branch_name) or row.branch_name,
+                "competitorName": emit_display_name_from_source_key(row.source_key, row.competitor_name) or row.competitor_name,
                 "accountId": row.account_id,
                 "accountLogin": row.account_login,
                 "externalPriceListId": row.external_price_list_id,

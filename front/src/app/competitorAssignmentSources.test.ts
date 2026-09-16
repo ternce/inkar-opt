@@ -3,6 +3,7 @@ import { test } from 'node:test';
 
 import {
   mergeAvailableCompetitorAssignmentSources,
+  normalizeCompetitorAssignmentSource,
   physicalCompetitorSourceIdentity,
 } from './competitorAssignmentSources.ts';
 
@@ -78,4 +79,19 @@ test('selected-only endpoint no longer defines the available pool', () => {
 
   assert.deepEqual(rows.map((row) => row.sourceName), ['Global unassigned PLK']);
   assert.deepEqual(rows.map((row) => row.isSelected), [false]);
+});
+
+test('known Emit source fallback does not display raw source key', () => {
+  const row = normalizeCompetitorAssignmentSource({
+    id: 1106,
+    sourceType: 'provisor',
+    sourceKey: 'emit:1106',
+    sourceName: 'emit:1106',
+    branchName: 'emit:1106',
+    competitorName: 'Emit International 1106',
+  });
+
+  assert.equal(row.sourceName, 'Эмити Интернешнл Актау');
+  assert.equal(row.branchName, 'Эмити Интернешнл Актау');
+  assert.equal(row.competitorName, 'Эмити Интернешнл Актау');
 });

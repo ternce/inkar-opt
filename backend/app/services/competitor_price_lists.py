@@ -52,7 +52,11 @@ from .competitor_read_models import refresh_price_list_item_counters
 from .competitor_coefficients import effective_price_coefficient, validate_price_coefficient
 from .competitor_percentiles import DEFAULT_BRANCH
 from .percentile_preparation import enqueue_percentile_preparation
-from .competitor_source_config import canonical_provisor_source_key, ensure_canonical_source_key
+from .competitor_source_config import (
+    canonical_provisor_source_key,
+    emit_display_name_from_source_key,
+    ensure_canonical_source_key,
+)
 from .manufacturers import resolve_manufacturer
 from .price_sources import UnifiedPriceItem, UnifiedPriceList
 from .sku import normalize_external_sku, normalize_sku, normalize_sku_variants
@@ -285,6 +289,15 @@ def fingerprint_persisted_price_list_items(db: Session, price_list_id: int) -> s
 
 def _source_name(row: CompetitorPriceList) -> str:
     return f"{row.source_type}:{row.source_key}"
+
+
+def _display_name(row: CompetitorPriceList) -> str:
+    return (
+        emit_display_name_from_source_key(row.source_key, row.display_name or row.supplier or _source_name(row))
+        or row.display_name
+        or row.supplier
+        or _source_name(row)
+    )
 
 
 def _selected_price_format_ids_for_refreshed_source(db: Session, row: CompetitorPriceList) -> list[int]:
@@ -665,12 +678,17 @@ def _region_meta(region: str | None) -> dict[str, str]:
 
 def _branch_name(row: CompetitorPriceList) -> str:
     meta = _region_meta(row.region)
-    return (row.branch_name or meta.get("branch") or DEFAULT_BRANCH).strip() or DEFAULT_BRANCH
+    name = emit_display_name_from_source_key(row.source_key, row.branch_name or meta.get("branch") or DEFAULT_BRANCH)
+    return (name or DEFAULT_BRANCH).strip() or DEFAULT_BRANCH
 
 
 def _competitor_name(row: CompetitorPriceList) -> str:
     meta = _region_meta(row.region)
-    return (row.competitor_name or meta.get("competitor") or row.supplier or row.display_name or row.source_type).strip()
+    name = emit_display_name_from_source_key(
+        row.source_key,
+        row.competitor_name or meta.get("competitor") or row.supplier or row.display_name or row.source_type,
+    )
+    return name.strip()
 
 
 def _replace_legacy_price_rows_for_list(*, db: Session, price_list: CompetitorPriceList) -> None:
@@ -1496,7 +1514,7 @@ def list_competitor_price_lists(
             row.source_type or "",
             row.account_id or "",
             row.external_price_list_id or row.source_key or row.id,
-            row.display_name or row.supplier or _source_name(row),
+            _display_name(row),
             int(counts.get(row.id, 0)),
             int(counts.get(row.id, 0)),
             str(visible).lower(),
@@ -1529,8 +1547,8 @@ def list_competitor_price_lists(
                 if ":" in row.source_key and row.source_key.split(":", 1)[0].isdigit()
                 else ""
             ),
-            "supplier": row.supplier or row.display_name,
-            "name": row.display_name or row.supplier or _source_name(row),
+            "supplier": emit_display_name_from_source_key(row.source_key, row.supplier or row.display_name) or row.supplier or row.display_name,
+            "name": _display_name(row),
             "region": row.region or "",
             "branchId": _region_meta(row.region).get("branchId") or _region_meta(row.region).get("branch") or "Без филиала",
             "branchCode": _region_meta(row.region).get("branchCode") or _region_meta(row.region).get("branch") or "Без филиала",
@@ -1580,8 +1598,8 @@ def get_competitor_price_list_items(*, db: Session, price_list_id: int) -> dict:
     return {
         "meta": {
             "id": row.id,
-            "name": row.display_name or row.supplier or _source_name(row),
-            "supplier": row.supplier or row.display_name,
+            "name": _display_name(row),
+            "supplier": emit_display_name_from_source_key(row.source_key, row.supplier or row.display_name) or row.supplier or row.display_name,
             "sourceType": row.source_type,
             "sourceKey": row.source_key,
             "region": row.region or "",

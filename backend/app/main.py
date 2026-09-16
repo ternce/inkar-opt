@@ -249,6 +249,7 @@ from .services.price_formats import (
 from .services.competitor_source_config import (
     canonical_competitor_source_key,
     canonical_provisor_source_key,
+    emit_display_name_from_source_key,
     ensure_canonical_source_key,
 )
 from .services.sku import normalize_external_sku, normalize_sku, normalize_sku_variants
@@ -297,7 +298,12 @@ from .services.competitors.percentiles.read_models import (
     percentile_coverage_audit,
     percentile_trace,
 )
-from .services.competitors.percentiles.sources import PERCENTILE_SOURCE_COMPETITOR, PERCENTILE_SOURCE_DEFAULT, PERCENTILE_SOURCE_EMIT
+from .services.competitors.percentiles.sources import (
+    PERCENTILE_SOURCE_COMPETITOR,
+    PERCENTILE_SOURCE_DEFAULT,
+    PERCENTILE_SOURCE_EMIT,
+    emit_percentile_source_id_aliases,
+)
 from .services.jobs import create_job, get_active_job, job_to_dict, schedule_job, update_job
 from .services.references.batch import import_reference_batch
 from .services.references.imports import import_reference_excel
@@ -2467,7 +2473,7 @@ def post_pricing_workflow_generate_batch(
             {
                 "id": row.id,
                 "sourceType": row.source_type,
-                "name": row.display_name or row.supplier,
+                "name": emit_display_name_from_source_key(row.source_key, row.display_name or row.supplier) or row.display_name or row.supplier,
                 "coefficient": float(row.coefficient or 1),
                 "enabled": True,
             }
@@ -3849,12 +3855,24 @@ def _competitor_columns_for_price_list(db: Session, pl: PriceList, pf: PriceForm
             "id": item.price_list.id,
             "key": _competitor_column_key(item.price_list.source_type, item.price_list.source_key),
             "title": _competitor_column_title(
-                item.price_list.display_name or item.price_list.competitor_name or item.price_list.supplier,
+                emit_display_name_from_source_key(
+                    item.price_list.source_key,
+                    item.price_list.display_name or item.price_list.competitor_name or item.price_list.supplier,
+                )
+                or item.price_list.display_name
+                or item.price_list.competitor_name
+                or item.price_list.supplier,
                 item.price_list.source_key,
             ),
             "sourceType": item.price_list.source_type,
             "priceListId": item.price_list.id,
-            "competitorName": item.price_list.competitor_name or item.price_list.supplier or item.price_list.display_name,
+            "competitorName": emit_display_name_from_source_key(
+                item.price_list.source_key,
+                item.price_list.competitor_name or item.price_list.supplier or item.price_list.display_name,
+            )
+            or item.price_list.competitor_name
+            or item.price_list.supplier
+            or item.price_list.display_name,
             "sourceKey": item.price_list.source_key,
             "coefficient": effective_price_coefficient(item.price_list),
             "priceCoefficient": effective_price_coefficient(item.price_list),
@@ -5587,7 +5605,7 @@ def debug_matching(
                     "source": row.source_type,
                     "sourceKey": row.source_key,
                     "account": row.account_login or row.account_id,
-                    "name": row.display_name or row.supplier,
+                    "name": emit_display_name_from_source_key(row.source_key, row.display_name or row.supplier) or row.display_name or row.supplier,
                     "totalItems": int(total),
                     "matchedItems": int(matched),
                     "unmatchedItems": int(total) - int(matched),
@@ -5707,7 +5725,7 @@ def debug_matching(
                 "source": row.source_type,
                 "sourceKey": row.source_key,
                 "account": row.account_login or row.account_id,
-                "name": row.display_name or row.supplier,
+                "name": emit_display_name_from_source_key(row.source_key, row.display_name or row.supplier) or row.display_name or row.supplier,
                 "totalItems": int(total),
                 "matchedItems": int(matched),
                 "unmatchedItems": int(total) - int(matched),
@@ -6535,6 +6553,15 @@ def _selected_competitor_rows(db: Session, pf: PriceFormat) -> list[CompetitorPr
 
 def _assignment_row_from_price_list(row: CompetitorPriceList, items_count: int = 0, assignment: object | None = None) -> dict:
     canonical_source_key = canonical_competitor_source_key(row)
+    display_name = emit_display_name_from_source_key(
+        canonical_source_key or row.source_key,
+        row.display_name or row.supplier or f"{row.source_type}:{row.source_key}",
+    )
+    branch_name = emit_display_name_from_source_key(canonical_source_key or row.source_key, row.branch_name or row.region or "")
+    competitor_name = emit_display_name_from_source_key(
+        canonical_source_key or row.source_key,
+        row.competitor_name or row.supplier or row.display_name or "",
+    )
     last_checked_at = row.last_checked_at.isoformat() if row.last_checked_at else ""
     last_success_at = row.last_success_at.isoformat() if row.last_success_at else ""
     updated_at = row.updated_at.isoformat() if row.updated_at else ""
@@ -6547,10 +6574,10 @@ def _assignment_row_from_price_list(row: CompetitorPriceList, items_count: int =
         "sourceType": row.source_type,
         "sourceKey": canonical_source_key or row.source_key,
         "canonicalSourceKey": canonical_source_key,
-        "sourceName": row.display_name or row.supplier or f"{row.source_type}:{row.source_key}",
-        "region": row.branch_name or row.region or "",
-        "branchName": row.branch_name or "",
-        "competitorName": row.competitor_name or row.supplier or row.display_name or "",
+        "sourceName": display_name or row.display_name or row.supplier or f"{row.source_type}:{row.source_key}",
+        "region": branch_name or row.branch_name or row.region or "",
+        "branchName": branch_name or row.branch_name or "",
+        "competitorName": competitor_name or row.competitor_name or row.supplier or row.display_name or "",
         "accountId": row.account_id or "",
         "accountLogin": row.account_login or "",
         "coefficient": effective_price_coefficient(row),
@@ -6672,6 +6699,11 @@ def get_competitor_assignments(
                 source_id = str(source.get("id") or "")
                 source_name = _assignment_percentile_source_name(source_id)
                 cfg = cfg_by_source_name.get(source_name)
+                if cfg is None and percentile_source == PERCENTILE_SOURCE_EMIT:
+                    for alias_source_id in sorted(emit_percentile_source_id_aliases(source_id)):
+                        cfg = cfg_by_source_name.get(_assignment_percentile_source_name(alias_source_id))
+                        if cfg is not None:
+                            break
                 if cfg is not None:
                     rows.append(_assignment_row_from_percentile(source, cfg))
                     appended_percentile_sources.add(source_name)

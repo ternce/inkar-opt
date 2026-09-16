@@ -42,6 +42,7 @@ from backend.app.services.competitors.percentiles.sources import (
     percentile_source_id,
 )
 from backend.app.services.competitor_price_lists import sync_selected_competitor_configs
+from backend.app.services.competitor_source_config import emit_display_name
 from backend.app.services.competitors.identity import canonical_regular_competitor_identity
 from backend.app.services.competitor_read_models import (
     live_emit_percentile_source_summary_rows,
@@ -214,6 +215,60 @@ def _global_emit_fixture(db):
     return canonical, target, other, product, price_list
 
 
+def _normalized_global_emit_fixture(db, *, saved_source_name: str | None = None):
+    display = emit_display_name(1106)
+    canonical = PriceFormat(id=GLOBAL_EMIT_PERCENTILE_STORAGE_PRICE_FORMAT_ID, code="PF4", name="PF4", branch="Aktau")
+    target = PriceFormat(id=27, code="PF27", name="PF27", branch="Aktau", competitor_price_mode="percentile", percentile_number=40)
+    product = Product(code="SKU-GLOBAL", name="Global Emit Product", provisor_goods_id=1106001, cost=100)
+    db.add_all([canonical, target, product])
+    db.flush()
+    price_list = CompetitorPriceList(
+        price_format_id=None,
+        source_type="provisor",
+        source_key="emit:1106",
+        display_name=display,
+        supplier=display,
+        branch_name=display,
+        competitor_name=display,
+        branch_id="1106",
+        external_price_list_id="1106",
+    )
+    db.add(price_list)
+    db.flush()
+    _assign(db, target, price_list, active=True, percentile_mode=MULTI_PRICE_PERCENTILE_MODE)
+    db.add(
+        CompetitorPrice(
+            price_format_id=target.id,
+            product_id=None,
+            source_name=saved_source_name
+            or _emit_percentile_config_name(int(target.id), "emit:1106", display, display, 40),
+            supplier=f"{display} P40",
+            coefficient=1.0,
+        )
+    )
+    for pct, value in [(10, 90), (20, 95), (30, 100), (40, 110), (60, 125)]:
+        db.add(
+            CompetitorPricePercentile(
+                price_format_id=canonical.id,
+                product_id=product.id,
+                competitor_price_list_id=price_list.id,
+                source_type="provisor",
+                source_key="emit:1106",
+                branch_name=display,
+                competitor_name=display,
+                percentile_scope="regional",
+                percentile=pct,
+                value=value,
+                source_count=7,
+                price_count=7,
+                used_price_count=7,
+                status="Calculated",
+            )
+        )
+    db.commit()
+    return canonical, target, product, price_list
+
+
 def test_global_emit_resolver_reads_pf4_rows_for_assigned_target_without_fanout():
     db = _session()
     _canonical, target, other, product, _price_list = _global_emit_fixture(db)
@@ -236,6 +291,82 @@ def test_global_emit_resolver_reads_pf4_rows_for_assigned_target_without_fanout(
         )
     ]
     assert load_percentile_price_cache(db, int(other.id)) == {}
+
+
+def test_global_emit_saved_legacy_source_name_resolves_after_display_normalization():
+    db = _session()
+    display = emit_display_name(1106)
+    legacy_source_name = _emit_percentile_config_name(
+        27,
+        "emit:1106",
+        "Emit International 1106",
+        "Emit International 1106",
+        40,
+    )
+    _canonical, target, product, price_list = _normalized_global_emit_fixture(db, saved_source_name=legacy_source_name)
+
+    cache = load_percentile_price_cache(db, int(target.id))
+    resolved = resolve_percentile_prices_from_cache(cache, int(product.id), percentile_number=40)
+
+    assert price_list.source_key == "emit:1106"
+    assert price_list.branch_id == "1106"
+    assert price_list.external_price_list_id == "1106"
+    assert price_list.branch_name == display
+    assert [(float(price), source) for price, source in resolved.prices] == [(110.0, legacy_source_name)]
+
+
+def test_global_emit_saved_normalized_source_name_resolves_after_display_normalization():
+    db = _session()
+    display = emit_display_name(1106)
+    normalized_source_name = _emit_percentile_config_name(27, "emit:1106", display, display, 40)
+    _canonical, target, product, _price_list = _normalized_global_emit_fixture(db, saved_source_name=normalized_source_name)
+
+    cache = load_percentile_price_cache(db, int(target.id))
+    resolved = resolve_percentile_prices_from_cache(cache, int(product.id), percentile_number=40)
+
+    assert [(float(price), source) for price, source in resolved.prices] == [(110.0, normalized_source_name)]
+
+
+def test_global_emit_saved_source_name_aliases_do_not_leak_wrong_identity():
+    db = _session()
+    display = emit_display_name(1106)
+    legacy_source_name = _emit_percentile_config_name(
+        27,
+        "emit:1106",
+        "Emit International 1106",
+        "Emit International 1106",
+        40,
+    )
+    canonical, target, product, price_list = _normalized_global_emit_fixture(db, saved_source_name=legacy_source_name)
+    for source_key, branch, competitor, value in [
+        ("emit:1106", "Wrong Branch", display, 777),
+        ("emit:1106", display, "Wrong Competitor", 888),
+        ("emit:1108", display, display, 999),
+    ]:
+        db.add(
+            CompetitorPricePercentile(
+                price_format_id=canonical.id,
+                product_id=product.id,
+                competitor_price_list_id=price_list.id,
+                source_type="provisor",
+                source_key=source_key,
+                branch_name=branch,
+                competitor_name=competitor,
+                percentile_scope="regional",
+                percentile=40,
+                value=value,
+                source_count=1,
+                price_count=1,
+                used_price_count=1,
+                status="Calculated",
+            )
+        )
+    db.commit()
+
+    cache = load_percentile_price_cache(db, int(target.id))
+    resolved = resolve_percentile_prices_from_cache(cache, int(product.id), percentile_number=40)
+
+    assert [(float(price), source) for price, source in resolved.prices] == [(110.0, legacy_source_name)]
 
 
 def test_global_emit_resolver_regional_rows_require_branch_and_competitor_with_source_key():

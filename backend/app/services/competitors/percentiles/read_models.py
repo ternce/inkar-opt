@@ -39,6 +39,7 @@ from ...competitor_source_config import (
     MULTI_PRICE_PERCENTILE_MODE,
     canonical_competitor_source_key,
     default_percentile_mode_for_source,
+    emit_display_name_from_source_key,
     effective_percentile_mode,
 )
 from ...competitor_read_models import live_emit_percentile_source_summary_rows
@@ -50,10 +51,21 @@ from .sources import (
     PERCENTILE_SOURCE_COMPETITOR,
     PERCENTILE_SOURCE_DEFAULT,
     PERCENTILE_SOURCE_EMIT,
+    emit_percentile_source_id_aliases,
     get_percentile_provider,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _emit_display(source_key: object, value: object = "") -> str:
+    return emit_display_name_from_source_key(source_key, str(value or "").strip()) or str(value or "").strip()
+
+
+def _source_id_requested(source_id: str, requested_source_ids: set[str]) -> bool:
+    if not requested_source_ids:
+        return True
+    return bool(emit_percentile_source_id_aliases(source_id) & requested_source_ids)
 
 
 def list_percentile_sources(
@@ -113,6 +125,8 @@ def list_percentile_sources(
     for row in rows:
         eligible_for_pricing = True
         generated_at = row.generated_at.isoformat() if row.generated_at else ""
+        display_region = _emit_display(row.source_key, row.branch_name or "Без филиала")
+        display_competitor = _emit_display(row.source_key, row.competitor_name or "")
         source_id = provider.source_id(
             price_format_id=target_price_format_id or row.price_format_id,
             scope=row.percentile_scope,
@@ -121,7 +135,7 @@ def list_percentile_sources(
             competitor=row.competitor_name,
             percentile=row.percentile,
         )
-        if requested_source_ids and source_id not in requested_source_ids:
+        if not _source_id_requested(source_id, requested_source_ids):
             continue
         out.append(
             {
@@ -131,11 +145,11 @@ def list_percentile_sources(
                 "competitorPriceListId": row.competitor_price_list_id,
                 "sourceKey": row.source_key or "",
                 "percentileSourceType": row.source_type or "",
-                "region": row.branch_name or "Без филиала",
-                "competitor": row.competitor_name or "",
                 "scope": row.percentile_scope or REGIONAL_SCOPE,
                 "percentile": int(row.percentile),
-                "name": f"{row.branch_name or 'Без филиала'} — {row.competitor_name or 'Конкурент'} — P{int(row.percentile)}",
+                "region": display_region,
+                "competitor": display_competitor,
+                "name": f"{display_region or 'Без филиала'} — {display_competitor or 'Конкурент'} — P{int(row.percentile)}",
                 "skuCount": int(row.sku_count or 0),
                 "sourceCount": int(row.source_count or 0),
                 "generatedAt": generated_at,
@@ -546,6 +560,8 @@ def list_percentile_groups(
     groups: list[dict] = []
     for row in rows:
         region, competitor, source_key = _group_key(row.branch_name, row.competitor_name, row.source_key)
+        display_region = _emit_display(source_key, region)
+        display_competitor = _emit_display(source_key, competitor)
         scope = str(row.percentile_scope or REGIONAL_SCOPE)
         if scope not in {REGIONAL_SCOPE, KAZAKHSTAN_SCOPE}:
             continue
@@ -553,10 +569,12 @@ def list_percentile_groups(
             {
                 "id": f"{scope}::{source_key}::{region}::{competitor}",
                 "sourceKey": source_key,
-                "region": region,
-                "competitor": competitor,
+                "storageRegion": region,
+                "storageCompetitor": competitor,
                 "scope": scope,
-                "name": f"{region or 'Без филиала'} — {competitor or 'Конкурент'}",
+                "region": display_region,
+                "competitor": display_competitor,
+                "name": f"{display_region or 'Без филиала'} — {display_competitor or 'Конкурент'}",
                 "skuCount": int(row.sku_count or 0),
                 "sourceCount": int(row.source_count or 0),
                 "generatedAt": row.generated_at.isoformat() if row.generated_at else "",
@@ -651,9 +669,17 @@ def _selected_group(
     if requested_source_key:
         for group in groups:
             if str(group.get("sourceKey") or "") == requested_source_key:
+                storage_region = str(group.get("storageRegion") or group.get("region") or "")
+                storage_competitor = str(group.get("storageCompetitor") or group.get("competitor") or "")
+                display_region = str(group.get("region") or "")
+                display_competitor = str(group.get("competitor") or "")
+                if requested_region and requested_region not in {storage_region, display_region}:
+                    continue
+                if requested_competitor and requested_competitor not in {storage_competitor, display_competitor}:
+                    continue
                 return (
-                    str(group.get("region") or ""),
-                    str(group.get("competitor") or ""),
+                    storage_region,
+                    storage_competitor,
                     str(group.get("sourceKey") or ""),
                 )
     if requested_region and requested_competitor:
@@ -667,18 +693,30 @@ def _selected_group(
             None,
         )
         if match is not None:
-            return requested_region, requested_competitor, requested_source_key
+            return (
+                str(match.get("storageRegion") or match.get("region") or ""),
+                str(match.get("storageCompetitor") or match.get("competitor") or ""),
+                requested_source_key,
+            )
         if not groups:
             return requested_region, requested_competitor, requested_source_key
     if requested_region:
         region_groups = [group for group in groups if str(group.get("region") or "") == requested_region]
         if region_groups:
             first_region_group = region_groups[0]
-            return str(first_region_group.get("region") or ""), str(first_region_group.get("competitor") or ""), requested_source_key
+            return (
+                str(first_region_group.get("storageRegion") or first_region_group.get("region") or ""),
+                str(first_region_group.get("storageCompetitor") or first_region_group.get("competitor") or ""),
+                requested_source_key,
+            )
     if not groups:
         return region.strip(), competitor.strip(), source_key.strip()
     first = groups[0]
-    return str(first.get("region") or ""), str(first.get("competitor") or ""), requested_source_key
+    return (
+        str(first.get("storageRegion") or first.get("region") or ""),
+        str(first.get("storageCompetitor") or first.get("competitor") or ""),
+        requested_source_key,
+    )
 
 
 def _price_columns_for_group(db: Session, pf: PriceFormat, *, region: str, competitor: str, source_key: str = "") -> list[dict]:
@@ -692,8 +730,10 @@ def _price_columns_for_group(db: Session, pf: PriceFormat, *, region: str, compe
     seen: dict[str, int] = {}
     columns: list[dict] = []
     for row in rows:
+        emit_label = emit_display_name_from_source_key(row.source_key)
         base_label = (
-            row.account_login
+            emit_label
+            or row.account_login
             or row.display_name
             or row.supplier
             or row.source_key

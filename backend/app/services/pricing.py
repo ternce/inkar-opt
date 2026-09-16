@@ -39,8 +39,15 @@ from ..timezone import local_iso
 from .competitor_matching import rebuild_competitor_prices_for_selected
 from .competitor_percentiles import REGIONAL_SCOPE, REGULAR_COMPETITOR_SCOPE
 from .competitors.identity import canonical_regular_competitor_identity
-from .competitors.percentiles.sources import PERCENTILE_SOURCE_COMPETITOR, PERCENTILE_SOURCE_EMIT, is_emit_source_key, percentile_source_id
+from .competitors.percentiles.sources import (
+    PERCENTILE_SOURCE_COMPETITOR,
+    PERCENTILE_SOURCE_EMIT,
+    emit_percentile_source_name_aliases,
+    is_emit_source_key,
+    percentile_source_id,
+)
 from .competitor_assignments import get_assigned_competitor_price_lists
+from .competitor_source_config import emit_display_name_from_source_key
 from .emit_percentile_resolver import (
     assigned_emit_percentile_group_keys,
     emit_row_matches_assigned_group,
@@ -542,7 +549,7 @@ def _selected_source_meta(db: Session, price_format_id: int) -> SelectedSourceMe
     for item in get_assigned_competitor_price_lists(db=db, price_format_id=price_format_id):
         row = item.price_list
         src = f"{row.source_type}:{row.source_key}"
-        labels[src] = row.display_name or row.supplier or src
+        labels[src] = emit_display_name_from_source_key(row.source_key, row.display_name or row.supplier or src) or row.display_name or row.supplier or src
     return SelectedSourceMeta(selected_sources=set(labels), labels=labels)
 
 
@@ -1014,8 +1021,17 @@ def _resolve_percentile_rows(
         branch = str(row.branch_name or "")
         competitor = str(row.competitor_name or "")
         source_name = _percentile_source_name_for_row(row, price_format_id)
-        cfg = assigned_configs.get(source_name)
-        is_assigned_source = source_name in assigned_source_names
+        candidate_source_names = [source_name]
+        if is_emit_source_key(source_key):
+            candidate_source_names = sorted(emit_percentile_source_name_aliases(source_name))
+        cfg = None
+        matched_source_name = source_name
+        for candidate_source_name in candidate_source_names:
+            cfg = assigned_configs.get(candidate_source_name)
+            if cfg is not None:
+                matched_source_name = candidate_source_name
+                break
+        is_assigned_source = matched_source_name in assigned_source_names
         is_active_emit_row = (branch, competitor, source_key) in active_groups or (
             not source_key
             and any(active_branch == branch and active_competitor == competitor for active_branch, active_competitor, _active_source_key in active_groups)
@@ -1035,6 +1051,7 @@ def _resolve_percentile_rows(
                 coefficient = Decimal("1")
             else:
                 coefficient = _as_decimal(getattr(cfg, "coefficient", None), Decimal("1")) or Decimal("1")
+                source_name = matched_source_name
         else:
             if not is_assigned_source:
                 continue
