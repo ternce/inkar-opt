@@ -20,6 +20,7 @@ from backend.app.models import (
     PriceFormat,
     PriceFormatCompetitorAssignment,
     Product,
+    Job,
     RegularCompetitorPricePercentile,
     RegularCompetitorPricePercentileSourceSummary,
 )
@@ -30,7 +31,14 @@ from backend.app.services.competitor_percentiles import (
     recalculate_emit_percentiles_globally,
     recalculate_percentiles_for_price_lists,
 )
-from backend.app.services.percentile_preparation import mark_percentile_preparation_ready_for_catalog, percentile_preparation_to_dict
+from backend.app.services.percentile_preparation import (
+    JOB_TYPE,
+    enqueue_percentile_preparation,
+    ensure_percentile_ready_for_generation,
+    mark_percentile_preparation_ready_for_catalog,
+    percentile_preparation_to_dict,
+    run_percentile_preparation_job,
+)
 from backend.app.services.pricing import load_percentile_price_cache, resolve_percentile_prices_from_cache
 from backend.app.services.competitors.percentiles.read_models import (
     list_percentile_product_rows,
@@ -2161,7 +2169,7 @@ def test_global_emit_reuse_authorizes_duplicate_logical_cpl_rows_without_fanout(
         row = CompetitorPriceList(
             price_format_id=None,
             source_type="emit",
-            source_key="emit:1106",
+            source_key="" if pf_id in {1, 2, 6, 32} else "emit:1106",
             display_name=name,
             supplier=name,
             branch_name=name,
@@ -2243,11 +2251,27 @@ def test_global_emit_reuse_authorizes_duplicate_logical_cpl_rows_without_fanout(
     assert db.query(CompetitorPricePercentileSourceSummary).filter(
         CompetitorPricePercentileSourceSummary.price_format_id == 1
     ).count() == 0
+    db.add(
+        CompetitorPricePercentileSourceSummary(
+            price_format_id=1,
+            source_type="emit",
+            source_key="emit:1106",
+            competitor_price_list_id=refreshed.id,
+            branch_name=legacy_display,
+            competitor_name=legacy_display,
+            percentile_scope="regional",
+            percentile=10,
+            sku_count=999,
+            source_count=999,
+        )
+    )
+    db.commit()
 
     for pf_id in (1, 6, 32):
         sources = list_percentile_sources(db=db, price_format_code=formats[pf_id].code, percentile_source=PERCENTILE_SOURCE_EMIT)
         regional_sources = [row for row in sources if row["sourceKey"] == "emit:1106"]
         assert {row["percentile"] for row in regional_sources} == {10, 20, 30, 40, 60}
+        assert len(regional_sources) == 5
         assert {row["region"] for row in regional_sources} == {display}
         cache = load_percentile_price_cache(db, pf_id)
         resolved = resolve_percentile_prices_from_cache(cache, product.id, percentile_number=40)
@@ -2257,3 +2281,267 @@ def test_global_emit_reuse_authorizes_duplicate_logical_cpl_rows_without_fanout(
     for pf_id in (40, 41, 42):
         assert list_percentile_sources(db=db, price_format_code=formats[pf_id].code, percentile_source=PERCENTILE_SOURCE_EMIT) == []
         assert load_percentile_price_cache(db, pf_id) == {}
+
+
+def test_global_emit_reuse_authorizes_production_sized_legacy_source_key_siblings():
+    db = _session()
+    display = emit_display_name(1108)
+    reuse_ids = list(range(50, 98))
+    formats = {
+        pf_id: PriceFormat(
+            id=pf_id,
+            code=f"PF{pf_id}",
+            name=f"PF{pf_id}",
+            branch="Kostanay",
+            competitor_price_mode="percentile",
+            percentile_number=40,
+        )
+        for pf_id in [4, *reuse_ids]
+    }
+    product = Product(code="SKU-EMIT-1108", name="Emit 1108 Product", provisor_goods_id=1108001, cost=100)
+    db.add_all([*formats.values(), product])
+    db.flush()
+
+    canonical = CompetitorPriceList(
+        price_format_id=None,
+        source_type="emit",
+        source_key="emit:1108",
+        display_name=display,
+        supplier=display,
+        branch_name=display,
+        competitor_name=display,
+        branch_id="1108",
+        external_price_list_id="1108",
+    )
+    db.add(canonical)
+    db.flush()
+    _assign(db, formats[4], canonical, active=True, percentile_mode=MULTI_PRICE_PERCENTILE_MODE)
+
+    for pf_id in reuse_ids:
+        row = CompetitorPriceList(
+            price_format_id=None,
+            source_type="emit",
+            source_key="" if pf_id % 2 == 0 else "emit:1108",
+            display_name=display,
+            supplier=display,
+            branch_name=display,
+            competitor_name=display,
+            branch_id="1108",
+            external_price_list_id="1108",
+        )
+        db.add(row)
+        db.flush()
+        _assign(db, formats[pf_id], row, active=True, percentile_mode=MULTI_PRICE_PERCENTILE_MODE)
+
+    db.add_all(
+        [
+            CompetitorPriceListItem(
+                price_list_id=canonical.id,
+                product_id=product.id,
+                provisor_goods_id=1108001,
+                distributor_goods_id="1108001",
+                distributor_price=Decimal("100"),
+            ),
+            CompetitorPriceListItem(
+                price_list_id=canonical.id,
+                product_id=product.id,
+                provisor_goods_id=1108001,
+                distributor_goods_id="1108001",
+                distributor_price=Decimal("200"),
+            ),
+        ]
+    )
+    db.commit()
+
+    result = recalculate_emit_percentiles_globally(db=db, source_price_list_ids=[canonical.id])
+    db.commit()
+
+    assert result["canonical_price_format_id"] == 4
+    assert result["global_reuse_target_count"] == 48
+    assert result["global_reuse_target_ids"] == reuse_ids
+    assert sorted(result["target_price_format_ids"]) == [4, *reuse_ids]
+    assert result["physical_fanout_target_count"] == 0
+    assert result["compatibility_rows_created"] == 0
+    assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == 4).count() > 0
+    assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id.in_(reuse_ids)).count() == 0
+
+
+def test_emit_assignment_post_reuses_pf4_and_is_ready_without_target_rows(monkeypatch):
+    from backend.app import main
+
+    Session = _session_factory_static()
+    with Session() as db:
+        canonical, target, _other, product, price_list = _global_emit_fixture(db)
+        assignment = db.execute(select(PriceFormatCompetitorAssignment).where(
+            PriceFormatCompetitorAssignment.price_format_id == target.id
+        )).scalars().one()
+        assignment.is_active = False
+        db.commit()
+        target_id, price_list_id, target_code, product_id = target.id, price_list.id, target.code, product.id
+
+    monkeypatch.setattr("backend.app.services.percentile_preparation.start_percentile_preparation_worker", lambda _id: pytest.fail("worker started"))
+    monkeypatch.setattr(competitor_percentiles_module, "_matched_positive_counts_by_price_list", lambda **_kwargs: pytest.fail("raw Emit prices scanned"))
+    main.app.dependency_overrides[main.get_db] = lambda: Session()
+    _override_admin(main)
+    try:
+        client = TestClient(main.app)
+        response = client.post(f"/api/price-formats/{target_code}/competitor-assignments", json={
+            "sourceType": "competitor", "sourceId": price_list_id, "coefficient": 1,
+        })
+        sources = client.get(f"/api/competitors/percentiles?format_code={target_code}&percentile_source=emit&visibility=assignment")
+    finally:
+        main.app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["percentilePreparation"]["status"] == "ready"
+    assert sources.status_code == 200
+    assert len([row for row in sources.json() if row["sourceKey"] == "emit:1106"]) == 5
+    with Session() as db:
+        assert db.scalar(select(PriceFormatCompetitorAssignment.is_active).where(
+            PriceFormatCompetitorAssignment.price_format_id == target_id
+        )) is True
+        assert db.query(Job).filter(Job.type == JOB_TYPE, Job.price_format_id == target_id).count() == 0
+        assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == target_id).count() == 0
+        assert db.query(CompetitorPricePercentileSourceSummary).filter(
+            CompetitorPricePercentileSourceSummary.price_format_id == target_id
+        ).count() == 0
+        ensure_percentile_ready_for_generation(db, db.get(PriceFormat, target_id))
+        cache = load_percentile_price_cache(db, target_id)
+        assert resolve_percentile_prices_from_cache(cache, product_id, percentile_number=40).prices[0][0] == 110
+
+
+def test_many_emit_assignments_reuse_pf4_without_jobs_or_target_writes(monkeypatch):
+    db = _session()
+    canonical, target, _other, _product, price_list = _global_emit_fixture(db)
+    targets = [target]
+    for index in range(5):
+        pf = PriceFormat(code=f"REUSE-{index}", name=f"REUSE-{index}", branch="Aktau", competitor_price_mode="percentile")
+        db.add(pf)
+        db.flush()
+        _assign(db, pf, price_list, percentile_mode=MULTI_PRICE_PERCENTILE_MODE)
+        targets.append(pf)
+    db.commit()
+    monkeypatch.setattr("backend.app.services.percentile_preparation.start_percentile_preparation_worker", lambda _id: pytest.fail("worker started"))
+
+    for pf in targets:
+        assert enqueue_percentile_preparation(db=db, price_format_id=pf.id)["status"] == "ready"
+        assert len([row for row in list_percentile_sources(db=db, price_format_code=pf.code, percentile_source=PERCENTILE_SOURCE_EMIT)
+                    if row["sourceKey"] == "emit:1106"]) == 5
+    assert db.query(Job).filter(Job.type == JOB_TYPE).count() == 0
+    assert db.query(CompetitorPricePercentile).filter(
+        CompetitorPricePercentile.price_format_id.in_([pf.id for pf in targets])
+    ).count() == 0
+
+
+def test_legacy_target_emit_rows_do_not_override_canonical_or_get_rebuilt(monkeypatch):
+    db = _session()
+    _canonical, target, _other, product, price_list = _global_emit_fixture(db)
+    db.add(CompetitorPricePercentile(
+        price_format_id=target.id, product_id=product.id, competitor_price_list_id=price_list.id,
+        source_type="emit", source_key="emit:1106", branch_name="Emit International 1106",
+        competitor_name="Emit International 1106", percentile_scope="regional", percentile=40,
+        value=Decimal("999"), source_count=1, price_count=1, used_price_count=1, status="Calculated",
+    ))
+    refresh_emit_percentile_source_summaries(db=db, price_format_id=target.id)
+    db.commit()
+    monkeypatch.setattr("backend.app.services.percentile_preparation.start_percentile_preparation_worker", lambda _id: pytest.fail("worker started"))
+
+    before = db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == target.id).count()
+    assert enqueue_percentile_preparation(db=db, price_format_id=target.id)["status"] == "ready"
+    assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == target.id).count() == before
+    assert len([row for row in list_percentile_sources(db=db, price_format_code=target.code, percentile_source=PERCENTILE_SOURCE_EMIT)
+                if row["sourceKey"] == "emit:1106" and row["percentile"] == 40]) == 1
+    cache = load_percentile_price_cache(db, target.id)
+    assert resolve_percentile_prices_from_cache(cache, product.id, percentile_number=40).prices[0][0] == 110
+
+
+def test_refresh_path_skips_target_emit_but_keeps_pf4_calculation(monkeypatch):
+    db = _session()
+    canonical, target, _other, product, price_list = _global_emit_fixture(db)
+    _assign(db, canonical, price_list, percentile_mode=MULTI_PRICE_PERCENTILE_MODE)
+    _raw = CompetitorPriceListItem(
+        price_list_id=price_list.id, product_id=product.id, matched_sku=product.code,
+        distributor_goods_id=product.code, distributor_price=Decimal("120"),
+    )
+    db.add(_raw)
+    db.commit()
+    seen_ids = []
+    original = competitor_percentiles_module._matched_positive_counts_by_price_list
+
+    def capture_raw_scan(*, db, price_list_ids):
+        seen_ids.extend(price_list_ids)
+        return original(db=db, price_list_ids=price_list_ids)
+
+    monkeypatch.setattr(competitor_percentiles_module, "_matched_positive_counts_by_price_list", capture_raw_scan)
+    recalculate_percentiles_for_price_lists(db=db, competitor_price_list_ids=[price_list.id])
+    db.commit()
+    assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == canonical.id).count() > 0
+    assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == target.id).count() == 0
+    assert seen_ids == [price_list.id]
+
+
+def test_emit_reuse_requires_canonical_coverage_for_every_assigned_group(monkeypatch):
+    db = _session()
+    _canonical, target, _other, _product, _existing_price_list = _global_emit_fixture(db)
+    missing = _price_list(db, target, source_key="emit:1108", branch="Other branch", competitor="Other Emit", external_price_list_id="1108")
+    missing.source_type = "emit"
+    _assign(db, target, missing, percentile_mode=MULTI_PRICE_PERCENTILE_MODE)
+    db.commit()
+    monkeypatch.setattr("backend.app.services.percentile_preparation.start_percentile_preparation_worker", lambda _id: pytest.fail("worker started"))
+
+    status = enqueue_percentile_preparation(db=db, price_format_id=target.id)
+
+    assert status["status"] == "failed"
+    assert "emit:1108" in status["lastError"]
+    assert db.query(Job).filter(Job.type == JOB_TYPE, Job.price_format_id == target.id).count() == 0
+    assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == target.id).count() == 0
+
+
+def test_mixed_preparation_calculates_local_source_but_skips_emit(monkeypatch):
+    Session = _session_factory_static()
+    monkeypatch.setattr("backend.app.services.percentile_preparation.SessionLocal", Session)
+    with Session() as db:
+        _canonical, target, _other, product, _emit = _global_emit_fixture(db)
+        local = _price_list(db, target, source_key="account:7:plk:local", competitor="Local")
+        _assign(db, target, local, percentile_mode=MULTI_PRICE_PERCENTILE_MODE)
+        db.add(CompetitorPriceListItem(
+            price_list_id=local.id, product_id=product.id, matched_sku=product.code,
+            distributor_goods_id=product.code, distributor_price=Decimal("135"),
+        ))
+        db.commit()
+        target_id = target.id
+        status = enqueue_percentile_preparation(db=db, price_format_id=target_id, start_worker=False)
+        assert status["status"] == "pending"
+        with pytest.raises(ValueError, match="not ready"):
+            ensure_percentile_ready_for_generation(db, target)
+        job_id = status["jobId"]
+
+    run_percentile_preparation_job(job_id)
+
+    with Session() as db:
+        assert percentile_preparation_to_dict(db, target_id)["status"] == "ready"
+        rows = db.execute(select(CompetitorPricePercentile).where(
+            CompetitorPricePercentile.price_format_id == target_id
+        )).scalars().all()
+        assert rows and "account:7:plk:local" in {row.source_key for row in rows}
+        assert "emit:1106" not in {row.source_key for row in rows}
+        ensure_percentile_ready_for_generation(db, db.get(PriceFormat, target_id))
+
+
+def test_old_queued_emit_preparation_job_cannot_write_target_rows(monkeypatch):
+    Session = _session_factory_static()
+    monkeypatch.setattr("backend.app.services.percentile_preparation.SessionLocal", Session)
+    with Session() as db:
+        _canonical, target, _other, _product, _emit = _global_emit_fixture(db)
+        job = Job(id="old-emit-preparation", type=JOB_TYPE, status="pending", price_format_id=target.id,
+                  format_code=target.code, result_json="{}", logs="[]")
+        db.add(job)
+        db.commit()
+        target_id = target.id
+
+    run_percentile_preparation_job("old-emit-preparation")
+
+    with Session() as db:
+        assert db.get(Job, "old-emit-preparation").status == "success"
+        assert percentile_preparation_to_dict(db, target_id)["status"] == "ready"
+        assert db.query(CompetitorPricePercentile).filter(CompetitorPricePercentile.price_format_id == target_id).count() == 0

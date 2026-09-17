@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import threading
 import time
 import uuid
@@ -21,9 +22,21 @@ from ..models import (
     PriceFormatPercentilePreparation,
 )
 from ..timezone import local_iso, now_kz_naive
-from .competitor_percentiles import eligible_percentile_assignments, recalculate_competitor_percentiles
+from .competitor_percentiles import (
+    PERCENTILES,
+    REGIONAL_SCOPE,
+    eligible_percentile_assignments,
+    global_emit_percentiles_enabled,
+    recalculate_competitor_percentiles,
+)
 from .competitor_source_config import emit_display_name_from_source_key
-from .emit_percentile_resolver import global_emit_percentile_rows_count
+from .emit_percentile_resolver import (
+    assigned_emit_percentile_groups,
+    canonical_emit_source_key,
+    emit_percentile_scope_filter,
+    global_emit_percentile_rows_count,
+    global_emit_percentile_storage_price_format_id,
+)
 from .jobs import job_to_dict, update_job
 
 
@@ -109,7 +122,15 @@ def percentile_configuration(db: Session, price_format_id: int) -> dict[str, Any
 
 def has_raw_percentile_data(db: Session, price_format_id: int) -> bool:
     selected = eligible_percentile_assignments(db=db, price_format_id=price_format_id, require_matched_prices=False)
-    ids = [int(item.price_list.id) for item in selected]
+    ids = [
+        int(item.price_list.id)
+        for item in selected
+        if not (
+            global_emit_percentiles_enabled()
+            and price_format_id != global_emit_percentile_storage_price_format_id()
+            and canonical_emit_source_key(item.price_list)
+        )
+    ]
     if not ids:
         return _catalog_percentile_rows_count(db, price_format_id) > 0
     count = int(
@@ -153,6 +174,41 @@ def _selected_catalog_percentile_sources(db: Session, price_format_id: int) -> l
         for source_name, supplier, coefficient in rows
         if str(source_name or "").strip()
     ]
+
+
+def _canonical_emit_reuse_state(db: Session, price_format_id: int) -> tuple[list[str], list[str], bool]:
+    """Return covered Emit groups, uncovered groups, and whether local work remains."""
+    if not global_emit_percentiles_enabled() or price_format_id == global_emit_percentile_storage_price_format_id():
+        return [], [], True
+    assigned = eligible_percentile_assignments(db=db, price_format_id=price_format_id, require_matched_prices=False)
+    emit_keys = {canonical_emit_source_key(item.price_list) for item in assigned} - {""}
+    local_required = any(not canonical_emit_source_key(item.price_list) for item in assigned)
+    groups = assigned_emit_percentile_groups(db=db, target_price_format_id=price_format_id)
+    covered: list[str] = []
+    missing: list[str] = []
+    for group in groups:
+        if group.source_key not in emit_keys:
+            continue
+        scope = emit_percentile_scope_filter([group])
+        levels = set(db.execute(
+            select(CompetitorPricePercentile.percentile)
+            .where(CompetitorPricePercentile.price_format_id == global_emit_percentile_storage_price_format_id())
+            .where(CompetitorPricePercentile.percentile_scope == REGIONAL_SCOPE)
+            .where(CompetitorPricePercentile.value.is_not(None))
+            .where(scope)
+            .distinct()
+        ).scalars())
+        identity = f"{group.source_key}:{group.branch_name}:{group.competitor_name}"
+        (covered if set(PERCENTILES).issubset(levels) else missing).append(identity)
+    if emit_keys - {group.source_key for group in groups}:
+        missing.extend(sorted(emit_keys - {group.source_key for group in groups}))
+    covered_keys = {group.source_key for group in groups if f"{group.source_key}:{group.branch_name}:{group.competitor_name}" in covered}
+    for source in _selected_catalog_percentile_sources(db, price_format_id):
+        source_name = str(source["sourceName"])
+        match = re.match(r"^percentile:(?:\d+:(?:regional|kazakhstan):)?(emit:\d+):", source_name)
+        if match is None or match.group(1) not in covered_keys:
+            local_required = True
+    return covered, missing, local_required
 
 
 def _catalog_percentile_rows_count(db: Session, price_format_id: int) -> int:
@@ -273,6 +329,29 @@ def enqueue_percentile_preparation(
     config = percentile_configuration(db, price_format_id)
     now = now_kz_naive()
 
+    covered_emit, missing_emit, local_required = _canonical_emit_reuse_state(db, price_format_id)
+    if covered_emit and not missing_emit and not local_required:
+        mark_percentile_preparation_ready_for_catalog(db=db, price_format_ids=[price_format_id], reason=reason)
+        db.commit()
+        logger.info(
+            "[EMIT_ASSIGNMENT_REUSE] source_groups=%s target_price_format_id=%s canonical_price_format_id=%s "
+            "action=authorized_global_reuse physical_rebuild_skipped=true",
+            covered_emit,
+            price_format_id,
+            global_emit_percentile_storage_price_format_id(),
+        )
+        return percentile_preparation_to_dict(db, price_format_id)
+    if missing_emit and not local_required:
+        row.status = "failed"
+        row.failed_at = now
+        row.last_error = f"Canonical Emit percentile rows unavailable for: {', '.join(missing_emit)}"
+        row.configuration_fingerprint = config["fingerprint"]
+        row.source_refresh_id = config["sourceRefreshId"]
+        row.source_refreshed_at = config["sourceRefreshedAt"]
+        row.updated_at = now
+        db.commit()
+        return percentile_preparation_to_dict(db, price_format_id)
+
     if not config["configured"]:
         if _catalog_percentile_rows_count(db, price_format_id) > 0:
             mark_percentile_preparation_ready_for_catalog(db=db, price_format_ids=[price_format_id], reason=reason)
@@ -363,6 +442,9 @@ def run_percentile_preparation_job(job_id: str) -> dict[str, Any] | None:
         db.commit()
 
         summary = recalculate_competitor_percentiles(db=db, price_format_id=price_format_id)
+        _covered_emit, missing_emit, _local_required = _canonical_emit_reuse_state(db, price_format_id)
+        if missing_emit:
+            raise ValueError(f"Canonical Emit percentile rows unavailable for: {', '.join(missing_emit)}")
         current = percentile_configuration(db, price_format_id)
         if current["fingerprint"] != config["fingerprint"] or current["sourceRefreshId"] != config["sourceRefreshId"]:
             db.rollback()

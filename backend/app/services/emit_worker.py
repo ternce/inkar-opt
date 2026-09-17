@@ -33,6 +33,7 @@ from ..config import Settings
 from ..models import CompetitorPriceList, CompetitorPriceListItem, PriceFormat, RefreshJob, RefreshLock
 from .db_time import db_now
 from .competitor_percentiles import recalculate_emit_percentiles_globally
+from .emit_percentile_resolver import global_emit_percentile_storage_price_format_id
 from .percentile_preparation import mark_percentile_preparation_ready_for_catalog
 from .competitor_read_models import refresh_price_list_item_counters
 from .competitor_source_config import canonical_competitor_source_key, emit_display_name
@@ -3168,16 +3169,18 @@ def _recalculate_percentiles_for_emit_rows(
         for row in db.execute(select(CompetitorPriceList).where(CompetitorPriceList.id.in_(ids))).scalars().all()
     } if ids else {}
 
-    target_format_ids = [int(item) for item in db.execute(select(PriceFormat.id).order_by(PriceFormat.id.asc())).scalars().all()]
+    all_price_format_ids = [int(item) for item in db.execute(select(PriceFormat.id).order_by(PriceFormat.id.asc())).scalars().all()]
     for price_list_id in ids:
         price_list = price_lists.get(price_list_id)
         filial_id = getattr(price_list, "branch_id", "") or getattr(price_list, "external_price_list_id", "") or ""
         logger.info(
-            "[EMIT_FORMAT_CONTEXT] filial_id=%s requested_format_code=%s price_list_id=%s assigned_price_format_ids=%s",
+            "[EMIT_FORMAT_CONTEXT] filial_id=%s requested_format_code=%s price_list_id=%s "
+            "canonical_price_format_id=%s all_price_format_ids=%s",
             filial_id or "unknown",
             requested_format or "null",
             price_list_id,
-            target_format_ids,
+            global_emit_percentile_storage_price_format_id(),
+            all_price_format_ids,
         )
 
     scoped_ids = sorted(set(ids))
@@ -3186,8 +3189,22 @@ def _recalculate_percentiles_for_emit_rows(
         source_price_list_ids=scoped_ids if scope_to_price_list_ids else None,
     )
     summaries = dict(result.get("summaries") or {})
+    target_format_ids = list(all_price_format_ids)
     if "target_price_format_ids" in result:
         target_format_ids = [int(item) for item in result.get("target_price_format_ids") or []]
+    for price_list_id in ids:
+        price_list = price_lists.get(price_list_id)
+        filial_id = getattr(price_list, "branch_id", "") or getattr(price_list, "external_price_list_id", "") or ""
+        logger.info(
+            "[EMIT_FORMAT_CONTEXT] filial_id=%s requested_format_code=%s price_list_id=%s "
+            "canonical_price_format_id=%s all_price_format_ids=%s authorized_price_format_ids=%s",
+            filial_id or "unknown",
+            requested_format or "null",
+            price_list_id,
+            global_emit_percentile_storage_price_format_id(),
+            all_price_format_ids,
+            target_format_ids,
+        )
     mark_percentile_preparation_ready_for_catalog(
         db=db,
         price_format_ids=target_format_ids,

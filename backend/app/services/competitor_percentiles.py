@@ -30,10 +30,13 @@ from .competitor_source_config import (
     MULTI_PRICE_PERCENTILE_MODE,
     canonical_competitor_source_key,
     default_percentile_mode_for_source,
-    emit_display_aliases_from_source_key,
     effective_percentile_mode,
 )
-from .emit_percentile_resolver import global_emit_percentile_storage_price_format_id
+from .emit_percentile_resolver import canonical_emit_source_key, global_emit_percentile_storage_price_format_id
+from .emit_percentile_resolver import (
+    authorized_emit_target_price_format_ids,
+    logical_emit_identities_from_selected_sources,
+)
 from .competitors.identity import (
     canonical_regular_competitor_identity,
     normalize_regular_competitor_text,
@@ -253,7 +256,9 @@ def recalculate_competitor_percentiles(
             source_price_list_ids=source_price_list_ids,
             require_assignment=require_assignment,
         )
-    refresh_emit_percentile_source_summaries(db=db, price_format_id=price_format_id)
+    # A skipped target rebuild must leave legacy summary rows untouched.
+    if "message" not in summary:
+        refresh_emit_percentile_source_summaries(db=db, price_format_id=price_format_id)
     return summary
 
 
@@ -317,14 +322,20 @@ def _selected_source_rows(
     if require_assignment:
         selected_rows = [
             item.price_list
-            for item in eligible_percentile_assignments(db=db, price_format_id=price_format_id)
+            for item in eligible_percentile_assignments(db=db, price_format_id=price_format_id, require_matched_prices=False)
             if not scoped_ids or int(item.price_list.id) in scoped_ids
         ]
+        if global_emit_percentiles_enabled() and price_format_id != global_emit_percentile_storage_price_format_id():
+            selected_rows = [row for row in selected_rows if not canonical_emit_source_key(row)]
+        counts = _matched_positive_counts_by_price_list(db=db, price_list_ids=[int(row.id) for row in selected_rows])
+        selected_rows = [row for row in selected_rows if int(counts.get(int(row.id), 0)) > 0]
     else:
         stmt = select(CompetitorPriceList)
         if scoped_ids:
             stmt = stmt.where(CompetitorPriceList.id.in_(scoped_ids))
         candidates = db.execute(stmt.order_by(CompetitorPriceList.id.asc())).scalars().all()
+        if global_emit_percentiles_enabled() and price_format_id != global_emit_percentile_storage_price_format_id():
+            candidates = [row for row in candidates if not canonical_emit_source_key(row)]
         counts = _matched_positive_counts_by_price_list(db=db, price_list_ids=[int(row.id) for row in candidates if row.id is not None])
         selected_rows = [
             row
@@ -365,78 +376,17 @@ def _all_price_format_ids(db: Session, target_price_format_ids: list[int] | None
     return [int(item) for item in db.execute(stmt).scalars().all()]
 
 
-def _emit_identity_values_match(*, source_key: str, expected: object, actual: object) -> bool:
-    expected_text = str(expected or "").strip()
-    actual_text = str(actual or "").strip()
-    if not expected_text or not actual_text:
-        return expected_text == actual_text
-    if expected_text == actual_text:
-        return True
-    aliases = emit_display_aliases_from_source_key(source_key)
-    return actual_text in aliases and expected_text in aliases
-
-
-def _emit_source_matches_identity(row: CompetitorPriceList, identity: tuple[str, str, str]) -> bool:
-    source_key, branch_name, competitor_name = identity
-    if canonical_competitor_source_key(row) != source_key:
-        return False
-    row_branch = str(row.branch_name or row.region or "").strip()
-    row_competitor = str(row.competitor_name or row.supplier or row.display_name or "").strip()
-    return _emit_identity_values_match(source_key=source_key, expected=branch_name, actual=row_branch) and _emit_identity_values_match(
-        source_key=source_key,
-        expected=competitor_name,
-        actual=row_competitor,
-    )
-
-
 def _authorized_emit_target_price_format_ids(
     *,
     db: Session,
     selected_sources: list[dict[str, Any]],
     target_price_format_ids: list[int],
 ) -> list[int]:
-    identities = sorted(
-        {
-            (
-                str(row.get("source_key") or "").strip(),
-                str(row.get("branch_name") or "").strip(),
-                str(row.get("competitor_name") or "").strip(),
-            )
-            for row in selected_sources
-            if str(row.get("source_key") or "").strip().startswith("emit:")
-        }
+    return authorized_emit_target_price_format_ids(
+        db=db,
+        identities=logical_emit_identities_from_selected_sources(selected_sources),
+        target_price_format_ids=target_price_format_ids,
     )
-    if not identities:
-        return []
-    target_ids = sorted({int(item) for item in target_price_format_ids if int(item) > 0})
-    source_keys = sorted({source_key for source_key, _branch, _competitor in identities})
-    candidate_price_lists = (
-        db.execute(
-            select(CompetitorPriceList)
-            .where(CompetitorPriceList.source_key.in_(source_keys))
-            .order_by(CompetitorPriceList.id.asc())
-        )
-        .scalars()
-        .all()
-    )
-    price_list_ids = sorted(
-        {
-            int(row.id)
-            for row in candidate_price_lists
-            if row.id is not None and any(_emit_source_matches_identity(row, identity) for identity in identities)
-        }
-    )
-    if not price_list_ids:
-        return []
-    stmt = (
-        select(PriceFormatCompetitorAssignment.price_format_id)
-        .where(PriceFormatCompetitorAssignment.competitor_price_list_id.in_(price_list_ids))
-        .where(PriceFormatCompetitorAssignment.is_active.is_(True))
-        .order_by(PriceFormatCompetitorAssignment.price_format_id.asc())
-    )
-    if target_ids:
-        stmt = stmt.where(PriceFormatCompetitorAssignment.price_format_id.in_(target_ids))
-    return sorted({int(item) for item in db.execute(stmt).scalars().all() if item is not None})
 
 
 def recalculate_emit_percentiles_globally(

@@ -80,8 +80,8 @@ def _session():
     return sessionmaker(bind=engine)()
 
 
-def _format(db, *, rounding=None):
-    pf = PriceFormat(code="0001", name="0001", branch="Almaty")
+def _format(db, *, rounding=None, price_format_id=None):
+    pf = PriceFormat(id=price_format_id, code="0001", name="0001", branch="Almaty")
     db.add(pf)
     db.flush()
     if rounding is not None:
@@ -1757,7 +1757,7 @@ def test_multi_price_percentile_source_uses_all_rows_for_one_sku():
 
 def test_emit_multi_price_same_list_goods_id_keeps_all_prices():
     db = _session()
-    pf = _format(db)
+    pf = _format(db, price_format_id=4)
     product = _product(db, code="PCT-EMIT-GOODS", cost=100)
     product.provisor_goods_id = 163571
     price_list = CompetitorPriceList(
@@ -1806,7 +1806,7 @@ def test_emit_multi_price_same_list_goods_id_keeps_all_prices():
 
 def test_emit_percentile_rebuild_maps_unmatched_raw_rows_by_goods_id():
     db = _session()
-    pf = _format(db)
+    pf = _format(db, price_format_id=4)
     product = _product(db, code="163571", cost=100)
     product.provisor_goods_id = 163571
     price_list = CompetitorPriceList(
@@ -2814,7 +2814,7 @@ def test_multi_price_percentile_ignores_invalid_prices_and_one_price_status():
 
 def test_emit_percentile_matches_excel_percentile_inc_customer_example():
     db = _session()
-    pf = _format(db)
+    pf = _format(db, price_format_id=4)
     product = _product(db, code="000000000001004334", cost=100)
     product.provisor_goods_id = 55562
     price_list = CompetitorPriceList(
@@ -2910,7 +2910,7 @@ def test_emit_percentile_matches_excel_percentile_inc_customer_example():
 
 def test_emit_percentile_coverage_counts_all_matched_positive_products():
     db = _session()
-    pf = _format(db)
+    pf = _format(db, price_format_id=4)
     products = [_product(db, code=f"PCT-EMIT-COV-{idx}", cost=100) for idx in range(1, 4)]
     price_list = CompetitorPriceList(
         price_format_id=pf.id,

@@ -11,7 +11,9 @@ from ..models import CompetitorPriceList, CompetitorPricePercentile, PriceFormat
 from .competitor_source_config import (
     MULTI_PRICE_PERCENTILE_MODE,
     canonical_competitor_source_key,
+    default_percentile_mode_for_source,
     emit_display_aliases_from_source_key,
+    emit_filial_id_from_source_key,
     effective_percentile_mode,
 )
 
@@ -33,6 +35,13 @@ class EmitPercentileGroup:
     source_type: str
 
 
+@dataclass(frozen=True)
+class EmitLogicalIdentity:
+    source_key: str
+    branch_name: str
+    competitor_name: str
+
+
 def global_emit_percentile_storage_price_format_id() -> int:
     return GLOBAL_EMIT_PERCENTILE_STORAGE_PRICE_FORMAT_ID
 
@@ -43,6 +52,125 @@ def is_global_emit_percentile_storage_price_format(price_format_id: int | None) 
 
 def is_emit_percentile_source_key(value: object) -> bool:
     return str(value or "").strip().startswith("emit:")
+
+
+def canonical_emit_source_key(row: CompetitorPriceList) -> str:
+    """Return the runtime logical Emit source key without mutating legacy rows."""
+
+    stored_key = str(row.source_key or "").strip()
+    filial_id = emit_filial_id_from_source_key(stored_key)
+    if filial_id:
+        return f"emit:{filial_id}"
+
+    source_type = str(row.source_type or "").strip().casefold()
+    external_id = str(row.external_price_list_id or "").strip()
+    if external_id and (
+        source_type == "emit"
+        or default_percentile_mode_for_source(row) == MULTI_PRICE_PERCENTILE_MODE
+    ):
+        return f"emit:{external_id}"
+    return ""
+
+
+def _emit_branch_name(row: CompetitorPriceList) -> str:
+    return str(row.branch_name or row.region or "").strip()
+
+
+def _emit_competitor_name(row: CompetitorPriceList) -> str:
+    return str(row.competitor_name or row.supplier or row.display_name or "").strip()
+
+
+def logical_emit_identity(row: CompetitorPriceList) -> EmitLogicalIdentity | None:
+    source_key = canonical_emit_source_key(row)
+    if not source_key:
+        return None
+    return EmitLogicalIdentity(
+        source_key=source_key,
+        branch_name=_emit_branch_name(row),
+        competitor_name=_emit_competitor_name(row),
+    )
+
+
+def _emit_identity_values_match(*, source_key: str, expected: object, actual: object) -> bool:
+    expected_text = str(expected or "").strip()
+    actual_text = str(actual or "").strip()
+    if not expected_text or not actual_text:
+        return expected_text == actual_text
+    if expected_text == actual_text:
+        return True
+    aliases = emit_display_aliases_from_source_key(source_key)
+    return actual_text in aliases and expected_text in aliases
+
+
+def emit_cpl_matches_logical_identity(row: CompetitorPriceList, identity: EmitLogicalIdentity) -> bool:
+    row_identity = logical_emit_identity(row)
+    if row_identity is None or row_identity.source_key != identity.source_key:
+        return False
+    return _emit_identity_values_match(
+        source_key=identity.source_key,
+        expected=identity.branch_name,
+        actual=row_identity.branch_name,
+    ) and _emit_identity_values_match(
+        source_key=identity.source_key,
+        expected=identity.competitor_name,
+        actual=row_identity.competitor_name,
+    )
+
+
+def logical_emit_identities_from_selected_sources(selected_sources: list[dict[str, Any]]) -> list[EmitLogicalIdentity]:
+    identities = {
+        EmitLogicalIdentity(
+            source_key=str(row.get("source_key") or "").strip(),
+            branch_name=str(row.get("branch_name") or "").strip(),
+            competitor_name=str(row.get("competitor_name") or "").strip(),
+        )
+        for row in selected_sources
+        if str(row.get("source_key") or "").strip().startswith("emit:")
+    }
+    return sorted(identities, key=lambda row: (row.source_key, row.branch_name, row.competitor_name))
+
+
+def authorized_emit_target_price_format_ids(
+    *,
+    db: Session,
+    identities: list[EmitLogicalIdentity],
+    target_price_format_ids: list[int],
+) -> list[int]:
+    if not identities:
+        return []
+    target_ids = sorted({int(item) for item in target_price_format_ids if int(item) > 0})
+    source_keys = sorted({identity.source_key for identity in identities})
+    filial_ids = sorted({emit_filial_id_from_source_key(source_key) for source_key in source_keys} - {""})
+    candidate_filters = [CompetitorPriceList.source_key.in_(source_keys)]
+    if filial_ids:
+        candidate_filters.append(CompetitorPriceList.external_price_list_id.in_(filial_ids))
+    candidate_price_lists = (
+        db.execute(
+            select(CompetitorPriceList)
+            .where(or_(*candidate_filters))
+            .order_by(CompetitorPriceList.id.asc())
+        )
+        .scalars()
+        .all()
+    )
+    price_list_ids = sorted(
+        {
+            int(row.id)
+            for row in candidate_price_lists
+            if row.id is not None and any(emit_cpl_matches_logical_identity(row, identity) for identity in identities)
+        }
+    )
+    if not price_list_ids:
+        return []
+    stmt = (
+        select(PriceFormatCompetitorAssignment.price_format_id)
+        .where(PriceFormatCompetitorAssignment.competitor_price_list_id.in_(price_list_ids))
+        .where(PriceFormatCompetitorAssignment.is_active.is_(True))
+        .order_by(PriceFormatCompetitorAssignment.price_format_id.asc())
+    )
+    if target_ids:
+        stmt = stmt.where(PriceFormatCompetitorAssignment.price_format_id.in_(target_ids))
+    return sorted({int(item) for item in db.execute(stmt).scalars().all() if item is not None})
 
 
 def _emit_storage_value_aliases(source_key: str, value: object) -> set[str]:
@@ -78,7 +206,7 @@ def assigned_emit_percentile_groups(*, db: Session, target_price_format_id: int)
     )
     groups_by_key: dict[tuple[str, str, str], EmitPercentileGroup] = {}
     for price_list, assignment in rows:
-        source_key = canonical_competitor_source_key(price_list)
+        source_key = canonical_emit_source_key(price_list) or canonical_competitor_source_key(price_list)
         if not is_emit_percentile_source_key(source_key):
             continue
         if effective_percentile_mode(price_list, assignment.percentile_mode) != MULTI_PRICE_PERCENTILE_MODE:

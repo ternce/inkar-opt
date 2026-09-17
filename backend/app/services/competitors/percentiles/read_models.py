@@ -44,6 +44,9 @@ from ...competitor_source_config import (
 )
 from ...competitor_read_models import live_emit_percentile_source_summary_rows
 from ...emit_percentile_resolver import (
+    assigned_emit_percentile_group_keys,
+    emit_row_matches_assigned_group,
+    global_emit_percentile_storage_price_format_id,
     global_emit_percentile_base_stmt,
     load_global_emit_percentile_rows,
 )
@@ -106,21 +109,41 @@ def list_percentile_sources(
                 CompetitorPricePercentileSourceSummary.competitor_name.asc(),
             )
         ).scalars().all()
-        live_rows = (
-            [
+        if persisted_rows:
+            canonical_rows = []
+            if target_price_format_id != global_emit_percentile_storage_price_format_id():
+                active_groups = assigned_emit_percentile_group_keys(db=db, target_price_format_id=target_price_format_id)
+                if active_groups:
+                    canonical_candidates = (
+                        db.execute(
+                            stmt.where(
+                                CompetitorPricePercentileSourceSummary.price_format_id
+                                == global_emit_percentile_storage_price_format_id()
+                            ).order_by(
+                                CompetitorPricePercentileSourceSummary.branch_name.asc(),
+                                CompetitorPricePercentileSourceSummary.competitor_name.asc(),
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    canonical_rows = [
+                        row for row in canonical_candidates if emit_row_matches_assigned_group(row, active_groups)
+                    ]
+            live_rows = canonical_rows
+        else:
+            live_rows = [
                 SimpleNamespace(**row)
                 for row in live_emit_percentile_source_summary_rows(db=db, price_format_id=target_price_format_id)
             ]
-            if not persisted_rows
-            else []
-        )
         rows = []
         seen_rows: set[tuple[str, str, str, str, int]] = set()
         for row in [*live_rows, *persisted_rows]:
+            row_source_key = str(row.source_key or "")
             key = (
-                str(row.source_key or ""),
-                str(row.branch_name or ""),
-                str(row.competitor_name or ""),
+                row_source_key,
+                _emit_display(row_source_key, row.branch_name or ""),
+                _emit_display(row_source_key, row.competitor_name or ""),
                 str(row.percentile_scope or ""),
                 int(row.percentile),
             )
