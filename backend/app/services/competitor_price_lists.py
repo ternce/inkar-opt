@@ -14,7 +14,7 @@ from decimal import Decimal
 from typing import Any
 
 from openpyxl import Workbook, load_workbook
-from sqlalchemy import delete, func, select
+from sqlalchemy import String, cast, delete, func, literal, select, update
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -726,6 +726,169 @@ def _replace_legacy_price_rows_for_list(*, db: Session, price_list: CompetitorPr
         )
 
 
+def relink_provisor_items_from_product_goods_ids(
+    *,
+    db: Session,
+    price_list_ids: list[int],
+) -> dict[str, object]:
+    scoped_ids = sorted({int(item) for item in price_list_ids if int(item or 0) > 0})
+    if not scoped_ids:
+        return {"priceListIds": [], "relinkedItems": 0, "conflictItems": 0, "ambiguousGoodsIds": 0, "ambiguousItems": 0}
+
+    provisor_price_list_ids = [
+        int(item)
+        for item in db.execute(
+            select(CompetitorPriceList.id)
+            .where(CompetitorPriceList.id.in_(scoped_ids))
+            .where(CompetitorPriceList.source_type == "provisor")
+        ).scalars()
+    ]
+    if not provisor_price_list_ids:
+        return {"priceListIds": [], "relinkedItems": 0, "conflictItems": 0, "ambiguousGoodsIds": 0, "ambiguousItems": 0}
+
+    product_goods = (
+        select(
+            Product.provisor_goods_id.label("goods_id"),
+            func.min(Product.id).label("product_id"),
+            func.count(Product.id).label("product_count"),
+        )
+        .where(Product.provisor_goods_id.is_not(None))
+        .group_by(Product.provisor_goods_id)
+        .subquery()
+    )
+    unique_product_goods = (
+        select(product_goods.c.goods_id, product_goods.c.product_id)
+        .where(product_goods.c.product_count == 1)
+        .subquery()
+    )
+    ambiguous_goods = (
+        select(product_goods.c.goods_id)
+        .where(product_goods.c.product_count > 1)
+        .subquery()
+    )
+
+    ambiguous_goods_ids = int(
+        db.scalar(
+            select(func.count(func.distinct(CompetitorPriceListItem.provisor_goods_id)))
+            .where(CompetitorPriceListItem.price_list_id.in_(provisor_price_list_ids))
+            .where(CompetitorPriceListItem.provisor_goods_id.in_(select(ambiguous_goods.c.goods_id)))
+        )
+        or 0
+    )
+    ambiguous_items = int(
+        db.scalar(
+            select(func.count(CompetitorPriceListItem.id))
+            .where(CompetitorPriceListItem.price_list_id.in_(provisor_price_list_ids))
+            .where(CompetitorPriceListItem.provisor_goods_id.in_(select(ambiguous_goods.c.goods_id)))
+        )
+        or 0
+    )
+    conflict_items = int(
+        db.scalar(
+            select(func.count(CompetitorPriceListItem.id))
+            .join(unique_product_goods, CompetitorPriceListItem.provisor_goods_id == unique_product_goods.c.goods_id)
+            .where(CompetitorPriceListItem.price_list_id.in_(provisor_price_list_ids))
+            .where(CompetitorPriceListItem.product_id.is_not(None))
+            .where(CompetitorPriceListItem.product_id != unique_product_goods.c.product_id)
+        )
+        or 0
+    )
+
+    match_key = literal("provisor:") + cast(CompetitorPriceListItem.provisor_goods_id, String)
+    result = db.execute(
+        update(CompetitorPriceListItem)
+        .where(CompetitorPriceListItem.price_list_id.in_(provisor_price_list_ids))
+        .where(CompetitorPriceListItem.provisor_goods_id.is_not(None))
+        .where(CompetitorPriceListItem.provisor_goods_id == unique_product_goods.c.goods_id)
+        .where(CompetitorPriceListItem.product_id.is_(None))
+        .values(
+            product_id=unique_product_goods.c.product_id,
+            match_key=match_key,
+            match_type="provisor_goods_id",
+            matched_sku=match_key,
+            match_score=100,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    relinked = int(result.rowcount or 0)
+    if relinked:
+        db.flush()
+    logger.info(
+        "[PROVISOR_EXACT_GOODSID_RELINK] price_list_ids=%s relinked_items=%s conflict_items=%s ambiguous_goods_ids=%s ambiguous_items=%s",
+        provisor_price_list_ids,
+        relinked,
+        conflict_items,
+        ambiguous_goods_ids,
+        ambiguous_items,
+    )
+    return {
+        "priceListIds": provisor_price_list_ids,
+        "relinkedItems": relinked,
+        "conflictItems": conflict_items,
+        "ambiguousGoodsIds": ambiguous_goods_ids,
+        "ambiguousItems": ambiguous_items,
+    }
+
+
+def _replace_assigned_competitor_price_rows_for_list(*, db: Session, price_list: CompetitorPriceList) -> list[int]:
+    if price_list.id is None or price_list.source_type != "provisor":
+        return []
+    price_format_ids = selected_price_format_ids_for_competitor_price_list(
+        db=db,
+        competitor_price_list_id=int(price_list.id),
+    )
+    if not price_format_ids:
+        return []
+
+    src = _source_name(price_list)
+    items = (
+        db.execute(
+            select(CompetitorPriceListItem)
+            .where(CompetitorPriceListItem.price_list_id == price_list.id)
+            .where(CompetitorPriceListItem.product_id.is_not(None))
+            .where(CompetitorPriceListItem.distributor_price.is_not(None))
+        )
+        .scalars()
+        .all()
+    )
+    for price_format_id in price_format_ids:
+        db.execute(
+            delete(CompetitorPrice)
+            .where(CompetitorPrice.price_format_id == price_format_id)
+            .where(CompetitorPrice.product_id.is_not(None))
+            .where(CompetitorPrice.source_name == src)
+        )
+        for item in items:
+            if item.product_id is None or item.distributor_price is None:
+                continue
+            db.add(
+                CompetitorPrice(
+                    price_format_id=price_format_id,
+                    product_id=item.product_id,
+                    source_name=src,
+                    supplier=price_list.supplier or price_list.display_name,
+                    price_date=price_list.price_date,
+                    coefficient=effective_price_coefficient(price_list),
+                    source_price=float(item.distributor_price),
+                    match_type=item.match_type or "matched",
+                    source_item_id=int(item.id) if item.id is not None else None,
+                    source_goods_id=item.provisor_goods_id,
+                    source_distributor_goods_id=str(item.distributor_goods_id or ""),
+                    source_manufacturer=str(item.raw_manufacturer or ""),
+                )
+            )
+    if price_format_ids:
+        db.flush()
+    logger.info(
+        "[PROVISOR_SCOPED_COMPETITOR_PRICE_REFRESH] source=%s price_list_id=%s price_format_ids=%s items=%s",
+        src,
+        int(price_list.id),
+        price_format_ids,
+        len(items),
+    )
+    return price_format_ids
+
+
 def _display_name_from_provisor_item(item: dict[str, Any], fallback_filial_id: int) -> str:
     filial = item.get("filial") if isinstance(item.get("filial"), dict) else {}
     name = str(filial.get("name") or "").strip()
@@ -1249,6 +1412,15 @@ def upsert_unified_price_list(
     db.flush()
     benchmark["flush_sec"] = round(time.perf_counter() - stage_started_at, 6)
     _db_save_timing(price_list_id=row.id, stage="flush", rows=inserted_rows_count, started_at=stage_started_at)
+    relink_summary = (
+        relink_provisor_items_from_product_goods_ids(db=db, price_list_ids=[int(row.id)])
+        if price_list.source == "provisor" and not run_matching
+        else {"priceListIds": [], "relinkedItems": 0, "conflictItems": 0, "ambiguousGoodsIds": 0, "ambiguousItems": 0}
+    )
+    benchmark["exact_goods_id_relinked_items"] = int(relink_summary.get("relinkedItems") or 0)
+    benchmark["exact_goods_id_conflict_items"] = int(relink_summary.get("conflictItems") or 0)
+    benchmark["exact_goods_id_ambiguous_goods_ids"] = int(relink_summary.get("ambiguousGoodsIds") or 0)
+    benchmark["exact_goods_id_ambiguous_items"] = int(relink_summary.get("ambiguousItems") or 0)
     _db_memory_snapshot(
         db=db,
         price_list_id=row.id,
@@ -1273,6 +1445,12 @@ def upsert_unified_price_list(
     else:
         affected_price_format_ids = []
         refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
+        materialized_price_format_ids = (
+            _replace_assigned_competitor_price_rows_for_list(db=db, price_list=row)
+            if price_list.source == "provisor"
+            else []
+        )
+        benchmark["exact_goods_id_materialized_price_format_ids"] = materialized_price_format_ids
     stage_started_at = time.perf_counter()
     db.commit()
     if run_matching:

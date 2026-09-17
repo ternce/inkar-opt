@@ -2261,6 +2261,38 @@ def _upsert_source_goods_match(
 
         row = db.execute(stmt).scalars().first()
 
+    if source_type == "provisor" and sku:
+        target = db.execute(
+            select(SourceGoodsMatch)
+            .where(SourceGoodsMatch.price_format_id == price_format_id)
+            .where(SourceGoodsMatch.source_type == source_type)
+            .where(SourceGoodsMatch.distributor_goods_id == sku)
+        ).scalars().first()
+        if target is not None and target is not row:
+            same_product = int(target.product_id) == int(product_id)
+            same_goods = (
+                not normalized_goods_id
+                or not _to_int(target.goods_id)
+                or _to_int(target.goods_id) == normalized_goods_id
+            )
+            if same_product and same_goods:
+                if match_cache is not None:
+                    match_cache[cache_key] = target
+                return
+            logger.warning(
+                "[SOURCE_GOODS_MATCH_CONFLICT] price_format_id=%s source_type=%s distributor_goods_id=%s "
+                "target_row_id=%s target_product_id=%s target_goods_id=%s incoming_product_id=%s incoming_goods_id=%s",
+                price_format_id,
+                source_type,
+                sku,
+                target.id,
+                target.product_id,
+                target.goods_id,
+                product_id,
+                normalized_goods_id,
+            )
+            return
+
     if row is None:
         row = SourceGoodsMatch(
             price_format_id=price_format_id,

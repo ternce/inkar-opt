@@ -513,3 +513,164 @@ def test_global_source_goods_match_allows_null_price_format_id():
     assert row.product_id == product.id
     assert row.distributor_goods_id == "0"
     assert row.match_method == "provisor_goods_id"
+
+
+def _write_provisor_match(db, pf_id, product_id, goods_id, distributor_id, *, cache=None):
+    _upsert_source_goods_match(
+        db=db,
+        match_cache=cache,
+        price_format_id=pf_id,
+        source_type="provisor",
+        distributor_goods_id=distributor_id,
+        goods_id=goods_id,
+        distributor_goods_name="Current Name",
+        distributor_producer="Current Producer",
+        product_id=product_id,
+        similarity_score=100,
+        match_method="provisor_goods_id",
+    )
+
+
+def test_source_goods_match_updates_legacy_id_when_target_absent():
+    db = _session()
+    pf = _price_format(db)
+    product = _product(db)
+    legacy = SourceGoodsMatch(
+        price_format_id=pf.id, source_type="provisor", distributor_goods_id="00000000579",
+        goods_id=24843, product_id=product.id, match_method="provisor_goods_id",
+    )
+    db.add(legacy)
+    db.flush()
+
+    _write_provisor_match(db, pf.id, product.id, 24843, "100000000000001689", cache={"goods:24843": legacy})
+    db.flush()
+
+    assert legacy.distributor_goods_id == "100000000000001689"
+    assert db.execute(select(SourceGoodsMatch)).scalars().all() == [legacy]
+
+
+def test_source_goods_match_preserves_existing_canonical_and_legacy_rows():
+    db = _session()
+    pf = _price_format(db)
+    product = Product(id=7, code="SKU-7", name="Product 7", cost=1)
+    db.add(product)
+    db.flush()
+    legacy = SourceGoodsMatch(
+        id=4, price_format_id=pf.id, source_type="provisor", distributor_goods_id="00000000579",
+        goods_id=24843, product_id=7, match_method="provisor_goods_id",
+    )
+    canonical = SourceGoodsMatch(
+        id=10885, price_format_id=pf.id, source_type="provisor", distributor_goods_id="100000000000001689",
+        goods_id=24843, product_id=7, match_method="provisor_goods_id",
+    )
+    db.add_all([legacy, canonical])
+    db.flush()
+    cache = {"goods:24843": legacy, "00000000579": legacy, "100000000000001689": canonical}
+
+    _write_provisor_match(db, pf.id, 7, 24843, "100000000000001689", cache=cache)
+    db.flush()
+
+    assert legacy.distributor_goods_id == "00000000579"
+    assert canonical.distributor_goods_id == "100000000000001689"
+    assert cache["goods:24843"] is canonical
+    assert db.execute(select(SourceGoodsMatch)).scalars().all() == [legacy, canonical]
+
+    _write_provisor_match(db, pf.id, 7, 24843, "100000000000001689", cache=cache)
+    db.flush()
+    assert legacy.distributor_goods_id == "00000000579"
+    assert len(db.execute(select(SourceGoodsMatch)).scalars().all()) == 2
+
+
+def test_provisor_product_rematch_preserves_legacy_and_canonical_source_matches():
+    db = _session()
+    pf = _price_format(db)
+    product = Product(id=7, code="SKU-7", name="Product 7", cost=1, provisor_goods_id=24843)
+    db.add(product)
+    price_list = _price_list(db, pf, source_key=1106, filial_id=1106)
+    item = _item(
+        db, price_list, distributor_goods_id="100000000000001689", goods_id=24843,
+        filial_id=1106, name="Product 7",
+    )
+    legacy = SourceGoodsMatch(
+        id=4, price_format_id=pf.id, source_type="provisor", distributor_goods_id="00000000579",
+        goods_id=24843, product_id=7, match_method="provisor_goods_id",
+    )
+    canonical = SourceGoodsMatch(
+        id=10885, price_format_id=pf.id, source_type="provisor", distributor_goods_id="100000000000001689",
+        goods_id=24843, product_id=7, match_method="provisor_goods_id",
+    )
+    db.add_all([legacy, canonical])
+    db.flush()
+
+    rematch_price_list_items_by_product(db=db, price_list=price_list)
+    db.flush()
+    rematch_price_list_items_by_product(db=db, price_list=price_list)
+    db.flush()
+
+    db.refresh(item)
+    assert item.product_id == product.id
+    assert legacy.distributor_goods_id == "00000000579"
+    assert canonical.distributor_goods_id == "100000000000001689"
+    assert len(db.execute(select(SourceGoodsMatch)).scalars().all()) == 2
+
+
+def test_source_goods_match_logs_conflicting_product_without_overwrite(caplog):
+    db = _session()
+    pf = _price_format(db)
+    first = _product(db, code="FIRST")
+    other = _product(db, code="OTHER")
+    legacy = SourceGoodsMatch(
+        price_format_id=pf.id, source_type="provisor", distributor_goods_id="OLD",
+        goods_id=24843, product_id=first.id,
+    )
+    target = SourceGoodsMatch(
+        price_format_id=pf.id, source_type="provisor", distributor_goods_id="NEW",
+        goods_id=24843, product_id=other.id,
+    )
+    db.add_all([legacy, target])
+    db.flush()
+
+    _write_provisor_match(db, pf.id, first.id, 24843, "NEW", cache={"goods:24843": legacy})
+    db.flush()
+
+    assert legacy.distributor_goods_id == "OLD"
+    assert target.product_id == other.id
+    assert target.distributor_goods_id == "NEW"
+    assert "[SOURCE_GOODS_MATCH_CONFLICT]" in caplog.text
+
+
+def test_source_goods_match_target_in_other_price_format_is_untouched():
+    db = _session()
+    pf = _price_format(db)
+    other_pf = PriceFormat(code="OTHER", name="Other")
+    db.add(other_pf)
+    product = _product(db)
+    db.flush()
+    legacy = SourceGoodsMatch(price_format_id=pf.id, source_type="provisor", distributor_goods_id="OLD", goods_id=24843, product_id=product.id)
+    other = SourceGoodsMatch(price_format_id=other_pf.id, source_type="provisor", distributor_goods_id="NEW", goods_id=24843, product_id=product.id)
+    db.add_all([legacy, other])
+    db.flush()
+
+    _write_provisor_match(db, pf.id, product.id, 24843, "NEW", cache={"goods:24843": legacy})
+    db.flush()
+
+    assert legacy.distributor_goods_id == "NEW"
+    assert other.distributor_goods_id == "NEW"
+    assert other.price_format_id == other_pf.id
+
+
+def test_source_goods_match_target_in_other_source_is_untouched():
+    db = _session()
+    pf = _price_format(db)
+    product = _product(db)
+    legacy = SourceGoodsMatch(price_format_id=pf.id, source_type="provisor", distributor_goods_id="OLD", goods_id=24843, product_id=product.id)
+    other = SourceGoodsMatch(price_format_id=pf.id, source_type="vidman", distributor_goods_id="NEW", goods_id=24843, product_id=product.id)
+    db.add_all([legacy, other])
+    db.flush()
+
+    _write_provisor_match(db, pf.id, product.id, 24843, "NEW", cache={"goods:24843": legacy})
+    db.flush()
+
+    assert legacy.distributor_goods_id == "NEW"
+    assert other.distributor_goods_id == "NEW"
+    assert other.source_type == "vidman"
