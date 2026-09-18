@@ -287,6 +287,8 @@ type CodeMappingRow = CodeMappingCandidate & {
   ourSku?: string;
   ourName?: string;
   ourManufacturer?: string;
+  assignedUserId?: number | null;
+  assignmentStatus?: string | null;
 };
 
 type MappingPagination = {
@@ -358,6 +360,7 @@ type ProvisorDiagnostics = {
 
 type Props = {
   formatCode: string;
+  currentUser: { id: number; role: string; displayName: string };
 };
 
 type CompetitorsInternalTab = 'price-lists' | 'percentiles' | 'mappings';
@@ -686,7 +689,7 @@ function PercentileBrowser({
   );
 }
 
-export function CompetitorsTab({ formatCode }: Props) {
+export function CompetitorsTab({ formatCode, currentUser }: Props) {
   const [activeTab, setActiveTab] = useState<CompetitorsInternalTab>('price-lists');
   const [sources, setSources] = useState<CompetitorSource[]>([]);
   const [sourceSearch, setSourceSearch] = useState('');
@@ -745,6 +748,9 @@ export function CompetitorsTab({ formatCode }: Props) {
   const [appliedProductQuery, setAppliedProductQuery] = useState('');
   const [mappingPage, setMappingPage] = useState(1);
   const [mappingPagination, setMappingPagination] = useState<MappingPagination>({ page: 1, pageSize: 50, total: 0, pageCount: 0 });
+  const [taskScope, setTaskScope] = useState('all');
+  const [taskCounts, setTaskCounts] = useState<any>(null);
+  const [matchingWorkers, setMatchingWorkers] = useState<Array<{ id: number; displayName: string }>>([]);
   const [codeRows, setCodeRows] = useState<CodeMappingRow[]>([]);
   const [metrics, setMetrics] = useState<CodeMappingMetric[]>([]);
   const [selectedRow, setSelectedRow] = useState<CodeMappingRow | null>(null);
@@ -865,6 +871,13 @@ export function CompetitorsTab({ formatCode }: Props) {
       limit: '50',
       include_candidates: 'false',
     });
+    if (currentUser.role === 'admin') {
+      params.set('task_scope', taskScope);
+      if (taskScope.startsWith('user:')) {
+        params.set('task_scope', 'user');
+        params.set('assignee_user_id', taskScope.slice(5));
+      }
+    }
     if (mappingFormatScope === 'current') params.set('format_code', formatCode);
     const combinedQuery = [appliedProductQuery, appliedSourceQuery].filter(Boolean).join(' ').trim();
     if (combinedQuery) params.set('q', combinedQuery);
@@ -885,6 +898,7 @@ export function CompetitorsTab({ formatCode }: Props) {
       setCodeRows(Array.isArray(data?.items) ? data.items : []);
       setMetrics(Array.isArray(data?.metrics) ? data.metrics : []);
       setMappingPagination(data?.pagination || { page: mappingPage, pageSize: 50, total: 0, pageCount: 0 });
+      setTaskCounts(data?.taskCounts || null);
       if (data?.pagination?.page && data.pagination.page !== mappingPage) setMappingPage(data.pagination.page);
     } finally {
       if (controller && mappingRequestRef.current === controller) mappingRequestRef.current = null;
@@ -965,7 +979,14 @@ export function CompetitorsTab({ formatCode }: Props) {
       mappingRequestKeyRef.current = '';
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, mappingPlatform, mappingStatus, mappingFormatScope, appliedSourceQuery, appliedProductQuery, mappingPage, formatCode]);
+  }, [activeTab, mappingPlatform, mappingStatus, mappingFormatScope, appliedSourceQuery, appliedProductQuery, mappingPage, formatCode, taskScope]);
+
+  useEffect(() => {
+    if (currentUser.role !== 'admin') return;
+    void fetch('/api/manual-matching/workers')
+      .then((response) => response.ok ? response.json() : { workers: [] })
+      .then((data) => setMatchingWorkers(Array.isArray(data?.workers) ? data.workers : []));
+  }, [currentUser.role]);
 
   useEffect(() => () => {
     candidateRequestRef.current?.abort();
@@ -1375,13 +1396,14 @@ export function CompetitorsTab({ formatCode }: Props) {
     setError(null);
     try {
       const res = row.mappingId
-        ? await fetch(`/api/competitors/code-mappings/${row.mappingId}/reject`, { method: 'POST' })
+        ? await fetch(`/api/competitors/code-mappings/${row.mappingId}/reject?task_product_id=${encodeURIComponent(String(row.productId || ''))}`, { method: 'POST' })
         : await fetch('/api/competitors/code-mappings', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               platform: candidate.platform || row.platform,
               status: 'rejected',
+              productId: row.productId,
               itemId: candidate.itemId,
               sourceExternalKey: candidate.sourceExternalKey,
               sourceMatchKey: candidate.sourceMatchKey,
@@ -1420,6 +1442,26 @@ export function CompetitorsTab({ formatCode }: Props) {
     } finally {
       setIsLoading(false);
     }
+  };
+
+  const reassignSelectedTask = async (assignedUserId: number) => {
+    if (!selectedRow?.productId) return;
+    const res = await fetch(`/api/manual-matching/assignments/${selectedRow.productId}/reassign`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ assigned_user_id: assignedUserId }),
+    });
+    const data = parseJsonOrNull(await res.text());
+    if (!res.ok) throw new Error(data?.detail || 'Не удалось переназначить задачу');
+    setSelectedRow(null);
+    await loadCodeMappings();
+  };
+
+  const reconcileMatchingTasks = async () => {
+    const res = await fetch('/api/manual-matching/reconcile', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const data = parseJsonOrNull(await res.text());
+    if (!res.ok) throw new Error(data?.detail || 'Не удалось распределить задачи');
+    await loadCodeMappings();
+    toast.success(`Назначено новых задач: ${data?.created || 0}`);
   };
 
   const filteredSources = useMemo(() => {
@@ -1583,6 +1625,29 @@ export function CompetitorsTab({ formatCode }: Props) {
 
   const renderMappingsWorkflow = () => (
     <div className="space-y-4">
+      <div className="admin-card flex flex-wrap items-center gap-4 p-4">
+        <strong>{currentUser.role === 'admin' ? 'Задачи сопоставления' : 'Мои задачи'}</strong>
+        <span>Осталось: {fmtNumber(currentUser.role === 'admin' ? taskCounts?.total_active : taskCounts?.my_active)}</span>
+        <span>Завершено: {fmtNumber(currentUser.role === 'admin' ? taskCounts?.total_completed : taskCounts?.my_completed)}</span>
+        {currentUser.role === 'admin' ? (
+          <>
+            <span>Не назначено: {fmtNumber(taskCounts?.unassigned_active)}</span>
+            <Select value={taskScope} onValueChange={(value) => { setTaskScope(value); setMappingPage(1); setSelectedRow(null); }}>
+              <SelectTrigger className="w-52"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">Все</SelectItem>
+                {matchingWorkers.map((worker) => <SelectItem key={worker.id} value={`user:${worker.id}`}>{worker.displayName}</SelectItem>)}
+                <SelectItem value="unassigned">Не назначено</SelectItem>
+              </SelectContent>
+            </Select>
+            {matchingWorkers.length === 2 ? (
+              <Button size="sm" variant="outline" onClick={() => void reconcileMatchingTasks().catch((err) => setError(err?.message || 'Ошибка распределения'))}>
+                Распределить новые задачи
+              </Button>
+            ) : null}
+          </>
+        ) : null}
+      </div>
       <div className="admin-card p-4">
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
           <div>
@@ -1769,6 +1834,17 @@ export function CompetitorsTab({ formatCode }: Props) {
         <div className="admin-card p-4">
           {selectedRow ? (
             <div className="space-y-4">
+              {currentUser.role === 'admin' && selectedRow.assignmentStatus === 'active' ? (
+                <div className="flex flex-wrap gap-2">
+                  {matchingWorkers.map((worker) => (
+                    <Button key={worker.id} size="sm" variant="outline"
+                      disabled={selectedRow.assignedUserId === worker.id}
+                      onClick={() => void reassignSelectedTask(worker.id).catch((err) => setError(err?.message || 'Ошибка переназначения'))}>
+                      Назначить: {worker.displayName}
+                    </Button>
+                  ))}
+                </div>
+              ) : null}
               <div>
                 <div className="rounded-md border border-blue-200 bg-blue-50 p-3">
                   <div className="text-xs font-semibold uppercase tracking-wide text-blue-800">НАШ ТОВАР</div>

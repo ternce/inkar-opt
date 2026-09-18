@@ -16,6 +16,7 @@ from ...models import (
     PriceFormat,
     Product,
     ProductExtra,
+    ManualMatchingAssignment,
 )
 from ..competitor_assignments import get_assigned_competitor_price_lists
 from ..competitor_read_models import refresh_price_list_item_counters
@@ -1791,6 +1792,12 @@ def _product_catalog_review_exists(platforms: list[str]):
     )
 
 
+def global_unmapped_product_condition():
+    """The product catalog's global unmapped predicate, including Provisor goods IDs."""
+    platforms = _product_catalog_platforms("all")
+    return ~_product_catalog_mapped_exists(platforms) & ~_product_catalog_review_exists(platforms)
+
+
 def _product_catalog_format_product_exists(price_format_id: int | None):
     if price_format_id is None:
         return None
@@ -1841,6 +1848,8 @@ def list_product_catalog_code_mappings(
     limit: int = 50,
     include_candidates: bool = True,
     format_code: str = "",
+    task_scope: str = "all",
+    assignee_user_id: int | None = None,
 ) -> dict:
     platforms = _product_catalog_platforms(platform)
     status = status if status in {"all", "mapped", "review", "unmapped"} else "all"
@@ -1855,6 +1864,23 @@ def list_product_catalog_code_mappings(
     )
     mapped_exists = _product_catalog_mapped_exists(platforms)
     review_exists = _product_catalog_review_exists(platforms)
+    global_unmapped = global_unmapped_product_condition()
+    is_global_platform = set(platforms) == SUPPORTED_PLATFORMS
+    unmapped_condition = global_unmapped if is_global_platform else ~mapped_exists & ~review_exists
+    task_filter = None
+    if task_scope == "my":
+        task_filter = exists(select(1).where(
+            ManualMatchingAssignment.product_id == Product.id,
+            ManualMatchingAssignment.assigned_user_id == assignee_user_id,
+            ManualMatchingAssignment.status == "active",
+        )) & global_unmapped
+    elif task_scope == "user":
+        task_filter = exists(select(1).where(
+            ManualMatchingAssignment.product_id == Product.id,
+            ManualMatchingAssignment.assigned_user_id == assignee_user_id,
+        ))
+    elif task_scope == "unassigned":
+        task_filter = ~exists(select(1).where(ManualMatchingAssignment.product_id == Product.id)) & global_unmapped
 
     external_product_ids = _product_catalog_search_external_product_ids(db, platforms=platforms, q=q)
     search = q.strip()
@@ -1871,6 +1897,8 @@ def list_product_catalog_code_mappings(
     base_count_stmt = select(func.count(Product.id)).select_from(Product).outerjoin(ProductExtra, ProductExtra.product_id == Product.id)
     if format_product_exists is not None:
         base_count_stmt = base_count_stmt.where(format_product_exists)
+    if task_filter is not None:
+        base_count_stmt = base_count_stmt.where(task_filter)
     mapped_count_stmt = base_count_stmt.where(mapped_exists)
     review_count_stmt = base_count_stmt.where(~mapped_exists).where(review_exists)
     total_products = int(db.scalar(base_count_stmt) or 0)
@@ -1879,13 +1907,15 @@ def list_product_catalog_code_mappings(
     unmapped_products = max(0, total_products - mapped_products - review_products)
 
     product_stmt = (
-        select(Product, ProductExtra)
+        select(Product, ProductExtra, unmapped_condition.label("is_unmapped"))
         .outerjoin(ProductExtra, ProductExtra.product_id == Product.id)
         .order_by(Product.code.asc())
     )
     count_stmt = base_count_stmt
     if format_product_exists is not None:
         product_stmt = product_stmt.where(format_product_exists)
+    if task_filter is not None:
+        product_stmt = product_stmt.where(task_filter)
     if product_filter is not None:
         product_stmt = product_stmt.where(product_filter)
         count_stmt = count_stmt.where(product_filter)
@@ -1896,15 +1926,22 @@ def list_product_catalog_code_mappings(
         product_stmt = product_stmt.where(~mapped_exists).where(review_exists)
         count_stmt = count_stmt.where(~mapped_exists).where(review_exists)
     elif status == "unmapped":
-        product_stmt = product_stmt.where(~mapped_exists).where(~review_exists)
-        count_stmt = count_stmt.where(~mapped_exists).where(~review_exists)
+        product_stmt = product_stmt.where(unmapped_condition)
+        count_stmt = count_stmt.where(unmapped_condition)
 
     filtered_total = int(db.scalar(count_stmt) or 0)
     page_count = (filtered_total + limit - 1) // limit if filtered_total else 0
     if page_count and page > page_count:
         page = page_count
     product_rows = db.execute(product_stmt.limit(limit).offset((page - 1) * limit)).all()
-    product_ids = [int(product.id) for product, _extra in product_rows]
+    product_ids = [int(product.id) for product, _extra, _is_unmapped in product_rows]
+    assignments_by_product = {}
+    if product_ids:
+        assignments_by_product = {
+            row.product_id: row for row in db.scalars(select(ManualMatchingAssignment).where(
+                ManualMatchingAssignment.product_id.in_(product_ids),
+            ))
+        }
 
     mappings_by_product: dict[int, list[dict]] = {product_id: [] for product_id in product_ids}
     if product_ids:
@@ -1931,12 +1968,12 @@ def list_product_catalog_code_mappings(
         }
 
     rows: list[dict] = []
-    for product, extra in product_rows:
+    for product, extra, is_unmapped in product_rows:
         product_id = int(product.id)
         mappings = list(mappings_by_product.get(product_id, []))
         if "provisor" in platforms and product.provisor_goods_id is not None:
             mappings.insert(0, _product_catalog_provisor_goods_mapping_payload(product))
-        row_status = "mapped" if mappings else "review" if product_id in review_product_ids else "unmapped"
+        row_status = "unmapped" if is_unmapped else "mapped" if mappings else "review"
         rows.append(
             {
                 "productId": product_id,
@@ -1950,6 +1987,8 @@ def list_product_catalog_code_mappings(
                 "reviewCandidates": [],
                 "candidates": [],
                 "bestCandidate": None,
+                "assignedUserId": assignments_by_product[product_id].assigned_user_id if product_id in assignments_by_product else None,
+                "assignmentStatus": assignments_by_product[product_id].status if product_id in assignments_by_product else None,
             }
         )
 
@@ -2503,16 +2542,14 @@ def find_products_for_mapping(*, db: Session, q: str, limit: int = 30) -> list[d
     if not query:
         return []
     like = f"%{query}%"
-    rows = (
-        db.execute(
-            select(Product, ProductExtra)
-            .join(ProductExtra, ProductExtra.product_id == Product.id, isouter=True)
-            .where((Product.code.ilike(like)) | (Product.name.ilike(like)) | (ProductExtra.manufacturer.ilike(like)))
-            .order_by(Product.code.asc())
-            .limit(max(1, min(limit, 100)))
-        )
-        .all()
+    stmt = (
+        select(Product, ProductExtra)
+        .join(ProductExtra, ProductExtra.product_id == Product.id, isouter=True)
+        .where((Product.code.ilike(like)) | (Product.name.ilike(like)) | (ProductExtra.manufacturer.ilike(like)))
+        .order_by(Product.code.asc())
+        .limit(max(1, min(limit, 100)))
     )
+    rows = db.execute(stmt).all()
     return [
         {
             "productId": product.id,

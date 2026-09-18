@@ -61,6 +61,7 @@ interface PriceFormat {
 }
 
 type CurrentUser = {
+  id: number;
   username: string;
   displayName: string;
   role: string;
@@ -465,7 +466,7 @@ export default function App() {
       case 'references':
         return <ReferencesTab isReadOnly={Boolean(currentUser?.isReadOnly)} />;
       case 'competitor-domain':
-        return <CompetitorsTab formatCode={selectedFormat.code} />;
+        return <CompetitorsTab formatCode={selectedFormat.code} currentUser={currentUser} />;
       case 'vidman-review':
         return <VidmanMatchingReviewTab isReadOnly={Boolean(currentUser?.isReadOnly)} />;
       case 'vidman-internal-coverage':

@@ -216,6 +216,24 @@ class UserBranchAssignment(Base):
     )
 
 
+class ManualMatchingAssignment(Base):
+    __tablename__ = "manual_matching_assignments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), nullable=False, unique=True, index=True)
+    assigned_user_id: Mapped[int] = mapped_column(ForeignKey("app_users.id"), nullable=False, index=True)
+    assigned_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("app_users.id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="active", nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive, nullable=False)
+
+    __table_args__ = (
+        Index("ix_manual_matching_assignment_owner_status", "assigned_user_id", "status"),
+    )
+
+
 class MarkupRange(Base):
     __tablename__ = "markup_ranges"
 

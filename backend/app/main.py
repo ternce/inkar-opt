@@ -83,6 +83,7 @@ from .models import (
     DeliveryPoint,
     CounterpartyPriceFormat,
     AppUser,
+    ManualMatchingAssignment,
 )
 from .schemas import (
     CalculatePricesRequest,
@@ -138,6 +139,16 @@ from .services.competitor_assignments import (
     upsert_assignment,
 )
 from .services.competitor_coefficients import effective_price_coefficient, validate_price_coefficient
+from .services.manual_matching_assignments import (
+    complete_manual_matching_task,
+    configured_worker_ids,
+    is_global_unmapped,
+    lock_manual_matching_task,
+    manual_matching_counts,
+    reconcile_manual_matching_assignments,
+    reopen_manual_matching_task,
+    require_manual_task_read,
+)
 from .services.percentile_export import load_percentile_export_price_cells
 from .services.emit_percentile_resolver import global_emit_percentile_rows_count
 from .services.sap_export import (
@@ -7054,12 +7065,24 @@ def get_competitor_code_mappings_product_catalog(
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=200),
     include_candidates: bool = Query(True),
+    task_scope: str = Query(""),
+    assignee_user_id: int | None = Query(None),
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(get_current_user),
 ):
-    _ = current_user
+    if current_user.role == "admin":
+        task_scope = task_scope or "all"
+        if task_scope not in {"all", "user", "unassigned"}:
+            raise HTTPException(status_code=400, detail="invalid task_scope")
+        if task_scope == "user" and assignee_user_id is None:
+            raise HTTPException(status_code=400, detail="assignee_user_id is required")
+    else:
+        if task_scope not in {"", "my"} or assignee_user_id is not None:
+            raise HTTPException(status_code=403, detail="cannot view another user's tasks")
+        task_scope = "my"
+        assignee_user_id = current_user.id
     try:
-        return list_product_catalog_code_mappings(
+        result = list_product_catalog_code_mappings(
             db=db,
             platform=source or platform,
             q=q,
@@ -7068,7 +7091,11 @@ def get_competitor_code_mappings_product_catalog(
             limit=limit,
             include_candidates=include_candidates,
             format_code=format_code or formatCode,
+            task_scope=task_scope,
+            assignee_user_id=assignee_user_id,
         )
+        result["taskCounts"] = manual_matching_counts(db, current_user)
+        return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -7084,7 +7111,7 @@ def get_competitor_code_mappings_product_catalog_candidates(
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(get_current_user),
 ):
-    _ = current_user
+    require_manual_task_read(db, product_id, current_user)
     try:
         return product_catalog_candidates_for_product(
             db=db,
@@ -7103,13 +7130,19 @@ def post_competitor_code_mappings_product_catalog_auto_match(
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(require_write_access),
 ):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="bulk auto-match requires admin")
     try:
-        return auto_match_product_catalog_code_mappings(
+        result = auto_match_product_catalog_code_mappings(
             db=db,
             platform=payload.get("source") or payload.get("platform") or "all",
             limit=int(payload.get("limit") or 100),
             created_by=current_user.username or "",
         )
+        worker_ids = configured_worker_ids()
+        if worker_ids is not None:
+            reconcile_manual_matching_assignments(db, worker_ids)
+        return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -7121,7 +7154,6 @@ def search_products_for_mapping(
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(get_current_user),
 ):
-    _ = current_user
     return find_products_for_mapping(db=db, q=q, limit=limit)
 
 
@@ -7388,6 +7420,74 @@ def search_competitor_items_for_mapping(
     )
 
 
+@app.get("/api/manual-matching/workers")
+def get_manual_matching_workers(
+    db: Session = Depends(get_db), current_user: AppUser = Depends(get_current_user),
+):
+    if current_user.role != "admin":
+        return {"workers": []}
+    try:
+        worker_ids = configured_worker_ids()
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if not worker_ids:
+        return {"workers": []}
+    rows = db.scalars(select(AppUser).where(AppUser.id.in_(worker_ids))).all()
+    return {"workers": [
+        {"id": row.id, "username": row.username, "displayName": row.display_name or row.username}
+        for row in sorted(rows, key=lambda user: worker_ids.index(user.id))
+    ]}
+
+
+@app.post("/api/manual-matching/reconcile")
+def post_manual_matching_reconcile(
+    payload: dict = Body(default={}), db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="admin required")
+    try:
+        worker_ids = configured_worker_ids()
+        if worker_ids is None:
+            worker_ids = (int(payload["worker_a_id"]), int(payload["worker_b_id"]))
+        return reconcile_manual_matching_assignments(db, worker_ids)
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/manual-matching/assignments/{product_id}/reassign")
+def post_manual_matching_reassign(
+    product_id: int, payload: dict = Body(...), db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="admin required")
+    worker_ids = configured_worker_ids()
+    if worker_ids is None:
+        raise HTTPException(status_code=409, detail="MANUAL_MATCHING_WORKER_IDS is not configured")
+    try:
+        new_owner_id = int(payload["assigned_user_id"])
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail="assigned_user_id is required") from exc
+    if new_owner_id not in worker_ids:
+        raise HTTPException(status_code=400, detail="assignee must be a configured worker")
+    new_owner = db.get(AppUser, new_owner_id)
+    if new_owner is None or not new_owner.is_active or new_owner.role not in {"pricing_manager", "pricing_lead"}:
+        raise HTTPException(status_code=409, detail="configured assignee is not an active matching worker")
+    row = db.scalar(select(ManualMatchingAssignment).where(
+        ManualMatchingAssignment.product_id == product_id,
+    ).with_for_update())
+    if row is None:
+        raise HTTPException(status_code=404, detail="assignment not found")
+    if row.status != "active" or not is_global_unmapped(db, product_id):
+        raise HTTPException(status_code=409, detail="task is no longer active")
+    row.assigned_user_id = new_owner_id
+    row.assigned_at = now_kz_naive()
+    row.updated_at = now_kz_naive()
+    db.commit()
+    return {"productId": product_id, "assignedUserId": new_owner_id}
+
+
 @app.post("/api/competitors/code-mappings")
 def create_competitor_code_mapping(
     payload: dict = Body(...),
@@ -7409,13 +7509,23 @@ def create_competitor_code_mapping(
     _ensure_mapping_item_format_access(db, payload.get("itemId") or payload.get("item_id"), int(pf.id) if pf is not None else None)
     product = None
     product_id = payload.get("ourProductId") or payload.get("productId") or payload.get("our_product_id")
-    if status == "mapped":
+    if status == "mapped" or (current_user.role != "admin" and status in {"rejected", "unmapped"}):
         if product_id in (None, ""):
-            raise HTTPException(status_code=400, detail="ourProductId is required for mapped status")
+            raise HTTPException(status_code=400, detail="productId is required for a manual task decision")
         product = db.get(Product, int(product_id))
         if product is None:
             raise HTTPException(status_code=404, detail="product not found")
+    assignment = (
+        lock_manual_matching_task(db, int(product_id), current_user, require_unmapped=current_user.role != "admin")
+        if product_id not in (None, "") else None
+    )
     source_payload = _code_mapping_source_payload(payload, platform, db)
+    existing_mapping = db.scalar(select(CompetitorCodeMapping).where(
+        CompetitorCodeMapping.platform == platform,
+        CompetitorCodeMapping.source_match_key == str(source_payload.get("source_match_key") or ""),
+    ).with_for_update())
+    if current_user.role != "admin" and existing_mapping is not None and existing_mapping.our_product_id not in (None, int(product_id)):
+        raise HTTPException(status_code=409, detail="source item is already mapped to another product")
     row = upsert_code_mapping(
         db=db,
         platform=platform,
@@ -7423,11 +7533,7 @@ def create_competitor_code_mapping(
         source_payload=source_payload,
         status=status,
         confidence=payload.get("confidence", 100),
-        created_by=str(
-            payload.get("createdBy")
-            or payload.get("created_by")
-            or (current_user.username if isinstance(current_user, AppUser) else "")
-        ),
+        created_by=current_user.username or "",
     )
     if platform == "provisor" and status == "mapped" and product is not None:
         goods_id = provisor_goods_id_from_mapping_keys(
@@ -7443,6 +7549,8 @@ def create_competitor_code_mapping(
                 product.provisor_goods_id = int(source_item.provisor_goods_id)
     db.flush()
     touched = apply_mapping_to_matching_items(db=db, mapping=row, product=product, clear=status == "unmapped")
+    if status == "mapped":
+        complete_manual_matching_task(assignment, current_user)
     db.commit()
     db.refresh(row)
     extra = db.get(ProductExtra, product.id) if product is not None else None
@@ -7462,6 +7570,13 @@ def unmap_competitor_code_mapping(
     row = db.get(CompetitorCodeMapping, mapping_id)
     if row is None:
         raise HTTPException(status_code=404, detail="mapping not found")
+    if row.status != "mapped" or row.our_product_id is None:
+        raise HTTPException(status_code=409, detail="mapping is no longer active")
+    assignment = lock_manual_matching_task(db, int(row.our_product_id), current_user, require_unmapped=False)
+    product_id = int(row.our_product_id)
+    db.refresh(row)
+    if row.status != "mapped" or row.our_product_id != product_id:
+        raise HTTPException(status_code=409, detail="mapping changed concurrently")
     try:
         platform_from_value(row.platform)
     except ValueError as e:
@@ -7480,6 +7595,9 @@ def unmap_competitor_code_mapping(
     row.approved_at = None
     row.updated_at = now_kz_naive()
     touched = apply_mapping_to_matching_items(db=db, mapping=row, product=None, clear=True)
+    db.flush()
+    if is_global_unmapped(db, product_id):
+        reopen_manual_matching_task(assignment)
     db.commit()
     db.refresh(row)
     data = mapping_to_dict(row)
@@ -7493,11 +7611,21 @@ def reject_competitor_code_mapping(
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(require_write_access),
     format_code: str | None = Query(None),
+    task_product_id: int | None = Query(None),
 ):
     _price_format_for_mapping_request(db, format_code, current_user if isinstance(current_user, AppUser) else None)
     row = db.get(CompetitorCodeMapping, mapping_id)
     if row is None:
         raise HTTPException(status_code=404, detail="mapping not found")
+    product_id = int(row.our_product_id or task_product_id or 0)
+    if current_user.role != "admin" and not product_id:
+        raise HTTPException(status_code=409, detail="task product id is required")
+    assignment = lock_manual_matching_task(
+        db, product_id, current_user, require_unmapped=row.status != "mapped",
+    ) if product_id else None
+    db.refresh(row)
+    if row.status == "rejected" or (row.our_product_id is not None and row.our_product_id != product_id):
+        raise HTTPException(status_code=409, detail="mapping changed concurrently")
     try:
         platform_from_value(row.platform)
     except ValueError as e:
@@ -7509,6 +7637,9 @@ def reject_competitor_code_mapping(
     row.approved_at = None
     row.updated_at = now_kz_naive()
     touched = apply_mapping_to_matching_items(db=db, mapping=row, product=None)
+    db.flush()
+    if product_id and is_global_unmapped(db, product_id):
+        reopen_manual_matching_task(assignment)
     db.commit()
     db.refresh(row)
     data = mapping_to_dict(row)
