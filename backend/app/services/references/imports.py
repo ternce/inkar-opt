@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 
@@ -20,10 +22,94 @@ from ...models import (
     ReferenceUpdateStatus,
 )
 from ...timezone import now_kz_naive
+from ..manufacturers import resolve_manufacturer
 from ..sku import normalize_sku
 from .parsers import as_decimal, as_int, parse_excel_rows
 from .types import REFERENCE_TYPE_BY_CODE, branch_display_name, canonical_branch_id
 from .validators import required_columns_for
+
+logger = logging.getLogger(__name__)
+
+
+def _manufacturer_summary() -> dict[str, int]:
+    return {
+        "manufacturer_candidates": 0,
+        "manufacturer_filled": 0,
+        "manufacturer_already_present": 0,
+        "manufacturer_missing_in_source": 0,
+        "manufacturer_conflicts": 0,
+    }
+
+
+@dataclass
+class ManufacturerBatchState:
+    products: dict[int, str] = field(default_factory=dict)
+    candidates_by_sku: dict[str, set[str]] = field(default_factory=dict)
+    summary: dict[str, int] = field(default_factory=_manufacturer_summary)
+
+
+def _manufacturer_is_missing(value: object) -> bool:
+    return str(value or "").strip() in {"", "-"}
+
+
+def _manufacturer_candidate(value: object) -> str:
+    raw = str(value or "").strip()
+    if _manufacturer_is_missing(raw):
+        return ""
+    canonical = resolve_manufacturer(raw, "", default="")
+    if canonical.strip().casefold() in {"", "-", "не указан", "unknown", "n a"}:
+        return ""
+    return canonical
+
+
+def _apply_manufacturer_fallback(
+    db: Session,
+    products: dict[int, str],
+    candidates: dict[int, set[str]],
+    summary: dict[str, int],
+) -> None:
+    for product_id, values in candidates.items():
+        product_code = products[product_id]
+        if len(values) > 1:
+            summary["manufacturer_conflicts"] += 1
+            logger.warning(
+                "[REFERENCE_MANUFACTURER_CONFLICT] product_id=%s code=%s candidates=%s",
+                product_id, product_code, sorted(values),
+            )
+            continue
+        extra = _get_extra(db, product_id)
+        if not _manufacturer_is_missing(extra.manufacturer):
+            summary["manufacturer_already_present"] += 1
+            continue
+        extra.manufacturer = next(iter(values))
+        extra.updated_at = now_kz_naive()
+        summary["manufacturer_filled"] += 1
+
+
+def _record_batch_candidates(
+    state: ManufacturerBatchState,
+    products: dict[int, str],
+    candidates: dict[int, set[str]],
+    summary: dict[str, int],
+    *,
+    fillable: bool,
+) -> None:
+    state.summary["manufacturer_candidates"] += summary["manufacturer_candidates"]
+    state.summary["manufacturer_missing_in_source"] += summary["manufacturer_missing_in_source"]
+    for product_id, values in candidates.items():
+        code = normalize_sku(products[product_id])
+        if not code:
+            continue
+        state.candidates_by_sku.setdefault(code, set()).update(values)
+        if fillable:
+            state.products[product_id] = code
+
+
+def _log_manufacturer_summary(job: ReferenceImportJob, summary: dict[str, int]) -> None:
+    logger.info(
+        "[REFERENCE_MANUFACTURER_SUMMARY] job_id=%s data_type=%s status=%s %s",
+        job.id, job.data_type, job.status, json.dumps(summary, sort_keys=True),
+    )
 
 
 def _branch_name(branch_id: str) -> str:
@@ -175,6 +261,7 @@ def import_reference_excel(
     content: bytes,
     filename: str,
     user_name: str = "",
+    manufacturer_batch_state: ManufacturerBatchState | None = None,
 ) -> ReferenceImportJob:
     if data_type not in REFERENCE_TYPE_BY_CODE:
         raise ValueError("unknown data_type")
@@ -199,6 +286,9 @@ def import_reference_excel(
     db.commit()
 
     logs: list[dict] = []
+    manufacturer_summary = _manufacturer_summary()
+    manufacturer_products: dict[int, str] = {}
+    manufacturer_candidates: dict[int, set[str]] = {}
     success_by_branch = {branch_id: 0 for branch_id in branch_ids}
     staged_stock_by_branch: dict[str, dict[int, tuple[Product, str, Decimal | None]]] = {}
     staged_cost_by_branch: dict[str, dict[int, tuple[Product, str, Decimal | None]]] = {}
@@ -226,9 +316,6 @@ def import_reference_excel(
 
                     if data_type == "products":
                         product.name = str(raw.get("name") or product.name or sku).strip()
-                        manufacturer = str(raw.get("manufacturer") or "").strip()
-                        if manufacturer:
-                            extra.manufacturer = manufacturer
                         extra.updated_at = now_kz_naive()
                         for branch_id in row_branch_ids:
                             success_by_branch.setdefault(branch_id, 0)
@@ -308,6 +395,15 @@ def import_reference_excel(
                         success_by_branch.setdefault(branch_id, 0)
                         success_by_branch[branch_id] += 1
 
+                if data_type in {"stock", "cost", "products"}:
+                    manufacturer = _manufacturer_candidate(raw.get("manufacturer"))
+                    if manufacturer:
+                        product_id = int(product.id)
+                        manufacturer_products[product_id] = product.code
+                        manufacturer_candidates.setdefault(product_id, set()).add(manufacturer)
+                        manufacturer_summary["manufacturer_candidates"] += 1
+                    else:
+                        manufacturer_summary["manufacturer_missing_in_source"] += 1
                 success += 1
             except Exception as exc:
                 failed += 1
@@ -341,6 +437,13 @@ def import_reference_excel(
                 _upsert_current_import_status(db=db, branch_id=branch_id, data_type=data_type, status=status, job=job)
             db.commit()
             db.refresh(job)
+            if manufacturer_batch_state is None:
+                _log_manufacturer_summary(job, manufacturer_summary)
+            else:
+                _record_batch_candidates(
+                    manufacturer_batch_state, manufacturer_products, manufacturer_candidates,
+                    manufacturer_summary, fillable=False,
+                )
             return job
 
         if job.status == "success" and data_type == "stock":
@@ -398,8 +501,17 @@ def import_reference_excel(
         else:
             for branch_id, count in success_by_branch.items():
                 _upsert_status(db=db, branch_id=branch_id, data_type=data_type, rows_count=count, status=job.status, job_id=job.id)
+        if data_type in {"stock", "cost", "products"} and manufacturer_batch_state is None:
+            _apply_manufacturer_fallback(db, manufacturer_products, manufacturer_candidates, manufacturer_summary)
         db.commit()
         db.refresh(job)
+        if manufacturer_batch_state is None:
+            _log_manufacturer_summary(job, manufacturer_summary)
+        elif data_type in {"stock", "cost", "products"}:
+            _record_batch_candidates(
+                manufacturer_batch_state, manufacturer_products, manufacturer_candidates,
+                manufacturer_summary, fillable=True,
+            )
         return job
     except Exception as exc:
         db.rollback()
@@ -422,4 +534,12 @@ def import_reference_excel(
         if job is None:
             raise
         db.refresh(job)
+        if manufacturer_batch_state is None:
+            manufacturer_summary["manufacturer_filled"] = 0
+            _log_manufacturer_summary(job, manufacturer_summary)
+        elif data_type in {"stock", "cost", "products"}:
+            _record_batch_candidates(
+                manufacturer_batch_state, manufacturer_products, manufacturer_candidates,
+                manufacturer_summary, fillable=False,
+            )
         return job

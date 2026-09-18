@@ -216,7 +216,9 @@ def import_products_excel(
             existing_extras[int(p.id)] = extra
 
         extra.stock = row["stock"]
-        extra.manufacturer = row["manufacturer"]
+        incoming_manufacturer = str(row["manufacturer"] or "").strip()
+        if incoming_manufacturer not in {"", "-"}:
+            extra.manufacturer = incoming_manufacturer
 
     db.commit()
 
