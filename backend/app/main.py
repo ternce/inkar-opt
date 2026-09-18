@@ -7,7 +7,6 @@ if sys.platform.startswith("win"):
 import logging
 import json
 import time
-import gc
 import tracemalloc
 import difflib
 import re
@@ -558,7 +557,7 @@ def _session_size(db: Session | None, name: str) -> int | None:
 def _python_memory_snapshot() -> tuple[float | None, float | None]:
     try:
         if not tracemalloc.is_tracing():
-            tracemalloc.start()
+            return None, None
         current, peak = tracemalloc.get_traced_memory()
         return round(current / (1024 * 1024), 2), round(peak / (1024 * 1024), 2)
     except Exception:
@@ -696,6 +695,7 @@ def _log_provisor_plk_benchmark(benchmark: dict[str, object] | None) -> dict[str
         "response_bytes": _bench_int_or_none(data.get("response_bytes")),
         "json_decode_sec": _bench_float(data.get("json_decode_sec")),
         "normalize_sec": _bench_float(data.get("normalize_sec")),
+        "fingerprint_sec": _bench_float(data.get("fingerprint_sec")),
         "items_received": int(data.get("items_received") or 0),
         "db_existing_match_sec": _bench_float(data.get("db_existing_match_sec")),
         "db_delete_sec": _bench_float(data.get("db_delete_sec")),
@@ -705,17 +705,31 @@ def _log_provisor_plk_benchmark(benchmark: dict[str, object] | None) -> dict[str
         "db_flush_sec": _bench_float(data.get("db_flush_sec")),
         "db_commit_sec": _bench_float(data.get("db_commit_sec")),
         "db_total_sec": _bench_float(data.get("db_total_sec")),
+        "download_sec": _bench_float(data.get("http_sec")),
+        "decode_sec": _bench_float(data.get("json_decode_sec")),
+        "persist_sec": _bench_float(data.get("persist_sec")),
+        "relink_sec": _bench_float(data.get("relink_sec")),
+        "materialize_prices_sec": _bench_float(data.get("materialize_prices_sec")),
+        "counters_sec": _bench_float(data.get("counters_sec")),
+        "cleanup_sec": _bench_float(data.get("cleanup_sec")),
         "total_sec": _bench_float(data.get("total_sec")),
         "outcome": str(data.get("outcome") or ""),
         "skip_reason": str(data.get("skip_reason") or ""),
         "rss_before_fetch_mb": data.get("rss_before_fetch_mb"),
         "rss_after_http_decode_mb": data.get("rss_after_http_decode_mb"),
         "rss_after_normalization_mb": data.get("rss_after_normalization_mb"),
+        "rss_after_db_persist_mb": data.get("rss_after_db_persist_mb"),
         "rss_before_db_replacement_mb": data.get("rss_before_db_replacement_mb"),
         "rss_after_insert_mb": data.get("rss_after_insert_mb"),
         "rss_after_flush_mb": data.get("rss_after_flush_mb"),
         "rss_after_commit_mb": data.get("rss_after_commit_mb"),
         "rss_after_cleanup_mb": data.get("rss_after_cleanup_mb"),
+        "peak_rss_mb": max(
+            (float(data[key]) for key in (
+                "rss_before_fetch_mb", "rss_after_http_decode_mb", "rss_after_normalization_mb",
+                "rss_after_db_persist_mb", "rss_after_cleanup_mb",
+            ) if data.get(key) is not None), default=None,
+        ),
         "identity_map_before_db_replacement": data.get("identity_map_before_db_replacement"),
         "identity_map_after_insert": data.get("identity_map_after_insert"),
         "identity_map_after_flush": data.get("identity_map_after_flush"),
@@ -761,6 +775,7 @@ def _aggregate_provisor_benchmarks(
         "rss_before_fetch_mb",
         "rss_after_http_decode_mb",
         "rss_after_normalization_mb",
+        "rss_after_db_persist_mb",
         "rss_before_db_replacement_mb",
         "rss_after_insert_mb",
         "rss_after_flush_mb",
@@ -790,6 +805,15 @@ def _aggregate_provisor_benchmarks(
         "total_response_bytes": sum(int(row.get("response_bytes") or 0) for row in benchmarks if row.get("response_bytes") is not None),
         "total_queue_wait_sec": total("queue_wait_sec"),
         "total_http_sec": total("http_sec"),
+        "total_decode_sec": total("decode_sec"),
+        "total_normalize_sec": total("normalize_sec"),
+        "total_fingerprint_sec": total("fingerprint_sec"),
+        "total_persist_sec": total("persist_sec"),
+        "total_relink_sec": total("relink_sec"),
+        "total_materialize_prices_sec": total("materialize_prices_sec"),
+        "total_counters_sec": total("counters_sec"),
+        "total_commit_sec": total("db_commit_sec"),
+        "total_cleanup_sec": total("cleanup_sec"),
         "total_pool_wait_sec": total("pool_wait_sec"),
         "total_http_attempts": sum(int(row.get("http_attempt_count") or 0) for row in benchmarks),
         "total_auth_retries": sum(int(row.get("auth_retry_count") or 0) for row in benchmarks),
@@ -8856,8 +8880,11 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
         provisor_account_parallel = max(1, int(payload.get("maxParallelAccounts") or payload.get("max_parallel_accounts") or provisor_account_parallel))
     if payload.get("maxParallelPlk") is not None or payload.get("max_parallel_plk") is not None:
         provisor_plk_parallel = max(1, int(payload.get("maxParallelPlk") or payload.get("max_parallel_plk") or provisor_plk_parallel))
-    source_limits = {"provisor": provisor_plk_parallel, "vidman": 1}
+    # A Provisor payload remains live through DB replacement. The pipeline lock
+    # covers fetch and persist across accounts, allowing only one live PLK payload.
+    source_limits = {"provisor": 1, "vidman": 1}
     account_sem = asyncio.Semaphore(provisor_account_parallel if refresh_source == "provisor" else 4)
+    provisor_pipeline_sem = asyncio.Semaphore(1)
     source_sems = {source: asyncio.Semaphore(limit) for source, limit in source_limits.items()}
     provisor_dedupe_lock = asyncio.Lock()
     provisor_claimed_keys: dict[str, tuple[int, object]] = {}
@@ -8872,6 +8899,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
             "accounts": provisor_account_parallel if refresh_source == "provisor" else 4,
             "plk": provisor_plk_parallel,
         },
+        "effective_provisor_concurrency": {"accounts": provisor_account_parallel, "plk_payloads": 1},
         "accounts_loaded": len(accounts),
         "accounts_skipped": [
             {"account_id": account_id, "reason": "not_active_or_not_matching_source"}
@@ -8900,6 +8928,8 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
         flush=True,
     )
 
+    SaveSession = sessionmaker(bind=db.get_bind())
+
     async def fetch_account(account: PriceSourceAccount) -> dict:
         status = {
             "source": refresh_source,
@@ -8926,6 +8956,8 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
             "heavy_excluded": 0,
             "fetch_duration_seconds": [],
             "skipped_price_lists": [],
+            "_persisted_ids": [],
+            "_refreshed": [],
         }
         async with account_sem:
             account_operation = f"{operation}:account:{account.id}"
@@ -8962,7 +8994,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                 adapter = adapter_for_source(account.source_type)
                 credentials = credentials_from_row(account)
                 if account.source_type == "provisor" and hasattr(adapter, "configure_http_pool"):
-                    adapter.configure_http_pool(max_parallel_plk=provisor_plk_parallel)
+                    adapter.configure_http_pool(max_parallel_plk=1)
                 if account.source_type == "provisor" and hasattr(adapter, "__aenter__"):
                     await adapter.__aenter__()
                     provisor_adapter_entered = True
@@ -9196,6 +9228,139 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                     f"timeout={PRICE_LIST_FETCH_TIMEOUT_SECONDS}s",
                     flush=True,
                 )
+                def persist_provisor_result(result: dict) -> dict:
+                    """Finish one PLK before the next download can start."""
+                    price_list = result.get("priceList")
+                    benchmark = result.get("benchmark") or {}
+                    items = result.get("items")
+                    row_count = len(items) if isinstance(items, list) else 0
+                    price_list_id = str(getattr(price_list, "price_list_id", "") or "")
+                    started = time.perf_counter()
+                    outer_session_write = False
+                    try:
+                        if price_list is not None and (result.get("skipped_unchanged") or result.get("timeout")):
+                            outer_session_write = True
+                            mark_unified_price_list_checked(
+                                db=db,
+                                price_format_code=format_code,
+                                price_list=price_list,
+                                status="timeout" if result.get("timeout") else "checked_unchanged",
+                                message=str(result.get("error") or "Refresh timed out") if result.get("timeout") else "Source price list unchanged",
+                            )
+                        elif result.get("ok") and price_list is not None:
+                            if not row_count and int(result.get("localItemsCount") or 0) > 0:
+                                inventory["preserved_previous_snapshots"] = int(inventory.get("preserved_previous_snapshots") or 0) + 1
+                                outer_session_write = True
+                                mark_unified_price_list_checked(
+                                    db=db, price_format_code=format_code, price_list=price_list,
+                                    status="success_zero_items", message="Empty response preserved existing rows",
+                                )
+                                provisor_audit.result(
+                                    account_id=int(account.id), filial_id=price_list_id,
+                                    outcome=PROVISOR_AUDIT_SUCCESS_ZERO,
+                                    reason_code="empty_response_preserved_previous_rows",
+                                    raw_rows=0, valid_rows=0, inserted_rows=0,
+                                    previous_rows=int(result.get("localItemsCount") or 0),
+                                    download_elapsed_sec=round(float(result.get("elapsed_ms") or 0) / 1000, 3),
+                                    db_elapsed_sec=round(time.perf_counter() - started, 3),
+                                )
+                                status["_refreshed"].append({
+                                    "sourceType": "provisor", "sourceKey": canonical_provisor_source_key(account.id, price_list_id),
+                                    "accountId": int(account.id), "name": price_list.price_list_name,
+                                    "itemsCount": 0, "preservedItemsCount": int(result.get("localItemsCount") or 0),
+                                    "status": "success_zero_items",
+                                    "fetchDurationSeconds": round(float(result.get("elapsed_ms") or 0) / 1000, 3),
+                                    "timeoutLimitSeconds": result.get("timeout_limit_seconds"),
+                                })
+                                benchmark["outcome"] = "unchanged"
+                                benchmark["skip_reason"] = "empty_response_preserved_previous_rows"
+                            else:
+                                _record_provisor_plk_memory(benchmark, stage="before_db_replacement", db=db, rows=row_count)
+                                with SaveSession() as save_db:
+                                    saved = upsert_unified_price_list(
+                                        db=save_db, price_format_code=format_code,
+                                        price_list=price_list, items=items,
+                                        status="updated", run_matching=False,
+                                    )
+                                    saved_id = int(saved.id)
+                                    saved_source_key = str(saved.source_key or "")
+                                    saved_display_name = str(saved.display_name or price_list.price_list_name)
+                                    db_benchmark = dict(getattr(saved, "_benchmark", {}) or {})
+                                _record_provisor_plk_memory(benchmark, stage="after_session_close", db=None, rows=row_count)
+                                benchmark.update({
+                                    "db_existing_match_sec": db_benchmark.get("load_existing_match_fields_sec", 0),
+                                    "db_delete_sec": db_benchmark.get("delete_old_items_sec", 0),
+                                    "db_prepare_sec": db_benchmark.get("prepare_rows_sec", 0),
+                                    "raw_json_serialize_sec": db_benchmark.get("raw_json_serialize_sec", 0),
+                                    "db_insert_sec": db_benchmark.get("bulk_insert_sec", 0),
+                                    "db_flush_sec": db_benchmark.get("flush_sec", 0),
+                                    "db_commit_sec": db_benchmark.get("commit_sec", 0),
+                                    "db_total_sec": db_benchmark.get("total_sec", 0),
+                                    "relink_sec": db_benchmark.get("relink_sec", 0),
+                                    "materialize_prices_sec": db_benchmark.get("materialize_prices_sec", 0),
+                                    "counters_sec": db_benchmark.get("counters_sec", 0),
+                                })
+                                positive_rows = benchmark.get("positive_price_count")
+                                if positive_rows is None:
+                                    positive_rows = sum(
+                                        item.distributor_price is not None and item.distributor_price > 0
+                                        for item in items
+                                    )
+                                provisor_audit.result(
+                                    account_id=int(account.id), filial_id=price_list_id,
+                                    outcome=PROVISOR_AUDIT_SUCCESS_NONZERO if row_count else PROVISOR_AUDIT_SUCCESS_ZERO,
+                                    reason_code="saved_with_positive_rows" if row_count else "saved_zero_rows",
+                                    raw_rows=row_count, valid_rows=row_count,
+                                    positive_price_rows=positive_rows,
+                                    zero_price_rows=row_count - positive_rows,
+                                    inserted_rows=row_count,
+                                    previous_rows=int(result.get("localItemsCount") or 0),
+                                    download_elapsed_sec=round(float(result.get("elapsed_ms") or 0) / 1000, 3),
+                                    db_elapsed_sec=round(time.perf_counter() - started, 3),
+                                )
+                                status["_persisted_ids"].append(saved_id)
+                                status["_refreshed"].append({
+                                    "sourceType": "provisor", "sourceKey": saved_source_key,
+                                    "accountId": int(account.id), "name": saved_display_name,
+                                    "itemsCount": row_count,
+                                    "fetchDurationSeconds": round(float(result.get("elapsed_ms") or 0) / 1000, 3),
+                                    "timeoutLimitSeconds": result.get("timeout_limit_seconds"),
+                                })
+                                inventory["persisted_snapshots"] = int(inventory.get("persisted_snapshots") or 0) + 1
+                        benchmark["persist_sec"] = round(time.perf_counter() - started, 6)
+                        _record_provisor_plk_memory(benchmark, stage="after_db_persist", db=db, rows=row_count)
+                    except Exception as exc:
+                        if outer_session_write:
+                            db.rollback()
+                        logger.exception("Failed to save Provisor PLK account_id=%s filial_id=%s", account.id, price_list_id)
+                        provisor_audit.result(
+                            account_id=int(account.id), filial_id=price_list_id,
+                            outcome=PROVISOR_AUDIT_DB_REPLACE_FAILED,
+                            reason_code=exc.__class__.__name__, raw_rows=row_count,
+                            valid_rows=row_count, previous_rows=int(result.get("localItemsCount") or 0),
+                            download_elapsed_sec=round(float(result.get("elapsed_ms") or 0) / 1000, 3),
+                            db_elapsed_sec=round(time.perf_counter() - started, 3),
+                        )
+                        result["ok"] = False
+                        result["error"] = str(exc)
+                        benchmark["outcome"] = "failed"
+                        benchmark["skip_reason"] = exc.__class__.__name__
+                    finally:
+                        cleanup_started = time.perf_counter()
+                        result["itemsCount"] = row_count
+                        result["rows"] = row_count
+                        if isinstance(items, list):
+                            items.clear()
+                        result.pop("items", None)
+                        result.pop("priceList", None)
+                        result.pop("benchmark", None)
+                        result["priceListId"] = price_list_id
+                        del items
+                        _record_provisor_plk_memory(benchmark, stage="after_cleanup", db=db, rows=row_count)
+                        benchmark["cleanup_sec"] = round(time.perf_counter() - cleanup_started, 6)
+                        provisor_plk_benchmarks.append(_log_provisor_plk_benchmark(benchmark))
+                    return result
+
                 async def fetch_one(price_list):
                     queued_at_perf = time.perf_counter()
                     queued_at_iso = local_iso(now_kz_naive())
@@ -9548,6 +9713,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                         "json_decode_sec": _bench_float(item_benchmark.get("json_decode_sec")),
                                         "normalize_sec": _bench_float(item_benchmark.get("normalization_sec")),
                                         "items_received": int(item_benchmark.get("input_rows") or len(items or [])),
+                                        "positive_price_count": item_benchmark.get("positive_price_count"),
                                         "rss_after_http_decode_mb": item_benchmark.get("rss_after_http_decode_mb"),
                                         "rss_after_normalization_mb": item_benchmark.get("rss_after_normalization_mb"),
                                     }
@@ -9580,12 +9746,14 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                 if provisor_updated_at:
                                     price_list = replace(price_list, source_updated_at=provisor_updated_at)
                                     if local_updated_at == provisor_updated_at and local_items_count > 0:
+                                        fingerprint_started_at = time.perf_counter()
                                         downloaded_fingerprint = fingerprint_unified_price_list_items(items or [])
                                         persisted_fingerprint = (
                                             fingerprint_persisted_price_list_items(db, int(local_price_list_id))
                                             if local_price_list_id is not None
                                             else ""
                                         )
+                                        plk_benchmark["fingerprint_sec"] = round(time.perf_counter() - fingerprint_started_at, 6)
                                         if downloaded_fingerprint == persisted_fingerprint:
                                             logger.info("[REFRESH] source=%s price_list=%s action=skip_unchanged", account.source_type, price_list_id)
                                             logger.info(
@@ -9891,10 +10059,28 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                             async with active_fetch_lock:
                                 active_fetch_count = max(0, active_fetch_count - 1)
 
-                tasks = [asyncio.create_task(fetch_one(pl)) for pl in price_lists]
+                tasks = [] if account.source_type == "provisor" else [asyncio.create_task(fetch_one(pl)) for pl in price_lists]
                 results = []
-                total_price_lists = max(1, len(tasks))
+                total_price_lists = max(1, len(price_lists))
                 try:
+                    if account.source_type == "provisor":
+                        for pl in price_lists:
+                            async with provisor_pipeline_sem:
+                                result = persist_provisor_result(await fetch_one(pl))
+                            results.append(result)
+                            processed_now = len(results)
+                            provisor_audit.maybe_progress(
+                                current_account=account.id,
+                                current_filial=result.get("priceListId") or "",
+                            )
+                            if job is not None:
+                                update_job(
+                                    db, job, status="running",
+                                    progress=40 + int((processed_now / total_price_lists) * 40),
+                                    message=f"Provisor PLK {processed_now}/{total_price_lists} saved",
+                                    log_level="info",
+                                    log_meta={"processed": processed_now, "total": total_price_lists},
+                                )
                     for done in asyncio.as_completed(tasks):
                         result = await done
                         results.append(result)
@@ -9927,10 +10113,10 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                     status["processed"] += 1
                     price_list_for_metrics = result.get("priceList") if isinstance(result, dict) else None
                     elapsed_ms_for_metrics = float(result.get("elapsed_ms") or 0) if isinstance(result, dict) else 0.0
-                    if price_list_for_metrics is not None and elapsed_ms_for_metrics > 0:
+                    if (price_list_for_metrics is not None or result.get("priceListId")) and elapsed_ms_for_metrics > 0:
                         status["fetch_duration_seconds"].append(
                             {
-                                "priceListId": str(getattr(price_list_for_metrics, "price_list_id", "") or ""),
+                                "priceListId": str(getattr(price_list_for_metrics, "price_list_id", "") or result.get("priceListId") or ""),
                                 "duration": round(elapsed_ms_for_metrics / 1000, 3),
                                 "timeoutLimit": result.get("timeout_limit_seconds"),
                             }
@@ -9942,7 +10128,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                         status["success"] += 1
                         if account.source_type == "provisor":
                             inventory["succeeded"] = int(inventory.get("succeeded") or 0) + 1
-                        if result.get("items"):
+                        if result.get("items") or (account.source_type == "provisor" and int(result.get("itemsCount") or 0) > 0):
                             status["success_with_items"] += 1
                         else:
                             status["success_zero_items"] += 1
@@ -10068,8 +10254,6 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
             return status
 
     fetched_statuses = await asyncio.gather(*(fetch_account(account) for account in accounts), return_exceptions=True)
-    SaveSession = sessionmaker(bind=db.get_bind())
-
     source_slowest_price_lists: dict[str, list[dict[str, object]]] = {}
     for account, status in zip(accounts, fetched_statuses):
         account_id = int(account.id)
@@ -10098,7 +10282,13 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                     "skipped_price_lists": [],
                 }
 
-        saved_count = 0
+        persisted_ids = status.pop("_persisted_ids", [])
+        saved_count = len(persisted_ids)
+        if account_source_type == "provisor":
+            persisted = status.get("_refreshed") or []
+            refreshed.extend(persisted)
+            refreshed_price_list_ids.extend(persisted_ids)
+        status.pop("_refreshed", None)
         if job is not None:
             update_job(db, job, status="running", progress=80, message="Сохраняем прайсы в БД", log_level="info")
         result_rows = [x for x in status.get("results", []) if isinstance(x, dict)]
@@ -10107,11 +10297,12 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                 [
                     {
                         "account_id": account_id,
-                        "price_id": str(getattr(x.get("priceList"), "price_list_id", "") or ""),
+                        "price_id": str(getattr(x.get("priceList"), "price_list_id", "") or x.get("priceListId") or ""),
                         "price_name": str(
                             getattr(x.get("priceList"), "price_list_name", "")
                             or getattr(x.get("priceList"), "distributor_name", "")
                             or getattr(x.get("priceList"), "price_list_id", "")
+                            or x.get("priceListId")
                             or ""
                         ),
                         "elapsed_ms": float(x.get("elapsed_ms") or 0),
@@ -10456,7 +10647,6 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                 summary_appended = True
             if account_source_type == "provisor":
                 result.clear()
-                gc.collect()
         status["results"] = summarized_results
 
         account_row = db.get(PriceSourceAccount, account_id)

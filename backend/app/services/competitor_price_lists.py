@@ -246,7 +246,8 @@ def _canonical_fingerprint_price(value: object) -> str:
 
 
 def _fingerprint_rows(rows: list[tuple[str, str]]) -> str:
-    payload = json.dumps(sorted(rows), ensure_ascii=False, separators=(",", ":"))
+    rows.sort()
+    payload = json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -275,9 +276,8 @@ def fingerprint_persisted_price_list_items(db: Session, price_list_id: int) -> s
                 CompetitorPriceListItem.distributor_price,
             )
             .where(CompetitorPriceListItem.price_list_id == price_list_id)
-            .order_by(CompetitorPriceListItem.id.asc())
         )
-        .all()
+        .yield_per(1000)
     )
     for goods_id, distributor_goods_id, price in persisted:
         external_id = str(goods_id or "").strip() or str(distributor_goods_id or "").strip()
@@ -1412,11 +1412,13 @@ def upsert_unified_price_list(
     db.flush()
     benchmark["flush_sec"] = round(time.perf_counter() - stage_started_at, 6)
     _db_save_timing(price_list_id=row.id, stage="flush", rows=inserted_rows_count, started_at=stage_started_at)
+    relink_started_at = time.perf_counter()
     relink_summary = (
         relink_provisor_items_from_product_goods_ids(db=db, price_list_ids=[int(row.id)])
         if price_list.source == "provisor" and not run_matching
         else {"priceListIds": [], "relinkedItems": 0, "conflictItems": 0, "ambiguousGoodsIds": 0, "ambiguousItems": 0}
     )
+    benchmark["relink_sec"] = round(time.perf_counter() - relink_started_at, 6)
     benchmark["exact_goods_id_relinked_items"] = int(relink_summary.get("relinkedItems") or 0)
     benchmark["exact_goods_id_conflict_items"] = int(relink_summary.get("conflictItems") or 0)
     benchmark["exact_goods_id_ambiguous_goods_ids"] = int(relink_summary.get("ambiguousGoodsIds") or 0)
@@ -1437,6 +1439,7 @@ def upsert_unified_price_list(
     )
     if price_list.source == "provisor" and _as_int(price_list.price_list_id) in PROVISOR_REFERENCE_FILIAL_IDS:
         _sync_provisor_reference_mapping_from_items(db, account_id=price_list.account_id)
+    counters_started_at = time.perf_counter()
     if run_matching:
         rematch_price_list_items_by_product(db=db, price_list=row)
         refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
@@ -1445,11 +1448,14 @@ def upsert_unified_price_list(
     else:
         affected_price_format_ids = []
         refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
+        benchmark["counters_sec"] = round(time.perf_counter() - counters_started_at, 6)
+        materialize_started_at = time.perf_counter()
         materialized_price_format_ids = (
             _replace_assigned_competitor_price_rows_for_list(db=db, price_list=row)
             if price_list.source == "provisor"
             else []
         )
+        benchmark["materialize_prices_sec"] = round(time.perf_counter() - materialize_started_at, 6)
         benchmark["exact_goods_id_materialized_price_format_ids"] = materialized_price_format_ids
     stage_started_at = time.perf_counter()
     db.commit()

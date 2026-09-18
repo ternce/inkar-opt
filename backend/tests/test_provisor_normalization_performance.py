@@ -189,6 +189,7 @@ def _baseline_convert(raw_items: list[dict]) -> list[UnifiedPriceItem]:
 
 def test_provisor_normalized_output_matches_uncached_baseline(monkeypatch):
     raw_items = _raw_items()
+    expected = _baseline_convert(raw_items)
 
     async def fake_get_prices_by_filial_id(**kwargs):
         return raw_items
@@ -206,9 +207,8 @@ def test_provisor_normalized_output_matches_uncached_baseline(monkeypatch):
     )
 
     actual = asyncio.run(service.fetch_price_list_items(account, price_list))
-    expected = _baseline_convert(raw_items)
 
-    assert actual == expected
+    assert [vars(item) for item in actual] == [vars(item) for item in expected]
     assert [item.raw["goodsId"] for item in actual] == [1001, 1002, 1003]
     assert [item.distributor_product_id for item in actual] == ["DG-1", "DG-2", "DG-3"]
     assert actual[0].manufacturer == expected[0].manufacturer

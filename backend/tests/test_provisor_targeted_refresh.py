@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import weakref
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -343,7 +344,7 @@ def test_provisor_refresh_enters_and_closes_account_scoped_adapter(monkeypatch):
     assert result["progress"]["success_with_items"] == 2
     assert adapter.entered is True
     assert adapter.closed is True
-    assert adapter.configured_parallel == 2
+    assert adapter.configured_parallel == 1
 
 
 def test_provisor_benchmark_logs_success_without_changing_refresh_behavior(monkeypatch, caplog):
@@ -598,6 +599,48 @@ def test_duplicate_provisor_plk_external_id_within_same_account_is_deduplicated(
     assert result["provisorAudit"]["failure_skip_reasons"]["duplicate_external_plk_id"] == 1
     row = db.execute(select(CompetitorPriceList)).scalar_one()
     assert row.source_key == "account:3:plk:128"
+
+
+def test_provisor_streams_twelve_plks_without_retaining_item_lists(monkeypatch):
+    import backend.app.main as main
+
+    class TrackedItems(list):
+        pass
+
+    class TrackingAdapter(_ManyPlkProvisorAdapter):
+        def __init__(self):
+            super().__init__(list(range(300, 312)))
+            self.previous: list[weakref.ReferenceType] = []
+            self.max_populated = 0
+
+        async def fetch_price_list_items(self, account, price_list):
+            populated = sum(bool(ref() and len(ref())) for ref in self.previous)
+            self.max_populated = max(self.max_populated, populated + 1)
+            assert populated == 0, "previous PLK item collection survived into the next fetch"
+            items = TrackedItems(await super().fetch_price_list_items(account, price_list))
+            self.previous.append(weakref.ref(items))
+            return items
+
+    db = _session()
+    _seed(db)
+    adapter = TrackingAdapter()
+    monkeypatch.setattr(main, "adapter_for_source", lambda source: adapter)
+    monkeypatch.setattr(main, "credentials_from_row", _fake_credentials)
+
+    result = asyncio.run(main._run_refresh_price_lists_logic(
+        format_code="FMT",
+        payload={"source": "provisor", "accountId": 3, "forceRefresh": True, "maxParallelPlk": 4},
+        db=db,
+    ))
+
+    assert adapter.max_populated == 1
+    assert len(adapter.fetched_item_ids) == 12
+    assert db.scalar(select(func.count(CompetitorPriceListItem.id))) == 12
+    assert len(result["refreshed"]) == 12
+    assert result["updated_count"] == 12
+    assert len(result["accounts"][0]["results"]) == 12
+    assert all(row["itemsCount"] == 1 and "items" not in row and "priceList" not in row
+               for row in result["accounts"][0]["results"])
 
 
 def test_zhasulan_farm_regression_all_discovered_plks_are_attempted(monkeypatch):
@@ -934,7 +977,7 @@ def test_provisor_memory_logs_include_session_close_and_summary_payloads(monkeyp
     assert {"before_fetch", "before_db_replacement", "after_session_close", "after_cleanup"}.issubset(stages)
     after_close = [row for row in memory if row.get("stage") == "after_session_close"]
     assert after_close
-    assert all(row.get("identity_map_size") == 0 for row in after_close)
+    assert all(row.get("identity_map_size") is None for row in after_close)
     assert "items" not in result["accounts"][0]["results"][0]
     assert "priceList" not in result["accounts"][0]["results"][0]
 

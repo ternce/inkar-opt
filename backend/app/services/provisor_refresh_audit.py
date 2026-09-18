@@ -271,6 +271,10 @@ class ProvisorRefreshAudit:
             )
             self._filials[key] = row
         if row.outcome:
+            # A duplicate discovered after its primary PLK has already finished
+            # still belongs in the skip reason tally.
+            if reason_code == "duplicate_external_plk_id":
+                self._reason_counts[reason_code] += 1
             return
         row.finished_at = time.perf_counter()
         row.outcome = outcome
