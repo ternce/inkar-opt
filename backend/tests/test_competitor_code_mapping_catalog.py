@@ -1,9 +1,11 @@
 from datetime import date
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, Lock
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from backend.app import main
@@ -125,6 +127,17 @@ def _product(db: Session, code: str, name: str, manufacturer: str = "") -> Produ
     db.add(ProductExtra(product_id=row.id, manufacturer=manufacturer))
     db.flush()
     return row
+
+
+def _capture_item_loads(db: Session):
+    loaded: list[int] = []
+
+    def record_load(_session, instance):
+        if isinstance(instance, CompetitorPriceListItem):
+            loaded.append(int(instance.id))
+
+    event.listen(db, "loaded_as_persistent", record_load)
+    return loaded, record_load
 
 
 def _candidate_items(db: Session, source: CompetitorPriceListItem, pf: PriceFormat) -> list[dict]:
@@ -1475,6 +1488,392 @@ def test_mapping_catalog_requires_auth_and_write_requires_write_role():
     finally:
         main.app.dependency_overrides.clear()
 
+
+def test_provisor_reject_and_unmap_use_targeted_sql_without_item_orm_loads():
+    db = _session()
+    pf = _price_format(db, "TARGET-PROVISOR")
+    price_list = _price_list(db, pf, source_key="target-provisor", price_date=date(2026, 1, 1))
+    product = _product(db, "TARGET-P", "Target product")
+    target = _item(db, price_list, 81001, name="Target")
+    for goods_id in range(82000, 82100):
+        _item(db, price_list, goods_id, name=f"Decoy {goods_id}")
+    db.commit()
+    product_id = product.id
+    target_id = target.id
+    db.expunge_all()
+
+    loaded, listener = _capture_item_loads(db)
+    try:
+        saved = create_competitor_code_mapping(
+            {
+                "platform": "provisor",
+                "status": "mapped",
+                "sourceExternalKey": "81001",
+                "sourceMatchKey": "provisor:81001",
+                "ourProductId": product_id,
+            },
+            db,
+            _admin(),
+        )
+        assert loaded == []
+        db.expire_all()
+        assert db.get(CompetitorPriceListItem, target_id).product_id == product_id
+        loaded.clear()
+        db.expunge_all()
+
+        unmapped = unmap_competitor_code_mapping(saved["id"], db, _admin())
+        assert unmapped["touchedItems"] == 1
+        assert loaded == []
+
+        loaded.clear()
+        rejected = create_competitor_code_mapping(
+            {
+                "platform": "provisor",
+                "status": "rejected",
+                "sourceExternalKey": "81001",
+                "sourceMatchKey": "provisor:81001",
+            },
+            db,
+            _admin(),
+        )
+        assert rejected["touchedItems"] == 1
+        assert loaded == []
+    finally:
+        event.remove(db, "loaded_as_persistent", listener)
+
+
+def test_vidman_map_reject_and_unmap_use_exact_external_identity_without_item_loads():
+    db = _session()
+    pf = _price_format(db, "TARGET-VIDMAN")
+    price_list = _price_list(db, pf, source_key="target-vidman", price_date=date(2026, 1, 1))
+    price_list.source_type = "vidman"
+    product = _product(db, "VID-TARGET", "Vidman target")
+    target = _item(db, price_list, 0, distributor_goods_id="VID-81001")
+    for index in range(100):
+        _item(db, price_list, 0, distributor_goods_id=f"VID-DECOY-{index}")
+    db.commit()
+    product_id = product.id
+    target_id = target.id
+    db.expunge_all()
+
+    loaded, listener = _capture_item_loads(db)
+    try:
+        saved = create_competitor_code_mapping(
+            {
+                "platform": "vidman",
+                "status": "mapped",
+                "sourceExternalKey": "VID-81001",
+                "sourceMatchKey": "vidman:VID-81001",
+                "ourProductId": product_id,
+            },
+            db,
+            _admin(),
+        )
+        assert saved["touchedItems"] == 1
+        assert loaded == []
+        db.expunge_all()
+
+        assert unmap_competitor_code_mapping(saved["id"], db, _admin())["touchedItems"] == 1
+        assert loaded == []
+        db.expunge_all()
+
+        rejected = create_competitor_code_mapping(
+            {
+                "platform": "vidman",
+                "status": "rejected",
+                "sourceExternalKey": "VID-81001",
+                "sourceMatchKey": "vidman:VID-81001",
+            },
+            db,
+            _admin(),
+        )
+        assert rejected["touchedItems"] == 1
+        assert loaded == []
+        db.expire_all()
+        assert db.get(CompetitorPriceListItem, target_id).match_type == "manual_rejected"
+    finally:
+        event.remove(db, "loaded_as_persistent", listener)
+
+
+def test_mapping_without_durable_source_identity_fails_without_scanning_items():
+    db = _session()
+    pf = _price_format(db, "NO-IDENTITY")
+    price_list = _price_list(db, pf, source_key="no-identity", price_date=date(2026, 1, 1))
+    for goods_id in range(100):
+        _item(db, price_list, goods_id + 1)
+    db.commit()
+    db.expunge_all()
+    loaded, listener = _capture_item_loads(db)
+    try:
+        try:
+            create_competitor_code_mapping(
+                {"platform": "provisor", "status": "rejected", "sourceMatchKey": "provisor:name:|manufacturer:"},
+                db,
+                _admin(),
+            )
+        except HTTPException as exc:
+            assert exc.status_code == 422
+            assert "without goodsId, external key, or normalized source identity" in str(exc.detail)
+        else:
+            raise AssertionError("mapping without durable identity must fail")
+        assert loaded == []
+    finally:
+        event.remove(db, "loaded_as_persistent", listener)
+
+
+def test_conflicting_provisor_goods_ids_fail_before_querying_items():
+    db = _session()
+    mapping = CompetitorCodeMapping(
+        platform="provisor",
+        source_external_key="101",
+        source_match_key="provisor:202",
+        status="rejected",
+    )
+    statements: list[str] = []
+
+    def capture_sql(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if "competitor_price_list_items" in statement.lower():
+            statements.append(statement)
+
+    event.listen(db.get_bind(), "before_cursor_execute", capture_sql)
+    try:
+        try:
+            code_mappings_service.apply_mapping_to_matching_items(db=db, mapping=mapping, product=None)
+        except ValueError as exc:
+            assert "conflicting Provisor goodsId" in str(exc)
+        else:
+            raise AssertionError("conflicting goodsId values must fail")
+    finally:
+        event.remove(db.get_bind(), "before_cursor_execute", capture_sql)
+    assert statements == []
+
+
+def test_vidman_mapping_can_target_persisted_normalized_identity():
+    db = _session()
+    pf = _price_format(db, "VIDMAN-NORMALIZED")
+    price_list = _price_list(db, pf, source_key="vidman-normalized", price_date=date(2026, 1, 1))
+    price_list.source_type = "vidman"
+    product = _product(db, "VID-NORM", "Vidman normalized product")
+    target = _item(db, price_list, 0, name="Normalized source", manufacturer="Maker")
+    target.provisor_goods_id = None
+    target.normalized_name = "normalized source"
+    target.normalized_manufacturer = "MAKER"
+    decoy = _item(db, price_list, 0, name="Other source", manufacturer="Maker")
+    decoy.provisor_goods_id = None
+    decoy.normalized_name = "other source"
+    decoy.normalized_manufacturer = "MAKER"
+    db.commit()
+
+    saved = create_competitor_code_mapping(
+        {
+            "platform": "vidman",
+            "status": "mapped",
+            "sourceMatchKey": "vidman:name:normalized source|manufacturer:maker",
+            "sourceName": "Normalized source",
+            "sourceManufacturer": "Maker",
+            "sourceNormalizedName": "normalized source",
+            "ourProductId": product.id,
+        },
+        db,
+        _admin(),
+    )
+    db.expire_all()
+    assert saved["touchedItems"] == 1
+    assert db.get(CompetitorPriceListItem, target.id).product_id == product.id
+    assert db.get(CompetitorPriceListItem, decoy.id).product_id is None
+
+
+def test_coverage_uses_aggregate_sql_without_loading_item_entities():
+    db = _session()
+    pf = _price_format(db, "COVERAGE-AGG")
+    price_list = _price_list(db, pf, source_key="coverage-agg", price_date=date(2026, 1, 1))
+    for goods_id in range(1, 101):
+        _item(db, price_list, goods_id)
+    db.commit()
+    db.expunge_all()
+    statements: list[str] = []
+    loaded, listener = _capture_item_loads(db)
+
+    def capture_sql(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement.lower())
+
+    event.listen(db.get_bind(), "before_cursor_execute", capture_sql)
+    try:
+        result = code_mappings_service._coverage_for_platform(db, "provisor")
+    finally:
+        event.remove(db.get_bind(), "before_cursor_execute", capture_sql)
+        event.remove(db, "loaded_as_persistent", listener)
+    assert result["total"] == 100
+    assert loaded == []
+    assert any("count(" in statement and "competitor_price_list_items" in statement for statement in statements)
+
+
+def test_legacy_vidman_catalog_is_sql_paginated_and_hard_bounded():
+    db = _session()
+    pf = _price_format(db, "LEGACY-BOUND")
+    price_list = _price_list(db, pf, source_key="legacy-bound", price_date=date(2026, 1, 1))
+    price_list.source_type = "vidman"
+    product = _product(db, "LEGACY-P", "Legacy product")
+    db.add_all([
+        CompetitorPriceListItem(
+            price_list_id=price_list.id,
+            product_id=product.id,
+            distributor_goods_id=f"LEGACY-{index}",
+            name=f"Legacy {index}",
+            raw_name=f"Legacy {index}",
+            match_type="manual_code_mapping",
+            matched_sku=product.code,
+        )
+        for index in range(code_mappings_service.LEGACY_CATALOG_ITEM_PAGE_LIMIT + 100)
+    ])
+    db.commit()
+    db.expunge_all()
+    loaded, listener = _capture_item_loads(db)
+    try:
+        result = list_catalog_code_mappings(
+            db=db,
+            platform="vidman",
+            include_candidates=True,
+            page=1,
+            limit=1,
+        )
+    finally:
+        event.remove(db, "loaded_as_persistent", listener)
+    assert len(result["items"]) == 1
+    assert len(loaded) == code_mappings_service.LEGACY_CATALOG_ITEM_PAGE_LIMIT
+
+
+def test_candidate_queries_are_bounded_and_do_not_materialize_item_entities():
+    db = _session()
+    pf = _price_format(db, "CANDIDATE-BOUND")
+    price_list = _price_list(db, pf, source_key="candidate-bound", price_date=date(2026, 1, 1))
+    product = _product(db, "BOUND-CAND", "Bounddrug tab 5 mg N10", "Maker")
+    for goods_id in range(1, code_mappings_service.PRODUCT_CATALOG_SOURCE_QUERY_LIMIT + 101):
+        _item(db, price_list, goods_id, name=f"Bounddrug tab 5 mg N10 {goods_id}", manufacturer="Maker")
+    db.commit()
+    product_id = product.id
+    db.expunge_all()
+    statements: list[str] = []
+    loaded, listener = _capture_item_loads(db)
+
+    def capture_sql(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if "competitor_price_list_items" in statement.lower():
+            statements.append(statement.lower())
+
+    event.listen(db.get_bind(), "before_cursor_execute", capture_sql)
+    try:
+        candidates = product_catalog_candidates_for_product(db=db, product_id=product_id, platform="provisor")
+    finally:
+        event.remove(db.get_bind(), "before_cursor_execute", capture_sql)
+        event.remove(db, "loaded_as_persistent", listener)
+    assert len(candidates) <= 5
+    assert loaded == []
+    assert statements and all(" limit " in statement for statement in statements)
+
+
+def test_exact_goods_id_candidate_query_returns_one_newest_projection():
+    db = _session()
+    pf = _price_format(db, "EXACT-BOUND")
+    product = _product(db, "EXACT-P", "Exact bound drug", "Maker")
+    product.provisor_goods_id = 99001
+    newest_id = None
+    for index in range(20):
+        price_list = _price_list(db, pf, source_key=f"exact-{index}", price_date=date(2026, 1, min(index + 1, 28)))
+        newest_id = _item(db, price_list, 99001, name=f"Exact bound drug {index}").id
+    db.commit()
+    product_id = product.id
+    db.expunge_all()
+    loaded, listener = _capture_item_loads(db)
+    try:
+        candidates = product_catalog_candidates_for_product(db=db, product_id=product_id, platform="provisor")
+    finally:
+        event.remove(db, "loaded_as_persistent", listener)
+    assert candidates[0]["itemId"] == newest_id
+    assert loaded == []
+
+
+def test_platform_all_product_catalog_does_not_load_competitor_items():
+    db = _session()
+    _product(db, "ALL-BOUND", "All platform bounded")
+    db.commit()
+    db.expunge_all()
+    loaded, listener = _capture_item_loads(db)
+    try:
+        result = list_product_catalog_code_mappings(db=db, platform="all", include_candidates=True)
+    finally:
+        event.remove(db, "loaded_as_persistent", listener)
+    assert result["items"]
+    assert loaded == []
+
+
+def test_two_simultaneous_mapping_operations_do_not_materialize_items(tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'concurrent-mappings.db'}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+    Base.metadata.create_all(engine)
+    sessions = sessionmaker(bind=engine)
+    with sessions() as seed:
+        pf = _price_format(seed, "CONCURRENT")
+        price_list = _price_list(seed, pf, source_key="concurrent", price_date=date(2026, 1, 1))
+        first_product = _product(seed, "CONCURRENT-1", "Concurrent one")
+        second_product = _product(seed, "CONCURRENT-2", "Concurrent two")
+        _item(seed, price_list, 70001)
+        _item(seed, price_list, 70002)
+        for goods_id in range(71000, 71100):
+            _item(seed, price_list, goods_id)
+        first_product_id = first_product.id
+        second_product_id = second_product.id
+        seed.commit()
+
+    loaded_ids: list[int] = []
+    loaded_lock = Lock()
+    start = Barrier(2)
+
+    def record_load(_session, instance):
+        if isinstance(instance, CompetitorPriceListItem):
+            with loaded_lock:
+                loaded_ids.append(int(instance.id))
+
+    event.listen(Session, "loaded_as_persistent", record_load)
+
+    def run_mapping(goods_id: int, product_id: int) -> int:
+        with sessions() as worker:
+            mapping = CompetitorCodeMapping(
+                platform="provisor",
+                source_external_key=str(goods_id),
+                source_match_key=f"provisor:{goods_id}",
+                status="mapped",
+                confidence=100,
+            )
+            product = worker.get(Product, product_id)
+            start.wait()
+            touched = code_mappings_service.apply_mapping_to_matching_items(
+                db=worker, mapping=mapping, product=product, clear=False,
+            )
+            worker.commit()
+            return touched
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda args: run_mapping(*args), [(70001, first_product_id), (70002, second_product_id)]))
+    finally:
+        event.remove(Session, "loaded_as_persistent", record_load)
+    assert results == [1, 1]
+    assert loaded_ids == []
+
+
+def test_mapping_catalog_write_role_and_admin_read_access():
+    db = _session()
+    pf = _price_format(db, "AUTH-WRITE")
+    price_list = _price_list(db, pf, source_key="auth-write", price_date=date(2026, 1, 1))
+    source = _item(db, price_list, 889, name="Auth write source")
+    product = _product(db, "AUTH-WRITE-P", "Auth write product")
+    db.commit()
+
+    def override_db():
+        yield db
+
     main.app.dependency_overrides[main.get_db] = override_db
     main.app.dependency_overrides[get_current_user] = _viewer
     try:
@@ -1484,7 +1883,7 @@ def test_mapping_catalog_requires_auth_and_write_requires_write_role():
             json={
                 "platform": "provisor",
                 "status": "mapped",
-                "formatCode": "AUTH",
+                "formatCode": "AUTH-WRITE",
                 "itemId": source.id,
                 "ourProductId": product.id,
             },
@@ -1497,7 +1896,7 @@ def test_mapping_catalog_requires_auth_and_write_requires_write_role():
     main.app.dependency_overrides[get_current_user] = _admin
     try:
         client = TestClient(main.app)
-        response = client.get("/api/competitors/code-mappings/catalog-view?platform=provisor&format_code=AUTH")
+        response = client.get("/api/competitors/code-mappings/catalog-view?platform=provisor&format_code=AUTH-WRITE")
         assert response.status_code == 200
         assert response.json()["pagination"]["total"] == 1
     finally:

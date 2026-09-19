@@ -446,6 +446,8 @@ class CompetitorPriceListItem(Base):
         Index("ix_competitor_price_list_items_pl_match_key", "price_list_id", "match_key"),
         Index("ix_competitor_price_list_items_pl_matched_sku", "price_list_id", "matched_sku"),
         Index("ix_competitor_price_list_items_pl_provisor_goods", "price_list_id", "provisor_goods_id"),
+        Index("ix_cpli_distributor_goods_id", "distributor_goods_id"),
+        Index("ix_cpli_normalized_identity", "normalized_name", "normalized_manufacturer"),
     )
 
 

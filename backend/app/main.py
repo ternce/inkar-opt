@@ -7548,7 +7548,10 @@ def create_competitor_code_mapping(
             if source_item is not None and source_item.provisor_goods_id is not None:
                 product.provisor_goods_id = int(source_item.provisor_goods_id)
     db.flush()
-    touched = apply_mapping_to_matching_items(db=db, mapping=row, product=product, clear=status == "unmapped")
+    try:
+        touched = apply_mapping_to_matching_items(db=db, mapping=row, product=product, clear=status == "unmapped")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if status == "mapped":
         complete_manual_matching_task(assignment, current_user)
     db.commit()
@@ -7594,7 +7597,10 @@ def unmap_competitor_code_mapping(
     row.confidence = None
     row.approved_at = None
     row.updated_at = now_kz_naive()
-    touched = apply_mapping_to_matching_items(db=db, mapping=row, product=None, clear=True)
+    try:
+        touched = apply_mapping_to_matching_items(db=db, mapping=row, product=None, clear=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     db.flush()
     if is_global_unmapped(db, product_id):
         reopen_manual_matching_task(assignment)
@@ -7636,7 +7642,10 @@ def reject_competitor_code_mapping(
     row.confidence = None
     row.approved_at = None
     row.updated_at = now_kz_naive()
-    touched = apply_mapping_to_matching_items(db=db, mapping=row, product=None)
+    try:
+        touched = apply_mapping_to_matching_items(db=db, mapping=row, product=None)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     db.flush()
     if product_id and is_global_unmapped(db, product_id):
         reopen_manual_matching_task(assignment)
