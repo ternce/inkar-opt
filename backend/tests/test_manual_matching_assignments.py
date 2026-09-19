@@ -13,7 +13,7 @@ from sqlalchemy.pool import StaticPool
 from backend.app import main
 from backend.app.deps import get_current_user
 from backend.app.models import (
-    AppUser, Base, CompetitorCodeMapping, CompetitorPriceList,
+    AppUser, Base, BranchStock, CompetitorCodeMapping, CompetitorPriceList,
     CompetitorPriceListItem, ManualMatchingAssignment, Product,
 )
 from backend.app.services.manual_matching_assignments import (
@@ -156,6 +156,63 @@ def test_worker_queue_search_pagination_and_candidate_read_are_owned():
         assert client.get("/api/competitors/code-mappings/product-catalog?limit=1&page=2").status_code == 200
         client = _client(db, admin)
         assert client.get("/api/competitors/code-mappings/product-catalog").json()["pagination"]["total"] == 3
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+def test_stock_priority_preserves_owners_and_applies_inside_worker_and_admin_scopes():
+    db = _db()
+    users, admin, products = _seed(db, 4)
+    reconcile_manual_matching_assignments(db, (users[0].id, users[1].id))
+    owners_before = _owners(db)
+    db.add_all([
+        BranchStock(branch_id="1", product_id=products[2].id, sku=products[2].code, stock=4),
+        BranchStock(branch_id="1", product_id=products[3].id, sku=products[3].code, stock=6),
+        BranchStock(branch_id="2", product_id=products[3].id, sku=products[3].code, stock=2),
+    ])
+    db.commit()
+    try:
+        worker_a = _client(db, users[0]).get("/api/competitors/code-mappings/product-catalog")
+        worker_b = _client(db, users[1]).get("/api/competitors/code-mappings/product-catalog")
+        admin_b = _client(db, admin).get(
+            f"/api/competitors/code-mappings/product-catalog?task_scope=user&assignee_user_id={users[1].id}"
+        )
+
+        assert [row["productId"] for row in worker_a.json()["items"]] == [products[2].id, products[0].id]
+        assert [row["productId"] for row in worker_b.json()["items"]] == [products[3].id, products[1].id]
+        assert [row["productId"] for row in admin_b.json()["items"]] == [products[3].id, products[1].id]
+        assert worker_a.json()["taskCounts"]["myUrgentActive"] == 1
+        assert worker_b.json()["taskCounts"]["myUrgentActive"] == 1
+        assert admin_b.json()["taskCounts"]["totalUrgentActive"] == 2
+        assert _owners(db) == owners_before
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+def test_successful_stock_snapshot_change_reorders_queue_without_reconciliation():
+    db = _db()
+    users, _, products = _seed(db, 3)
+    reconcile_manual_matching_assignments(db, (users[0].id, users[1].id))
+    owner = users[0]
+    owners_before = _owners(db)
+    stock = BranchStock(branch_id="1", product_id=products[0].id, sku=products[0].code, stock=5)
+    db.add(stock)
+    db.commit()
+    try:
+        client = _client(db, owner)
+        before = client.get("/api/competitors/code-mappings/product-catalog").json()
+        assert [row["productId"] for row in before["items"]] == [products[0].id, products[2].id]
+
+        # Successful stock activation replaces the materialized branch snapshot;
+        # model that replacement directly and do not reconcile assignments.
+        db.delete(stock)
+        db.add(BranchStock(branch_id="1", product_id=products[2].id, sku=products[2].code, stock=9))
+        db.commit()
+
+        after = client.get("/api/competitors/code-mappings/product-catalog").json()
+        assert [row["productId"] for row in after["items"]] == [products[2].id, products[0].id]
+        assert after["taskCounts"]["myUrgentActive"] == 1
+        assert _owners(db) == owners_before
     finally:
         main.app.dependency_overrides.clear()
 

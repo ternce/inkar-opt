@@ -13,6 +13,7 @@ from backend.app.deps import get_current_user
 from backend.app.models import (
     AppUser,
     Base,
+    BranchStock,
     CalculatedPrice,
     CompetitorCodeMapping,
     CompetitorPriceList,
@@ -902,6 +903,95 @@ def test_product_catalog_returns_product_rows_and_existing_mappings():
     assert rows["SKU-2"]["status"] == "unmapped"
     assert result["metrics"][0]["total"] == 2
     assert result["metrics"][0]["mapped"] == 1
+
+
+def test_product_catalog_stock_priority_aggregates_and_sorts_before_pagination():
+    db = _session()
+    normal = _product(db, "A-NORMAL", "Normal", "Maker")
+    zero = _product(db, "B-ZERO", "Zero", "Maker")
+    negative = _product(db, "C-NEGATIVE", "Negative", "Maker")
+    high_qty = _product(db, "Y-HIGH-QTY", "High quantity", "Maker")
+    multi_region = _product(db, "Z-MULTI", "Multiple regions", "Maker")
+    db.add_all([
+        BranchStock(branch_id="almaty", product_id=zero.id, sku=zero.code, stock=0),
+        BranchStock(branch_id="astana", product_id=negative.id, sku=negative.code, stock=-4),
+        BranchStock(branch_id="almaty", product_id=high_qty.id, sku=high_qty.code, stock=100),
+        BranchStock(branch_id="almaty", product_id=multi_region.id, sku=multi_region.code, stock=15),
+        BranchStock(branch_id="astana", product_id=multi_region.id, sku=multi_region.code, stock=3),
+        BranchStock(branch_id="kostanay", product_id=multi_region.id, sku=multi_region.code, stock=0),
+    ])
+    db.commit()
+
+    first_page = list_product_catalog_code_mappings(
+        db=db, platform="all", status="all", page=1, limit=1, include_candidates=False,
+    )
+    all_rows = list_product_catalog_code_mappings(
+        db=db, platform="all", status="all", page=1, limit=20, include_candidates=False,
+    )
+
+    assert first_page["items"][0]["productId"] == multi_region.id
+    assert [row["productId"] for row in all_rows["items"][:2]] == [multi_region.id, high_qty.id]
+    by_id = {row["productId"]: row for row in all_rows["items"]}
+    assert by_id[multi_region.id]["isStockPriority"] is True
+    assert by_id[multi_region.id]["stockRegionCount"] == 2
+    assert by_id[multi_region.id]["currentStockQty"] == 18
+    assert by_id[high_qty.id]["stockRegionCount"] == 1
+    for product in (normal, zero, negative):
+        assert by_id[product.id]["isStockPriority"] is False
+        assert by_id[product.id]["stockRegionCount"] == 0
+        assert by_id[product.id]["currentStockQty"] == 0
+
+
+def test_product_catalog_stock_priority_combines_with_search_status_and_platform_all():
+    db = _session()
+    urgent = _product(db, "SEARCH-URGENT", "Search urgent", "Maker")
+    _product(db, "SEARCH-NORMAL", "Search normal", "Maker")
+    db.add(BranchStock(branch_id="1", product_id=urgent.id, sku=urgent.code, stock=7))
+    db.commit()
+
+    result = list_product_catalog_code_mappings(
+        db=db, platform="all", q="SEARCH", status="unmapped", include_candidates=False,
+    )
+
+    assert [row["sku"] for row in result["items"]] == ["SEARCH-URGENT", "SEARCH-NORMAL"]
+    assert result["items"][0]["isStockPriority"] is True
+
+
+def test_product_catalog_stock_priority_uses_aggregate_sql_without_loading_stock_entities():
+    db = _session()
+    products = [_product(db, f"STOCK-BOUND-{idx:03d}", f"Stock bounded {idx}", "Maker") for idx in range(80)]
+    db.add_all([
+        BranchStock(branch_id="1", product_id=product.id, sku=product.code, stock=idx + 1)
+        for idx, product in enumerate(products)
+    ])
+    db.commit()
+    db.expunge_all()
+    loaded_stock_rows = 0
+    statements: list[str] = []
+
+    def stock_loaded(_target, _context):
+        nonlocal loaded_stock_rows
+        loaded_stock_rows += 1
+
+    def before_execute(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    event.listen(BranchStock, "load", stock_loaded)
+    event.listen(db.get_bind(), "before_cursor_execute", before_execute)
+    try:
+        result = list_product_catalog_code_mappings(
+            db=db, platform="all", status="all", page=1, limit=10, include_candidates=False,
+        )
+    finally:
+        event.remove(BranchStock, "load", stock_loaded)
+        event.remove(db.get_bind(), "before_cursor_execute", before_execute)
+
+    product_queries = [statement for statement in statements if "current_positive_stock" in statement]
+    assert len(result["items"]) == 10
+    assert loaded_stock_rows == 0
+    assert len(product_queries) == 1
+    assert " LIMIT " in product_queries[0].upper()
+    assert "GROUP BY branch_stock.product_id" in product_queries[0]
 
 
 def test_product_catalog_supports_multiple_external_mappings_per_product():

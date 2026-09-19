@@ -41,7 +41,10 @@ from backend.app.models import (
     UniversalList,
     UniversalListPriceFormat,
 )
-from backend.app.services.competitors.code_mappings import list_catalog_code_mappings
+from backend.app.services.competitors.code_mappings import (
+    list_catalog_code_mappings,
+    list_product_catalog_code_mappings,
+)
 from backend.app.services.competitors.percentiles.read_models import (
     list_percentile_product_rows,
     list_percentile_sources,
@@ -941,6 +944,51 @@ def test_failed_stock_import_preserves_previous_successful_snapshot_for_generati
     assert status.status == "success"
     assert status.current_import_status == "error"
     assert count == 200
+
+
+def test_matching_priority_tracks_successful_stock_snapshots_and_ignores_failed_imports():
+    db = _session()
+    rows = _stock_rows("QUEUE", 1)
+    rows[1][2] = 10
+    successful = import_reference_excel(
+        db=db,
+        data_type="stock",
+        branch_ids=["1"],
+        content=_xlsx_bytes(rows),
+        filename="queue-current.xlsx",
+    )
+    assert successful.status == "success"
+    product = db.get(Product, db.query(BranchStock.product_id).filter(BranchStock.branch_id == "1").scalar())
+    assert product is not None
+    initial = list_product_catalog_code_mappings(db=db, q=product.code, include_candidates=False)["items"][0]
+    assert initial["isStockPriority"] is True
+    assert initial["stockRegionCount"] == 1
+    assert initial["currentStockQty"] == 10
+
+    failed = import_reference_excel(
+        db=db,
+        data_type="stock",
+        branch_ids=["1"],
+        content=_xlsx_bytes([["Wrong"], [product.code]]),
+        filename="queue-failed.xlsx",
+    )
+    assert failed.status == "error"
+    after_failed = list_product_catalog_code_mappings(db=db, q=product.code, include_candidates=False)["items"][0]
+    assert after_failed["isStockPriority"] is True
+    assert after_failed["currentStockQty"] == 10
+
+    replacement = import_reference_excel(
+        db=db,
+        data_type="stock",
+        branch_ids=["1"],
+        content=_xlsx_bytes([rows[0], [product.code, "QUEUE 0", 0]]),
+        filename="queue-replacement.xlsx",
+    )
+    assert replacement.status == "success"
+    after_replacement = list_product_catalog_code_mappings(db=db, q=product.code, include_candidates=False)["items"][0]
+    assert after_replacement["isStockPriority"] is False
+    assert after_replacement["stockRegionCount"] == 0
+    assert after_replacement["currentStockQty"] == 0
 
 
 def test_partial_stock_import_preserves_exact_previous_snapshot_without_mixed_rows():

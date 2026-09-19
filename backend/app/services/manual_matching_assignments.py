@@ -3,12 +3,15 @@ from __future__ import annotations
 import os
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from ..models import AppUser, ManualMatchingAssignment, Product
 from ..timezone import now_kz_naive
-from .competitors.code_mappings import global_unmapped_product_condition
+from .competitors.code_mappings import (
+    current_positive_stock_condition,
+    global_unmapped_product_condition,
+)
 
 
 def configured_worker_ids() -> tuple[int, int] | None:
@@ -128,13 +131,26 @@ def reopen_manual_matching_task(row: ManualMatchingAssignment | None) -> None:
 
 def manual_matching_counts(db: Session, user: AppUser) -> dict:
     active_condition = global_unmapped_condition()
-    active_assignments = select(ManualMatchingAssignment).join(Product).where(
+    urgent_condition = current_positive_stock_condition(Product.id)
+    active_assignments = select(
+        ManualMatchingAssignment,
+        urgent_condition.label("is_urgent"),
+    ).join(Product).where(
         ManualMatchingAssignment.status == "active", active_condition,
     ).subquery()
-    total_active = int(db.scalar(select(func.count(Product.id)).where(active_condition)) or 0)
-    per_user = dict(db.execute(select(
-        active_assignments.c.assigned_user_id, func.count(active_assignments.c.id),
-    ).group_by(active_assignments.c.assigned_user_id)).all())
+    total_active, total_urgent_active = db.execute(select(
+        func.count(Product.id),
+        func.sum(case((urgent_condition, 1), else_=0)),
+    ).where(active_condition)).one()
+    total_active = int(total_active or 0)
+    total_urgent_active = int(total_urgent_active or 0)
+    per_user_rows = db.execute(select(
+        active_assignments.c.assigned_user_id,
+        func.count(active_assignments.c.id),
+        func.sum(case((active_assignments.c.is_urgent, 1), else_=0)),
+    ).group_by(active_assignments.c.assigned_user_id)).all()
+    per_user = {row.assigned_user_id: int(row[1] or 0) for row in per_user_rows}
+    urgent_per_user = {row.assigned_user_id: int(row[2] or 0) for row in per_user_rows}
     total_completed = int(db.scalar(select(func.count(ManualMatchingAssignment.id)).where(
         ManualMatchingAssignment.status == "completed",
     )) or 0)
@@ -144,6 +160,7 @@ def manual_matching_counts(db: Session, user: AppUser) -> dict:
     return {
         "my_active": int(per_user.get(user.id, 0)), "my_completed": my_completed,
         "total_active": total_active, "total_completed": total_completed,
+        "myUrgentActive": urgent_per_user.get(user.id, 0), "totalUrgentActive": total_urgent_active,
         "unassigned_active": total_active - sum(per_user.values()),
         "per_user_active": per_user if user.role == "admin" else {},
     }

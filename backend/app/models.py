@@ -1561,6 +1561,13 @@ class BranchStock(Base):
 
     __table_args__ = (
         UniqueConstraint("branch_id", "product_id", name="uq_branch_stock_branch_product"),
+        Index(
+            "ix_branch_stock_positive_product_branch",
+            "product_id",
+            "branch_id",
+            postgresql_where=text("stock > 0"),
+            sqlite_where=text("stock > 0"),
+        ),
     )
 
 

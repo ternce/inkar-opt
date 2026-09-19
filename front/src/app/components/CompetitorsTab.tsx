@@ -289,6 +289,9 @@ type CodeMappingRow = CodeMappingCandidate & {
   ourManufacturer?: string;
   assignedUserId?: number | null;
   assignmentStatus?: string | null;
+  isStockPriority?: boolean;
+  stockRegionCount?: number;
+  currentStockQty?: number;
 };
 
 type MappingPagination = {
@@ -1628,6 +1631,7 @@ export function CompetitorsTab({ formatCode, currentUser }: Props) {
       <div className="admin-card flex flex-wrap items-center gap-4 p-4">
         <strong>{currentUser.role === 'admin' ? 'Задачи сопоставления' : 'Мои задачи'}</strong>
         <span>Осталось: {fmtNumber(currentUser.role === 'admin' ? taskCounts?.total_active : taskCounts?.my_active)}</span>
+        <span className="font-medium text-red-700">Срочных: {fmtNumber(currentUser.role === 'admin' ? taskCounts?.totalUrgentActive : taskCounts?.myUrgentActive)}</span>
         <span>Завершено: {fmtNumber(currentUser.role === 'admin' ? taskCounts?.total_completed : taskCounts?.my_completed)}</span>
         {currentUser.role === 'admin' ? (
           <>
@@ -1796,14 +1800,24 @@ export function CompetitorsTab({ formatCode, currentUser }: Props) {
                 {codeRows.map((row) => (
                   <tr
                     key={`product-${row.productId}`}
-                    className={`cursor-pointer ${Number(selectedRow?.productId) === Number(row.productId) ? 'bg-blue-50' : ''}`}
+                    className={`cursor-pointer ${Number(selectedRow?.productId) === Number(row.productId) ? 'bg-blue-50' : row.isStockPriority ? 'bg-amber-50/60' : ''}`}
                     onClick={() => selectMappingRow(row)}
                   >
                     <td className="px-4 py-3 text-sm text-gray-900">
                       <div className="font-medium">{row.sku || row.ourSku || '-'}</div>
                       <div className="mt-1 text-xs text-gray-500">ID {row.productId}</div>
                     </td>
-                    <td className="px-4 py-3 text-sm text-gray-900 min-w-72">{row.name || row.ourName || '-'}</td>
+                    <td className="px-4 py-3 text-sm text-gray-900 min-w-72">
+                      <div>{row.name || row.ourName || '-'}</div>
+                      {row.isStockPriority ? (
+                        <div className="mt-1 flex flex-wrap items-center gap-2 text-xs">
+                          <span className="rounded-full bg-red-100 px-2 py-0.5 font-semibold text-red-700">В ОСТАТКАХ</span>
+                          <span className="font-medium text-red-700">Срочно сопоставить</span>
+                          <span className="text-gray-600">В остатках: {fmtNumber(row.stockRegionCount)} рег.</span>
+                          <span className="text-gray-600">Остаток: {fmtNumber(row.currentStockQty)}</span>
+                        </div>
+                      ) : null}
+                    </td>
                     <td className="px-4 py-3 text-sm text-gray-700">{row.manufacturer || row.ourManufacturer || '-'}</td>
                     <td className="px-4 py-3 text-sm font-medium text-gray-900">{mappingSummary(row)}</td>
                     <td className="px-4 py-3 text-sm text-gray-700">{fmtNumber(row.mappingCount)} внешних ID</td>

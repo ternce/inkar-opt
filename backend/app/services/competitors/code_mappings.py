@@ -11,6 +11,7 @@ from ...models import (
     CompetitorCodeMapping,
     CompetitorPriceList,
     CompetitorPriceListItem,
+    BranchStock,
     CalculatedPrice,
     PriceList,
     PriceFormat,
@@ -28,6 +29,30 @@ MANUAL_CANDIDATE_POOL_LIMIT = 250
 MANUAL_CANDIDATE_LIMIT = 10
 PRODUCT_CATALOG_SOURCE_QUERY_LIMIT = 250
 LEGACY_CATALOG_ITEM_PAGE_LIMIT = 1000
+
+
+def current_positive_stock_condition(product_id_column):
+    """True when the materialized current stock snapshot has positive stock."""
+    return exists(
+        select(1).select_from(BranchStock).where(
+            BranchStock.product_id == product_id_column,
+            BranchStock.stock > 0,
+        )
+    )
+
+
+def current_positive_stock_by_product_subquery():
+    """Aggregate current positive stock once for catalog ordering and display."""
+    return (
+        select(
+            BranchStock.product_id.label("product_id"),
+            func.count(func.distinct(BranchStock.branch_id)).label("stock_region_count"),
+            func.sum(BranchStock.stock).label("current_stock_qty"),
+        )
+        .where(BranchStock.stock > 0)
+        .group_by(BranchStock.product_id)
+        .subquery("current_positive_stock")
+    )
 
 
 STRUCTURED_MANUAL_FIELDS = (
@@ -1750,6 +1775,10 @@ def list_product_catalog_code_mappings(
     mapped_exists = _product_catalog_mapped_exists(platforms)
     review_exists = _product_catalog_review_exists(platforms)
     global_unmapped = global_unmapped_product_condition()
+    current_stock = current_positive_stock_by_product_subquery()
+    stock_region_count = func.coalesce(current_stock.c.stock_region_count, 0)
+    current_stock_qty = func.coalesce(current_stock.c.current_stock_qty, 0)
+    is_stock_priority = current_stock.c.product_id.is_not(None)
     is_global_platform = set(platforms) == SUPPORTED_PLATFORMS
     unmapped_condition = global_unmapped if is_global_platform else ~mapped_exists & ~review_exists
     task_filter = None
@@ -1792,9 +1821,22 @@ def list_product_catalog_code_mappings(
     unmapped_products = max(0, total_products - mapped_products - review_products)
 
     product_stmt = (
-        select(Product, ProductExtra, unmapped_condition.label("is_unmapped"))
+        select(
+            Product,
+            ProductExtra,
+            unmapped_condition.label("is_unmapped"),
+            is_stock_priority.label("is_stock_priority"),
+            stock_region_count.label("stock_region_count"),
+            current_stock_qty.label("current_stock_qty"),
+        )
         .outerjoin(ProductExtra, ProductExtra.product_id == Product.id)
-        .order_by(Product.code.asc())
+        .outerjoin(current_stock, current_stock.c.product_id == Product.id)
+        .order_by(
+            is_stock_priority.desc(),
+            stock_region_count.desc(),
+            current_stock_qty.desc(),
+            Product.code.asc(),
+        )
     )
     count_stmt = base_count_stmt
     if format_product_exists is not None:
@@ -1819,7 +1861,7 @@ def list_product_catalog_code_mappings(
     if page_count and page > page_count:
         page = page_count
     product_rows = db.execute(product_stmt.limit(limit).offset((page - 1) * limit)).all()
-    product_ids = [int(product.id) for product, _extra, _is_unmapped in product_rows]
+    product_ids = [int(row[0].id) for row in product_rows]
     assignments_by_product = {}
     if product_ids:
         assignments_by_product = {
@@ -1853,7 +1895,7 @@ def list_product_catalog_code_mappings(
         }
 
     rows: list[dict] = []
-    for product, extra, is_unmapped in product_rows:
+    for product, extra, is_unmapped, stock_priority, region_count, stock_qty in product_rows:
         product_id = int(product.id)
         mappings = list(mappings_by_product.get(product_id, []))
         if "provisor" in platforms and product.provisor_goods_id is not None:
@@ -1874,6 +1916,9 @@ def list_product_catalog_code_mappings(
                 "bestCandidate": None,
                 "assignedUserId": assignments_by_product[product_id].assigned_user_id if product_id in assignments_by_product else None,
                 "assignmentStatus": assignments_by_product[product_id].status if product_id in assignments_by_product else None,
+                "isStockPriority": bool(stock_priority),
+                "stockRegionCount": int(region_count or 0),
+                "currentStockQty": float(stock_qty or 0),
             }
         )
 
