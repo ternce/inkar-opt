@@ -2758,35 +2758,44 @@ def _report_sheet_title_for_format(pf: PriceFormat, used: set[str] | None = None
 def _report_price_list_context(db: Session, price_list_id: str, current_user: AppUser) -> tuple[PriceList, PriceFormat, dict]:
     pl, pf = _price_list_by_identifier(db, price_list_id)
     _ensure_price_format_access(pf, current_user)
-    summary = _generated_price_list_summary(db, pl, pf)
-    return pl, pf, {
-        "priceListId": pl.id,
-        "priceListNumber": pl.number,
-        "branch": pf.branch,
-        "priceFormatId": pf.id,
-        "priceFormatCode": pf.code,
-        "priceFormatName": pf.name,
-        "customerCategory": pf.sap_category or "",
-        "calculatedAt": local_iso(pl.created_at) if pl.created_at else "",
-        "calculatedAtDisplay": _fmt_dt(pl.created_at),
-        "totalCalculated": summary["skuCount"],
-    }
+    return pl, pf, _report_context_dict(db, pl, pf, _previous_price_list_for_report(db, pl))
 
 
-def _latest_report_price_list_for_format(db: Session, price_format_id: int) -> PriceList | None:
+def _latest_report_price_list_for_format(
+    db: Session,
+    price_format_id: int,
+    activation_date: date,
+) -> PriceList | None:
+    stmt = (
+        select(PriceList)
+        .where(PriceList.price_format_id == price_format_id)
+        .where(PriceList.activation_date == activation_date)
+    )
     return (
         db.execute(
-            select(PriceList)
-            .where(PriceList.price_format_id == price_format_id)
-            .order_by(PriceList.created_at.desc(), PriceList.id.desc())
-            .limit(1)
+            stmt.order_by(PriceList.created_at.desc(), PriceList.id.desc()).limit(1)
         )
         .scalars()
         .first()
     )
 
 
-def _report_context_dict(db: Session, pl: PriceList, pf: PriceFormat) -> dict:
+def _resolve_report_price_lists(
+    db: Session,
+    price_format_id: int,
+    activation_date: date,
+) -> tuple[PriceList | None, PriceList | None]:
+    current = _latest_report_price_list_for_format(db, price_format_id, activation_date)
+    previous = _latest_report_price_list_for_format(db, price_format_id, activation_date - timedelta(days=1))
+    return current, previous
+
+
+def _report_context_dict(
+    db: Session,
+    pl: PriceList,
+    pf: PriceFormat,
+    previous_pl: PriceList | None = None,
+) -> dict:
     summary = _generated_price_list_summary(db, pl, pf)
     return {
         "priceListId": pl.id,
@@ -2799,10 +2808,18 @@ def _report_context_dict(db: Session, pl: PriceList, pf: PriceFormat) -> dict:
         "calculatedAt": local_iso(pl.created_at) if pl.created_at else "",
         "calculatedAtDisplay": _fmt_dt(pl.created_at),
         "totalCalculated": summary["skuCount"],
+        "currentPriceListId": pl.id,
+        "currentPriceListNumber": pl.number,
+        "currentActivationDate": pl.activation_date.isoformat() if pl.activation_date else None,
+        "currentCreatedAt": local_iso(pl.created_at) if pl.created_at else None,
+        "previousPriceListId": previous_pl.id if previous_pl is not None else None,
+        "previousPriceListNumber": previous_pl.number if previous_pl is not None else "",
+        "previousActivationDate": previous_pl.activation_date.isoformat() if previous_pl is not None and previous_pl.activation_date else None,
+        "previousCreatedAt": local_iso(previous_pl.created_at) if previous_pl is not None and previous_pl.created_at else None,
     }
 
 
-def _parse_report_contexts_payload(db: Session, payload: dict, current_user: AppUser) -> tuple[str, list[tuple[PriceList, PriceFormat, dict]]]:
+def _parse_report_contexts_payload(db: Session, payload: dict, current_user: AppUser) -> tuple[str, list[tuple[PriceList, PriceList | None, PriceFormat, dict]]]:
     branch = _canonical_user_selected_branch(payload.get("branch"), field_name="branch")
     if not branch:
         raise HTTPException(status_code=400, detail="branch is required")
@@ -2812,8 +2829,16 @@ def _parse_report_contexts_payload(db: Session, payload: dict, current_user: App
     if len(contexts_in) > REPORT_MAX_CONTEXTS:
         raise HTTPException(status_code=400, detail=f"too many contexts; max {REPORT_MAX_CONTEXTS}")
 
+    requested_activation_date: date | None = None
+    raw_activation_date = payload.get("activationDate") or payload.get("activation_date")
+    if raw_activation_date not in (None, ""):
+        try:
+            requested_activation_date = date.fromisoformat(str(raw_activation_date).strip())
+        except Exception:
+            raise HTTPException(status_code=400, detail="activationDate must be ISO date (YYYY-MM-DD)")
+
     seen_formats: set[int] = set()
-    contexts: list[tuple[PriceList, PriceFormat, dict]] = []
+    contexts: list[tuple[PriceList, PriceList | None, PriceFormat, dict]] = []
     for raw in contexts_in:
         if not isinstance(raw, dict):
             raise HTTPException(status_code=400, detail="invalid context")
@@ -2832,17 +2857,24 @@ def _parse_report_contexts_payload(db: Session, payload: dict, current_user: App
         if pf.branch != branch:
             raise HTTPException(status_code=400, detail="all selected formats must belong to requested branch")
 
+        previous_pl: PriceList | None = None
         price_list_id = raw.get("priceListId")
-        if price_list_id in (None, ""):
-            pl = _latest_report_price_list_for_format(db, pf.id)
+        if requested_activation_date is not None:
+            pl, previous_pl = _resolve_report_price_lists(db, pf.id, requested_activation_date)
             if pl is None:
-                raise HTTPException(status_code=400, detail="selected price format has no generated price lists")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"selected price format has no price list for activation date {requested_activation_date.isoformat()}",
+                )
+        elif price_list_id in (None, ""):
+            raise HTTPException(status_code=400, detail="activationDate is required for automatic report selection")
         else:
             pl, pl_pf = _price_list_by_identifier(db, str(price_list_id))
             _ensure_price_format_access(pl_pf, current_user)
             if pl_pf.id != pf.id or pl.price_format_id != pf.id:
                 raise HTTPException(status_code=400, detail="price list does not belong to selected price format")
-        contexts.append((pl, pf, _report_context_dict(db, pl, pf)))
+            previous_pl = _previous_price_list_for_report(db, pl)
+        contexts.append((pl, previous_pl, pf, _report_context_dict(db, pl, pf, previous_pl)))
     return branch, contexts
 
 
@@ -2856,19 +2888,10 @@ def _report_base_stmt(price_list_id: int):
 
 
 def _previous_price_list_for_report(db: Session, pl: PriceList) -> PriceList | None:
-    if pl.price_format_id is None:
+    if pl.price_format_id is None or pl.activation_date is None:
         return None
-    return (
-        db.execute(
-            select(PriceList)
-            .where(PriceList.price_format_id == pl.price_format_id)
-            .where((PriceList.created_at < pl.created_at) | ((PriceList.created_at == pl.created_at) & (PriceList.id < pl.id)))
-            .order_by(PriceList.created_at.desc(), PriceList.id.desc())
-            .limit(1)
-        )
-        .scalars()
-        .first()
-    )
+    _current, previous = _resolve_report_price_lists(db, int(pl.price_format_id), pl.activation_date)
+    return previous
 
 
 def _apply_report_search(stmt, q: str | None):
@@ -2956,8 +2979,17 @@ def _rank_rows_for_context(db: Session, pl: PriceList, pf: PriceFormat, q: str |
     return [_rank_1_row(cp, product, extra, pf) for cp, product, extra in db.execute(stmt).all()]
 
 
-def _decrease_rows_for_context(db: Session, pl: PriceList, pf: PriceFormat, q: str | None = None) -> tuple[list[dict], str]:
-    previous_pl = _previous_price_list_for_report(db, pl)
+def _decrease_rows_for_context(
+    db: Session,
+    pl: PriceList,
+    pf: PriceFormat,
+    q: str | None = None,
+    *,
+    previous_pl: PriceList | None = None,
+    previous_resolved: bool = False,
+) -> tuple[list[dict], str]:
+    if not previous_resolved:
+        previous_pl = _previous_price_list_for_report(db, pl)
     if previous_pl is None:
         return [], ""
     PreviousCalculatedPrice = aliased(CalculatedPrice)
@@ -2986,11 +3018,12 @@ def _decrease_rows_for_context(db: Session, pl: PriceList, pf: PriceFormat, q: s
     return rows, previous_pl.number
 
 
-def _combined_report_context(branch: str, contexts: list[tuple[PriceList, PriceFormat, dict]]) -> dict:
+def _combined_report_context(branch: str, contexts: list[tuple[PriceList, PriceList | None, PriceFormat, dict]]) -> dict:
     return {
         "branch": branch,
+        "activationDate": next((context.get("currentActivationDate") for _pl, _previous_pl, _pf, context in contexts if context.get("currentActivationDate")), None),
         "selectedFormatCount": len(contexts),
-        "contexts": [context for _pl, _pf, context in contexts],
+        "contexts": [context for _pl, _previous_pl, _pf, context in contexts],
     }
 
 
@@ -3076,12 +3109,28 @@ def get_report_contexts(
             .scalars()
             .all()
         )
-        summaries = [_generated_price_list_summary(db, pl, pf) for pl in price_lists]
+        summaries = []
+        for pl in price_lists:
+            summary = _generated_price_list_summary(db, pl, pf)
+            summary["activationDateDisplay"] = summary.get("activationDate") or ""
+            summary["activationDate"] = pl.activation_date.isoformat() if pl.activation_date else ""
+            summaries.append(summary)
+        latest_by_activation_date: dict[str, dict] = {}
+        for summary in summaries:
+            activation_date_value = str(summary.get("activationDate") or "").strip()
+            if activation_date_value and activation_date_value not in latest_by_activation_date:
+                latest_by_activation_date[activation_date_value] = summary
+        available_activation_dates = sorted(latest_by_activation_date, reverse=True)
         output.append(
             {
                 "priceFormat": _price_format_to_dict(db, pf),
                 "priceLists": summaries,
-                "latestPriceList": summaries[0] if summaries else None,
+                "availableActivationDates": available_activation_dates,
+                "latestPriceListsByActivationDate": [
+                    latest_by_activation_date[activation_date_value]
+                    for activation_date_value in available_activation_dates
+                ],
+                "latestPriceList": latest_by_activation_date.get(available_activation_dates[0]) if available_activation_dates else None,
             }
         )
     return output
@@ -3099,7 +3148,7 @@ def query_rank_1_report(
     branch, contexts = _parse_report_contexts_payload(db, payload, current_user)
     rows: list[dict] = []
     total_calculated = 0
-    for pl, pf, context in contexts:
+    for pl, _previous_pl, pf, context in contexts:
         context_rows = _rank_rows_for_context(db, pl, pf, q)
         rows.extend(context_rows)
         total_calculated += int(context.get("totalCalculated") or 0)
@@ -3131,8 +3180,15 @@ def query_decreases_report(
     branch, contexts = _parse_report_contexts_payload(db, payload, current_user)
     rows: list[dict] = []
     context_payloads = []
-    for pl, pf, context in contexts:
-        context_rows, previous_number = _decrease_rows_for_context(db, pl, pf, q)
+    for pl, previous_pl, pf, context in contexts:
+        context_rows, previous_number = _decrease_rows_for_context(
+            db,
+            pl,
+            pf,
+            q,
+            previous_pl=previous_pl,
+            previous_resolved=True,
+        )
         rows.extend(context_rows)
         enriched = dict(context)
         enriched["previousPriceListNumber"] = previous_number
@@ -3148,6 +3204,7 @@ def query_decreases_report(
         "limit": limit,
         "context": {
             "branch": branch,
+            "activationDate": next((context.get("currentActivationDate") for context in context_payloads if context.get("currentActivationDate")), None),
             "selectedFormatCount": len(contexts),
             "contexts": context_payloads,
         },
@@ -3168,7 +3225,7 @@ def export_rank_1_report_combined(
 ):
     q = str(payload.get("q") or "").strip() or None
     branch, contexts = _parse_report_contexts_payload(db, payload, current_user)
-    sheets = [(pf, _rank_rows_for_context(db, pl, pf, q)) for pl, pf, _context in contexts]
+    sheets = [(pf, _rank_rows_for_context(db, pl, pf, q)) for pl, _previous_pl, pf, _context in contexts]
     return _export_report_workbook_xlsx(
         sheets=sheets,
         headers=REPORT_RANK_1_HEADERS,
@@ -3185,8 +3242,15 @@ def export_decreases_report_combined(
     q = str(payload.get("q") or "").strip() or None
     branch, contexts = _parse_report_contexts_payload(db, payload, current_user)
     sheets = []
-    for pl, pf, _context in contexts:
-        rows, _previous_number = _decrease_rows_for_context(db, pl, pf, q)
+    for pl, previous_pl, pf, _context in contexts:
+        rows, _previous_number = _decrease_rows_for_context(
+            db,
+            pl,
+            pf,
+            q,
+            previous_pl=previous_pl,
+            previous_resolved=True,
+        )
         sheets.append((pf, rows))
     return _export_report_workbook_xlsx(
         sheets=sheets,

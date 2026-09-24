@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import io
 
 from fastapi.testclient import TestClient
@@ -32,32 +32,47 @@ def _client_with_reports_data(*, role: str = ROLE_PRICING_MANAGER, user_branch: 
     main.app.dependency_overrides[main.get_current_user] = lambda: user
 
     now = datetime(2026, 9, 8, 9, 0, 0)
+    current_activation_date = date(2026, 9, 25)
+    previous_activation_date = date(2026, 9, 24)
     ids: dict[str, int] = {}
     with Session() as db:
         long_name = "VIP/Very*Long[Sheet]:Name?WithForbiddenSymbolsAAAA"
         pf_vip = PriceFormat(code="AST-VIP", name=long_name, branch="Астана", sap_category="VIP", price_list_type="gpl")
         pf_cat1 = PriceFormat(code="AST-CAT1", name=long_name, branch="Астана", sap_category="1", price_list_type="gpl")
         pf_alm = PriceFormat(code="ALM-CAT1", name="Almaty Category 1", branch="Алматы", sap_category="1", price_list_type="gpl")
-        db.add_all([pf_vip, pf_cat1, pf_alm])
+        pf_gap = PriceFormat(code="AST-GAP", name="Astana Missing Previous Date", branch="Астана", sap_category="GAP", price_list_type="gpl")
+        db.add_all([pf_vip, pf_cat1, pf_alm, pf_gap])
         db.flush()
-        ids.update({"pf_vip": pf_vip.id, "pf_cat1": pf_cat1.id, "pf_alm": pf_alm.id})
+        ids.update({"pf_vip": pf_vip.id, "pf_cat1": pf_cat1.id, "pf_alm": pf_alm.id, "pf_gap": pf_gap.id})
 
-        pl_vip_old = PriceList(number="AST-VIP-OLD", price_format_id=pf_vip.id, status="generated", created_at=now - timedelta(days=2))
-        pl_vip_prev = PriceList(number="AST-VIP-PREV", price_format_id=pf_vip.id, status="generated", created_at=now - timedelta(days=1))
-        pl_vip_latest = PriceList(number="AST-VIP-LATEST", price_format_id=pf_vip.id, status="generated", created_at=now)
-        pl_cat1_prev = PriceList(number="AST-CAT1-PREV", price_format_id=pf_cat1.id, status="generated", created_at=now - timedelta(days=1))
-        pl_cat1_latest = PriceList(number="AST-CAT1-LATEST", price_format_id=pf_cat1.id, status="generated", created_at=now + timedelta(minutes=1))
-        pl_alm = PriceList(number="ALM-LATEST", price_format_id=pf_alm.id, status="generated", created_at=now)
-        db.add_all([pl_vip_old, pl_vip_prev, pl_vip_latest, pl_cat1_prev, pl_cat1_latest, pl_alm])
+        pl_vip_old = PriceList(number="AST-VIP-OLD", price_format_id=pf_vip.id, activation_date=date(2026, 9, 23), status="generated", created_at=now - timedelta(days=2))
+        pl_vip_prev_early = PriceList(number="AST-VIP-PREV-EARLY", price_format_id=pf_vip.id, activation_date=previous_activation_date, status="generated", created_at=now - timedelta(days=1, hours=1))
+        pl_vip_prev = PriceList(number="AST-VIP-PREV", price_format_id=pf_vip.id, activation_date=previous_activation_date, status="generated", created_at=now - timedelta(days=1))
+        pl_vip_current_a = PriceList(number="AST-VIP-CURRENT-A", price_format_id=pf_vip.id, activation_date=current_activation_date, status="generated", created_at=now - timedelta(hours=2))
+        pl_vip_current_b = PriceList(number="AST-VIP-CURRENT-B", price_format_id=pf_vip.id, activation_date=current_activation_date, status="generated", created_at=now - timedelta(hours=1))
+        pl_vip_latest = PriceList(number="AST-VIP-LATEST", price_format_id=pf_vip.id, activation_date=current_activation_date, status="generated", created_at=now)
+        pl_cat1_prev = PriceList(number="AST-CAT1-PREV", price_format_id=pf_cat1.id, activation_date=previous_activation_date, status="generated", created_at=now - timedelta(days=1))
+        pl_cat1_latest = PriceList(number="AST-CAT1-LATEST", price_format_id=pf_cat1.id, activation_date=current_activation_date, status="generated", created_at=now + timedelta(minutes=1))
+        pl_alm = PriceList(number="ALM-LATEST", price_format_id=pf_alm.id, activation_date=current_activation_date, status="generated", created_at=now)
+        pl_gap_old = PriceList(number="AST-GAP-23", price_format_id=pf_gap.id, activation_date=date(2026, 9, 23), status="generated", created_at=now - timedelta(days=2))
+        pl_gap_current_low = PriceList(number="AST-GAP-25-A", price_format_id=pf_gap.id, activation_date=current_activation_date, status="generated", created_at=now + timedelta(hours=1))
+        pl_gap_current_high = PriceList(number="AST-GAP-25-B", price_format_id=pf_gap.id, activation_date=current_activation_date, status="generated", created_at=now + timedelta(hours=1))
+        db.add_all([pl_vip_old, pl_vip_prev_early, pl_vip_prev, pl_vip_current_a, pl_vip_current_b, pl_vip_latest, pl_cat1_prev, pl_cat1_latest, pl_alm, pl_gap_old, pl_gap_current_low, pl_gap_current_high])
         db.flush()
         ids.update(
             {
                 "pl_vip_old": pl_vip_old.id,
+                "pl_vip_prev_early": pl_vip_prev_early.id,
                 "pl_vip_prev": pl_vip_prev.id,
+                "pl_vip_current_a": pl_vip_current_a.id,
+                "pl_vip_current_b": pl_vip_current_b.id,
                 "pl_vip_latest": pl_vip_latest.id,
                 "pl_cat1_prev": pl_cat1_prev.id,
                 "pl_cat1_latest": pl_cat1_latest.id,
                 "pl_alm": pl_alm.id,
+                "pl_gap_old": pl_gap_old.id,
+                "pl_gap_current_low": pl_gap_current_low.id,
+                "pl_gap_current_high": pl_gap_current_high.id,
             }
         )
 
@@ -71,6 +86,10 @@ def _client_with_reports_data(*, role: str = ROLE_PRICING_MANAGER, user_branch: 
             Product(code="UP", name="Increase Product", cost=10),
             Product(code="ZERO", name="Zero Old", cost=10),
             Product(code="ALM", name="Almaty Product", cost=10),
+            Product(code="DATECASE", name="Activation Date Comparison", cost=10),
+            Product(code="PREVONLY", name="Previous Only", cost=10),
+            Product(code="CURRONLY", name="Current Only", cost=10),
+            Product(code="GAP", name="Gap Date Product", cost=10),
         ]
         db.add_all(products)
         db.flush()
@@ -94,7 +113,8 @@ def _client_with_reports_data(*, role: str = ROLE_PRICING_MANAGER, user_branch: 
                 )
             )
 
-        for code, old_price in {"BOTH": 1000, "VIPONLY": 800, "D045": 1000, "UNCH": 1000, "UP": 1000, "ZERO": 0}.items():
+        add_cp(pl_vip_prev_early, "DATECASE", 5500)
+        for code, old_price in {"BOTH": 1000, "VIPONLY": 800, "D045": 1000, "UNCH": 1000, "UP": 1000, "ZERO": 0, "DATECASE": 5400, "PREVONLY": 700}.items():
             add_cp(pl_vip_prev, code, old_price)
         for code, old_price in {"BOTH": 777, "D045": 777}.items():
             add_cp(pl_vip_old, code, old_price)
@@ -105,8 +125,12 @@ def _client_with_reports_data(*, role: str = ROLE_PRICING_MANAGER, user_branch: 
             ("UNCH", 1000, "right", None),
             ("UP", 1001, "right", None),
             ("ZERO", 0, "left", None),
+            ("DATECASE", 5000, "right", None),
+            ("CURRONLY", 600, "right", None),
         ]:
             add_cp(pl_vip_latest, code, new_price, zone, rating)
+        add_cp(pl_vip_current_a, "DATECASE", 5100)
+        add_cp(pl_vip_current_b, "DATECASE", 5000)
 
         for code, old_price in {"BOTH": 2000, "CATONLY": 500, "D010": 1000}.items():
             add_cp(pl_cat1_prev, code, old_price)
@@ -118,6 +142,9 @@ def _client_with_reports_data(*, role: str = ROLE_PRICING_MANAGER, user_branch: 
             add_cp(pl_cat1_latest, code, new_price, zone, rating)
 
         add_cp(pl_alm, "ALM", 990, "left")
+        add_cp(pl_gap_old, "GAP", 700, "right")
+        add_cp(pl_gap_current_low, "GAP", 650, "right")
+        add_cp(pl_gap_current_high, "GAP", 640, "left")
         db.commit()
 
     return TestClient(main.app), ids
@@ -130,8 +157,8 @@ def _clear_overrides():
 
 def _contexts(ids: dict[str, int]):
     return [
-        {"priceFormatId": ids["pf_vip"], "priceListId": ids["pl_vip_latest"]},
-        {"priceFormatId": ids["pf_cat1"], "priceListId": ids["pl_cat1_latest"]},
+        {"priceFormatId": ids["pf_vip"]},
+        {"priceFormatId": ids["pf_cat1"]},
     ]
 
 
@@ -143,18 +170,19 @@ def test_report_contexts_return_latest_generated_price_list_per_format():
         payload = response.json()
 
         by_code = {row["priceFormat"]["code"]: row for row in payload}
-        assert set(by_code) == {"AST-CAT1", "AST-VIP"}
+        assert set(by_code) == {"AST-CAT1", "AST-GAP", "AST-VIP"}
         assert by_code["AST-VIP"]["latestPriceList"]["id"] == ids["pl_vip_latest"]
         assert by_code["AST-CAT1"]["latestPriceList"]["id"] == ids["pl_cat1_latest"]
         assert by_code["AST-VIP"]["priceFormat"]["sapCategory"] == "VIP"
-        assert [row["number"] for row in by_code["AST-VIP"]["priceLists"]][:2] == ["AST-VIP-LATEST", "AST-VIP-PREV"]
+        assert by_code["AST-VIP"]["availableActivationDates"] == ["2026-09-25", "2026-09-24", "2026-09-23"]
+        assert [row["number"] for row in by_code["AST-VIP"]["latestPriceListsByActivationDate"]] == ["AST-VIP-LATEST", "AST-VIP-PREV", "AST-VIP-OLD"]
     finally:
         _clear_overrides()
 
 def test_combined_rank_1_query_uses_left_zone_and_selected_formats():
     client, ids = _client_with_reports_data()
     try:
-        response = client.post("/api/reports/rank-1/query", json={"branch": "Astana", "contexts": _contexts(ids), "page": 1, "limit": 20})
+        response = client.post("/api/reports/rank-1/query", json={"branch": "Astana", "activationDate": "2026-09-25", "contexts": _contexts(ids), "page": 1, "limit": 20})
         assert response.status_code == 200
         payload = response.json()
         by_material_format = {(row["material"], row["priceFormatCode"]): row for row in payload["items"]}
@@ -174,34 +202,69 @@ def test_combined_rank_1_query_uses_left_zone_and_selected_formats():
 def test_combined_decreases_compare_previous_prices_within_same_price_format():
     client, ids = _client_with_reports_data()
     try:
-        response = client.post("/api/reports/decreases/query", json={"branch": "Astana", "contexts": _contexts(ids), "page": 1, "limit": 20})
+        response = client.post("/api/reports/decreases/query", json={"branch": "Astana", "activationDate": "2026-09-25", "contexts": _contexts(ids), "page": 1, "limit": 20})
         assert response.status_code == 200
         payload = response.json()
         rows = {(row["material"], row["priceFormatCode"]): row for row in payload["items"]}
 
-        assert set(rows) == {("BOTH", "AST-CAT1"), ("BOTH", "AST-VIP"), ("CATONLY", "AST-CAT1"), ("D010", "AST-CAT1"), ("D045", "AST-VIP"), ("VIPONLY", "AST-VIP")}
+        assert set(rows) == {("BOTH", "AST-CAT1"), ("BOTH", "AST-VIP"), ("CATONLY", "AST-CAT1"), ("D010", "AST-CAT1"), ("D045", "AST-VIP"), ("DATECASE", "AST-VIP"), ("VIPONLY", "AST-VIP")}
         assert rows[("BOTH", "AST-VIP")]["oldPrice"] == 1000.0
         assert rows[("BOTH", "AST-VIP")]["oldPrice"] != 777.0
         assert rows[("BOTH", "AST-CAT1")]["oldPrice"] == 2000.0
         assert rows[("BOTH", "AST-CAT1")]["oldPrice"] != 1000.0
         assert rows[("D045", "AST-VIP")]["decreasePercent"] == -0.0045
         assert rows[("D010", "AST-CAT1")]["decreasePercent"] == -0.001
-        assert payload["summary"]["totalDecreaseKzt"] == -36.5
+        assert rows[("DATECASE", "AST-VIP")]["oldPrice"] == 5400.0
+        assert rows[("DATECASE", "AST-VIP")]["newPrice"] == 5000.0
+        assert rows[("DATECASE", "AST-VIP")]["decreaseKzt"] == -400.0
+        assert "PREVONLY" not in {row[0] for row in rows}
+        assert "CURRONLY" not in {row[0] for row in rows}
+        assert payload["summary"]["totalDecreaseKzt"] == -436.5
         previous = {ctx["priceFormatCode"]: ctx["previousPriceListNumber"] for ctx in payload["context"]["contexts"]}
         assert previous == {"AST-VIP": "AST-VIP-PREV", "AST-CAT1": "AST-CAT1-PREV"}
+        contexts = {ctx["priceFormatCode"]: ctx for ctx in payload["context"]["contexts"]}
+        assert contexts["AST-VIP"]["currentPriceListId"] == ids["pl_vip_latest"]
+        assert contexts["AST-VIP"]["previousPriceListId"] == ids["pl_vip_prev"]
+        assert contexts["AST-VIP"]["currentActivationDate"] == "2026-09-25"
+        assert contexts["AST-VIP"]["previousActivationDate"] == "2026-09-24"
 
-        searched = client.post("/api/reports/decreases/query", json={"branch": "Astana", "contexts": _contexts(ids), "q": "Maker D010", "page": 1, "limit": 20}).json()
+        searched = client.post("/api/reports/decreases/query", json={"branch": "Astana", "activationDate": "2026-09-25", "contexts": _contexts(ids), "q": "Maker D010", "page": 1, "limit": 20}).json()
         assert searched["total"] == 1
         assert searched["items"][0]["material"] == "D010"
     finally:
         _clear_overrides()
 
 
+def test_reports_use_exact_previous_calendar_date_and_higher_id_breaks_timestamp_tie():
+    client, ids = _client_with_reports_data()
+    context = [{"priceFormatId": ids["pf_gap"], "priceListId": ids["pl_gap_current_low"]}]
+    try:
+        rank = client.post(
+            "/api/reports/rank-1/query",
+            json={"branch": "Astana", "activationDate": "2026-09-25", "contexts": context},
+        )
+        decreases = client.post(
+            "/api/reports/decreases/query",
+            json={"branch": "Astana", "activationDate": "2026-09-25", "contexts": context},
+        )
+    finally:
+        _clear_overrides()
+
+    assert rank.status_code == 200
+    assert rank.json()["items"][0]["material"] == "GAP"
+    rank_context = rank.json()["context"]["contexts"][0]
+    assert rank_context["currentPriceListId"] == ids["pl_gap_current_high"]
+    assert rank_context["previousPriceListId"] is None
+    assert decreases.status_code == 200
+    assert decreases.json()["items"] == []
+    assert decreases.json()["context"]["contexts"][0]["previousPriceListId"] is None
+
+
 def test_combined_reports_support_pagination_and_selected_price_list_override():
     client, ids = _client_with_reports_data()
     try:
-        page_1 = client.post("/api/reports/rank-1/query", json={"branch": "Astana", "contexts": _contexts(ids), "page": 1, "limit": 2}).json()
-        page_2 = client.post("/api/reports/rank-1/query", json={"branch": "Astana", "contexts": _contexts(ids), "page": 2, "limit": 2}).json()
+        page_1 = client.post("/api/reports/rank-1/query", json={"branch": "Astana", "activationDate": "2026-09-25", "contexts": _contexts(ids), "page": 1, "limit": 2}).json()
+        page_2 = client.post("/api/reports/rank-1/query", json={"branch": "Astana", "activationDate": "2026-09-25", "contexts": _contexts(ids), "page": 2, "limit": 2}).json()
         assert page_1["total"] == 5
         assert len(page_1["items"]) == 2
         assert len(page_2["items"]) == 2
@@ -237,7 +300,7 @@ def test_report_context_authorization_and_branch_validation():
 def test_combined_exports_create_one_sanitized_sheet_per_selected_format():
     client, ids = _client_with_reports_data()
     try:
-        response = client.post("/api/reports/rank-1/export.xlsx", json={"branch": "Astana", "contexts": _contexts(ids)})
+        response = client.post("/api/reports/rank-1/export.xlsx", json={"branch": "Astana", "activationDate": "2026-09-25", "contexts": _contexts(ids)})
         assert response.status_code == 200
         wb = load_workbook(io.BytesIO(response.content), data_only=True)
         assert len(wb.sheetnames) == 2
@@ -251,7 +314,7 @@ def test_combined_exports_create_one_sanitized_sheet_per_selected_format():
             if sheet.max_row > 1:
                 assert "-43F" in sheet["F2"].number_format
 
-        decrease_response = client.post("/api/reports/decreases/export.xlsx", json={"branch": "Astana", "contexts": _contexts(ids)})
+        decrease_response = client.post("/api/reports/decreases/export.xlsx", json={"branch": "Astana", "activationDate": "2026-09-25", "contexts": _contexts(ids)})
         assert decrease_response.status_code == 200
         decrease_wb = load_workbook(io.BytesIO(decrease_response.content), data_only=True)
         assert len(decrease_wb.sheetnames) == 2
@@ -264,5 +327,10 @@ def test_combined_exports_create_one_sanitized_sheet_per_selected_format():
                 assert "-43F" in sheet["G2"].number_format
                 assert "-43F" in sheet["H2"].number_format
                 assert sheet["I2"].number_format == "0.0%"
+        vip_sheet = next(sheet for sheet in decrease_wb.worksheets if any(row[2].value == "DATECASE" for row in sheet.iter_rows(min_row=2)))
+        date_row = next(row for row in vip_sheet.iter_rows(min_row=2) if row[2].value == "DATECASE")
+        assert date_row[5].value == 5000
+        assert date_row[6].value == 5400
+        assert date_row[7].value == -400
     finally:
         _clear_overrides()
