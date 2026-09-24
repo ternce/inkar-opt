@@ -164,6 +164,132 @@ def _regular_percentile_config_name(pf_id: int, competitor_identity: str, compet
     return f"percentile:{source_id}"
 
 
+def test_percentile_assignment_api_persists_coefficient_aliases_default_and_get(monkeypatch):
+    from backend.app import main
+
+    Session = _session_factory_static()
+    with Session() as db:
+        pf = _format(db, code="PCT-COEFFICIENT")
+        pf_id = int(pf.id)
+        db.commit()
+
+    source_id = f"competitor:{pf_id}:regular_competitor:test-source::Test Competitor:p10"
+    default_source_id = f"competitor:{pf_id}:regular_competitor:default-source::Default Competitor:p20"
+    monkeypatch.setattr(main, "enqueue_percentile_preparation", lambda **_kwargs: {"status": "queued"})
+    main.app.dependency_overrides[main.get_db] = lambda: Session()
+    _override_admin(main)
+    try:
+        client = TestClient(main.app)
+        created = client.post(
+            "/api/price-formats/PCT-COEFFICIENT/competitor-assignments",
+            json={
+                "sourceType": "percentile",
+                "sourceId": source_id,
+                "sourceName": "Test Competitor - P10",
+                "priceCoefficient": 1.01,
+                "coefficient": -1,
+            },
+        )
+        assert created.status_code == 200
+        with Session() as db:
+            posted_coefficient = db.execute(
+                select(CompetitorPrice.coefficient).where(CompetitorPrice.source_name == f"percentile:{source_id}")
+            ).scalar_one()
+        assert posted_coefficient == Decimal("1.010000")
+        created_default = client.post(
+            "/api/price-formats/PCT-COEFFICIENT/competitor-assignments",
+            json={
+                "sourceType": "percentile",
+                "sourceId": default_source_id,
+                "sourceName": "Default Competitor - P20",
+            },
+        )
+        assert created_default.status_code == 200
+        with Session() as db:
+            default_coefficient = db.execute(
+                select(CompetitorPrice.coefficient).where(
+                    CompetitorPrice.source_name == f"percentile:{default_source_id}"
+                )
+            ).scalar_one()
+        assert default_coefficient == Decimal("1.000000")
+        updated = client.patch(
+            f"/api/price-formats/PCT-COEFFICIENT/competitor-assignments/percentile:{source_id}",
+            json={"priceCoefficient": 1.025, "active": True},
+        )
+        assert updated.status_code == 200
+        with Session() as db:
+            patched_coefficient = db.execute(
+                select(CompetitorPrice.coefficient).where(CompetitorPrice.source_name == f"percentile:{source_id}")
+            ).scalar_one()
+        assert patched_coefficient == Decimal("1.025000")
+        updated_legacy = client.patch(
+            f"/api/price-formats/PCT-COEFFICIENT/competitor-assignments/percentile:{source_id}",
+            json={"coefficient": 0.99, "active": True},
+        )
+        assert updated_legacy.status_code == 200
+        with Session() as db:
+            legacy_coefficient = db.execute(
+                select(CompetitorPrice.coefficient).where(CompetitorPrice.source_name == f"percentile:{source_id}")
+            ).scalar_one()
+        assert legacy_coefficient == Decimal("0.990000")
+        assignments = client.get("/api/price-formats/PCT-COEFFICIENT/competitor-assignments")
+    finally:
+        main.app.dependency_overrides.clear()
+
+    assert assignments.status_code == 200
+    with Session() as db:
+        saved = db.execute(
+            select(CompetitorPrice).where(CompetitorPrice.source_name == f"percentile:{source_id}")
+        ).scalar_one()
+        saved_default = db.execute(
+            select(CompetitorPrice).where(CompetitorPrice.source_name == f"percentile:{default_source_id}")
+        ).scalar_one()
+        assert saved.coefficient == Decimal("0.990000")
+        assert saved_default.coefficient == Decimal("1.000000")
+    rows = {row["sourceId"]: row for row in assignments.json() if row["assignmentKind"] == "percentile_config"}
+    assert rows[source_id]["coefficient"] == pytest.approx(0.99)
+    assert rows[default_source_id]["coefficient"] == pytest.approx(1.0)
+
+
+def test_percentile_assignment_api_rejects_invalid_price_coefficient(monkeypatch):
+    from backend.app import main
+
+    Session = _session_factory_static()
+    with Session() as db:
+        pf = _format(db, code="PCT-INVALID-COEFFICIENT")
+        pf_id = int(pf.id)
+        source_id = f"competitor:{pf_id}:regular_competitor:test-source::Test Competitor:p10"
+        db.add(
+            CompetitorPrice(
+                price_format_id=pf.id,
+                product_id=None,
+                source_name=f"percentile:{source_id}",
+                supplier="Test Competitor - P10",
+                coefficient=1.01,
+            )
+        )
+        db.commit()
+
+    monkeypatch.setattr(main, "enqueue_percentile_preparation", lambda **_kwargs: {"status": "queued"})
+    main.app.dependency_overrides[main.get_db] = lambda: Session()
+    _override_admin(main)
+    try:
+        response = TestClient(main.app).patch(
+            f"/api/price-formats/PCT-INVALID-COEFFICIENT/competitor-assignments/percentile:{source_id}",
+            json={"priceCoefficient": 0, "active": True},
+        )
+    finally:
+        main.app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "priceCoefficient must be between 0.01 and 100"
+    with Session() as db:
+        saved = db.execute(
+            select(CompetitorPrice).where(CompetitorPrice.source_name == f"percentile:{source_id}")
+        ).scalar_one()
+        assert saved.coefficient == Decimal("1.010000")
+
+
 def _global_emit_fixture(db):
     canonical = PriceFormat(id=GLOBAL_EMIT_PERCENTILE_STORAGE_PRICE_FORMAT_ID, code="PF4", name="PF4", branch="Aktau")
     target = PriceFormat(id=27, code="PF27", name="PF27", branch="Aktau", competitor_price_mode="percentile", percentile_number=40)

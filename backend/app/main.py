@@ -6537,6 +6537,15 @@ def _assignment_percentile_source_family(source_id: object) -> str:
     return PERCENTILE_SOURCE_EMIT
 
 
+def _percentile_assignment_coefficient(payload: dict) -> float:
+    value = (
+        payload["priceCoefficient"]
+        if "priceCoefficient" in payload
+        else payload.get("coefficient", 1.0)
+    )
+    return validate_price_coefficient(value)
+
+
 def _regular_assignment_source_from_config(cfg: CompetitorPrice, pf: PriceFormat) -> dict | None:
     source_name = str(cfg.source_name or "").strip()
     prefix = f"percentile:competitor:{int(pf.id)}:regular_competitor:"
@@ -6768,12 +6777,12 @@ def post_competitor_assignment(format_code: str, payload: dict = Body(...), db: 
 
     source_type = str(payload.get("sourceType") or "").strip()
     source_id = payload.get("sourceId")
-    try:
-        coefficient = validate_price_coefficient(payload.get("coefficient", 1.0) or 1.0)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
     if source_type == "percentile":
+        try:
+            coefficient = _percentile_assignment_coefficient(payload)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         source_name = _assignment_percentile_source_name(source_id)
         existing = (
             db.execute(
@@ -6798,6 +6807,11 @@ def post_competitor_assignment(format_code: str, payload: dict = Body(...), db: 
         db.commit()
         percentile_status = enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="percentile_assignment_added")
         return {"status": "ok", "percentilePreparation": percentile_status}
+
+    try:
+        coefficient = validate_price_coefficient(payload.get("coefficient", 1.0) or 1.0)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     try:
         source_id_int = int(source_id)
@@ -6829,13 +6843,13 @@ def patch_competitor_assignment(format_code: str, assignment_id: str, payload: d
     if pf is None:
         raise HTTPException(status_code=404, detail="price format not found")
     _ensure_price_format_access(pf, current_user)
-    try:
-        coefficient = validate_price_coefficient(payload.get("coefficient", 1.0) or 1.0)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
     active = payload.get("active")
 
     if assignment_id.startswith("percentile:"):
+        try:
+            coefficient = _percentile_assignment_coefficient(payload)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         source_name = _assignment_percentile_source_name(assignment_id.removeprefix("percentile:"))
         cfg = (
             db.execute(
@@ -6856,6 +6870,11 @@ def patch_competitor_assignment(format_code: str, assignment_id: str, payload: d
         db.commit()
         percentile_status = enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="percentile_assignment_changed")
         return {"status": "ok", "percentilePreparation": percentile_status}
+
+    try:
+        coefficient = validate_price_coefficient(payload.get("coefficient", 1.0) or 1.0)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     try:
         source_id_int = int(assignment_id)
