@@ -679,7 +679,9 @@ def list_manual_import_history(*, db: Session, price_list_id: int) -> list[dict[
             "unmatchedRows": row.unmatched_rows,
             "persistedRows": row.persisted_rows,
             "preservedPreviousSnapshot": bool(row.preserved_previous_snapshot),
+            "requestedBy": row.requested_by,
             "errorSummary": row.error_summary,
+            "metadata": json.loads(row.metadata_json or "{}"),
         }
         for row in rows
     ]

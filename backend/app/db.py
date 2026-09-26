@@ -227,6 +227,7 @@ def _ensure_competitor_price_lists_global_owner_nullable() -> None:
                     last_success_at DATETIME,
                     last_refresh_status VARCHAR(64) DEFAULT '',
                     last_refresh_message TEXT DEFAULT '',
+                    update_mode VARCHAR(16) NOT NULL DEFAULT 'auto',
                     price_date DATE,
                     coefficient NUMERIC(18, 6) NOT NULL,
                     price_coefficient NUMERIC(18, 6) DEFAULT 1.0,
@@ -272,6 +273,7 @@ def _ensure_compatible_columns() -> None:
             ("provisor_goods_id", "BIGINT"),
         ],
         "competitor_price_lists": [
+            ("update_mode", "VARCHAR(16) NOT NULL DEFAULT 'auto'"),
             ("branch_id", "TEXT DEFAULT ''"),
             ("branch_code", "TEXT DEFAULT ''"),
             ("branch_name", "TEXT DEFAULT 'Без филиала'"),
@@ -314,6 +316,9 @@ def _ensure_compatible_columns() -> None:
             ("parsed_strength_signature", "TEXT DEFAULT ''"),
             ("parsed_dimensions_json", "TEXT DEFAULT ''"),
             ("parsed_critical_tokens_json", "TEXT DEFAULT ''"),
+        ],
+        "vidman_competitor_price_list_sources": [
+            ("update_mode", "VARCHAR(16) NOT NULL DEFAULT 'auto'"),
         ],
         "competitors_prices": [
             ("match_type", "VARCHAR(64) DEFAULT ''"),

@@ -24,11 +24,13 @@ from ..models import (
     CompetitorCodeMapping,
     CompetitorPriceList,
     CompetitorPriceListItem,
+    ManualPriceListImport,
     PriceSourceAccount,
     PriceFormat,
     Product,
     ProductRating,
     SourceGoodsMatch,
+    VidmanCompetitorPriceListSource,
 )
 from .competitor_persist import _ensure_price_format
 from .competitor_matching import (
@@ -1690,6 +1692,22 @@ def list_competitor_price_lists(
     }
     all_rows = rows
     visible_ids = {int(row.id) for row in all_rows}
+    vidman_sources = {
+        int(item.competitor_price_list_id): item
+        for item in db.execute(
+            select(VidmanCompetitorPriceListSource).where(
+                VidmanCompetitorPriceListSource.competitor_price_list_id.in_(visible_ids or {-1})
+            )
+        ).scalars()
+        if item.competitor_price_list_id is not None
+    }
+    latest_manual_imports: dict[int, ManualPriceListImport] = {}
+    for item in db.execute(
+        select(ManualPriceListImport)
+        .where(ManualPriceListImport.competitor_price_list_id.in_(visible_ids or {-1}))
+        .order_by(ManualPriceListImport.started_at.desc(), ManualPriceListImport.id.desc())
+    ).scalars():
+        latest_manual_imports.setdefault(int(item.competitor_price_list_id), item)
     for row in all_rows:
         visible = int(row.id) in visible_ids
         hidden_reason = "" if visible else _price_list_assignment_hidden_reason(row, counts)
@@ -1761,6 +1779,21 @@ def list_competitor_price_lists(
             "branchMatchReason": str(getattr(row, "_branch_match_reason", "")),
             "branchMismatchReason": str(getattr(row, "_branch_mismatch_reason", "")),
             "filialId": row.external_price_list_id or row.branch_id or row.source_key,
+            "updateMode": (
+                vidman_sources[int(row.id)].update_mode
+                if int(row.id) in vidman_sources
+                else (row.update_mode or "auto")
+            ),
+            "latestManualFile": (
+                latest_manual_imports[int(row.id)].original_filename
+                if int(row.id) in latest_manual_imports
+                else ""
+            ),
+            "latestManualImportAt": (
+                latest_manual_imports[int(row.id)].finished_at.isoformat()
+                if int(row.id) in latest_manual_imports and latest_manual_imports[int(row.id)].finished_at
+                else ""
+            ),
         }
         for row in rows
     ]
