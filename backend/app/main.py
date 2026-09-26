@@ -84,6 +84,9 @@ from .models import (
     CounterpartyPriceFormat,
     AppUser,
     ManualMatchingAssignment,
+    ManualPriceListImport,
+    VidmanAccount,
+    VidmanCompetitorPriceListSource,
 )
 from .schemas import (
     CalculatePricesRequest,
@@ -166,6 +169,14 @@ from .services.manual_price_list_import import (
     list_manual_import_errors,
     list_manual_import_history,
     preview_manual_price_list,
+)
+from .services.vidman_file_import import (
+    MAX_VIDMAN_FILE_SIZE_BYTES,
+    import_vidman_file,
+    import_vidman_multi_source_file,
+    preview_vidman_file,
+    preview_vidman_multi_source_file,
+    set_vidman_update_mode,
 )
 from .services.price_source_accounts import (
     account_to_dict,
@@ -8411,6 +8422,199 @@ def get_manual_competitor_price_list_imports(price_list_id: int, db: Session = D
     return {"items": list_manual_import_history(db=db, price_list_id=price_list_id)}
 
 
+def _ensure_competitor_price_list_access(*, db: Session, price_list_id: int, user: AppUser) -> CompetitorPriceList:
+    row = db.get(CompetitorPriceList, price_list_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="competitor price list not found")
+    pf = db.get(PriceFormat, row.price_format_id)
+    if pf is None:
+        raise HTTPException(status_code=404, detail="price format not found")
+    _ensure_price_format_access(pf, user)
+    return row
+
+
+@app.post("/api/competitor-price-lists/{price_list_id}/vidman/manual/preview")
+async def preview_vidman_manual_file(
+    price_list_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+):
+    _ensure_competitor_price_list_access(db=db, price_list_id=price_list_id, user=current_user)
+    try:
+        content = await _read_upload_limited(file, max_bytes=MAX_VIDMAN_FILE_SIZE_BYTES)
+        return preview_vidman_file(
+            db=db,
+            competitor_price_list_id=price_list_id,
+            content=content,
+            filename=file.filename or "vidman.xlsx",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/price-formats/{format_code}/vidman-file/preview")
+async def preview_vidman_multi_source_upload(
+    format_code: str,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+):
+    pf = db.execute(select(PriceFormat).where(PriceFormat.code == format_code)).scalars().first()
+    if pf is None:
+        raise HTTPException(status_code=404, detail="price format not found")
+    _ensure_price_format_access(pf, current_user)
+    try:
+        content = await _read_upload_limited(file, max_bytes=MAX_VIDMAN_FILE_SIZE_BYTES)
+        return preview_vidman_multi_source_file(
+            db=db, price_format=pf, content=content, filename=file.filename or "vidman.xlsx"
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/price-formats/{format_code}/vidman-file/confirm")
+async def confirm_vidman_multi_source_upload(
+    format_code: str,
+    file: UploadFile = File(...),
+    checksum: str = Form(...),
+    allow_incomplete: bool = Form(False),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+):
+    pf = db.execute(select(PriceFormat).where(PriceFormat.code == format_code)).scalars().first()
+    if pf is None:
+        raise HTTPException(status_code=404, detail="price format not found")
+    _ensure_price_format_access(pf, current_user)
+    try:
+        content = await _read_upload_limited(file, max_bytes=MAX_VIDMAN_FILE_SIZE_BYTES)
+        return import_vidman_multi_source_file(
+            db=db,
+            price_format=pf,
+            content=content,
+            filename=file.filename or "vidman.xlsx",
+            expected_checksum=checksum,
+            allow_incomplete=allow_incomplete,
+            requested_by=str(current_user.username or current_user.id),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/price-formats/{format_code}/vidman-file/imports")
+def get_vidman_multi_source_imports(
+    format_code: str,
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    pf = db.execute(select(PriceFormat).where(PriceFormat.code == format_code)).scalars().first()
+    if pf is None:
+        raise HTTPException(status_code=404, detail="price format not found")
+    _ensure_price_format_access(pf, current_user)
+    rows = db.execute(
+        select(ManualPriceListImport)
+        .where(ManualPriceListImport.source_key.like("vidman-file-batch:%"))
+        .order_by(ManualPriceListImport.started_at.desc(), ManualPriceListImport.id.desc())
+        .limit(200)
+    ).scalars()
+    items = []
+    for row in rows:
+        try:
+            metadata = json.loads(row.metadata_json or "{}")
+        except Exception:
+            metadata = {}
+        if int(metadata.get("priceFormatId") or 0) != int(pf.id):
+            continue
+        items.append(
+            {
+                "id": int(row.id),
+                "status": row.status,
+                "filename": row.original_filename,
+                "checksum": row.file_checksum,
+                "startedAt": row.started_at.isoformat() if row.started_at else "",
+                "totalRows": int(row.total_rows or 0),
+                "validRows": int(row.valid_rows or 0),
+                "invalidRows": int(row.invalid_rows or 0),
+                "duplicateRows": int(row.duplicate_rows or 0),
+                "matchedRows": int(row.matched_rows or 0),
+                "unmatchedRows": int(row.unmatched_rows or 0),
+                "preservedPreviousSnapshot": bool(row.preserved_previous_snapshot),
+                "errorSummary": row.error_summary or "",
+                "metadata": metadata,
+            }
+        )
+    return {"items": items[:50]}
+
+
+@app.post("/api/competitor-price-lists/{price_list_id}/vidman/manual/confirm")
+async def confirm_vidman_manual_file(
+    price_list_id: int,
+    file: UploadFile = File(...),
+    checksum: str = Form(...),
+    allow_incomplete: bool = Form(False),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+):
+    _ensure_competitor_price_list_access(db=db, price_list_id=price_list_id, user=current_user)
+    try:
+        content = await _read_upload_limited(file, max_bytes=MAX_VIDMAN_FILE_SIZE_BYTES)
+        return import_vidman_file(
+            db=db,
+            competitor_price_list_id=price_list_id,
+            content=content,
+            filename=file.filename or "vidman.xlsx",
+            expected_checksum=checksum,
+            allow_incomplete=allow_incomplete,
+            requested_by=str(current_user.username or current_user.id),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/competitor-price-lists/{price_list_id}/vidman/update-mode")
+def update_vidman_source_mode(
+    price_list_id: int,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+):
+    _ensure_competitor_price_list_access(db=db, price_list_id=price_list_id, user=current_user)
+    try:
+        return set_vidman_update_mode(
+            db=db,
+            competitor_price_list_id=price_list_id,
+            update_mode=str(payload.get("updateMode") or ""),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/competitor-price-lists/{price_list_id}/vidman/manual/imports")
+def get_vidman_manual_imports(
+    price_list_id: int,
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    row = _ensure_competitor_price_list_access(db=db, price_list_id=price_list_id, user=current_user)
+    if row.source_type not in {"vidman", "manual_vidman"}:
+        raise HTTPException(status_code=404, detail="Vidman price list not found")
+    return {"items": list_manual_import_history(db=db, price_list_id=price_list_id)}
+
+
+@app.get("/api/competitor-price-lists/{price_list_id}/vidman/manual/imports/{import_id}/errors")
+def get_vidman_manual_import_errors(
+    price_list_id: int,
+    import_id: int,
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    row = _ensure_competitor_price_list_access(db=db, price_list_id=price_list_id, user=current_user)
+    history = db.get(ManualPriceListImport, import_id)
+    if row.source_type not in {"vidman", "manual_vidman"} or history is None or history.competitor_price_list_id != row.id:
+        raise HTTPException(status_code=404, detail="Vidman import not found")
+    return {"items": list_manual_import_errors(db=db, import_id=import_id)}
+
+
 @app.get("/api/competitor-price-lists/manual/imports/{import_id}/errors")
 def get_manual_competitor_price_list_import_errors(import_id: int, db: Session = Depends(get_db)):
     return {"items": list_manual_import_errors(db=db, import_id=import_id)}
@@ -9357,6 +9561,44 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                             "[PROVISOR_REFERENCE_SKIP] account_id=%s reason=reference_filial_not_available using_existing_product_provisor_goods_id=true",
                             account.id,
                         )
+                if account.source_type == "vidman" and price_lists:
+                    vidman_account_ids = list(
+                        db.execute(
+                            select(VidmanAccount.id).where(VidmanAccount.login == account.login)
+                        ).scalars()
+                    )
+                    manual_main_ids = {
+                        str(value)
+                        for value in db.execute(
+                            select(VidmanCompetitorPriceListSource.main_id)
+                            .where(VidmanCompetitorPriceListSource.account_id.in_(vidman_account_ids or [-1]))
+                            .where(VidmanCompetitorPriceListSource.update_mode == "manual")
+                        ).scalars()
+                    }
+                    if manual_main_ids:
+                        retained_price_lists = []
+                        for discovered in price_lists:
+                            discovered_id = str(getattr(discovered, "price_list_id", "") or "").strip()
+                            if discovered_id in manual_main_ids:
+                                status["skipped"] += 1
+                                status["skipped_price_lists"].append(
+                                    {
+                                        "priceListId": discovered_id,
+                                        "name": getattr(discovered, "price_list_name", "") or discovered_id,
+                                        "reason": "manual_managed_source",
+                                        "preservedPreviousSnapshot": True,
+                                    }
+                                )
+                                logger.info(
+                                    "[VIDMAN_MANUAL_MANAGED_SKIP] account_id=%s main_id=%s",
+                                    account.id,
+                                    discovered_id,
+                                )
+                            else:
+                                retained_price_lists.append(discovered)
+                        price_lists = retained_price_lists
+                        status["total"] = len(price_lists)
+
                 local_price_list_state: dict[str, tuple[str, int, datetime | None, int | None]] = {}
                 if pf_for_refresh is not None and price_lists:
                     if account.source_type == "provisor":

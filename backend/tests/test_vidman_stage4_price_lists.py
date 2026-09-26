@@ -202,6 +202,48 @@ def test_same_snapshot_rerun_is_idempotent():
     assert db.query(CompetitorPriceListItem).count() == 1
 
 
+def test_manual_transaction_can_roll_back_publication_replacement():
+    db = _session()
+    _, account, plk, first_run, product_a, _ = _seed(db)
+    _raw_link_match(db, account=account, plk=plk, run=first_run, product=product_a, price="10")
+    _build(db, account, plk, apply=True, run=first_run)
+
+    replacement_run = VidmanImportRun(account_id=account.id, status="success")
+    db.add(replacement_run)
+    db.flush()
+    db.add(VidmanImportPage(
+        import_run_id=replacement_run.id,
+        price_list_id=plk.id,
+        main_id=plk.main_id,
+        page_number=1,
+        status="success",
+    ))
+    _raw_link_match(
+        db,
+        account=account,
+        plk=plk,
+        run=replacement_run,
+        product=product_a,
+        price="99",
+        row_number=2,
+    )
+    db.flush()
+
+    build_vidman_competitor_price_list(
+        db=db,
+        account_id=account.id,
+        main_id=plk.main_id,
+        price_format_code="FMT",
+        import_run_id=replacement_run.id,
+        apply=True,
+        commit=False,
+    )
+    db.rollback()
+
+    item = db.execute(select(CompetitorPriceListItem)).scalar_one()
+    assert item.distributor_price == Decimal("10.0000")
+
+
 def test_failed_run_cannot_replace_previous_valid_list():
     db = _session()
     _, account, plk, run, product_a, _ = _seed(db)
@@ -390,3 +432,50 @@ def test_active_assignment_rebuilds_selected_competitor_prices():
 
     assert second.rows_written == 1
     assert db.query(CompetitorPrice).filter(CompetitorPrice.source_name.like("vidman:%")).count() == 1
+
+
+def test_manual_update_mode_does_not_change_assignment_pricing_or_coefficient():
+    db = _session()
+    pf, account, plk, first_run, product_a, _ = _seed(db)
+    _raw_link_match(db, account=account, plk=plk, run=first_run, product=product_a, price="10000")
+    first = _build(db, account, plk, apply=True, run=first_run)
+    assignment = PriceFormatCompetitorAssignment(
+        price_format_id=pf.id,
+        competitor_price_list_id=first.competitor_price_list_id,
+        coefficient=Decimal("1.01"),
+        is_active=True,
+    )
+    db.add(assignment)
+    source = db.query(VidmanCompetitorPriceListSource).one()
+    source.update_mode = "manual"
+    db.commit()
+
+    replacement_run = VidmanImportRun(account_id=account.id, status="success")
+    db.add(replacement_run)
+    db.flush()
+    db.add(VidmanImportPage(
+        import_run_id=replacement_run.id,
+        price_list_id=plk.id,
+        main_id=plk.main_id,
+        page_number=1,
+        status="success",
+    ))
+    _raw_link_match(
+        db,
+        account=account,
+        plk=plk,
+        run=replacement_run,
+        product=product_a,
+        price="11000",
+        row_number=2,
+    )
+    db.flush()
+
+    second = _build(db, account, plk, apply=True, run=replacement_run)
+
+    persisted_assignment = db.get(PriceFormatCompetitorAssignment, assignment.id)
+    assert second.competitor_price_list_id == first.competitor_price_list_id
+    assert persisted_assignment.is_active is True
+    assert persisted_assignment.coefficient == Decimal("1.010000")
+    assert db.query(CompetitorPrice).filter(CompetitorPrice.source_name.like("vidman:%")).count() == 1
+    assert db.query(VidmanCompetitorPriceListSource).one().update_mode == "manual"

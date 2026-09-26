@@ -350,6 +350,7 @@ class CompetitorPriceList(Base):
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_refresh_status: Mapped[str] = mapped_column(String(64), default="")
     last_refresh_message: Mapped[str] = mapped_column(Text, default="")
+    update_mode: Mapped[str] = mapped_column(String(16), default="auto", index=True)
     price_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     coefficient: Mapped[float] = mapped_column(Numeric(18, 6), default=1.0)
@@ -537,6 +538,7 @@ class VidmanCompetitorPriceListSource(Base):
     main_id: Mapped[int] = mapped_column(BigInteger, index=True)
     price_format_code: Mapped[str] = mapped_column(Text, default="", index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    update_mode: Mapped[str] = mapped_column(String(16), default="auto", index=True)
     region: Mapped[str] = mapped_column(Text, default="")
     branch_id: Mapped[str] = mapped_column(Text, default="")
     branch_code: Mapped[str] = mapped_column(Text, default="")

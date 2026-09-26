@@ -297,6 +297,7 @@ def build_vidman_competitor_price_list(
     apply: bool = False,
     preview_limit: int = 50,
     require_active: bool = True,
+    commit: bool = True,
 ) -> VidmanBuildSummary:
     source_key = vidman_competitor_source_key(account_id, main_id)
     summary = VidmanBuildSummary(
@@ -552,7 +553,11 @@ def build_vidman_competitor_price_list(
     for price_format_id in affected_price_format_ids:
         sync_selected_competitor_configs(db=db, price_format_id=price_format_id)
         rebuild_competitor_prices_for_selected(db=db, price_format_id=price_format_id)
-        enqueue_percentile_preparation(db=db, price_format_id=price_format_id, reason="vidman_price_list_built")
-    db.commit()
+        if commit:
+            enqueue_percentile_preparation(db=db, price_format_id=price_format_id, reason="vidman_price_list_built")
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     canonical_competitor_source_key(price_list)
     return summary

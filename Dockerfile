@@ -18,9 +18,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# System deps (minimal)
+# System deps. LibreOffice Calc is used only as a guarded fallback for legacy
+# BIFF workbooks that Excel accepts but xlrd cannot parse.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates \
+  && apt-get install -y --no-install-recommends ca-certificates libreoffice-calc \
   && rm -rf /var/lib/apt/lists/*
 
 COPY backend/requirements.txt ./backend/requirements.txt

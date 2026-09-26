@@ -51,6 +51,9 @@ type CompetitorSource = {
   branchMismatchReason?: string;
   filialId?: string;
   name?: string;
+  updateMode?: 'auto' | 'manual';
+  latestManualFile?: string;
+  latestManualImportAt?: string;
 };
 
 type ManualImportReport = {
@@ -72,6 +75,42 @@ type ManualImportReport = {
   matchedRows?: number;
   unmatchedRows?: number;
   persistedRows?: number;
+  checksum?: string;
+  confirmationToken?: string;
+  knownMatchedRows?: number;
+  reviewRows?: number;
+  currentPublishedRows?: number;
+  headerRow?: number;
+  formatVariant?: string;
+  matchedProducts?: number;
+  unmatchedCodes?: number;
+  unmatchedProductCodes?: string[];
+  invalidPrices?: number;
+  requiresCompletenessOverride?: boolean;
+  warnings?: string[];
+  detectedSources?: number;
+  sources?: Array<{
+    name: string;
+    stableKey: string;
+    status?: string;
+    validPriceRows: number;
+    skuMatchedRows: number;
+    skuUnmatchedRows: number;
+    invalidRows: number;
+    duplicateRows?: number;
+    currentPublishedRows: number;
+    requiresCompletenessOverride?: boolean;
+  }>;
+  results?: Array<{
+    name: string;
+    stableKey: string;
+    status: string;
+    rowsWritten?: number;
+    matchedRows?: number;
+    unmatchedRows?: number;
+    error?: string;
+    message?: string;
+  }>;
   sampleRows?: Array<{ rowNumber: number; sku: string; name: string; price: number }>;
   errors?: Array<{ rowNumber?: number; field: string; errorCode: string; message: string }>;
 };
@@ -391,6 +430,50 @@ const refreshStatusLabel = (row: CompetitorSource) => {
   return competitorFreshnessLabel({ ...row, status: raw });
 };
 
+const backendErrorText = (data: any, text: string, fallback: string) => {
+  if (typeof data?.detail === 'string' && data.detail.trim()) return data.detail;
+  if (Array.isArray(data?.detail)) {
+    const messages = data.detail
+      .map((item: any) => typeof item?.msg === 'string' ? item.msg : '')
+      .filter(Boolean);
+    if (messages.length) return messages.join('; ');
+  }
+  return text.trim() || fallback;
+};
+
+const vidmanStatusLabel = (status?: string | null) => {
+  const labels: Record<string, string> = {
+    ready: 'Готов к импорту',
+    skipped_empty: 'Пропущен — нет цен',
+    skipped_empty_existing_preserved: 'Пропущен — сохранены текущие данные',
+    success: 'Успешно',
+    partial_success: 'Завершено с предупреждениями',
+    failed: 'Ошибка',
+    error: 'Ошибка',
+    blocked: 'Заблокирован',
+    created: 'Создан',
+    updated: 'Обновлён',
+  };
+  const key = String(status || '').trim().toLowerCase();
+  return labels[key] || status || '—';
+};
+
+const localizeVidmanMessage = (message?: string | null) => {
+  const text = String(message || '').trim();
+  const labels: Record<string, string> = {
+    'No valid prices found; source was not created or updated.': 'Валидные цены не найдены; ПЛК не был создан или обновлён.',
+    'file is too large': 'Файл превышает допустимый размер.',
+    'empty file': 'Выбранный файл пуст.',
+    'only .xlsx and .xls Vidman files are supported': 'Поддерживаются только файлы Vidman в форматах XLSX и XLS.',
+    'Legacy .xls parsing failed and LibreOffice conversion is unavailable.': 'Не удалось обработать устаревший XLS-файл: конвертация LibreOffice недоступна.',
+    'file checksum does not match the confirmed preview': 'Файл изменился после предпросмотра. Выполните предпросмотр ещё раз.',
+    'another Vidman file import is already running for this branch': 'Для этого филиала уже выполняется импорт Vidman.',
+    no_internal_sku_matches: 'Не найдено совпадений по кодам товаров.',
+    completeness_override_required: 'Требуется подтверждение загрузки неполного набора данных.',
+  };
+  return labels[text] || text;
+};
+
 const refreshStatusClass = (row: CompetitorSource) => {
   const label = refreshStatusLabel(row);
   if (label === 'Ошибка авторизации') return 'bad';
@@ -707,6 +790,15 @@ export function CompetitorsTab({ formatCode, currentUser }: Props) {
   const [manualReport, setManualReport] = useState<ManualImportReport | null>(null);
   const [manualHistory, setManualHistory] = useState<ManualImportHistoryRow[]>([]);
   const [manualDialogOpen, setManualDialogOpen] = useState(false);
+  const [vidmanDialogOpen, setVidmanDialogOpen] = useState(false);
+  const [vidmanTarget, setVidmanTarget] = useState<CompetitorSource | null>(null);
+  const [vidmanFile, setVidmanFile] = useState<File | null>(null);
+  const [vidmanReport, setVidmanReport] = useState<ManualImportReport | null>(null);
+  const [vidmanHistory, setVidmanHistory] = useState<ManualImportHistoryRow[]>([]);
+  const [vidmanAllowIncomplete, setVidmanAllowIncomplete] = useState(false);
+  const [vidmanPreviewLoading, setVidmanPreviewLoading] = useState(false);
+  const [vidmanImportLoading, setVidmanImportLoading] = useState(false);
+  const [vidmanError, setVidmanError] = useState<string | null>(null);
   const [percentiles, setPercentiles] = useState<PercentileSource[]>([]);
   const [percentileRows, setPercentileRows] = useState<PercentileBrowserRow[]>([]);
   const [percentileSummary, setPercentileSummary] = useState<PercentileSummary>({
@@ -1286,6 +1378,117 @@ export function CompetitorsTab({ formatCode, currentUser }: Props) {
         externalSearchRequestRef.current = null;
         setIsSearchingExternal(false);
       }
+    }
+  };
+
+  const openVidmanImport = (row?: CompetitorSource) => {
+    setVidmanTarget(row || null);
+    setVidmanFile(null);
+    setVidmanReport(null);
+    setVidmanHistory([]);
+    setVidmanAllowIncomplete(false);
+    setVidmanPreviewLoading(false);
+    setVidmanImportLoading(false);
+    setVidmanError(null);
+    setVidmanDialogOpen(true);
+  };
+
+  const previewVidmanImport = async () => {
+    if (!vidmanFile) {
+      setVidmanError('Выберите файл XLSX или XLS.');
+      return;
+    }
+    setVidmanPreviewLoading(true);
+    setVidmanReport(null);
+    setVidmanError(null);
+    setError(null);
+    try {
+      const fd = new FormData();
+      fd.append('file', vidmanFile);
+      const res = await fetch(`/api/price-formats/${encodeURIComponent(formatCode)}/vidman-file/preview`, { method: 'POST', body: fd });
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) throw new Error(backendErrorText(data, text, 'Не удалось выполнить предпросмотр файла Vidman.'));
+      setVidmanReport(data);
+    } catch (e: any) {
+      setVidmanError(localizeVidmanMessage(e?.message || 'Не удалось выполнить предпросмотр файла Vidman.'));
+    } finally {
+      setVidmanPreviewLoading(false);
+    }
+  };
+
+  const confirmVidmanImport = async () => {
+    if (!vidmanFile || !vidmanReport?.confirmationToken) return;
+    setIsLoading(true);
+    setVidmanImportLoading(true);
+    setVidmanError(null);
+    setError(null);
+    try {
+      const fd = new FormData();
+      fd.append('file', vidmanFile);
+      fd.append('checksum', vidmanReport.confirmationToken);
+      fd.append('allow_incomplete', String(vidmanAllowIncomplete));
+      const res = await fetch(`/api/price-formats/${encodeURIComponent(formatCode)}/vidman-file/confirm`, { method: 'POST', body: fd });
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) throw new Error(backendErrorText(data, text, 'Не удалось импортировать файл Vidman.'));
+      setVidmanReport(data);
+      setVidmanFile(null);
+      await loadSources();
+      toast.success('Файл Vidman импортирован');
+    } catch (e: any) {
+      setVidmanError(localizeVidmanMessage(e?.message || 'Не удалось импортировать файл Vidman.'));
+    } finally {
+      setVidmanImportLoading(false);
+      setIsLoading(false);
+    }
+  };
+
+  const loadVidmanHistory = async (row: CompetitorSource) => {
+    openVidmanImport(row);
+    setIsLoading(true);
+    try {
+      const res = await fetch(`/api/competitor-price-lists/${row.id}/vidman/manual/imports`);
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить историю Vidman.');
+      setVidmanHistory(Array.isArray(data?.items) ? data.items : []);
+    } catch (e: any) {
+      setVidmanError(localizeVidmanMessage(e?.message || 'Не удалось загрузить историю Vidman.'));
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const openVidmanMultiSourceImport = async () => {
+    openVidmanImport();
+    try {
+      const res = await fetch(`/api/price-formats/${encodeURIComponent(formatCode)}/vidman-file/imports`);
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить историю импортов Vidman.');
+      setVidmanHistory(Array.isArray(data?.items) ? data.items : []);
+    } catch (e: any) {
+      setVidmanError(localizeVidmanMessage(e?.message || 'Не удалось загрузить историю импортов Vidman.'));
+    }
+  };
+
+  const setVidmanMode = async (row: CompetitorSource, updateMode: 'auto' | 'manual') => {
+    setIsLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/competitor-price-lists/${row.id}/vidman/update-mode`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ updateMode }),
+      });
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) throw new Error(data?.detail || text || 'Не удалось изменить режим обновления Vidman.');
+      await loadSources();
+      toast.success(updateMode === 'auto' ? 'Автообновление Vidman восстановлено' : 'Включён ручной режим');
+    } catch (e: any) {
+      setError(localizeVidmanMessage(e?.message || 'Не удалось изменить режим обновления Vidman.'));
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -2272,6 +2475,10 @@ export function CompetitorsTab({ formatCode, currentUser }: Props) {
                   <FileUp className="mr-2 h-4 w-4" />
                   Загрузить ручной Excel
                 </Button>
+                <Button variant="outline" size="sm" onClick={() => void openVidmanMultiSourceImport()} disabled={isLoading}>
+                  <FileUp className="mr-2 h-4 w-4" />
+                  Загрузить Vidman-файл
+                </Button>
               </div>
             </div>
 
@@ -2335,6 +2542,9 @@ export function CompetitorsTab({ formatCode, currentUser }: Props) {
                           <span className={`status-pill ${refreshStatusClass(row)}`} title={row.refreshMessage || row.status || ''}>
                             {refreshStatusLabel(row)}
                           </span>
+                          {(row.sourceType === 'vidman' || row.sourceType === 'manual_vidman') && row.updateMode === 'manual' ? (
+                            <span className="status-pill warn ml-1" title={row.latestManualFile || ''}>ручной</span>
+                          ) : null}
                         </td>
                         <td className="px-4 py-3 text-sm text-gray-700"><span className={`status-pill ${competitorFreshnessClassName(row)}`}>{competitorFreshnessLabel(row)}</span></td>
                         <td className="px-4 py-3 text-sm text-gray-700 whitespace-nowrap">{formatLocalDateTime(competitorLastSuccessfulCheck(row))}</td>
@@ -2362,10 +2572,22 @@ export function CompetitorsTab({ formatCode, currentUser }: Props) {
                                   accountIds: row.accountId ? [Number(row.accountId)] : [],
                                   filialIds: row.sourceType === 'provisor' && row.filialId ? [Number(row.filialId)] : [],
                                 })}
-                                disabled={isLoading}
+                                disabled={isLoading || (row.sourceType === 'vidman' && row.updateMode === 'manual')}
                               >
                                 Пересчитать
                               </Button>
+                            ) : null}
+                            {row.sourceType === 'vidman' || row.sourceType === 'manual_vidman' ? (
+                              <>
+                                <Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => loadVidmanHistory(row)} disabled={isLoading}>
+                                  История
+                                </Button>
+                                {row.updateMode === 'manual' ? (
+                                  <Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => setVidmanMode(row, 'auto')} disabled={isLoading}>
+                                    Вернуть автообновление
+                                  </Button>
+                                ) : null}
+                              </>
                             ) : null}
                             {row.sourceType === 'manual' ? (
                               <>
@@ -2710,6 +2932,90 @@ export function CompetitorsTab({ formatCode, currentUser }: Props) {
           )}
         </TabsContent>
       </Tabs>
+      <Dialog open={vidmanDialogOpen} onOpenChange={setVidmanDialogOpen}>
+        <DialogContent className="max-w-4xl">
+          <DialogHeader>
+            <DialogTitle>Импорт ПЛК из Vidman</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="rounded border border-gray-200 p-3 text-sm text-gray-700">
+              Загрузите XLS/XLSX-файл Vidman. Система автоматически определит поставщиков в файле, сопоставит товары по коду и создаст или обновит каждый ПЛК отдельно.
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Input className="max-w-md" type="file" accept=".xlsx,.xls" onChange={(e) => { setVidmanFile(e.target.files?.[0] || null); setVidmanReport(null); setVidmanError(null); }} />
+              <Button variant="outline" onClick={previewVidmanImport} disabled={isLoading || vidmanPreviewLoading || vidmanImportLoading || !vidmanFile}>
+                {vidmanPreviewLoading ? <RefreshCw className="mr-2 h-4 w-4 animate-spin" /> : null}
+                {vidmanPreviewLoading ? 'Анализируем файл...' : 'Предпросмотр'}
+              </Button>
+              <Button onClick={confirmVidmanImport} disabled={isLoading || vidmanPreviewLoading || vidmanImportLoading || !vidmanReport?.confirmationToken || (vidmanReport.requiresCompletenessOverride && !vidmanAllowIncomplete)}>
+                {vidmanImportLoading ? <RefreshCw className="mr-2 h-4 w-4 animate-spin" /> : null}
+                {vidmanImportLoading ? 'Импортируем...' : 'Импортировать'}
+              </Button>
+            </div>
+            {vidmanError ? (
+              <div role="alert" className="rounded border border-red-300 bg-red-50 p-3 text-sm text-red-800">{vidmanError}</div>
+            ) : null}
+            {vidmanReport ? (
+              <div className="space-y-3">
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-6 text-sm">
+                  <div><span className="text-gray-500">Строка заголовков</span><div className="font-semibold">{fmtNumber(vidmanReport.headerRow)}</div></div>
+                  <div><span className="text-gray-500">Товарных строк</span><div className="font-semibold">{fmtNumber(vidmanReport.totalRows)}</div></div>
+                  <div><span className="text-gray-500">Найдено ПЛК</span><div className="font-semibold">{fmtNumber(vidmanReport.detectedSources)}</div></div>
+                  <div><span className="text-gray-500">Сопоставлено товаров</span><div className="font-semibold">{fmtNumber(vidmanReport.matchedProducts)}</div></div>
+                  <div><span className="text-gray-500">Не найдено кодов</span><div className="font-semibold">{fmtNumber(vidmanReport.unmatchedCodes)}</div></div>
+                  <div><span className="text-gray-500">Некорректных цен</span><div className="font-semibold">{fmtNumber(vidmanReport.invalidPrices)}</div></div>
+                </div>
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-6 text-sm">
+                  <div><span className="text-gray-500">Строк</span><div className="font-semibold">{fmtNumber(vidmanReport.totalRows)}</div></div>
+                  <div><span className="text-gray-500">Валидных</span><div className="font-semibold">{fmtNumber(vidmanReport.validRows)}</div></div>
+                  <div><span className="text-gray-500">Ошибок</span><div className="font-semibold">{fmtNumber(vidmanReport.invalidRows)}</div></div>
+                  <div><span className="text-gray-500">Найдено совпадений</span><div className="font-semibold">{fmtNumber(vidmanReport.knownMatchedRows)}</div></div>
+                  <div><span className="text-gray-500">На проверку</span><div className="font-semibold">{fmtNumber(vidmanReport.reviewRows)}</div></div>
+                  <div><span className="text-gray-500">Опубликовано</span><div className="font-semibold">{fmtNumber(vidmanReport.currentPublishedRows)}</div></div>
+                </div>
+                {vidmanReport.warnings?.length ? (
+                  <div className="rounded border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">{vidmanReport.warnings.join('; ')}</div>
+                ) : null}
+                {vidmanReport.sources?.length ? (
+                  <div className="max-h-72 overflow-auto rounded border border-gray-200">
+                    <table className="admin-table">
+                      <thead><tr><th className="px-3 py-2 text-left">ПЛК</th><th className="px-3 py-2 text-left">Статус</th><th className="px-3 py-2 text-left">Позиций с ценой</th><th className="px-3 py-2 text-left">Сопоставлено</th><th className="px-3 py-2 text-left">Не найдено</th><th className="px-3 py-2 text-left">Ошибок</th><th className="px-3 py-2 text-left">Дубликатов</th></tr></thead>
+                      <tbody>{vidmanReport.sources.map((source) => <tr key={source.stableKey}><td className="px-3 py-2">{source.name}</td><td className="px-3 py-2">{vidmanStatusLabel(source.status || (source.validPriceRows ? 'ready' : 'skipped_empty'))}</td><td className="px-3 py-2">{fmtNumber(source.validPriceRows)}</td><td className="px-3 py-2">{fmtNumber(source.skuMatchedRows)}</td><td className="px-3 py-2">{fmtNumber(source.skuUnmatchedRows)}</td><td className="px-3 py-2">{fmtNumber(source.invalidRows)}</td><td className="px-3 py-2">{fmtNumber(source.duplicateRows)}</td></tr>)}</tbody>
+                    </table>
+                  </div>
+                ) : null}
+                {vidmanReport.results?.length ? (
+                  <div className="max-h-64 overflow-auto rounded border border-gray-200">
+                    <table className="admin-table">
+                      <thead><tr><th className="px-3 py-2 text-left">ПЛК</th><th className="px-3 py-2 text-left">Результат</th><th className="px-3 py-2 text-left">Записано</th><th className="px-3 py-2 text-left">Не найдено</th></tr></thead>
+                      <tbody>{vidmanReport.results.map((source) => <tr key={source.stableKey}><td className="px-3 py-2">{source.name}</td><td className="px-3 py-2">{vidmanStatusLabel(source.status)}{source.error || source.message ? `: ${localizeVidmanMessage(source.error || source.message)}` : ''}</td><td className="px-3 py-2">{fmtNumber(source.rowsWritten)}</td><td className="px-3 py-2">{fmtNumber(source.unmatchedRows)}</td></tr>)}</tbody>
+                    </table>
+                  </div>
+                ) : null}
+                {vidmanReport.requiresCompletenessOverride ? (
+                  <label className="flex items-center gap-2 text-sm text-amber-900">
+                    <Checkbox checked={vidmanAllowIncomplete} onCheckedChange={(value) => setVidmanAllowIncomplete(value === true)} />
+                    Подтверждаю, что файл содержит полный набор данных, несмотря на небольшое количество строк.
+                  </label>
+                ) : null}
+                {vidmanReport.errors?.length ? (
+                  <div className="max-h-40 overflow-auto rounded border border-gray-200 text-sm">
+                    {vidmanReport.errors.slice(0, 20).map((row, index) => <div className="border-b p-2" key={`${row.rowNumber}-${index}`}>Строка {row.rowNumber || '—'}: {localizeVidmanMessage(row.message)}</div>)}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+            {vidmanHistory.length ? (
+              <div className="max-h-64 overflow-auto rounded border border-gray-200">
+                <table className="admin-table">
+                  <thead><tr><th className="px-3 py-2 text-left">Статус</th><th className="px-3 py-2 text-left">Файл</th><th className="px-3 py-2 text-left">Строки</th><th className="px-3 py-2 text-left">Дата загрузки</th></tr></thead>
+                  <tbody>{vidmanHistory.map((row) => <tr key={row.id}><td className="px-3 py-2">{vidmanStatusLabel(row.status)}</td><td className="px-3 py-2">{row.filename}</td><td className="px-3 py-2">{fmtNumber(row.validRows)} / {fmtNumber(row.totalRows)}</td><td className="px-3 py-2">{formatLocalDateTime(row.startedAt)}</td></tr>)}</tbody>
+                </table>
+              </div>
+            ) : null}
+          </div>
+        </DialogContent>
+      </Dialog>
       <Dialog open={manualDialogOpen} onOpenChange={setManualDialogOpen}>
         <DialogContent className="max-w-4xl">
           <DialogHeader>

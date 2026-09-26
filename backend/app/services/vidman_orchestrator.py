@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -11,6 +12,7 @@ from ..models import (
     PriceFormat,
     PriceSourceAccount,
     VidmanCanonicalProduct,
+    VidmanCompetitorPriceListSource,
     VidmanImportPage,
     VidmanImportRun,
     VidmanLogicalCompetitor,
@@ -38,6 +40,8 @@ STATUS_MAPPING_REQUIRED = "MAPPING_REQUIRED"
 STATUS_FALLBACK_NOT_SELECTED = "FALLBACK_NOT_SELECTED"
 STATUS_NO_TRUSTED_PRODUCTS = "NO_TRUSTED_PRODUCTS"
 STATUS_FAILED_PRESERVED_PREVIOUS = "FAILED_PRESERVED_PREVIOUS"
+STATUS_MANUAL_MANAGED_SKIPPED = "MANUAL_MANAGED_SKIPPED"
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -331,6 +335,24 @@ async def _refresh_single_plk(
     main_id = int(price_list.main_id)
     result = VidmanPlkRefreshResult(account_id=account_id, main_id=main_id, name=price_list.name, status="running")
     try:
+        manual_source = db.execute(
+            select(VidmanCompetitorPriceListSource)
+            .where(VidmanCompetitorPriceListSource.account_id == account_id)
+            .where(VidmanCompetitorPriceListSource.main_id == main_id)
+            .where(VidmanCompetitorPriceListSource.update_mode == "manual")
+        ).scalar_one_or_none()
+        if manual_source is not None:
+            logger.info(
+                "[VIDMAN_MANUAL_MANAGED_SKIP] account_id=%s main_id=%s competitor_price_list_id=%s",
+                account_id,
+                main_id,
+                manual_source.competitor_price_list_id,
+            )
+            result.status = STATUS_MANUAL_MANAGED_SKIPPED
+            result.competitor_price_list_id = manual_source.competitor_price_list_id
+            result.preserved_previous_snapshot = True
+            result.skipped_reason = "manual_managed_source"
+            return result
         collector = VidmanRawCollector(
             db=db,
             login=credentials.login,
