@@ -2797,7 +2797,16 @@ def _resolve_report_price_lists(
     activation_date: date,
 ) -> tuple[PriceList | None, PriceList | None]:
     current = _latest_report_price_list_for_format(db, price_format_id, activation_date)
-    previous = _latest_report_price_list_for_format(db, price_format_id, activation_date - timedelta(days=1))
+    previous_activation_date = db.scalar(
+        select(func.max(PriceList.activation_date))
+        .where(PriceList.price_format_id == price_format_id)
+        .where(PriceList.activation_date < activation_date)
+    )
+    previous = (
+        _latest_report_price_list_for_format(db, price_format_id, previous_activation_date)
+        if previous_activation_date is not None
+        else None
+    )
     return current, previous
 
 

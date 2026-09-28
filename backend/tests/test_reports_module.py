@@ -54,10 +54,14 @@ def _client_with_reports_data(*, role: str = ROLE_PRICING_MANAGER, user_branch: 
         pl_cat1_prev = PriceList(number="AST-CAT1-PREV", price_format_id=pf_cat1.id, activation_date=previous_activation_date, status="generated", created_at=now - timedelta(days=1))
         pl_cat1_latest = PriceList(number="AST-CAT1-LATEST", price_format_id=pf_cat1.id, activation_date=current_activation_date, status="generated", created_at=now + timedelta(minutes=1))
         pl_alm = PriceList(number="ALM-LATEST", price_format_id=pf_alm.id, activation_date=current_activation_date, status="generated", created_at=now)
-        pl_gap_old = PriceList(number="AST-GAP-23", price_format_id=pf_gap.id, activation_date=date(2026, 9, 23), status="generated", created_at=now - timedelta(days=2))
-        pl_gap_current_low = PriceList(number="AST-GAP-25-A", price_format_id=pf_gap.id, activation_date=current_activation_date, status="generated", created_at=now + timedelta(hours=1))
-        pl_gap_current_high = PriceList(number="AST-GAP-25-B", price_format_id=pf_gap.id, activation_date=current_activation_date, status="generated", created_at=now + timedelta(hours=1))
-        db.add_all([pl_vip_old, pl_vip_prev_early, pl_vip_prev, pl_vip_current_a, pl_vip_current_b, pl_vip_latest, pl_cat1_prev, pl_cat1_latest, pl_alm, pl_gap_old, pl_gap_current_low, pl_gap_current_high])
+        gap_previous_activation_date = date(2026, 9, 26)
+        gap_current_activation_date = date(2026, 9, 29)
+        pl_gap_prev_low = PriceList(number="AST-GAP-26-A", price_format_id=pf_gap.id, activation_date=gap_previous_activation_date, status="generated", created_at=now - timedelta(days=2))
+        pl_gap_prev_high = PriceList(number="AST-GAP-26-B", price_format_id=pf_gap.id, activation_date=gap_previous_activation_date, status="generated", created_at=now - timedelta(days=2))
+        pl_gap_prev_stale = PriceList(number="AST-GAP-26-STALE", price_format_id=pf_gap.id, activation_date=gap_previous_activation_date, status="generated", created_at=now - timedelta(days=3))
+        pl_gap_current_low = PriceList(number="AST-GAP-29-A", price_format_id=pf_gap.id, activation_date=gap_current_activation_date, status="generated", created_at=now + timedelta(hours=1))
+        pl_gap_current_high = PriceList(number="AST-GAP-29-B", price_format_id=pf_gap.id, activation_date=gap_current_activation_date, status="generated", created_at=now + timedelta(hours=1))
+        db.add_all([pl_vip_old, pl_vip_prev_early, pl_vip_prev, pl_vip_current_a, pl_vip_current_b, pl_vip_latest, pl_cat1_prev, pl_cat1_latest, pl_alm, pl_gap_prev_low, pl_gap_prev_high, pl_gap_prev_stale, pl_gap_current_low, pl_gap_current_high])
         db.flush()
         ids.update(
             {
@@ -70,7 +74,9 @@ def _client_with_reports_data(*, role: str = ROLE_PRICING_MANAGER, user_branch: 
                 "pl_cat1_prev": pl_cat1_prev.id,
                 "pl_cat1_latest": pl_cat1_latest.id,
                 "pl_alm": pl_alm.id,
-                "pl_gap_old": pl_gap_old.id,
+                "pl_gap_prev_low": pl_gap_prev_low.id,
+                "pl_gap_prev_high": pl_gap_prev_high.id,
+                "pl_gap_prev_stale": pl_gap_prev_stale.id,
                 "pl_gap_current_low": pl_gap_current_low.id,
                 "pl_gap_current_high": pl_gap_current_high.id,
             }
@@ -142,7 +148,9 @@ def _client_with_reports_data(*, role: str = ROLE_PRICING_MANAGER, user_branch: 
             add_cp(pl_cat1_latest, code, new_price, zone, rating)
 
         add_cp(pl_alm, "ALM", 990, "left")
-        add_cp(pl_gap_old, "GAP", 700, "right")
+        add_cp(pl_gap_prev_low, "GAP", 710, "right")
+        add_cp(pl_gap_prev_high, "GAP", 700, "right")
+        add_cp(pl_gap_prev_stale, "GAP", 720, "right")
         add_cp(pl_gap_current_low, "GAP", 650, "right")
         add_cp(pl_gap_current_high, "GAP", 640, "left")
         db.commit()
@@ -235,17 +243,21 @@ def test_combined_decreases_compare_previous_prices_within_same_price_format():
         _clear_overrides()
 
 
-def test_reports_use_exact_previous_calendar_date_and_higher_id_breaks_timestamp_tie():
+def test_reports_use_previous_available_date_and_latest_versions_for_query_and_export():
     client, ids = _client_with_reports_data()
     context = [{"priceFormatId": ids["pf_gap"], "priceListId": ids["pl_gap_current_low"]}]
     try:
         rank = client.post(
             "/api/reports/rank-1/query",
-            json={"branch": "Astana", "activationDate": "2026-09-25", "contexts": context},
+            json={"branch": "Astana", "activationDate": "2026-09-29", "contexts": context},
         )
         decreases = client.post(
             "/api/reports/decreases/query",
-            json={"branch": "Astana", "activationDate": "2026-09-25", "contexts": context},
+            json={"branch": "Astana", "activationDate": "2026-09-29", "contexts": context},
+        )
+        exported = client.post(
+            "/api/reports/decreases/export.xlsx",
+            json={"branch": "Astana", "activationDate": "2026-09-29", "contexts": context},
         )
     finally:
         _clear_overrides()
@@ -254,10 +266,34 @@ def test_reports_use_exact_previous_calendar_date_and_higher_id_breaks_timestamp
     assert rank.json()["items"][0]["material"] == "GAP"
     rank_context = rank.json()["context"]["contexts"][0]
     assert rank_context["currentPriceListId"] == ids["pl_gap_current_high"]
-    assert rank_context["previousPriceListId"] is None
+    assert rank_context["currentActivationDate"] == "2026-09-29"
+    assert rank_context["previousPriceListId"] == ids["pl_gap_prev_high"]
+    assert rank_context["previousActivationDate"] == "2026-09-26"
     assert decreases.status_code == 200
-    assert decreases.json()["items"] == []
-    assert decreases.json()["context"]["contexts"][0]["previousPriceListId"] is None
+    assert decreases.json()["items"][0]["material"] == "GAP"
+    assert decreases.json()["items"][0]["oldPrice"] == 700.0
+    assert decreases.json()["items"][0]["newPrice"] == 640.0
+    assert exported.status_code == 200
+    workbook = load_workbook(io.BytesIO(exported.content), data_only=True)
+    export_row = next(workbook.active.iter_rows(min_row=2, values_only=True))
+    assert export_row[2] == "GAP"
+    assert export_row[5:8] == (640, 700, -60)
+
+
+def test_decreases_are_empty_when_no_earlier_price_list_exists():
+    client, ids = _client_with_reports_data()
+    context = [{"priceFormatId": ids["pf_vip"], "priceListId": ids["pl_vip_old"]}]
+    try:
+        response = client.post(
+            "/api/reports/decreases/query",
+            json={"branch": "Astana", "contexts": context},
+        )
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 200
+    assert response.json()["items"] == []
+    assert response.json()["context"]["contexts"][0]["previousPriceListId"] is None
 
 
 def test_combined_reports_support_pagination_and_selected_price_list_override():
