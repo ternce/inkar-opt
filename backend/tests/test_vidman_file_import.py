@@ -105,11 +105,14 @@ def _actual_client_pivot_xlsx(
             " \nКод ",
             "Наименование\u00a0",
             "  Производитель  ",
-            "эмити",
-            "стофарм",
+            " Эмити\n ",
+            "СТОФАРМ\u00a0",
             "медикус",
             "медсервис",
             "инкар",
+            "ПДЦ розн",
+            "ПДЦ опт",
+            "Произвольная колонка",
         ]
     )
     sheet.append(
@@ -122,10 +125,13 @@ def _actual_client_pivot_xlsx(
             medicus_price,
             medservice_price,
             "2131,98",
+            "999,01",
+            "998,02",
+            "997,03",
         ]
     )
     sheet.append(
-        ["000000000001000097", "Medicine 97", "Maker", "451,36", "536,69", None, None, "330,75"]
+        ["000000000001000097", "Medicine 97", "Maker", "451,36", "536,69", None, None, "330,75", "996,04", "995,05", "994,06"]
     )
     stream = io.BytesIO()
     workbook.save(stream)
@@ -416,34 +422,31 @@ def test_empty_supplier_columns_are_reported_but_not_created_and_existing_is_pre
 
     assert parsed.header_row == 5
     assert parsed.format_variant == "supplier_columns"
-    assert [source.name for source in parsed.sources] == [
-        "эмити", "стофарм", "медикус", "медсервис", "инкар",
-    ]
-    assert [len(source.rows) for source in parsed.sources] == [2, 1, 0, 0, 2]
+    assert [source.name for source in parsed.sources] == ["Эмити", "Стофарм"]
+    assert [len(source.rows) for source in parsed.sources] == [2, 1]
     assert parsed.sources[0].rows[0].primary_sku == "000000000001000017"
     assert str(parsed.sources[0].rows[0].price) == "1736.2200"
-    assert str(parsed.sources[4].rows[1].price) == "330.7500"
+    assert str(parsed.sources[1].rows[0].price) == "536.6900"
 
     preview = service.preview_vidman_multi_source_file(
         db=db, price_format=pf, branch=pf.branch, content=content, filename="actual-client.xlsx"
     )
     assert preview["headerRow"] == 5
     assert preview["totalRows"] == 2
-    assert preview["detectedSources"] == 5
+    assert preview["branch"] == pf.branch
+    assert preview["detectedSources"] == 2
     assert preview["matchedProducts"] == 2
     assert preview["unmatchedCodes"] == 0
     assert preview["invalidPrices"] == 0
     assert preview["sources"][0]["skuMatchedRows"] == 2
     assert preview["sources"][1]["skuMatchedRows"] == 1
-    assert preview["sources"][2]["validPriceRows"] == 0
-    assert preview["sources"][2]["status"] == "skipped_empty"
-    assert preview["sources"][3]["status"] == "skipped_empty"
+    assert {row["name"] for row in preview["sources"]} == {"Эмити", "Стофарм"}
+    assert not {"Инкар", "ПДЦ розн", "ПДЦ опт", "Произвольная колонка"} & {row["name"] for row in preview["sources"]}
 
-    source_by_name = {source.name: source for source in parsed.sources}
     preserved = CompetitorPriceList(
         price_format_id=pf.id,
         source_type=service.MULTI_SOURCE_TYPE,
-        source_key=source_by_name["медсервис"].stable_key,
+        source_key=service._stable_file_source_key(context=pf.branch, source_name="медсервис"),
         display_name="медсервис",
         supplier="медсервис",
         competitor_name="медсервис",
@@ -486,19 +489,16 @@ def test_empty_supplier_columns_are_reported_but_not_created_and_existing_is_pre
     )
     results = {row["name"]: row for row in first["results"]}
     assert first["ok"] is True
-    assert results["медикус"]["status"] == "skipped_empty"
-    assert results["медикус"]["competitorPriceListId"] is None
-    assert results["медикус"]["message"] == "No valid prices found; source was not created or updated."
-    assert results["медсервис"]["status"] == "skipped_empty_existing_preserved"
-    assert results["медсервис"]["competitorPriceListId"] == preserved_id
-    assert results["медсервис"]["preservedPreviousSnapshot"] is True
+    assert set(results) == {"Эмити", "Стофарм"}
     non_empty_ids = {
-        name: results[name]["competitorPriceListId"] for name in ["эмити", "стофарм", "инкар"]
+        name: results[name]["competitorPriceListId"] for name in ["Эмити", "Стофарм"]
     }
     assert db.query(CompetitorPriceList).filter(
         CompetitorPriceList.source_type == service.MULTI_SOURCE_TYPE
-    ).count() == 4
-    assert service._existing_file_source(db, source_by_name["медикус"].stable_key) is None
+    ).count() == 3
+    assert service._existing_file_source(db, service._stable_file_source_key(context=pf.branch, source_name="Инкар")) is None
+    assert service._existing_file_source(db, service._stable_file_source_key(context=pf.branch, source_name="ПДЦ розн")) is None
+    assert service._existing_file_source(db, service._stable_file_source_key(context=pf.branch, source_name="ПДЦ опт")) is None
     preserved_after = db.get(CompetitorPriceList, preserved_id)
     assert str(preserved_after.price_coefficient) == "1.370000"
     assert preserved_after.update_mode == "auto"
@@ -515,10 +515,9 @@ def test_empty_supplier_columns_are_reported_but_not_created_and_existing_is_pre
         )
     }
     assert item_counts == {
-        f"{pf.branch} — эмити — vidman-file": 2,
-        f"{pf.branch} — стофарм — vidman-file": 1,
+        f"{pf.branch} — Эмити — vidman-file": 2,
+        f"{pf.branch} — Стофарм — vidman-file": 1,
         "медсервис": 1,
-        f"{pf.branch} — инкар — vidman-file": 2,
     }
 
     skipped_history = db.query(ManualPriceListImport).filter(
@@ -526,13 +525,7 @@ def test_empty_supplier_columns_are_reported_but_not_created_and_existing_is_pre
             ["skipped_empty", "skipped_empty_existing_preserved"]
         )
     ).all()
-    assert len(skipped_history) == 2
-    history_by_key = {row.source_key: row for row in skipped_history}
-    assert history_by_key[source_by_name["медикус"].stable_key].competitor_price_list_id is None
-    assert history_by_key[source_by_name["медикус"].stable_key].valid_rows == 0
-    preserved_history = history_by_key[source_by_name["медсервис"].stable_key]
-    assert preserved_history.competitor_price_list_id == preserved_id
-    assert preserved_history.preserved_previous_snapshot is True
+    assert skipped_history == []
 
     batch_history = db.get(ManualPriceListImport, first["batchImportId"])
     assert batch_history.status == "success"
@@ -552,17 +545,137 @@ def test_empty_supplier_columns_are_reported_but_not_created_and_existing_is_pre
         requested_by="tester-2",
     )
     later_results = {row["name"]: row for row in later["results"]}
-    assert later_results["медикус"]["status"] == "success"
-    assert later_results["медикус"]["competitorPriceListId"] is not None
-    assert later_results["медсервис"]["status"] == "success"
-    assert later_results["медсервис"]["competitorPriceListId"] == preserved_id
     assert {
         name: later_results[name]["competitorPriceListId"]
-        for name in ["эмити", "стофарм", "инкар"]
+        for name in ["Эмити", "Стофарм"]
     } == non_empty_ids
     assert db.query(CompetitorPriceList).filter(
         CompetitorPriceList.source_type == service.MULTI_SOURCE_TYPE
-    ).count() == 5
+    ).count() == 3
+
+
+def test_supplier_whitelist_zero_price_source_is_skipped_and_ignored_columns_leave_no_history(monkeypatch):
+    emity = "\u042d\u043c\u0438\u0442\u0438"
+    stoffarm = "\u0421\u0442\u043e\u0444\u0430\u0440\u043c"
+    inkar = "\u0418\u043d\u043a\u0430\u0440"
+    arbitrary = "Arbitrary supplier"
+    branch = "\u0415\u0441\u0438\u043a"
+    db = _session()
+    pf = PriceFormat(code="ESIK", name="Esik", branch=branch)
+    db.add_all([pf, Product(code="001", name="One", cost=1)])
+    db.commit()
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(
+        [
+            "\u041a\u043e\u0434",
+            "\u041d\u0430\u0438\u043c\u0435\u043d\u043e\u0432\u0430\u043d\u0438\u0435",
+            "\u041f\u0440\u043e\u0438\u0437\u0432\u043e\u0434\u0438\u0442\u0435\u043b\u044c",
+            f"  {emity.upper()}\n",
+            f"{stoffarm}\u00a0",
+            inkar,
+            arbitrary,
+        ]
+    )
+    sheet.append(["001", "One", "Maker", None, "10,50", "11,50", "12,50"])
+    stream = io.BytesIO()
+    workbook.save(stream)
+    content = stream.getvalue()
+
+    preview = service.preview_vidman_multi_source_file(
+        db=db, price_format=pf, branch=branch, content=content, filename="zero-source.xlsx"
+    )
+    assert [(row["name"], row["status"]) for row in preview["sources"]] == [
+        (emity, "skipped_empty"),
+        (stoffarm, "ready"),
+    ]
+    assert preview["detectedSources"] == 2
+
+    monkeypatch.setattr(service, "enqueue_percentile_preparation", lambda **_kwargs: {})
+    result = service.import_vidman_multi_source_file(
+        db=db,
+        price_format=pf,
+        branch=branch,
+        content=content,
+        filename="zero-source.xlsx",
+        expected_checksum=preview["confirmationToken"],
+        allow_incomplete=False,
+        requested_by="tester",
+    )
+    results = {row["name"]: row for row in result["results"]}
+    assert results[emity]["status"] == "skipped_empty"
+    assert results[emity]["competitorPriceListId"] is None
+    assert results[stoffarm]["status"] == "success"
+    assert db.query(CompetitorPriceList).filter(
+        CompetitorPriceList.source_type == service.MULTI_SOURCE_TYPE
+    ).count() == 1
+    for ignored_name in (inkar, arbitrary):
+        ignored_key = service._stable_file_source_key(
+            context=branch, source_name=ignored_name
+        )
+        assert service._existing_file_source(db, ignored_key) is None
+        assert db.query(ManualPriceListImport).filter(
+            ManualPriceListImport.source_key == ignored_key
+        ).count() == 0
+
+
+def test_supplier_whitelist_identity_is_branch_plus_canonical_source(monkeypatch):
+    emity = "\u042d\u043c\u0438\u0442\u0438"
+    stoffarm = "\u0421\u0442\u043e\u0444\u0430\u0440\u043c"
+    esik = "\u0415\u0441\u0438\u043a"
+    shymkent = "\u0428\u044b\u043c\u043a\u0435\u043d\u0442"
+    db = _session()
+    pf = PriceFormat(code="ALM-FMT", name="Almaty format", branch="\u0410\u043b\u043c\u0430\u0442\u044b")
+    db.add_all(
+        [
+            pf,
+            Product(code="000000000001000017", name="Medicine 17", cost=1),
+            Product(code="000000000001000097", name="Medicine 97", cost=1),
+        ]
+    )
+    db.commit()
+    content = _actual_client_pivot_xlsx()
+    monkeypatch.setattr(service, "enqueue_percentile_preparation", lambda **_kwargs: {})
+
+    def run_import(branch: str, requested_by: str):
+        preview = service.preview_vidman_multi_source_file(
+            db=db, price_format=pf, branch=branch, content=content, filename="client.xlsx"
+        )
+        assert [row["name"] for row in preview["sources"]] == [emity, stoffarm]
+        return service.import_vidman_multi_source_file(
+            db=db,
+            price_format=pf,
+            branch=branch,
+            content=content,
+            filename="client.xlsx",
+            expected_checksum=preview["confirmationToken"],
+            allow_incomplete=False,
+            requested_by=requested_by,
+        )
+
+    esik_first = run_import(esik, "tester-esik-1")
+    esik_ids = {row["name"]: row["competitorPriceListId"] for row in esik_first["results"]}
+    assert set(esik_ids) == {emity, stoffarm}
+    assert {
+        row["name"]: row["competitorPriceListId"]
+        for row in run_import(esik, "tester-esik-2")["results"]
+    } == esik_ids
+
+    shymkent_result = run_import(shymkent, "tester-shymkent")
+    shymkent_ids = {
+        row["name"]: row["competitorPriceListId"]
+        for row in shymkent_result["results"]
+    }
+    assert all(esik_ids[name] != shymkent_ids[name] for name in (emity, stoffarm))
+    assert all(
+        db.get(CompetitorPriceList, esik_ids[name]).branch_name == esik
+        for name in (emity, stoffarm)
+    )
+    assert all(
+        db.get(CompetitorPriceList, shymkent_ids[name]).branch_name == shymkent
+        for name in (emity, stoffarm)
+    )
 
 
 def test_supplier_layout_numeric_excel_sku_matches_unique_zero_padded_product_code():

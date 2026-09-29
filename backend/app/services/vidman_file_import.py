@@ -927,6 +927,10 @@ STOCK_PREFIXES = ("остаток ", "stock ")
 PIVOT_CODE_HEADERS = {_header("\u041a\u043e\u0434"), "sku", "code"}
 PIVOT_NAME_HEADERS = {_header("\u041d\u0430\u0438\u043c\u0435\u043d\u043e\u0432\u0430\u043d\u0438\u0435"), "name", "product name"}
 PIVOT_MANUFACTURER_HEADERS = {_header("\u041f\u0440\u043e\u0438\u0437\u0432\u043e\u0434\u0438\u0442\u0435\u043b\u044c"), "manufacturer", "producer"}
+MANUAL_VIDMAN_SOURCE_HEADERS = {
+    _header("Эмити"): "Эмити",
+    _header("Стофарм"): "Стофарм",
+}
 
 
 @dataclass(frozen=True)
@@ -1104,21 +1108,24 @@ def parse_vidman_pivot_file(content: bytes, filename: str, *, context: str) -> P
         manufacturer_index = next(
             index for index, value in enumerate(normalized_headers) if value in PIVOT_MANUFACTURER_HEADERS
         )
+        detected_source_names: set[str] = set()
         for index in range(manufacturer_index + 1, len(header)):
-            source_name = re.sub(r"\s+", " ", _text(header[index])).strip()
-            if source_name:
-                detected.append(
-                    (
-                        index,
-                        None,
-                        DetectedVidmanSource(
-                            name=source_name,
-                            stable_key=_stable_file_source_key(context=context, source_name=source_name),
-                            price_header=source_name,
-                            stock_header="",
-                        ),
-                    )
+            source_name = MANUAL_VIDMAN_SOURCE_HEADERS.get(normalized_headers[index])
+            if source_name is None or source_name in detected_source_names:
+                continue
+            detected_source_names.add(source_name)
+            detected.append(
+                (
+                    index,
+                    None,
+                    DetectedVidmanSource(
+                        name=source_name,
+                        stable_key=_stable_file_source_key(context=context, source_name=source_name),
+                        price_header=source_name,
+                        stock_header="",
+                    ),
                 )
+            )
     else:
         primary_index = normalized_headers.index("sku")
         fallback_index = next(i for i, value in enumerate(normalized_headers) if value in {"goodsid", "goods id"})
