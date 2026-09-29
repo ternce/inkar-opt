@@ -2794,17 +2794,20 @@ def _latest_report_price_list_for_format(
 def _resolve_report_price_lists(
     db: Session,
     price_format_id: int,
-    activation_date: date,
+    current_activation_date: date,
+    previous_activation_date: date | None = None,
 ) -> tuple[PriceList | None, PriceList | None]:
-    current = _latest_report_price_list_for_format(db, price_format_id, activation_date)
-    previous_activation_date = db.scalar(
-        select(func.max(PriceList.activation_date))
-        .where(PriceList.price_format_id == price_format_id)
-        .where(PriceList.activation_date < activation_date)
-    )
+    current = _latest_report_price_list_for_format(db, price_format_id, current_activation_date)
+    resolved_previous_activation_date = previous_activation_date
+    if resolved_previous_activation_date is None:
+        resolved_previous_activation_date = db.scalar(
+            select(func.max(PriceList.activation_date))
+            .where(PriceList.price_format_id == price_format_id)
+            .where(PriceList.activation_date < current_activation_date)
+        )
     previous = (
-        _latest_report_price_list_for_format(db, price_format_id, previous_activation_date)
-        if previous_activation_date is not None
+        _latest_report_price_list_for_format(db, price_format_id, resolved_previous_activation_date)
+        if resolved_previous_activation_date is not None
         else None
     )
     return current, previous
@@ -2812,34 +2815,53 @@ def _resolve_report_price_lists(
 
 def _report_context_dict(
     db: Session,
-    pl: PriceList,
+    pl: PriceList | None,
     pf: PriceFormat,
     previous_pl: PriceList | None = None,
+    *,
+    requested_current_activation_date: date | None = None,
+    requested_previous_activation_date: date | None = None,
+    comparison_mode: str = "auto",
 ) -> dict:
-    summary = _generated_price_list_summary(db, pl, pf)
+    summary = _generated_price_list_summary(db, pl, pf) if pl is not None else {"skuCount": 0}
+    current_available = pl is not None
+    previous_available = previous_pl is not None
+    warnings: list[str] = []
+    format_label = str(pf.code or pf.name or pf.id)
+    if requested_current_activation_date is not None and not current_available:
+        warnings.append(f"Для ЦФ {format_label} отсутствует прайс с датой действия {requested_current_activation_date.strftime('%d.%m.%Y')}.")
+    if comparison_mode == "manual" and requested_previous_activation_date is not None and not previous_available:
+        warnings.append(f"Для ЦФ {format_label} отсутствует прайс с датой действия {requested_previous_activation_date.strftime('%d.%m.%Y')}.")
     return {
-        "priceListId": pl.id,
-        "priceListNumber": pl.number,
+        "priceListId": pl.id if pl is not None else None,
+        "priceListNumber": pl.number if pl is not None else "",
         "branch": pf.branch,
         "priceFormatId": pf.id,
         "priceFormatCode": pf.code,
         "priceFormatName": pf.name,
         "customerCategory": pf.sap_category or "",
-        "calculatedAt": local_iso(pl.created_at) if pl.created_at else "",
-        "calculatedAtDisplay": _fmt_dt(pl.created_at),
+        "calculatedAt": local_iso(pl.created_at) if pl is not None and pl.created_at else "",
+        "calculatedAtDisplay": _fmt_dt(pl.created_at) if pl is not None else "",
         "totalCalculated": summary["skuCount"],
-        "currentPriceListId": pl.id,
-        "currentPriceListNumber": pl.number,
-        "currentActivationDate": pl.activation_date.isoformat() if pl.activation_date else None,
-        "currentCreatedAt": local_iso(pl.created_at) if pl.created_at else None,
+        "requestedCurrentActivationDate": requested_current_activation_date.isoformat() if requested_current_activation_date else None,
+        "requestedPreviousActivationDate": requested_previous_activation_date.isoformat() if requested_previous_activation_date else None,
+        "comparisonMode": comparison_mode,
+        "currentPriceListId": pl.id if pl is not None else None,
+        "currentPriceListNumber": pl.number if pl is not None else "",
+        "currentActivationDate": pl.activation_date.isoformat() if pl is not None and pl.activation_date else None,
+        "currentCreatedAt": local_iso(pl.created_at) if pl is not None and pl.created_at else None,
         "previousPriceListId": previous_pl.id if previous_pl is not None else None,
         "previousPriceListNumber": previous_pl.number if previous_pl is not None else "",
         "previousActivationDate": previous_pl.activation_date.isoformat() if previous_pl is not None and previous_pl.activation_date else None,
         "previousCreatedAt": local_iso(previous_pl.created_at) if previous_pl is not None and previous_pl.created_at else None,
+        "currentAvailable": current_available,
+        "previousAvailable": previous_available,
+        "comparisonAvailable": current_available and previous_available,
+        "warnings": warnings,
     }
 
 
-def _parse_report_contexts_payload(db: Session, payload: dict, current_user: AppUser) -> tuple[str, list[tuple[PriceList, PriceList | None, PriceFormat, dict]]]:
+def _parse_report_contexts_payload(db: Session, payload: dict, current_user: AppUser) -> tuple[str, list[tuple[PriceList | None, PriceList | None, PriceFormat, dict]]]:
     branch = _canonical_user_selected_branch(payload.get("branch"), field_name="branch")
     if not branch:
         raise HTTPException(status_code=400, detail="branch is required")
@@ -2849,16 +2871,37 @@ def _parse_report_contexts_payload(db: Session, payload: dict, current_user: App
     if len(contexts_in) > REPORT_MAX_CONTEXTS:
         raise HTTPException(status_code=400, detail=f"too many contexts; max {REPORT_MAX_CONTEXTS}")
 
-    requested_activation_date: date | None = None
-    raw_activation_date = payload.get("activationDate") or payload.get("activation_date")
-    if raw_activation_date not in (None, ""):
+    def parse_activation_date(value: object, field_name: str) -> date | None:
+        if value in (None, ""):
+            return None
         try:
-            requested_activation_date = date.fromisoformat(str(raw_activation_date).strip())
+            return date.fromisoformat(str(value).strip())
         except Exception:
-            raise HTTPException(status_code=400, detail="activationDate must be ISO date (YYYY-MM-DD)")
+            raise HTTPException(status_code=400, detail=f"{field_name} must be ISO date (YYYY-MM-DD)")
+
+    legacy_activation_date = parse_activation_date(
+        payload.get("activationDate") if payload.get("activationDate") not in (None, "") else payload.get("activation_date"),
+        "activationDate",
+    )
+    requested_activation_date = parse_activation_date(
+        payload.get("currentActivationDate") if payload.get("currentActivationDate") not in (None, "") else payload.get("current_activation_date"),
+        "currentActivationDate",
+    )
+    if legacy_activation_date is not None and requested_activation_date is not None and legacy_activation_date != requested_activation_date:
+        raise HTTPException(status_code=400, detail="activationDate and currentActivationDate must be equal when both are provided")
+    requested_activation_date = requested_activation_date or legacy_activation_date
+    requested_previous_activation_date = parse_activation_date(
+        payload.get("previousActivationDate") if payload.get("previousActivationDate") not in (None, "") else payload.get("previous_activation_date"),
+        "previousActivationDate",
+    )
+    if requested_previous_activation_date is not None and requested_activation_date is None:
+        raise HTTPException(status_code=400, detail="currentActivationDate is required when previousActivationDate is provided")
+    comparison_mode = "manual" if requested_previous_activation_date is not None else "auto"
+    if requested_activation_date is not None and requested_previous_activation_date is not None and requested_previous_activation_date >= requested_activation_date:
+        raise HTTPException(status_code=400, detail="previousActivationDate must be earlier than currentActivationDate")
 
     seen_formats: set[int] = set()
-    contexts: list[tuple[PriceList, PriceList | None, PriceFormat, dict]] = []
+    contexts: list[tuple[PriceList | None, PriceList | None, PriceFormat, dict]] = []
     for raw in contexts_in:
         if not isinstance(raw, dict):
             raise HTTPException(status_code=400, detail="invalid context")
@@ -2880,12 +2923,7 @@ def _parse_report_contexts_payload(db: Session, payload: dict, current_user: App
         previous_pl: PriceList | None = None
         price_list_id = raw.get("priceListId")
         if requested_activation_date is not None:
-            pl, previous_pl = _resolve_report_price_lists(db, pf.id, requested_activation_date)
-            if pl is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"selected price format has no price list for activation date {requested_activation_date.isoformat()}",
-                )
+            pl, previous_pl = _resolve_report_price_lists(db, pf.id, requested_activation_date, requested_previous_activation_date)
         elif price_list_id in (None, ""):
             raise HTTPException(status_code=400, detail="activationDate is required for automatic report selection")
         else:
@@ -2894,7 +2932,15 @@ def _parse_report_contexts_payload(db: Session, payload: dict, current_user: App
             if pl_pf.id != pf.id or pl.price_format_id != pf.id:
                 raise HTTPException(status_code=400, detail="price list does not belong to selected price format")
             previous_pl = _previous_price_list_for_report(db, pl)
-        contexts.append((pl, previous_pl, pf, _report_context_dict(db, pl, pf, previous_pl)))
+        contexts.append((pl, previous_pl, pf, _report_context_dict(
+            db,
+            pl,
+            pf,
+            previous_pl,
+            requested_current_activation_date=requested_activation_date or pl.activation_date,
+            requested_previous_activation_date=requested_previous_activation_date,
+            comparison_mode=comparison_mode,
+        )))
     return branch, contexts
 
 
@@ -3038,10 +3084,13 @@ def _decrease_rows_for_context(
     return rows, previous_pl.number
 
 
-def _combined_report_context(branch: str, contexts: list[tuple[PriceList, PriceList | None, PriceFormat, dict]]) -> dict:
+def _combined_report_context(branch: str, contexts: list[tuple[PriceList | None, PriceList | None, PriceFormat, dict]]) -> dict:
     return {
         "branch": branch,
         "activationDate": next((context.get("currentActivationDate") for _pl, _previous_pl, _pf, context in contexts if context.get("currentActivationDate")), None),
+        "currentActivationDate": next((context.get("requestedCurrentActivationDate") for _pl, _previous_pl, _pf, context in contexts if context.get("requestedCurrentActivationDate")), None),
+        "previousActivationDate": next((context.get("requestedPreviousActivationDate") for _pl, _previous_pl, _pf, context in contexts if context.get("requestedPreviousActivationDate")), None),
+        "comparisonMode": next((context.get("comparisonMode") for _pl, _previous_pl, _pf, context in contexts), "auto"),
         "selectedFormatCount": len(contexts),
         "contexts": [context for _pl, _previous_pl, _pf, context in contexts],
     }
@@ -3169,6 +3218,8 @@ def query_rank_1_report(
     rows: list[dict] = []
     total_calculated = 0
     for pl, _previous_pl, pf, context in contexts:
+        if pl is None:
+            continue
         context_rows = _rank_rows_for_context(db, pl, pf, q)
         rows.extend(context_rows)
         total_calculated += int(context.get("totalCalculated") or 0)
@@ -3201,13 +3252,8 @@ def query_decreases_report(
     rows: list[dict] = []
     context_payloads = []
     for pl, previous_pl, pf, context in contexts:
-        context_rows, previous_number = _decrease_rows_for_context(
-            db,
-            pl,
-            pf,
-            q,
-            previous_pl=previous_pl,
-            previous_resolved=True,
+        context_rows, previous_number = ([], "") if pl is None else _decrease_rows_for_context(
+            db, pl, pf, q, previous_pl=previous_pl, previous_resolved=True
         )
         rows.extend(context_rows)
         enriched = dict(context)
@@ -3225,6 +3271,9 @@ def query_decreases_report(
         "context": {
             "branch": branch,
             "activationDate": next((context.get("currentActivationDate") for context in context_payloads if context.get("currentActivationDate")), None),
+            "currentActivationDate": next((context.get("requestedCurrentActivationDate") for context in context_payloads if context.get("requestedCurrentActivationDate")), None),
+            "previousActivationDate": next((context.get("requestedPreviousActivationDate") for context in context_payloads if context.get("requestedPreviousActivationDate")), None),
+            "comparisonMode": next((context.get("comparisonMode") for context in context_payloads), "auto"),
             "selectedFormatCount": len(contexts),
             "contexts": context_payloads,
         },
@@ -3245,7 +3294,7 @@ def export_rank_1_report_combined(
 ):
     q = str(payload.get("q") or "").strip() or None
     branch, contexts = _parse_report_contexts_payload(db, payload, current_user)
-    sheets = [(pf, _rank_rows_for_context(db, pl, pf, q)) for pl, _previous_pl, pf, _context in contexts]
+    sheets = [(pf, _rank_rows_for_context(db, pl, pf, q) if pl is not None else []) for pl, _previous_pl, pf, _context in contexts]
     return _export_report_workbook_xlsx(
         sheets=sheets,
         headers=REPORT_RANK_1_HEADERS,
@@ -3263,13 +3312,8 @@ def export_decreases_report_combined(
     branch, contexts = _parse_report_contexts_payload(db, payload, current_user)
     sheets = []
     for pl, previous_pl, pf, _context in contexts:
-        rows, _previous_number = _decrease_rows_for_context(
-            db,
-            pl,
-            pf,
-            q,
-            previous_pl=previous_pl,
-            previous_resolved=True,
+        rows, _previous_number = ([], "") if pl is None else _decrease_rows_for_context(
+            db, pl, pf, q, previous_pl=previous_pl, previous_resolved=True
         )
         sheets.append((pf, rows))
     return _export_report_workbook_xlsx(

@@ -41,9 +41,10 @@ def _client_with_reports_data(*, role: str = ROLE_PRICING_MANAGER, user_branch: 
         pf_cat1 = PriceFormat(code="AST-CAT1", name=long_name, branch="Астана", sap_category="1", price_list_type="gpl")
         pf_alm = PriceFormat(code="ALM-CAT1", name="Almaty Category 1", branch="Алматы", sap_category="1", price_list_type="gpl")
         pf_gap = PriceFormat(code="AST-GAP", name="Astana Missing Previous Date", branch="Астана", sap_category="GAP", price_list_type="gpl")
-        db.add_all([pf_vip, pf_cat1, pf_alm, pf_gap])
+        pf_manual = PriceFormat(code="AST-MANUAL", name="Astana Historical Comparison", branch="Астана", sap_category="HIST", price_list_type="gpl")
+        db.add_all([pf_vip, pf_cat1, pf_alm, pf_gap, pf_manual])
         db.flush()
-        ids.update({"pf_vip": pf_vip.id, "pf_cat1": pf_cat1.id, "pf_alm": pf_alm.id, "pf_gap": pf_gap.id})
+        ids.update({"pf_vip": pf_vip.id, "pf_cat1": pf_cat1.id, "pf_alm": pf_alm.id, "pf_gap": pf_gap.id, "pf_manual": pf_manual.id})
 
         pl_vip_old = PriceList(number="AST-VIP-OLD", price_format_id=pf_vip.id, activation_date=date(2026, 9, 23), status="generated", created_at=now - timedelta(days=2))
         pl_vip_prev_early = PriceList(number="AST-VIP-PREV-EARLY", price_format_id=pf_vip.id, activation_date=previous_activation_date, status="generated", created_at=now - timedelta(days=1, hours=1))
@@ -61,7 +62,12 @@ def _client_with_reports_data(*, role: str = ROLE_PRICING_MANAGER, user_branch: 
         pl_gap_prev_stale = PriceList(number="AST-GAP-26-STALE", price_format_id=pf_gap.id, activation_date=gap_previous_activation_date, status="generated", created_at=now - timedelta(days=3))
         pl_gap_current_low = PriceList(number="AST-GAP-29-A", price_format_id=pf_gap.id, activation_date=gap_current_activation_date, status="generated", created_at=now + timedelta(hours=1))
         pl_gap_current_high = PriceList(number="AST-GAP-29-B", price_format_id=pf_gap.id, activation_date=gap_current_activation_date, status="generated", created_at=now + timedelta(hours=1))
-        db.add_all([pl_vip_old, pl_vip_prev_early, pl_vip_prev, pl_vip_current_a, pl_vip_current_b, pl_vip_latest, pl_cat1_prev, pl_cat1_latest, pl_alm, pl_gap_prev_low, pl_gap_prev_high, pl_gap_prev_stale, pl_gap_current_low, pl_gap_current_high])
+        pl_manual_26 = PriceList(number="AST-MANUAL-26", price_format_id=pf_manual.id, activation_date=date(2026, 9, 26), status="generated", created_at=now)
+        pl_manual_28 = PriceList(number="AST-MANUAL-28", price_format_id=pf_manual.id, activation_date=date(2026, 9, 28), status="generated", created_at=now + timedelta(days=1))
+        pl_manual_29_old = PriceList(number="AST-MANUAL-29-A", price_format_id=pf_manual.id, activation_date=date(2026, 9, 29), status="generated", created_at=now + timedelta(days=2))
+        pl_manual_29 = PriceList(number="AST-MANUAL-29-B", price_format_id=pf_manual.id, activation_date=date(2026, 9, 29), status="generated", created_at=now + timedelta(days=2))
+        pl_manual_30 = PriceList(number="AST-MANUAL-30", price_format_id=pf_manual.id, activation_date=date(2026, 9, 30), status="generated", created_at=now + timedelta(days=3))
+        db.add_all([pl_vip_old, pl_vip_prev_early, pl_vip_prev, pl_vip_current_a, pl_vip_current_b, pl_vip_latest, pl_cat1_prev, pl_cat1_latest, pl_alm, pl_gap_prev_low, pl_gap_prev_high, pl_gap_prev_stale, pl_gap_current_low, pl_gap_current_high, pl_manual_26, pl_manual_28, pl_manual_29_old, pl_manual_29, pl_manual_30])
         db.flush()
         ids.update(
             {
@@ -79,6 +85,11 @@ def _client_with_reports_data(*, role: str = ROLE_PRICING_MANAGER, user_branch: 
                 "pl_gap_prev_stale": pl_gap_prev_stale.id,
                 "pl_gap_current_low": pl_gap_current_low.id,
                 "pl_gap_current_high": pl_gap_current_high.id,
+                "pl_manual_26": pl_manual_26.id,
+                "pl_manual_28": pl_manual_28.id,
+                "pl_manual_29_old": pl_manual_29_old.id,
+                "pl_manual_29": pl_manual_29.id,
+                "pl_manual_30": pl_manual_30.id,
             }
         )
 
@@ -96,6 +107,7 @@ def _client_with_reports_data(*, role: str = ROLE_PRICING_MANAGER, user_branch: 
             Product(code="PREVONLY", name="Previous Only", cost=10),
             Product(code="CURRONLY", name="Current Only", cost=10),
             Product(code="GAP", name="Gap Date Product", cost=10),
+            Product(code="HIST", name="Historical Comparison Product", cost=10),
         ]
         db.add_all(products)
         db.flush()
@@ -153,6 +165,11 @@ def _client_with_reports_data(*, role: str = ROLE_PRICING_MANAGER, user_branch: 
         add_cp(pl_gap_prev_stale, "GAP", 720, "right")
         add_cp(pl_gap_current_low, "GAP", 650, "right")
         add_cp(pl_gap_current_high, "GAP", 640, "left")
+        add_cp(pl_manual_26, "HIST", 900, "left")
+        add_cp(pl_manual_28, "HIST", 850, "left")
+        add_cp(pl_manual_29_old, "HIST", 825, "left")
+        add_cp(pl_manual_29, "HIST", 800, "left")
+        add_cp(pl_manual_30, "HIST", 700, "left")
         db.commit()
 
     return TestClient(main.app), ids
@@ -178,7 +195,7 @@ def test_report_contexts_return_latest_generated_price_list_per_format():
         payload = response.json()
 
         by_code = {row["priceFormat"]["code"]: row for row in payload}
-        assert set(by_code) == {"AST-CAT1", "AST-GAP", "AST-VIP"}
+        assert set(by_code) == {"AST-CAT1", "AST-GAP", "AST-MANUAL", "AST-VIP"}
         assert by_code["AST-VIP"]["latestPriceList"]["id"] == ids["pl_vip_latest"]
         assert by_code["AST-CAT1"]["latestPriceList"]["id"] == ids["pl_cat1_latest"]
         assert by_code["AST-VIP"]["priceFormat"]["sapCategory"] == "VIP"
@@ -294,6 +311,131 @@ def test_decreases_are_empty_when_no_earlier_price_list_exists():
     assert response.status_code == 200
     assert response.json()["items"] == []
     assert response.json()["context"]["contexts"][0]["previousPriceListId"] is None
+
+
+def test_manual_comparisons_use_exact_dates_and_latest_versions():
+    client, ids = _client_with_reports_data()
+    cases = [
+        ("2026-09-29", "2026-09-30", 800.0, 700.0, ids["pl_manual_29"], ids["pl_manual_30"]),
+        ("2026-09-28", "2026-09-29", 850.0, 800.0, ids["pl_manual_28"], ids["pl_manual_29"]),
+        ("2026-09-26", "2026-09-29", 900.0, 800.0, ids["pl_manual_26"], ids["pl_manual_29"]),
+    ]
+    try:
+        for previous_date, current_date, old_price, new_price, previous_id, current_id in cases:
+            response = client.post(
+                "/api/reports/decreases/query",
+                json={
+                    "branch": "Astana",
+                    "currentActivationDate": current_date,
+                    "previousActivationDate": previous_date,
+                    "contexts": [{"priceFormatId": ids["pf_manual"]}],
+                },
+            )
+            assert response.status_code == 200
+            payload = response.json()
+            assert [(row["material"], row["oldPrice"], row["newPrice"]) for row in payload["items"]] == [("HIST", old_price, new_price)]
+            context = payload["context"]["contexts"][0]
+            assert context["comparisonMode"] == "manual"
+            assert context["requestedPreviousActivationDate"] == previous_date
+            assert context["requestedCurrentActivationDate"] == current_date
+            assert context["previousPriceListId"] == previous_id
+            assert context["currentPriceListId"] == current_id
+            assert context["comparisonAvailable"] is True
+    finally:
+        _clear_overrides()
+
+
+def test_manual_missing_previous_is_unavailable_without_fallback_and_rank_still_works():
+    client, ids = _client_with_reports_data()
+    body = {
+        "branch": "Astana",
+        "currentActivationDate": "2026-09-29",
+        "previousActivationDate": "2026-09-28",
+        "contexts": [
+            {"priceFormatId": ids["pf_manual"]},
+            {"priceFormatId": ids["pf_gap"]},
+        ],
+    }
+    try:
+        rank = client.post("/api/reports/rank-1/query", json=body)
+        decreases = client.post("/api/reports/decreases/query", json=body)
+    finally:
+        _clear_overrides()
+
+    assert rank.status_code == 200
+    assert {(row["material"], row["priceFormatCode"]) for row in rank.json()["items"]} == {
+        ("HIST", "AST-MANUAL"),
+        ("GAP", "AST-GAP"),
+    }
+    assert decreases.status_code == 200
+    assert [(row["material"], row["priceFormatCode"]) for row in decreases.json()["items"]] == [("HIST", "AST-MANUAL")]
+    contexts = {row["priceFormatCode"]: row for row in decreases.json()["context"]["contexts"]}
+    assert contexts["AST-MANUAL"]["comparisonAvailable"] is True
+    assert contexts["AST-GAP"]["previousPriceListId"] is None
+    assert contexts["AST-GAP"]["previousAvailable"] is False
+    assert contexts["AST-GAP"]["comparisonAvailable"] is False
+    assert "28.09.2026" in contexts["AST-GAP"]["warnings"][0]
+
+
+def test_manual_date_validation_and_current_date_alias_compatibility():
+    client, ids = _client_with_reports_data()
+    context = [{"priceFormatId": ids["pf_manual"]}]
+    try:
+        equal_aliases = client.post(
+            "/api/reports/rank-1/query",
+            json={"branch": "Astana", "activationDate": "2026-09-30", "currentActivationDate": "2026-09-30", "contexts": context},
+        )
+        conflict = client.post(
+            "/api/reports/rank-1/query",
+            json={"branch": "Astana", "activationDate": "2026-09-29", "currentActivationDate": "2026-09-30", "contexts": context},
+        )
+        equal_dates = client.post(
+            "/api/reports/decreases/query",
+            json={"branch": "Astana", "currentActivationDate": "2026-09-30", "previousActivationDate": "2026-09-30", "contexts": context},
+        )
+        reversed_dates = client.post(
+            "/api/reports/decreases/query",
+            json={"branch": "Astana", "currentActivationDate": "2026-09-29", "previousActivationDate": "2026-09-30", "contexts": context},
+        )
+        malformed = client.post(
+            "/api/reports/decreases/query",
+            json={"branch": "Astana", "currentActivationDate": "30.09.2026", "previousActivationDate": "2026-09-29", "contexts": context},
+        )
+    finally:
+        _clear_overrides()
+
+    assert equal_aliases.status_code == 200
+    assert equal_aliases.json()["context"]["comparisonMode"] == "auto"
+    assert conflict.status_code == 400
+    assert "must be equal" in conflict.json()["detail"]
+    assert equal_dates.status_code == 400
+    assert reversed_dates.status_code == 400
+    assert malformed.status_code == 400
+    assert "currentActivationDate" in malformed.json()["detail"]
+
+
+def test_manual_decrease_query_and_export_use_the_same_pair():
+    client, ids = _client_with_reports_data()
+    body = {
+        "branch": "Astana",
+        "currentActivationDate": "2026-09-30",
+        "previousActivationDate": "2026-09-29",
+        "contexts": [{"priceFormatId": ids["pf_manual"]}],
+    }
+    try:
+        queried = client.post("/api/reports/decreases/query", json=body)
+        exported = client.post("/api/reports/decreases/export.xlsx", json=body)
+    finally:
+        _clear_overrides()
+
+    assert queried.status_code == 200
+    assert queried.json()["items"][0]["oldPrice"] == 800.0
+    assert queried.json()["items"][0]["newPrice"] == 700.0
+    assert exported.status_code == 200
+    workbook = load_workbook(io.BytesIO(exported.content), data_only=True)
+    export_row = next(workbook.active.iter_rows(min_row=2, values_only=True))
+    assert export_row[2] == "HIST"
+    assert export_row[5:8] == (700, 800, -100)
 
 
 def test_combined_reports_support_pagination_and_selected_price_list_override():

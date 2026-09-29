@@ -1246,6 +1246,38 @@ td.sticky-action-column,
   gap: 6px;
 }
 
+.reports-date-comparison {
+  display: grid;
+  gap: 8px;
+}
+
+.reports-date-pair {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) auto minmax(150px, 1fr);
+  align-items: end;
+  gap: 10px;
+}
+
+.reports-date-arrow {
+  padding-bottom: 9px;
+  color: #64748b;
+  font-size: 18px;
+  font-weight: 800;
+}
+
+.reports-date-comparison small {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.reports-validation,
+.reports-warning {
+  color: #b45309 !important;
+  font-size: 12px;
+  font-style: normal;
+  line-height: 1.35;
+}
+
 .reports-field > span,
 .reports-field-label > span,
 .reports-calculation-row > span {
@@ -3333,6 +3365,14 @@ td.sticky-action-column,
 
   .reports-format-list {
     grid-template-columns: 1fr;
+  }
+
+  .reports-date-pair {
+    grid-template-columns: 1fr;
+  }
+
+  .reports-date-arrow {
+    display: none;
   }
 
   .reports-field-label,

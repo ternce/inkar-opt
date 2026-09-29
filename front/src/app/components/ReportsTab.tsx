@@ -47,6 +47,9 @@ type ReportPayload = {
   context?: {
     branch: string;
     activationDate?: string;
+    currentActivationDate?: string;
+    previousActivationDate?: string;
+    comparisonMode?: 'auto' | 'manual';
     selectedFormatCount: number;
     contexts: Array<{
       priceFormatId: number | string;
@@ -56,11 +59,20 @@ type ReportPayload = {
       customerCategory: string;
       calculatedAtDisplay: string;
       totalCalculated: number;
+      currentPriceListId?: number | string | null;
+      currentPriceListNumber?: string;
       previousPriceListNumber?: string;
+      requestedCurrentActivationDate?: string;
+      requestedPreviousActivationDate?: string;
+      comparisonMode?: 'auto' | 'manual';
       currentActivationDate?: string;
       currentCreatedAt?: string;
       previousActivationDate?: string;
       previousCreatedAt?: string;
+      currentAvailable?: boolean;
+      previousAvailable?: boolean;
+      comparisonAvailable?: boolean;
+      warnings?: string[];
     }>;
   };
   summary?: Record<string, number>;
@@ -96,9 +108,10 @@ const fmtPercent = (value: unknown) => {
 
 const endpointFor = (reportType: ReportType) => (reportType === 'rank-1' ? 'rank-1' : 'decreases');
 
-const requestBody = (branchFilter: string, activationDate: string, contexts: AppliedContext[], q: string, page: number, limit: number) => ({
+const requestBody = (branchFilter: string, currentActivationDate: string, previousActivationDate: string, contexts: AppliedContext[], q: string, page: number, limit: number) => ({
   branch: branchFilter,
-  activationDate,
+  currentActivationDate,
+  ...(previousActivationDate ? { previousActivationDate } : {}),
   contexts,
   q: q.trim(),
   page,
@@ -127,7 +140,10 @@ const downloadNameFromDisposition = (value: string | null, fallback: string) => 
 export function ReportsTab({ branch, selectedFormatCode, priceFormats }: ReportsTabProps) {
   const [activeTab, setActiveTab] = useState<ReportType>('rank-1');
   const [branchFilter, setBranchFilter] = useState(branch || priceFormats[0]?.branch || '');
-  const [activationDate, setActivationDate] = useState('');
+  const [draftPreviousActivationDate, setDraftPreviousActivationDate] = useState('');
+  const [draftCurrentActivationDate, setDraftCurrentActivationDate] = useState('');
+  const [appliedPreviousActivationDate, setAppliedPreviousActivationDate] = useState('');
+  const [appliedCurrentActivationDate, setAppliedCurrentActivationDate] = useState('');
   const [contextOptions, setContextOptions] = useState<ReportContextOption[]>([]);
   const [selectedFormatIds, setSelectedFormatIds] = useState<string[]>([]);
   const [appliedContexts, setAppliedContexts] = useState<AppliedContext[]>([]);
@@ -147,20 +163,33 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
   );
 
   const availableContextOptions = useMemo(
-    () => contextOptions.filter((item) => item.priceLists.some((priceList) => priceList.activationDate === activationDate)),
-    [activationDate, contextOptions]
+    () => contextOptions.filter((item) => item.availableActivationDates?.includes(draftCurrentActivationDate) || item.priceLists.some((priceList) => priceList.activationDate === draftCurrentActivationDate)),
+    [draftCurrentActivationDate, contextOptions]
   );
 
   const availableContextIds = useMemo(() => new Set(availableContextOptions.map(contextId)), [availableContextOptions]);
 
   const selectedContexts = useMemo(
-    () => selectedFormatIds.filter((formatId) => availableContextIds.has(formatId)).map((priceFormatId) => ({ priceFormatId })),
-    [availableContextIds, selectedFormatIds]
+    () => selectedFormatIds.map((priceFormatId) => ({ priceFormatId })),
+    [selectedFormatIds]
+  );
+
+  const availableActivationDates = useMemo(() => {
+    const selected = contextOptions.filter((item) => selectedFormatIds.includes(contextId(item)));
+    const source = selected.length ? selected : contextOptions;
+    return Array.from(new Set(source.flatMap((item) => item.availableActivationDates || item.latestPriceListsByActivationDate?.map((priceList) => priceList.activationDate) || [])))
+      .filter(Boolean)
+      .sort()
+      .reverse();
+  }, [contextOptions, selectedFormatIds]);
+
+  const invalidDatePair = Boolean(
+    draftPreviousActivationDate && draftCurrentActivationDate && draftPreviousActivationDate >= draftCurrentActivationDate
   );
 
   const contextsReady = useMemo(
-    () => contextsBranch === branchFilter && appliedContexts.every((item) => availableContextIds.has(String(item.priceFormatId))),
-    [appliedContexts, availableContextIds, branchFilter, contextsBranch]
+    () => contextsBranch === branchFilter && appliedContexts.every((item) => contextOptions.some((option) => contextId(option) === String(item.priceFormatId))),
+    [appliedContexts, branchFilter, contextOptions, contextsBranch]
   );
 
   const quickContextLabels = useMemo(() => {
@@ -187,7 +216,7 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
 
   const togglePreviewContext = (item: ReportContextOption) => {
     const id = contextId(item);
-    if (!item.priceLists.some((priceList) => priceList.activationDate === activationDate)) return;
+    if (!item.priceLists.some((priceList) => priceList.activationDate === draftCurrentActivationDate)) return;
     toggleFormat(id);
   };
 
@@ -221,12 +250,17 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
       setContextsBranch(branchFilter);
 
       const dates = Array.from(new Set(rows.flatMap((row) => row.availableActivationDates || row.priceLists.map((item) => item.activationDate)).filter(Boolean))).sort().reverse();
-      const targetDate = dates.includes(activationDate) ? activationDate : dates[0] || '';
-      setActivationDate(targetDate);
+      const targetDate = dates.includes(appliedCurrentActivationDate) ? appliedCurrentActivationDate : dates[0] || '';
       const rowsForDate = rows.filter((row) => row.priceLists.some((item) => item.activationDate === targetDate));
       const idsWithLists = rowsForDate.map((row) => String(row.priceFormat.id));
       const preferred = rowsForDate.find((row) => row.priceFormat.code === selectedFormatCode);
       const defaultIds = preferred ? [String(preferred.priceFormat.id), ...idsWithLists.filter((id) => id !== String(preferred.priceFormat.id))] : idsWithLists;
+      const selectedDates = Array.from(new Set(rowsForDate.flatMap((row) => row.availableActivationDates || row.priceLists.map((item) => item.activationDate)).filter(Boolean))).sort().reverse();
+      const previousDate = selectedDates.find((dateValue) => dateValue < targetDate) || '';
+      setDraftCurrentActivationDate(targetDate);
+      setDraftPreviousActivationDate(previousDate);
+      setAppliedCurrentActivationDate(targetDate);
+      setAppliedPreviousActivationDate(previousDate);
       setSelectedFormatIds(defaultIds);
       setAppliedContexts(defaultIds.map((priceFormatId) => ({ priceFormatId })));
       setPage(1);
@@ -242,7 +276,7 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
   }, [branchFilter, selectedFormatCode]);
 
   useEffect(() => {
-    if (isLoadingContexts || !branchFilter || !activationDate || !appliedContexts.length || !contextsReady) {
+    if (isLoadingContexts || !branchFilter || !appliedCurrentActivationDate || !appliedContexts.length || !contextsReady) {
       setPayload(null);
       return;
     }
@@ -255,7 +289,7 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
           const res = await fetch(`/api/reports/${endpointFor(activeTab)}/query`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(requestBody(branchFilter, activationDate, appliedContexts, q, page, limit)),
+            body: JSON.stringify(requestBody(branchFilter, appliedCurrentActivationDate, appliedPreviousActivationDate, appliedContexts, q, page, limit)),
             signal: controller.signal,
           });
           const text = await res.text();
@@ -274,36 +308,36 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [activeTab, activationDate, appliedContexts, branchFilter, contextsReady, isLoadingContexts, page, q]);
+  }, [activeTab, appliedCurrentActivationDate, appliedPreviousActivationDate, appliedContexts, branchFilter, contextsReady, isLoadingContexts, page, q]);
 
   useEffect(() => {
     setPage(1);
   }, [activeTab, appliedContexts, q]);
 
   const applySelection = () => {
+    if (!draftCurrentActivationDate || invalidDatePair) return;
     setAppliedContexts(selectedContexts);
+    setAppliedCurrentActivationDate(draftCurrentActivationDate);
+    setAppliedPreviousActivationDate(draftPreviousActivationDate);
     setPage(1);
   };
 
-  const changeActivationDate = (value: string) => {
-    setActivationDate(value);
-    const formatIds = contextOptions
-      .filter((item) => item.priceLists.some((priceList) => priceList.activationDate === value))
-      .map(contextId);
-    setSelectedFormatIds(formatIds);
-    setAppliedContexts(formatIds.map((priceFormatId) => ({ priceFormatId })));
-    setPage(1);
+  const changeCurrentActivationDate = (value: string) => {
+    setDraftCurrentActivationDate(value);
+    if (draftPreviousActivationDate && draftPreviousActivationDate >= value) {
+      setDraftPreviousActivationDate(availableActivationDates.find((dateValue) => dateValue < value) || '');
+    }
   };
 
   const exportExcel = async () => {
-    if (isLoadingContexts || !branchFilter || !activationDate || !appliedContexts.length || !contextsReady) return;
+    if (isLoadingContexts || !branchFilter || !appliedCurrentActivationDate || !appliedContexts.length || !contextsReady) return;
     setIsExporting(true);
     setError('');
     try {
       const res = await fetch(`/api/reports/${endpointFor(activeTab)}/export.xlsx`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody(branchFilter, activationDate, appliedContexts, q, 1, limit)),
+        body: JSON.stringify(requestBody(branchFilter, appliedCurrentActivationDate, appliedPreviousActivationDate, appliedContexts, q, 1, limit)),
       });
       if (!res.ok) {
         const text = await res.text();
@@ -346,7 +380,7 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
             <div className="eyebrow">Отчёты</div>
             <h3>Параметры отчёта</h3>
           </div>
-          <Button onClick={applySelection} disabled={!selectedContexts.length}>
+          <Button onClick={applySelection} disabled={!selectedContexts.length || !draftCurrentActivationDate || invalidDatePair}>
             Применить
           </Button>
         </div>
@@ -362,10 +396,36 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
             </Select>
           </label>
 
-          <label className="reports-field">
-            <span>Дата действия</span>
-            <Input type="date" value={activationDate} onChange={(event) => changeActivationDate(event.target.value)} />
-          </label>
+          <div className="reports-date-comparison">
+            <div className="reports-field-label"><span>Дата сравнения</span></div>
+            <div className="reports-date-pair">
+              <label className="reports-field">
+                <span>Предыдущая дата</span>
+                <Select value={draftPreviousActivationDate} onValueChange={setDraftPreviousActivationDate}>
+                  <SelectTrigger><SelectValue placeholder="Предыдущая дата" /></SelectTrigger>
+                  <SelectContent>
+                    {availableActivationDates.filter((dateValue) => !draftCurrentActivationDate || dateValue < draftCurrentActivationDate).map((dateValue) => (
+                      <SelectItem key={dateValue} value={dateValue}>{formatActivationDate(dateValue)}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </label>
+              <span className="reports-date-arrow" aria-hidden="true">→</span>
+              <label className="reports-field">
+                <span>Текущая дата</span>
+                <Select value={draftCurrentActivationDate} onValueChange={changeCurrentActivationDate}>
+                  <SelectTrigger><SelectValue placeholder="Текущая дата" /></SelectTrigger>
+                  <SelectContent>
+                    {availableActivationDates.map((dateValue) => (
+                      <SelectItem key={dateValue} value={dateValue}>{formatActivationDate(dateValue)}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </label>
+            </div>
+            <small>Сравнение выполняется по датам начала действия прайс-листов.</small>
+            {invalidDatePair ? <div className="reports-validation">Предыдущая дата должна быть раньше текущей.</div> : null}
+          </div>
 
           <div className="reports-format-picker">
             <div className="reports-field-label">
@@ -378,7 +438,7 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
             <div className="reports-format-list">
               {contextOptions.map((item) => {
                 const id = String(item.priceFormat.id);
-                const latestForDate = item.priceLists.find((priceList) => priceList.activationDate === activationDate);
+                const latestForDate = (item.latestPriceListsByActivationDate || item.priceLists).find((priceList) => priceList.activationDate === draftCurrentActivationDate);
                 const disabled = !latestForDate;
                 return (
                   <label key={id} className={`reports-format-row ${disabled ? 'disabled' : ''}`}>
@@ -399,12 +459,14 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
           {selectedFormatIds.map((formatId) => {
             const option = contextOptions.find((item) => String(item.priceFormat.id) === formatId);
             if (!option) return null;
-            const latestForDate = option.priceLists.find((item) => item.activationDate === activationDate);
-            if (!latestForDate) return null;
+            const dateLists = option.latestPriceListsByActivationDate || option.priceLists;
+            const latestForDate = dateLists.find((item) => item.activationDate === draftCurrentActivationDate);
+            const previousForDate = dateLists.find((item) => item.activationDate === draftPreviousActivationDate);
             return (
               <div key={formatId} className="reports-calculation-row">
                 <span>{option.priceFormat.code}</span>
-                <strong>{latestForDate.number} · {formatActivationDate(latestForDate.activationDate)} · {fmtNumber(latestForDate.skuCount, 0)} SKU</strong>
+                <strong>{latestForDate ? `${latestForDate.number} · ${formatActivationDate(latestForDate.activationDate)} · ${fmtNumber(latestForDate.skuCount, 0)} SKU` : `нет прайса за ${formatActivationDate(draftCurrentActivationDate)}`}</strong>
+                {draftPreviousActivationDate && !previousForDate ? <em className="reports-warning">Нет прайса за {formatActivationDate(draftPreviousActivationDate)}</em> : null}
               </div>
             );
           })}
@@ -429,7 +491,7 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
         <section className="generated-panel reports-context-panel">
           <div className="generated-summary reports-summary">
             <Metric label="Филиал" value={payload.context.branch || '—'} />
-            <Metric label="Дата действия" value={formatActivationDate(payload.context.activationDate || activationDate) || '—'} />
+            <Metric label="Период сравнения" value={`${formatActivationDate(payload.context.previousActivationDate || appliedPreviousActivationDate) || '—'} → ${formatActivationDate(payload.context.currentActivationDate || payload.context.activationDate || appliedCurrentActivationDate) || '—'}`} />
             <Metric label="Форматов" value={fmtNumber(payload.context.selectedFormatCount || 0, 0)} />
             <Metric label={isRank ? 'Ранг 1' : 'Снижений'} value={fmtNumber(isRank ? payload.summary?.totalRank1 ?? 0 : payload.summary?.totalDecreases ?? 0, 0)} />
             <Metric label={isRank ? 'Доля' : 'Среднее снижение'} value={isRank ? fmtPercent(payload.summary?.sharePercent ?? 0) : fmtPercent(payload.summary?.averageDecreasePercent ?? 0)} />
@@ -438,8 +500,9 @@ export function ReportsTab({ branch, selectedFormatCode, priceFormats }: Reports
             {payload.context.contexts.map((item) => (
               <div key={`${item.priceFormatId}-${item.priceListNumber}`} className="reports-context-card">
                 <strong>{item.priceFormatName || item.priceFormatCode}</strong>
-                <span>{item.customerCategory || '—'} · {item.priceListNumber} · действует с {formatActivationDate(item.currentActivationDate || activationDate)} · создан {item.calculatedAtDisplay || '—'}</span>
-                {item.previousPriceListNumber ? <em>Предыдущий расчёт: {item.previousPriceListNumber}</em> : null}
+                <span>{item.customerCategory || '—'} · {item.currentPriceListNumber || item.priceListNumber || 'нет текущего прайса'} · действует с {formatActivationDate(item.currentActivationDate || item.requestedCurrentActivationDate || appliedCurrentActivationDate)} · создан {item.calculatedAtDisplay || '—'}</span>
+                {item.previousPriceListNumber ? <em>Предыдущий расчёт: {item.previousPriceListNumber} · {formatActivationDate(item.previousActivationDate || '')}</em> : null}
+                {item.warnings?.map((warning) => <em key={warning} className="reports-warning">{warning}</em>)}
               </div>
             ))}
           </div>
