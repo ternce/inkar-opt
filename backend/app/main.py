@@ -8510,6 +8510,7 @@ async def preview_vidman_manual_file(
 async def preview_vidman_multi_source_upload(
     format_code: str,
     file: UploadFile = File(...),
+    branch: str = Form(""),
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(require_write_access),
 ):
@@ -8518,9 +8519,14 @@ async def preview_vidman_multi_source_upload(
         raise HTTPException(status_code=404, detail="price format not found")
     _ensure_price_format_access(pf, current_user)
     try:
+        target_branch = _canonical_user_selected_branch(branch, field_name="branch")
+        if not target_branch:
+            raise HTTPException(status_code=400, detail="Не выбран филиал для импорта Vidman-файла.")
+        if not user_can_access_branch(current_user, _branch_id_for_name(target_branch), target_branch):
+            raise HTTPException(status_code=403, detail="branch is not assigned to current user")
         content = await _read_upload_limited(file, max_bytes=MAX_VIDMAN_FILE_SIZE_BYTES)
         return preview_vidman_multi_source_file(
-            db=db, price_format=pf, content=content, filename=file.filename or "vidman.xlsx"
+            db=db, price_format=pf, branch=target_branch, content=content, filename=file.filename or "vidman.xlsx"
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -8532,6 +8538,7 @@ async def confirm_vidman_multi_source_upload(
     file: UploadFile = File(...),
     checksum: str = Form(...),
     allow_incomplete: bool = Form(False),
+    branch: str = Form(""),
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(require_write_access),
 ):
@@ -8540,10 +8547,16 @@ async def confirm_vidman_multi_source_upload(
         raise HTTPException(status_code=404, detail="price format not found")
     _ensure_price_format_access(pf, current_user)
     try:
+        target_branch = _canonical_user_selected_branch(branch, field_name="branch")
+        if not target_branch:
+            raise HTTPException(status_code=400, detail="Не выбран филиал для импорта Vidman-файла.")
+        if not user_can_access_branch(current_user, _branch_id_for_name(target_branch), target_branch):
+            raise HTTPException(status_code=403, detail="branch is not assigned to current user")
         content = await _read_upload_limited(file, max_bytes=MAX_VIDMAN_FILE_SIZE_BYTES)
         return import_vidman_multi_source_file(
             db=db,
             price_format=pf,
+            branch=target_branch,
             content=content,
             filename=file.filename or "vidman.xlsx",
             expected_checksum=checksum,

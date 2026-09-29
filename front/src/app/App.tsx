@@ -466,7 +466,7 @@ export default function App() {
       case 'references':
         return <ReferencesTab isReadOnly={Boolean(currentUser?.isReadOnly)} />;
       case 'competitor-domain':
-        return <CompetitorsTab formatCode={selectedFormat.code} currentUser={currentUser} />;
+        return <CompetitorsTab formatCode={selectedFormat.code} branch={selectedBranch} currentUser={currentUser} />;
       case 'vidman-review':
         return <VidmanMatchingReviewTab isReadOnly={Boolean(currentUser?.isReadOnly)} />;
       case 'vidman-internal-coverage':

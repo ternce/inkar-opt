@@ -9,12 +9,16 @@ import zlib
 from types import SimpleNamespace
 
 import pytest
+from fastapi.testclient import TestClient
 from openpyxl import Workbook
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
+from backend.app import main
 from backend.app.db import Base
 from backend.app.models import (
+    AppUser,
     CompetitorPriceList,
     CompetitorPriceListItem,
     ManualPriceListImport,
@@ -421,7 +425,7 @@ def test_empty_supplier_columns_are_reported_but_not_created_and_existing_is_pre
     assert str(parsed.sources[4].rows[1].price) == "330.7500"
 
     preview = service.preview_vidman_multi_source_file(
-        db=db, price_format=pf, content=content, filename="actual-client.xlsx"
+        db=db, price_format=pf, branch=pf.branch, content=content, filename="actual-client.xlsx"
     )
     assert preview["headerRow"] == 5
     assert preview["totalRows"] == 2
@@ -473,6 +477,7 @@ def test_empty_supplier_columns_are_reported_but_not_created_and_existing_is_pre
     first = service.import_vidman_multi_source_file(
         db=db,
         price_format=pf,
+        branch=pf.branch,
         content=content,
         filename="actual-client.xlsx",
         expected_checksum=preview["confirmationToken"],
@@ -509,7 +514,12 @@ def test_empty_supplier_columns_are_reported_but_not_created_and_existing_is_pre
             CompetitorPriceList.source_type == service.MULTI_SOURCE_TYPE
         )
     }
-    assert item_counts == {"эмити": 2, "стофарм": 1, "медсервис": 1, "инкар": 2}
+    assert item_counts == {
+        f"{pf.branch} — эмити — vidman-file": 2,
+        f"{pf.branch} — стофарм — vidman-file": 1,
+        "медсервис": 1,
+        f"{pf.branch} — инкар — vidman-file": 2,
+    }
 
     skipped_history = db.query(ManualPriceListImport).filter(
         ManualPriceListImport.status.in_(
@@ -534,6 +544,7 @@ def test_empty_supplier_columns_are_reported_but_not_created_and_existing_is_pre
     later = service.import_vidman_multi_source_file(
         db=db,
         price_format=pf,
+        branch=pf.branch,
         content=later_content,
         filename="actual-client-later.xlsx",
         expected_checksum=later_checksum,
@@ -567,7 +578,7 @@ def test_supplier_layout_numeric_excel_sku_matches_unique_zero_padded_product_co
     workbook.save(stream)
 
     preview = service.preview_vidman_multi_source_file(
-        db=db, price_format=pf, content=stream.getvalue(), filename="numeric-code.xlsx"
+        db=db, price_format=pf, branch=pf.branch, content=stream.getvalue(), filename="numeric-code.xlsx"
     )
 
     assert preview["matchedProducts"] == 1
@@ -636,7 +647,7 @@ def test_pivot_preview_detects_three_sources_and_matches_only_internal_skus():
     )
 
     report = service.preview_vidman_multi_source_file(
-        db=db, price_format=pf, content=content, filename="client.xlsx"
+        db=db, price_format=pf, branch=pf.branch, content=content, filename="client.xlsx"
     )
 
     assert report["detectedSources"] == 3
@@ -672,6 +683,7 @@ def test_multi_source_import_reuses_ids_and_preserves_assignments_and_coefficien
     first = service.import_vidman_multi_source_file(
         db=db,
         price_format=pf,
+        branch=pf.branch,
         content=content,
         filename="client.xlsx",
         expected_checksum=checksum,
@@ -696,6 +708,7 @@ def test_multi_source_import_reuses_ids_and_preserves_assignments_and_coefficien
     second = service.import_vidman_multi_source_file(
         db=db,
         price_format=pf,
+        branch=pf.branch,
         content=content,
         filename="client.xlsx",
         expected_checksum=checksum,
@@ -721,6 +734,130 @@ def test_multi_source_import_reuses_ids_and_preserves_assignments_and_coefficien
     assert all(len(json.loads(row.metadata_json)["results"]) == 3 for row in batches)
 
 
+def test_multi_source_import_uses_explicit_branch_for_identity_and_display(monkeypatch):
+    db = _session()
+    pf = PriceFormat(code="ALM-FMT", name="Almaty format", branch="Алматы")
+    db.add_all([pf, Product(code="0001", name="One", cost=1)])
+    db.commit()
+    content = _pivot_xlsx([["0001", None, "D-1", "One", "", "Maker", 10, 1, 11, 1, 12, 1]])
+    monkeypatch.setattr(service, "enqueue_percentile_preparation", lambda **_kwargs: {})
+
+    preview = service.preview_vidman_multi_source_file(
+        db=db, price_format=pf, branch="Есик", content=content, filename="client.xlsx"
+    )
+    assert preview["branch"] == "Есик"
+    assert preview["detectedSources"] == 3
+    assert {row["stableKey"] for row in preview["sources"]} == {
+        service._stable_file_source_key(context="Есик", source_name=name)
+        for name in ["Source A", "Source B", "Source C"]
+    }
+
+    def run_import(branch: str, requested_by: str):
+        return service.import_vidman_multi_source_file(
+            db=db,
+            price_format=pf,
+            branch=branch,
+            content=content,
+            filename="client.xlsx",
+            expected_checksum=preview["confirmationToken"],
+            allow_incomplete=False,
+            requested_by=requested_by,
+        )
+
+    first_esik = run_import("Есик", "tester-esik-1")
+    first_esik_ids = {row["name"]: row["competitorPriceListId"] for row in first_esik["results"]}
+    esik_sources = db.execute(
+        select(CompetitorPriceList).where(CompetitorPriceList.id.in_(first_esik_ids.values()))
+    ).scalars().all()
+    assert first_esik["branch"] == "Есик"
+    assert len(esik_sources) == 3
+    assert all(row.branch_name == "Есик" and row.region == "Есик" for row in esik_sources)
+    assert all(row.branch_id == "Есик" and row.branch_code == "Есик" for row in esik_sources)
+    assert all(row.supplier == row.competitor_name for row in esik_sources)
+    assert {row.display_name for row in esik_sources} == {
+        "Есик — Source A — vidman-file",
+        "Есик — Source B — vidman-file",
+        "Есик — Source C — vidman-file",
+    }
+    assert all("Алматы" not in row.display_name for row in esik_sources)
+
+    assignment = PriceFormatCompetitorAssignment(
+        price_format_id=pf.id,
+        competitor_price_list_id=first_esik_ids["Source A"],
+        coefficient=1.17,
+        is_active=True,
+    )
+    db.add(assignment)
+    db.get(CompetitorPriceList, first_esik_ids["Source A"]).price_coefficient = 1.17
+    db.commit()
+
+    second_esik = run_import("Есик", "tester-esik-2")
+    assert {row["name"]: row["competitorPriceListId"] for row in second_esik["results"]} == first_esik_ids
+    persisted_assignment = db.get(PriceFormatCompetitorAssignment, assignment.id)
+    assert persisted_assignment.is_active is True
+    assert str(persisted_assignment.coefficient) == "1.170000"
+    assert str(db.get(CompetitorPriceList, first_esik_ids["Source A"]).price_coefficient) == "1.170000"
+
+    almaty = run_import("Алматы", "tester-almaty")
+    shymkent = run_import("Шымкент", "tester-shymkent")
+    almaty_ids = {row["name"]: row["competitorPriceListId"] for row in almaty["results"]}
+    shymkent_ids = {row["name"]: row["competitorPriceListId"] for row in shymkent["results"]}
+    assert first_esik_ids["Source A"] != almaty_ids["Source A"]
+    assert first_esik_ids["Source A"] != shymkent_ids["Source A"]
+    assert almaty_ids["Source A"] != shymkent_ids["Source A"]
+    assert db.get(CompetitorPriceList, almaty_ids["Source A"]).branch_name == "Алматы"
+    assert db.get(CompetitorPriceList, shymkent_ids["Source A"]).branch_name == "Шымкент"
+    assert {
+        row["name"]: row["competitorPriceListId"]
+        for row in run_import("Алматы", "tester-almaty-2")["results"]
+    } == almaty_ids
+    assert {
+        row["name"]: row["competitorPriceListId"]
+        for row in run_import("Шымкент", "tester-shymkent-2")["results"]
+    } == shymkent_ids
+
+
+def test_multi_source_preview_requires_explicit_branch():
+    db = _session()
+    pf = PriceFormat(code="ALM-FMT", name="Almaty format", branch="Алматы")
+    db.add(pf)
+    db.commit()
+    content = _pivot_xlsx([])
+
+    with pytest.raises(ValueError, match="Не выбран филиал"):
+        service.preview_vidman_multi_source_file(
+            db=db, price_format=pf, branch="", content=content, filename="client.xlsx"
+        )
+
+
+def test_multi_source_preview_endpoint_returns_400_when_branch_is_missing():
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        db.add(PriceFormat(code="ALM-FMT", name="Almaty format", branch="Алматы"))
+        db.commit()
+
+    def override_db():
+        with Session() as db:
+            yield db
+
+    user = AppUser(id=1, username="vidman-admin", role="admin", is_active=True)
+    main.app.dependency_overrides[main.get_db] = override_db
+    main.app.dependency_overrides[main.require_write_access] = lambda: user
+    try:
+        response = TestClient(main.app).post(
+            "/api/price-formats/ALM-FMT/vidman-file/preview",
+            files={"file": ("client.xlsx", _pivot_xlsx([]), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        )
+    finally:
+        main.app.dependency_overrides.pop(main.get_db, None)
+        main.app.dependency_overrides.pop(main.require_write_access, None)
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Не выбран филиал для импорта Vidman-файла."
+
+
 def test_bad_source_block_preserves_its_snapshot_and_modes_are_independent():
     db = _session()
     pf = PriceFormat(code="AKT", name="Aktau", branch="Aktau")
@@ -729,7 +866,7 @@ def test_bad_source_block_preserves_its_snapshot_and_modes_are_independent():
     first_content = _pivot_xlsx([["1", None, "D", "One", "", "Maker", 10, 1, 20, 1, 30, 1]])
     first_checksum = service.parse_vidman_pivot_file(first_content, "first.xlsx", context="Aktau").checksum
     first = service.import_vidman_multi_source_file(
-        db=db, price_format=pf, content=first_content, filename="first.xlsx",
+        db=db, price_format=pf, branch=pf.branch, content=first_content, filename="first.xlsx",
         expected_checksum=first_checksum, allow_incomplete=False, requested_by="tester",
     )
     ids = {row["name"]: row["competitorPriceListId"] for row in first["results"]}
@@ -737,7 +874,7 @@ def test_bad_source_block_preserves_its_snapshot_and_modes_are_independent():
     second_content = _pivot_xlsx([["missing", None, "D", "Unknown", "", "Maker", 11, 1, 99, 1, 31, 1], ["2", None, "D2", "Two", "", "Maker", 12, 1, None, None, 32, 1]])
     second_checksum = service.parse_vidman_pivot_file(second_content, "second.xlsx", context="Aktau").checksum
     second = service.import_vidman_multi_source_file(
-        db=db, price_format=pf, content=second_content, filename="second.xlsx",
+        db=db, price_format=pf, branch=pf.branch, content=second_content, filename="second.xlsx",
         expected_checksum=second_checksum, allow_incomplete=False, requested_by="tester",
     )
     source_b_result = next(row for row in second["results"] if row["name"] == "Source B")

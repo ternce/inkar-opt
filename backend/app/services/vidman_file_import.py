@@ -1278,9 +1278,12 @@ def _existing_file_source(db: Session, stable_key: str) -> CompetitorPriceList |
 
 
 def preview_vidman_multi_source_file(
-    *, db: Session, price_format: PriceFormat, content: bytes, filename: str
+    *, db: Session, price_format: PriceFormat, branch: str, content: bytes, filename: str
 ) -> dict[str, Any]:
-    parsed = parse_vidman_pivot_file(content, filename, context=price_format.branch or price_format.code)
+    target_branch = str(branch or "").strip()
+    if not target_branch:
+        raise ValueError("Не выбран филиал для импорта Vidman-файла.")
+    parsed = parse_vidman_pivot_file(content, filename, context=target_branch)
     exact, folded, numeric, by_goods_id = _product_code_index(db)
     source_reports: list[dict[str, Any]] = []
     totals = {"validRows": 0, "matchedRows": 0, "unmatchedRows": 0, "invalidRows": 0, "duplicateRows": 0}
@@ -1336,6 +1339,7 @@ def preview_vidman_multi_source_file(
     return {
         "ok": True,
         "mode": "dry_run",
+        "branch": target_branch,
         "filename": parsed.filename,
         "fileType": parsed.file_type,
         "sheet": parsed.sheet,
@@ -1360,19 +1364,23 @@ def import_vidman_multi_source_file(
     *,
     db: Session,
     price_format: PriceFormat,
+    branch: str,
     content: bytes,
     filename: str,
     expected_checksum: str,
     allow_incomplete: bool,
     requested_by: str,
 ) -> dict[str, Any]:
-    parsed = parse_vidman_pivot_file(content, filename, context=price_format.branch or price_format.code)
+    target_branch = str(branch or "").strip()
+    if not target_branch:
+        raise ValueError("Не выбран филиал для импорта Vidman-файла.")
+    parsed = parse_vidman_pivot_file(content, filename, context=target_branch)
     if not expected_checksum or parsed.checksum != str(expected_checksum).strip().lower():
         raise ValueError("file checksum does not match the confirmed preview")
     exact, folded, numeric, by_goods_id = _product_code_index(db)
     batch_id = f"vidman-file-{uuid.uuid4().hex}"
     owner_token = new_owner_token()
-    lock_name = f"vidman_multi_file:{price_format.branch or price_format.code}"
+    lock_name = f"vidman_multi_file:{target_branch}"
     if not try_acquire_lock(
         db,
         name=lock_name,
@@ -1485,13 +1493,13 @@ def import_vidman_multi_source_file(
                         db.add(price_list)
                         db.flush()
                     now = now_kz_naive()
-                    price_list.display_name = source.name
+                    price_list.display_name = f"{target_branch} — {source.name} — vidman-file"
                     price_list.supplier = source.name
                     price_list.competitor_name = source.name
-                    price_list.region = price_format.branch or ""
-                    price_list.branch_id = price_format.branch or ""
-                    price_list.branch_code = price_format.branch or ""
-                    price_list.branch_name = price_format.branch or ""
+                    price_list.region = target_branch
+                    price_list.branch_id = target_branch
+                    price_list.branch_code = target_branch
+                    price_list.branch_name = target_branch
                     price_list.external_price_list_id = source.stable_key
                     price_list.sync_batch_id = batch_id
                     price_list.source_updated_at = now.isoformat()
@@ -1603,7 +1611,7 @@ def import_vidman_multi_source_file(
                     "batchId": batch_id,
                     "priceFormatId": int(price_format.id),
                     "priceFormatCode": price_format.code,
-                    "branch": price_format.branch,
+                    "branch": target_branch,
                     "results": results,
                 },
                 ensure_ascii=False,
@@ -1623,7 +1631,7 @@ def import_vidman_multi_source_file(
                 db.rollback()
                 warnings.append(f"downstream_rebuild_failed:{price_format_id}")
                 logger.exception("Downstream rebuild failed after committed multi-source Vidman import")
-        return {"ok": True, "batchId": batch_id, "batchImportId": int(batch_history.id), "filename": parsed.filename, "detectedSources": len(parsed.sources), "results": results, "warnings": warnings}
+        return {"ok": True, "branch": target_branch, "batchId": batch_id, "batchImportId": int(batch_history.id), "filename": parsed.filename, "detectedSources": len(parsed.sources), "results": results, "warnings": warnings}
     finally:
         try:
             release_lock(db, name=lock_name, owner_token=owner_token)

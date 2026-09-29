@@ -58,6 +58,7 @@ type CompetitorSource = {
 
 type ManualImportReport = {
   ok?: boolean;
+  branch?: string;
   status?: string;
   id?: number;
   importId?: number;
@@ -402,6 +403,7 @@ type ProvisorDiagnostics = {
 
 type Props = {
   formatCode: string;
+  branch: string;
   currentUser: { id: number; role: string; displayName: string };
 };
 
@@ -775,7 +777,7 @@ function PercentileBrowser({
   );
 }
 
-export function CompetitorsTab({ formatCode, currentUser }: Props) {
+export function CompetitorsTab({ formatCode, branch, currentUser }: Props) {
   const [activeTab, setActiveTab] = useState<CompetitorsInternalTab>('price-lists');
   const [sources, setSources] = useState<CompetitorSource[]>([]);
   const [sourceSearch, setSourceSearch] = useState('');
@@ -1405,6 +1407,7 @@ export function CompetitorsTab({ formatCode, currentUser }: Props) {
     try {
       const fd = new FormData();
       fd.append('file', vidmanFile);
+      fd.append('branch', branch);
       const res = await fetch(`/api/price-formats/${encodeURIComponent(formatCode)}/vidman-file/preview`, { method: 'POST', body: fd });
       const text = await res.text();
       const data = parseJsonOrNull(text);
@@ -1428,6 +1431,7 @@ export function CompetitorsTab({ formatCode, currentUser }: Props) {
       fd.append('file', vidmanFile);
       fd.append('checksum', vidmanReport.confirmationToken);
       fd.append('allow_incomplete', String(vidmanAllowIncomplete));
+      fd.append('branch', branch);
       const res = await fetch(`/api/price-formats/${encodeURIComponent(formatCode)}/vidman-file/confirm`, { method: 'POST', body: fd });
       const text = await res.text();
       const data = parseJsonOrNull(text);
@@ -2940,6 +2944,7 @@ export function CompetitorsTab({ formatCode, currentUser }: Props) {
           <div className="space-y-4">
             <div className="rounded border border-gray-200 p-3 text-sm text-gray-700">
               Загрузите XLS/XLSX-файл Vidman. Система автоматически определит поставщиков в файле, сопоставит товары по коду и создаст или обновит каждый ПЛК отдельно.
+              <div className="mt-2 font-semibold text-gray-900">Филиал: {vidmanReport?.branch || branch || 'не выбран'}</div>
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <Input className="max-w-md" type="file" accept=".xlsx,.xls" onChange={(e) => { setVidmanFile(e.target.files?.[0] || null); setVidmanReport(null); setVidmanError(null); }} />
