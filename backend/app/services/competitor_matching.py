@@ -29,7 +29,7 @@ from ..models import (
     SourceGoodsMatch,
 )
 from .competitors.code_mappings import apply_manual_mappings_to_items
-from .competitor_assignments import get_assigned_competitor_price_lists
+from .competitor_assignments import get_assigned_competitor_price_lists, repair_manual_vidman_assignment_modes
 from .competitor_coefficients import effective_price_coefficient
 from .competitor_source_config import MULTI_PRICE_PERCENTILE_MODE, default_percentile_mode_for_source, effective_percentile_mode
 from .manufacturers import normalize_manufacturer
@@ -3830,6 +3830,20 @@ def rematch_price_list_items_by_product(
         .all()
     )
     loaded_at = time.perf_counter()
+    authoritative_manual_vidman_matches = {
+        int(item.id): (
+            int(item.product_id),
+            str(item.matched_sku or ""),
+            str(item.match_key or ""),
+            str(item.match_type or "manual_vidman_sku"),
+            item.match_score,
+        )
+        for item in items
+        if price_list.source_type == "manual_vidman"
+        and item.product_id is not None
+        and str(item.matched_sku or "").strip()
+        and str(item.match_type or "").startswith("manual_vidman_")
+    }
     supplier_indexes = _build_supplier_indexes(price_list=price_list, items=items)
     supplier_candidates = supplier_indexes.candidates
     supplier_token_index = supplier_indexes.token_index
@@ -3916,11 +3930,43 @@ def rematch_price_list_items_by_product(
     source_matches_by_product: dict[int, list[SourceGoodsMatch]] = defaultdict(list)
     for saved in source_matches.values():
         source_matches_by_product[int(saved.product_id)].append(saved)
-    manual_mapping_result = apply_manual_mappings_to_items(db=db, price_list=price_list, items=items)
+    manual_mapping_items = [
+        item for item in items if int(item.id) not in authoritative_manual_vidman_matches
+    ]
+    manual_mapping_result = apply_manual_mappings_to_items(
+        db=db,
+        price_list=price_list,
+        items=manual_mapping_items,
+    )
     used_item_ids: set[int] = set(manual_mapping_result.get("itemIds") or set())
     manual_mapped_product_ids: set[int] = set(manual_mapping_result.get("productIds") or set())
     stats["matchedByManualMapping"] = int(manual_mapping_result.get("applied") or 0)
     stats["manualRejected"] = int(manual_mapping_result.get("rejected") or 0)
+    authoritative_product_ids: set[int] = set()
+    valid_product_ids = {int(product.id) for product in products}
+    if authoritative_manual_vidman_matches:
+        for item in items:
+            saved = authoritative_manual_vidman_matches.get(int(item.id))
+            if saved is None or saved[0] not in valid_product_ids:
+                continue
+            product_id, matched_sku, match_key, match_type, match_score = saved
+            item.product_id = product_id
+            item.matched_sku = matched_sku
+            item.match_key = match_key
+            item.match_type = match_type
+            item.match_score = match_score
+            used_item_ids.add(int(item.id))
+            authoritative_product_ids.add(product_id)
+        manual_mapped_product_ids.update(authoritative_product_ids)
+        restored_count = sum(
+            1
+            for item in items
+            if int(item.id) in authoritative_manual_vidman_matches
+            and item.product_id is not None
+            and int(item.product_id) in authoritative_product_ids
+        )
+        stats["matchedBySku"] += restored_count
+        stats["authoritativeManualVidmanMappings"] = restored_count
 
     for product in products:
         if int(product.id) in manual_mapped_product_ids:
@@ -4681,6 +4727,7 @@ def rebuild_competitor_prices_for_selected(
     total_started_at = time.perf_counter()
     operation = f"rebuild_competitor_prices:{price_format_id}"
     _timing(operation, "start_selection/rebuild", total_started_at)
+    repair_manual_vidman_assignment_modes(db=db, price_format_id=price_format_id)
     assigned = get_assigned_competitor_price_lists(db=db, price_format_id=price_format_id)
     skipped_aggregated = [
         item

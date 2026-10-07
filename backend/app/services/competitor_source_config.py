@@ -93,6 +93,11 @@ def default_percentile_mode_for_source(row: CompetitorPriceList) -> str:
     """Default source behavior kept outside percentile calculation logic."""
 
     source_type = _text(row.source_type)
+    # Manual Vidman files publish one physical price per source column.  A
+    # source named "Эмити" must not inherit Emit's aggregated-percentile mode
+    # merely because its display metadata contains an Emit marker.
+    if source_type == "manual_vidman":
+        return ""
     names = " ".join(
         _text(value)
         for value in (
@@ -109,6 +114,10 @@ def default_percentile_mode_for_source(row: CompetitorPriceList) -> str:
 
 
 def effective_percentile_mode(row: CompetitorPriceList, configured_mode: object = "") -> str:
+    # Old assignments may have persisted the former, marker-derived default.
+    # Keep manual Vidman physical even before that stale value is repaired.
+    if _text(row.source_type) == "manual_vidman":
+        return ""
     mode = str(configured_mode or "").strip()
     return mode or default_percentile_mode_for_source(row)
 

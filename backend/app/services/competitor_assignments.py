@@ -312,6 +312,39 @@ def selected_price_format_ids_for_competitor_price_list(*, db: Session, competit
     return [int(item) for item in rows if item is not None]
 
 
+def repair_manual_vidman_assignment_modes(*, db: Session, price_format_id: int | None = None) -> list[int]:
+    """Restore stale manual Vidman assignments to physical-source behavior.
+
+    The old name-marker default could persist Emit's multi-price mode on a
+    manual source named "Эмити".  Limit the repair to that exact source type
+    and stale mode; genuine Emit assignments are never selected here.
+    """
+
+    stmt = (
+        select(PriceFormatCompetitorAssignment)
+        .join(
+            CompetitorPriceList,
+            CompetitorPriceList.id == PriceFormatCompetitorAssignment.competitor_price_list_id,
+        )
+        .where(CompetitorPriceList.source_type == "manual_vidman")
+        .where(PriceFormatCompetitorAssignment.percentile_mode == MULTI_PRICE_PERCENTILE_MODE)
+    )
+    if price_format_id is not None:
+        stmt = stmt.where(PriceFormatCompetitorAssignment.price_format_id == int(price_format_id))
+    rows = db.execute(stmt).scalars().all()
+    now = datetime.utcnow()
+    for row in rows:
+        row.percentile_mode = ""
+        row.updated_at = now
+    if rows:
+        logger.info(
+            "[MANUAL_VIDMAN_ASSIGNMENT_REPAIR] price_format_id=%s repaired_assignment_ids=%s",
+            price_format_id if price_format_id is not None else "all",
+            [int(row.id) for row in rows],
+        )
+    return [int(row.id) for row in rows]
+
+
 def get_assignment(
     *,
     db: Session,
