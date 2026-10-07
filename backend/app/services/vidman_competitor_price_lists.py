@@ -27,7 +27,7 @@ from .competitor_matching import rebuild_competitor_prices_for_selected
 from .competitor_persist import _ensure_price_format
 from .competitor_price_lists import _replace_legacy_price_rows_for_list, sync_selected_competitor_configs
 from .competitor_assignments import selected_price_format_ids_for_competitor_price_list
-from .competitor_read_models import refresh_price_list_item_counters
+from .competitor_read_models import refresh_price_list_matched_item_counters
 from .competitor_source_config import canonical_competitor_source_key
 from .percentile_preparation import enqueue_percentile_preparation
 from .vidman_product_matching import AUTO_MATCHED, MANUALLY_APPROVED
@@ -480,11 +480,6 @@ def build_vidman_competitor_price_list(
     price_list.price_coefficient = source.price_coefficient
     price_list.updated_at = datetime.utcnow()
 
-    db.execute(
-        delete(CompetitorPriceListItem)
-        .where(CompetitorPriceListItem.price_list_id == price_list.id)
-        .execution_options(synchronize_session=False)
-    )
     mappings: list[dict[str, Any]] = []
     for row in publish_rows:
         raw = row["raw"]
@@ -536,9 +531,16 @@ def build_vidman_competitor_price_list(
                 ),
             }
         )
+    db.execute(
+        delete(CompetitorPriceListItem)
+        .where(CompetitorPriceListItem.price_list_id == price_list.id)
+        .execution_options(synchronize_session=False)
+    )
     db.bulk_insert_mappings(CompetitorPriceListItem, mappings)
     db.flush()
-    refresh_price_list_item_counters(db=db, price_list_ids=[int(price_list.id)])
+    refresh_price_list_matched_item_counters(
+        db=db, item_counts={int(price_list.id): len(mappings)}
+    )
 
     source.last_successful_import_run_id = int(import_run_id)
     source.competitor_price_list_id = int(price_list.id)

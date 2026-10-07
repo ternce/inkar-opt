@@ -44,24 +44,49 @@ def get_database_url() -> str:
     return url
 
 
+database_url = get_database_url()
+
 engine = create_engine(
-    get_database_url(),
-    connect_args={"check_same_thread": False} if get_database_url().startswith("sqlite") else {},
+    database_url,
+    connect_args={"check_same_thread": False} if database_url.startswith("sqlite") else {},
 )
 
 
-@event.listens_for(engine, "connect")
-def _configure_sqlite_connection(dbapi_connection, connection_record) -> None:
-    if not get_database_url().startswith("sqlite"):
-        return
+def _configure_connection(
+    dbapi_connection,
+    connection_record=None,
+    *,
+    url: str | None = None,
+    process_role: str | None = None,
+) -> None:
+    resolved_url = url or database_url
     cursor = dbapi_connection.cursor()
     try:
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA synchronous=NORMAL")
-        cursor.execute("PRAGMA busy_timeout=15000")
-        cursor.execute("PRAGMA foreign_keys=ON")
+        if resolved_url.startswith("sqlite"):
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA busy_timeout=15000")
+            cursor.execute("PRAGMA foreign_keys=ON")
+            return
+
+        role = (process_role or os.getenv("PROCESS_ROLE", "all")).strip().lower() or "all"
+        if resolved_url.startswith("postgresql") and role == "web":
+            # These are session-level limits. The connect hook runs once for each
+            # physical connection, and the settings remain when it is pooled.
+            cursor.execute("SET statement_timeout = '120s'")
+            cursor.execute("SET lock_timeout = '10s'")
+            cursor.execute("SET idle_in_transaction_session_timeout = '180s'")
+            # psycopg starts a transaction for SET when autocommit is disabled.
+            # Commit only this new-connection initialization transaction so the
+            # first borrower receives an idle, pool-safe connection.
+            dbapi_connection.commit()
     finally:
         cursor.close()
+
+
+@event.listens_for(engine, "connect")
+def _configure_engine_connection(dbapi_connection, connection_record) -> None:
+    _configure_connection(dbapi_connection, connection_record)
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 

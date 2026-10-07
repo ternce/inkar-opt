@@ -1910,6 +1910,7 @@ async def provisor_prices(
                     return {"_persist": {"ok": True, **stats.to_dict()}}
                 return {"items": items, "_persist": {"ok": True, **stats.to_dict()}}
             except Exception as e:
+                db.rollback()
                 if persist_only:
                     return {"_persist": {"ok": False, "error": str(e)}}
                 return {"items": items, "_persist": {"ok": False, "error": str(e)}}

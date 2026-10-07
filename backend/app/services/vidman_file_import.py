@@ -47,7 +47,7 @@ from .vidman_competitor_price_lists import (
 from .competitor_assignments import selected_price_format_ids_for_competitor_price_list
 from .competitor_matching import rebuild_competitor_prices_for_selected
 from .competitor_price_lists import sync_selected_competitor_configs
-from .competitor_read_models import refresh_price_list_item_counters
+from .competitor_read_models import refresh_price_list_matched_item_counters
 from .percentile_preparation import enqueue_percentile_preparation
 from .vidman_normalization import _canonical_from_parsed, parse_vidman_product, process_vidman_stage2
 from .vidman_product_matching import (
@@ -1460,6 +1460,7 @@ def import_vidman_multi_source_file(
                         "preservedPreviousSnapshot": preserved,
                     }
                 )
+                db.commit()
                 continue
             matched_rows = []
             unmatched = 0
@@ -1482,11 +1483,15 @@ def import_vidman_multi_source_file(
             suspicious = bool(current_rows >= COMPLETENESS_MIN_CURRENT_ROWS and Decimal(len(matched_rows)) < Decimal(current_rows) * COMPLETENESS_WARN_RATIO)
             if suspicious and not allow_incomplete:
                 results.append({"name": source.name, "stableKey": source.stable_key, "status": "blocked", "error": "completeness_override_required", "preservedPreviousSnapshot": True})
+                db.rollback()
                 continue
             if not matched_rows:
                 results.append({"name": source.name, "stableKey": source.stable_key, "status": "error", "error": "no_internal_sku_matches", "preservedPreviousSnapshot": bool(existing)})
+                db.rollback()
                 continue
             try:
+                source_affected_ids: list[int] = []
+                source_result: dict[str, Any]
                 with db.begin_nested():
                     price_list = existing
                     if price_list is None:
@@ -1517,40 +1522,42 @@ def import_vidman_multi_source_file(
                     price_list.price_date = date.today()
                     price_list.update_mode = "manual"
                     price_list.updated_at = now
-                    db.execute(delete(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == price_list.id))
-                    for row, product, matched_sku, sku_field in matched_rows:
-                        db.add(
-                            CompetitorPriceListItem(
-                                price_list_id=price_list.id,
-                                product_id=product.id,
-                                provisor_goods_id=(
-                                    int(row.fallback_sku)
-                                    if row.fallback_sku and re.fullmatch(r"\d+", row.fallback_sku)
-                                    else None
-                                ),
-                                name=row.name or product.name,
-                                distributor_goods_name=row.name or product.name,
-                                distributor_goods_id=row.distributor_sku,
-                                distributor_price=row.price,
-                                stock=row.stock,
-                                expiry_date=row.expiry,
-                                match_key=matched_sku,
-                                match_type=f"manual_vidman_{sku_field.casefold()}",
-                                match_score=Decimal("100"),
-                                matched_sku=product.code,
-                                raw_name=row.name,
-                                raw_manufacturer=row.manufacturer,
-                                raw_json=json.dumps(
-                                    {"origin": "manual_vidman_multi_source", "batchId": batch_id, "primarySku": row.primary_sku, "fallbackSku": row.fallback_sku, "matchedBy": sku_field, "source": source.name},
-                                    ensure_ascii=False,
-                                    default=str,
-                                ),
-                            )
+                    replacement_items = [
+                        CompetitorPriceListItem(
+                            price_list_id=price_list.id,
+                            product_id=product.id,
+                            provisor_goods_id=(
+                                int(item.fallback_sku)
+                                if item.fallback_sku and re.fullmatch(r"\d+", item.fallback_sku)
+                                else None
+                            ),
+                            name=item.name or product.name,
+                            distributor_goods_name=item.name or product.name,
+                            distributor_goods_id=item.distributor_sku,
+                            distributor_price=item.price,
+                            stock=item.stock,
+                            expiry_date=item.expiry,
+                            match_key=matched_sku,
+                            match_type=f"manual_vidman_{sku_field.casefold()}",
+                            match_score=Decimal("100"),
+                            matched_sku=product.code,
+                            raw_name=item.name,
+                            raw_manufacturer=item.manufacturer,
+                            raw_json=json.dumps(
+                                {"origin": "manual_vidman_multi_source", "batchId": batch_id, "primarySku": item.primary_sku, "fallbackSku": item.fallback_sku, "matchedBy": sku_field, "source": source.name},
+                                ensure_ascii=False,
+                                default=str,
+                            ),
                         )
+                        for item, product, matched_sku, sku_field in matched_rows
+                    ]
+                    db.execute(delete(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == price_list.id))
+                    db.add_all(replacement_items)
                     db.flush()
-                    refresh_price_list_item_counters(db=db, price_list_ids=[int(price_list.id)])
-                    assigned_ids = selected_price_format_ids_for_competitor_price_list(db=db, competitor_price_list_id=int(price_list.id))
-                    affected_price_formats.update(assigned_ids)
+                    refresh_price_list_matched_item_counters(
+                        db=db, item_counts={int(price_list.id): len(matched_rows)}
+                    )
+                    source_affected_ids = selected_price_format_ids_for_competitor_price_list(db=db, competitor_price_list_id=int(price_list.id))
                     history = ManualPriceListImport(
                         competitor_price_list_id=price_list.id,
                         source_key=source.stable_key,
@@ -1574,8 +1581,12 @@ def import_vidman_multi_source_file(
                     )
                     db.add(history)
                     db.flush()
-                    results.append({"name": source.name, "stableKey": source.stable_key, "competitorPriceListId": int(price_list.id), "importId": int(history.id), "status": history.status, "matchedRows": len(matched_rows), "unmatchedRows": unmatched, "rowsWritten": len(matched_rows), "updateMode": "manual", "preservedAssignments": True})
+                    source_result = {"name": source.name, "stableKey": source.stable_key, "competitorPriceListId": int(price_list.id), "importId": int(history.id), "status": history.status, "matchedRows": len(matched_rows), "unmatchedRows": unmatched, "rowsWritten": len(matched_rows), "updateMode": "manual", "preservedAssignments": True}
+                db.commit()
+                affected_price_formats.update(source_affected_ids)
+                results.append(source_result)
             except Exception as exc:
+                db.rollback()
                 logger.exception("Failed one source in Vidman multi-source import: %s", source.name)
                 results.append({"name": source.name, "stableKey": source.stable_key, "status": "error", "error": str(exc)[:1000], "preservedPreviousSnapshot": bool(existing)})
 

@@ -4,7 +4,7 @@ import json
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 
 from backend.app.db import Base
@@ -126,6 +126,38 @@ def test_existing_match_fields_survive_refresh_with_column_only_load():
     assert float(saved.match_score) == 87.5
     assert saved.matched_sku == "SKU-A"
     assert refreshed.source_updated_at == "2026-07-27T11:00:00"
+
+
+def test_replacement_uses_known_total_without_unfiltered_live_count():
+    db = _session()
+    _seed(db)
+    statements: list[str] = []
+
+    def capture_sql(_connection, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement.lower())
+
+    event.listen(db.get_bind(), "before_cursor_execute", capture_sql)
+    try:
+        row = upsert_unified_price_list(
+            db=db,
+            price_format_code="FMT",
+            price_list=_price_list(),
+            items=[_item(goods_id=1001, distributor_goods_id="DG-1")],
+            run_matching=False,
+        )
+    finally:
+        event.remove(db.get_bind(), "before_cursor_execute", capture_sql)
+
+    item_count_queries = [
+        statement
+        for statement in statements
+        if "count(" in statement
+        and "from competitor_price_list_items" in statement
+        and "group by competitor_price_list_items.price_list_id" in statement
+    ]
+    assert item_count_queries
+    assert all("distributor_price" in statement for statement in item_count_queries)
+    assert row.items_count == 1
 
 
 def test_refresh_exact_goods_id_relinks_and_raw_json_remains_intact():

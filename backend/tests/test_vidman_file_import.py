@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -845,6 +845,102 @@ def test_multi_source_import_reuses_ids_and_preserves_assignments_and_coefficien
     batches = [row for row in db.query(ManualPriceListImport).all() if row.source_key.startswith("vidman-file-batch:")]
     assert len(batches) == 2
     assert all(len(json.loads(row.metadata_json)["results"]) == 3 for row in batches)
+
+
+def test_multi_source_commits_each_source_before_loading_the_next(monkeypatch):
+    db = _session()
+    pf = PriceFormat(code="AKT-COMMITS", name="Aktau", branch="Aktau")
+    db.add(Product(code="0001", name="One", cost=1))
+    db.add(pf)
+    db.commit()
+    content = _pivot_xlsx(
+        [["0001", None, "D-1", "One", "", "Maker", 10, 1, 11, 1, 12, 1]]
+    )
+    checksum = service.parse_vidman_pivot_file(content, "client.xlsx", context="Aktau").checksum
+    commit_count = 0
+    commits_seen_before_source: list[int] = []
+    original_existing = service._existing_file_source
+
+    def after_commit(_session):
+        nonlocal commit_count
+        commit_count += 1
+
+    def tracked_existing(session, source_key):
+        commits_seen_before_source.append(commit_count)
+        return original_existing(session, source_key)
+
+    event.listen(db, "after_commit", after_commit)
+    monkeypatch.setattr(service, "_existing_file_source", tracked_existing)
+    monkeypatch.setattr(service, "enqueue_percentile_preparation", lambda **_kwargs: {})
+    try:
+        result = service.import_vidman_multi_source_file(
+            db=db,
+            price_format=pf,
+            branch=pf.branch,
+            content=content,
+            filename="client.xlsx",
+            expected_checksum=checksum,
+            allow_incomplete=False,
+            requested_by="tester",
+        )
+    finally:
+        event.remove(db, "after_commit", after_commit)
+
+    assert result["ok"] is True
+    assert len(commits_seen_before_source) == 3
+    assert commits_seen_before_source[1] > commits_seen_before_source[0]
+    assert commits_seen_before_source[2] > commits_seen_before_source[1]
+
+
+def test_multi_source_rolls_back_failed_source_and_preserves_completed_sources(monkeypatch):
+    db = _session()
+    pf = PriceFormat(code="AKT-PARTIAL", name="Aktau", branch="Aktau")
+    db.add(Product(code="0001", name="One", cost=1))
+    db.add(pf)
+    db.commit()
+    content = _pivot_xlsx(
+        [["0001", None, "D-1", "One", "", "Maker", 10, 1, 11, 1, 12, 1]]
+    )
+    checksum = service.parse_vidman_pivot_file(content, "client.xlsx", context="Aktau").checksum
+    original_counter = service.refresh_price_list_matched_item_counters
+    counter_calls = 0
+    rollback_count = 0
+
+    def fail_second_counter(**kwargs):
+        nonlocal counter_calls
+        counter_calls += 1
+        if counter_calls == 2:
+            raise RuntimeError("forced source failure")
+        return original_counter(**kwargs)
+
+    def after_rollback(_session):
+        nonlocal rollback_count
+        rollback_count += 1
+
+    event.listen(db, "after_rollback", after_rollback)
+    monkeypatch.setattr(service, "refresh_price_list_matched_item_counters", fail_second_counter)
+    monkeypatch.setattr(service, "enqueue_percentile_preparation", lambda **_kwargs: {})
+    try:
+        result = service.import_vidman_multi_source_file(
+            db=db,
+            price_format=pf,
+            branch=pf.branch,
+            content=content,
+            filename="client.xlsx",
+            expected_checksum=checksum,
+            allow_incomplete=False,
+            requested_by="tester",
+        )
+    finally:
+        event.remove(db, "after_rollback", after_rollback)
+
+    by_name = {row["name"]: row for row in result["results"]}
+    assert by_name["Source A"]["status"] == "success"
+    assert by_name["Source B"]["status"] == "error"
+    assert "forced source failure" in by_name["Source B"]["error"]
+    assert by_name["Source C"]["status"] == "success"
+    assert rollback_count >= 1
+    assert db.get(CompetitorPriceList, by_name["Source A"]["competitorPriceListId"]) is not None
 
 
 def test_multi_source_import_uses_explicit_branch_for_identity_and_display(monkeypatch):

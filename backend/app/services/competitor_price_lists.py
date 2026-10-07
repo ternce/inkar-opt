@@ -50,7 +50,7 @@ from .competitor_assignments import (
     selected_price_format_ids_for_competitor_price_list,
     set_competitor_assignments,
 )
-from .competitor_read_models import refresh_price_list_item_counters
+from .competitor_read_models import refresh_price_list_item_counters, refresh_price_list_matched_item_counters
 from .competitor_coefficients import effective_price_coefficient, validate_price_coefficient
 from .competitor_percentiles import DEFAULT_BRANCH
 from .percentile_preparation import enqueue_percentile_preparation
@@ -966,8 +966,6 @@ def upsert_provisor_price_list(
     row.updated_at = datetime.utcnow()
     _move_vidman_selection_to_latest_duplicate(db, row)
 
-    db.execute(delete(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == row.id))
-
     code_to_id: dict[str, int] = {}
     if run_matching:
         codes = list(
@@ -980,6 +978,7 @@ def upsert_provisor_price_list(
         codes = [x for x in codes if x]
         code_to_id = dict(db.execute(select(Product.code, Product.id).where(Product.code.in_(codes))).all()) if codes else {}
 
+    replacement_items: list[CompetitorPriceListItem] = []
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -1011,7 +1010,7 @@ def upsert_provisor_price_list(
         else:
             package_count = None
 
-        db.add(
+        replacement_items.append(
             CompetitorPriceListItem(
                 price_list_id=row.id,
                 product_id=product_id,
@@ -1035,16 +1034,20 @@ def upsert_provisor_price_list(
             )
         )
 
+    db.execute(delete(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == row.id))
+    db.add_all(replacement_items)
+    inserted_items_count = len(replacement_items)
+
     db.flush()
-    refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
     if int(filial_id) in PROVISOR_REFERENCE_FILIAL_IDS:
         _sync_provisor_reference_mapping_from_items(db, account_id="")
     if run_matching:
         rematch_price_list_items_by_product(db=db, price_list=row)
-        refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
+        refresh_price_list_matched_item_counters(db=db, item_counts={int(row.id): inserted_items_count})
         _replace_legacy_price_rows_for_list(db=db, price_list=row)
         affected_price_format_ids = _refresh_selected_price_formats_for_source(db=db, row=row)
     else:
+        refresh_price_list_matched_item_counters(db=db, item_counts={int(row.id): inserted_items_count})
         affected_price_format_ids = []
     db.commit()
     if run_matching:
@@ -1214,16 +1217,6 @@ def upsert_unified_price_list(
     benchmark["preserved_match_fields_count"] = len(preserved_match_fields)
     _db_save_timing(price_list_id=row.id, stage="load_existing_match_fields", rows=existing_count, started_at=stage_started_at)
 
-    stage_started_at = time.perf_counter()
-    delete_result = db.execute(
-        delete(CompetitorPriceListItem)
-        .where(CompetitorPriceListItem.price_list_id == row.id)
-        .execution_options(synchronize_session=False)
-    )
-    benchmark["delete_old_items_sec"] = round(time.perf_counter() - stage_started_at, 6)
-    benchmark["deleted_rows_count"] = int(delete_result.rowcount or 0)
-    _db_save_timing(price_list_id=row.id, stage="delete_old_items", rows=int(delete_result.rowcount or 0), started_at=stage_started_at)
-
     code_to_id: dict[str, int] = {}
     if run_matching:
         sku_candidates = [
@@ -1257,6 +1250,16 @@ def upsert_unified_price_list(
         for key in manufacturer_inputs
     }
     _prepare_rows_timing(price_list_id=row.id, stage="resolve_manufacturers_bulk_or_cache", rows=len(manufacturer_cache), started_at=stage_started_at)
+
+    stage_started_at = time.perf_counter()
+    delete_result = db.execute(
+        delete(CompetitorPriceListItem)
+        .where(CompetitorPriceListItem.price_list_id == row.id)
+        .execution_options(synchronize_session=False)
+    )
+    benchmark["delete_old_items_sec"] = round(time.perf_counter() - stage_started_at, 6)
+    benchmark["deleted_rows_count"] = int(delete_result.rowcount or 0)
+    _db_save_timing(price_list_id=row.id, stage="delete_old_items", rows=int(delete_result.rowcount or 0), started_at=stage_started_at)
 
     stage_started_at = time.perf_counter()
     empty_structure_fields = _empty_match_structure_fields()
@@ -1444,12 +1447,12 @@ def upsert_unified_price_list(
     counters_started_at = time.perf_counter()
     if run_matching:
         rematch_price_list_items_by_product(db=db, price_list=row)
-        refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
+        refresh_price_list_matched_item_counters(db=db, item_counts={int(row.id): inserted_rows_count})
         _replace_legacy_price_rows_for_list(db=db, price_list=row)
         affected_price_format_ids = _refresh_selected_price_formats_for_source(db=db, row=row)
     else:
         affected_price_format_ids = []
-        refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
+        refresh_price_list_matched_item_counters(db=db, item_counts={int(row.id): inserted_rows_count})
         benchmark["counters_sec"] = round(time.perf_counter() - counters_started_at, 6)
         materialize_started_at = time.perf_counter()
         materialized_price_format_ids = (
@@ -1711,7 +1714,7 @@ def list_competitor_price_lists(
     for row in all_rows:
         visible = int(row.id) in visible_ids
         hidden_reason = "" if visible else _price_list_assignment_hidden_reason(row, counts)
-        logger.info(
+        logger.debug(
             "[PRICE_LIST_ASSIGNMENT_DEBUG] source_type=%s account_id=%s price_list_id=%s price_name=%s items_count=%s real_items_count_from_db=%s visible=%s hidden_reason=%s",
             row.source_type or "",
             row.account_id or "",

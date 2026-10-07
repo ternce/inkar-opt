@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
@@ -74,6 +74,34 @@ def refresh_price_list_item_counters(*, db: Session, price_list_ids: Iterable[in
         if row is not None:
             row.items_count = item_count
             row.matched_positive_items_count = matched_count
+    return counts
+
+
+def refresh_price_list_matched_item_counters(
+    *, db: Session, item_counts: Mapping[int, int]
+) -> dict[int, tuple[int, int]]:
+    """Persist known totals while recalculating only the match-dependent count."""
+    totals = {int(price_list_id): int(count or 0) for price_list_id, count in item_counts.items()}
+    ids = _ids(totals)
+    if not ids:
+        return {}
+    matched_counts = dict(
+        db.execute(
+            select(CompetitorPriceListItem.price_list_id, func.count())
+            .where(CompetitorPriceListItem.price_list_id.in_(ids))
+            .where(*matched_positive_item_filter())
+            .group_by(CompetitorPriceListItem.price_list_id)
+        ).all()
+    )
+    counts: dict[int, tuple[int, int]] = {}
+    for price_list_id in ids:
+        item_count = totals.get(price_list_id, 0)
+        matched_count = int(matched_counts.get(price_list_id, 0) or 0)
+        row = db.get(CompetitorPriceList, price_list_id)
+        if row is not None:
+            row.items_count = item_count
+            row.matched_positive_items_count = matched_count
+        counts[price_list_id] = (item_count, matched_count)
     return counts
 
 

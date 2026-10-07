@@ -35,7 +35,7 @@ from .db_time import db_now
 from .competitor_percentiles import recalculate_emit_percentiles_globally
 from .emit_percentile_resolver import global_emit_percentile_storage_price_format_id
 from .percentile_preparation import mark_percentile_preparation_ready_for_catalog
-from .competitor_read_models import refresh_price_list_item_counters
+from .competitor_read_models import refresh_price_list_matched_item_counters
 from .competitor_source_config import canonical_competitor_source_key, emit_display_name
 from .competitor_persist import _ensure_price_format
 from .manufacturers import _clean_text, _extract_manufacturer_cleaned, _normalize_manufacturer_cleaned, resolve_manufacturer
@@ -2752,7 +2752,10 @@ def replace_emit_price_list_from_staging(
     stats.db_replace_elapsed_sec = round(time.perf_counter() - started, 3)
     flush_started = time.perf_counter()
     db.flush()
-    refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
+    refresh_price_list_matched_item_counters(
+        db=db,
+        item_counts={int(row.id): int(stats.final_production_row_count or final_count)},
+    )
     _add_elapsed(stats, "flush_elapsed", flush_started)
     trace_goods_id = _trace_goods_id()
     if trace_goods_id is not None:

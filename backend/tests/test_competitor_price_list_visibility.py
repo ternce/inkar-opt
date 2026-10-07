@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from datetime import date, datetime
+import logging
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
@@ -139,6 +140,24 @@ def test_global_pool_hides_listed_placeholders_but_shows_attempted_zero_rows():
     assert placeholder.id not in by_id
     assert by_id[empty_success.id]["itemsCount"] == 0
     assert by_id[empty_success.id]["sourceVisibilityState"] == "empty_success"
+
+
+def test_price_list_assignment_debug_is_silent_at_default_info_level(caplog):
+    db = _session()
+    pf = _format(db)
+    price_list = _price_list(
+        db,
+        pf,
+        source_key="4:128",
+        branch_name="Almaty",
+        external_price_list_id=128,
+    )
+    _item(db, price_list)
+
+    with caplog.at_level(logging.INFO):
+        list_competitor_price_lists(db=db, price_format_code=pf.code)
+
+    assert "[PRICE_LIST_ASSIGNMENT_DEBUG]" not in caplog.text
 
 
 def test_list_competitor_price_lists_uses_persisted_item_counts():
