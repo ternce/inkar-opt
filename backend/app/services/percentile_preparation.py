@@ -36,6 +36,7 @@ from .emit_percentile_resolver import (
     emit_percentile_scope_filter,
     global_emit_percentile_rows_count,
     global_emit_percentile_storage_price_format_id,
+    has_global_emit_percentile_rows,
 )
 from .jobs import job_to_dict, update_job
 
@@ -132,17 +133,17 @@ def has_raw_percentile_data(db: Session, price_format_id: int) -> bool:
         )
     ]
     if not ids:
-        return _catalog_percentile_rows_count(db, price_format_id) > 0
-    count = int(
+        return _catalog_percentile_rows_exist(db, price_format_id)
+    return (
         db.execute(
-            select(func.count(CompetitorPriceListItem.id))
+            select(CompetitorPriceListItem.id)
             .where(CompetitorPriceListItem.price_list_id.in_(ids))
             .where(CompetitorPriceListItem.distributor_price.is_not(None))
             .where(CompetitorPriceListItem.distributor_price > 0)
+            .limit(1)
         ).scalar()
-        or 0
+        is not None
     )
-    return count > 0
 
 
 def _selected_catalog_percentile_sources(db: Session, price_format_id: int) -> list[dict[str, Any]]:
@@ -227,6 +228,18 @@ def _catalog_percentile_rows_count(db: Session, price_format_id: int) -> int:
     )
 
 
+def _catalog_percentile_rows_exist(db: Session, price_format_id: int) -> bool:
+    """Cheap availability probe; unlike the repair count, this never scans every matching row."""
+    physical_row = db.execute(
+        select(CompetitorPricePercentile.id)
+        .where(CompetitorPricePercentile.price_format_id == price_format_id)
+        .limit(1)
+    ).scalar()
+    if physical_row is not None:
+        return True
+    return has_global_emit_percentile_rows(db=db, target_price_format_id=price_format_id)
+
+
 def mark_percentile_preparation_ready_for_catalog(
     *,
     db: Session,
@@ -256,8 +269,29 @@ def mark_percentile_preparation_ready_for_catalog(
 
 
 def percentile_preparation_to_dict(db: Session, price_format_id: int) -> dict[str, Any]:
-    row = _status_row(db, price_format_id)
-    rows_count = _catalog_percentile_rows_count(db, price_format_id)
+    started_at = time.perf_counter()
+    row = db.get(PriceFormatPercentilePreparation, price_format_id)
+    fallback_reason = ""
+    if row is None:
+        # Legacy/missing metadata retains the previous exact fallback. A
+        # preparation/catalog writer will persist the authoritative row.
+        fallback_reason = "missing_metadata"
+        rows_count = _catalog_percentile_rows_count(db, price_format_id)
+        row = _status_row(db, price_format_id)
+        row.rows_count = rows_count
+    elif str(row.status or "") in {"stale", "failed"}:
+        # Stale metadata and failed rebuilds are not authoritative: a failed
+        # transaction can leave the previous percentile rows intact.
+        fallback_reason = f"{str(row.status or 'stale')}_metadata"
+        rows_count = _catalog_percentile_rows_count(db, price_format_id)
+    else:
+        rows_count = int(row.rows_count or 0)
+    logger.debug(
+        "[PERF] operation=percentile_preparation_status elapsed_ms=%.2f price_format_count=1 rows=%s live_fallback=%s",
+        (time.perf_counter() - started_at) * 1000,
+        rows_count,
+        fallback_reason or "none",
+    )
     return {
         "priceFormatId": price_format_id,
         "status": row.status or "not_configured",

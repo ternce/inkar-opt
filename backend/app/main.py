@@ -2658,16 +2658,42 @@ def _price_list_by_identifier(db: Session, price_list_id: str) -> tuple[PriceLis
     return row[0], row[1]
 
 
-def _generated_price_list_summary(db: Session, pl: PriceList, pf: PriceFormat) -> dict:
-    sku_count = int(db.execute(select(func.count(CalculatedPrice.id)).where(CalculatedPrice.price_list_id == pl.id)).scalar() or 0)
-    with_competitors = int(
-        db.execute(
-            select(func.count(CalculatedPrice.id))
-            .where(CalculatedPrice.price_list_id == pl.id)
-            .where(CalculatedPrice.competitor_price.is_not(None))
-        ).scalar()
-        or 0
+def _generated_price_list_counts(db: Session, price_list_ids: list[int]) -> dict[int, tuple[int, int]]:
+    started_at = time.perf_counter()
+    ids = sorted({int(price_list_id) for price_list_id in price_list_ids})
+    if not ids:
+        return {}
+    rows = db.execute(
+        select(
+            CalculatedPrice.price_list_id,
+            func.count(CalculatedPrice.id),
+            func.count(CalculatedPrice.id).filter(CalculatedPrice.competitor_price.is_not(None)),
+        )
+        .where(CalculatedPrice.price_list_id.in_(ids))
+        .group_by(CalculatedPrice.price_list_id)
+    ).all()
+    counts = {
+        int(price_list_id): (int(total or 0), int(with_competitors or 0))
+        for price_list_id, total, with_competitors in rows
+    }
+    logger.debug(
+        "[PERF] operation=generated_price_list_counts elapsed_ms=%.2f list_ids=%s rows=%s",
+        (time.perf_counter() - started_at) * 1000,
+        len(ids),
+        len(rows),
     )
+    return counts
+
+
+def _generated_price_list_summary(
+    db: Session,
+    pl: PriceList,
+    pf: PriceFormat,
+    *,
+    counts: dict[int, tuple[int, int]] | None = None,
+) -> dict:
+    resolved_counts = counts if counts is not None else _generated_price_list_counts(db, [int(pl.id)])
+    sku_count, with_competitors = resolved_counts.get(int(pl.id), (0, 0))
     pricing_rule = resolve_price_format_pricing_rule(db=db, pf=pf)
     return {
         "id": pl.id,
@@ -3156,7 +3182,8 @@ def get_report_price_lists(
         stmt = stmt.where(PriceFormat.code == format_code)
     rows = db.execute(stmt.limit(200)).all()
     rows = [(pl, pf) for pl, pf in rows if user_can_access_branch(current_user, _branch_id_for_name(pf.branch), pf.branch)]
-    return [_generated_price_list_summary(db, pl, pf) for pl, pf in rows]
+    counts = _generated_price_list_counts(db, [int(pl.id) for pl, _pf in rows])
+    return [_generated_price_list_summary(db, pl, pf, counts=counts) for pl, pf in rows]
 
 
 @app.get("/api/reports/contexts")
@@ -3168,9 +3195,9 @@ def get_report_contexts(
     selected_branch = _canonical_user_selected_branch(branch, field_name="branch")
     stmt = select(PriceFormat).where(PriceFormat.branch == selected_branch).order_by(PriceFormat.name.asc(), PriceFormat.code.asc())
     formats = _filter_price_formats_for_user(list(db.execute(stmt).scalars().all()), current_user)
-    output = []
+    price_lists_by_format: dict[int, list[PriceList]] = {}
     for pf in formats:
-        price_lists = list(
+        price_lists_by_format[int(pf.id)] = list(
             db.execute(
                 select(PriceList)
                 .where(PriceList.price_format_id == pf.id)
@@ -3179,9 +3206,14 @@ def get_report_contexts(
             .scalars()
             .all()
         )
+    all_price_lists = [price_list for rows in price_lists_by_format.values() for price_list in rows]
+    counts = _generated_price_list_counts(db, [int(pl.id) for pl in all_price_lists])
+    output = []
+    for pf in formats:
+        price_lists = price_lists_by_format[int(pf.id)]
         summaries = []
         for pl in price_lists:
-            summary = _generated_price_list_summary(db, pl, pf)
+            summary = _generated_price_list_summary(db, pl, pf, counts=counts)
             summary["activationDateDisplay"] = summary.get("activationDate") or ""
             summary["activationDate"] = pl.activation_date.isoformat() if pl.activation_date else ""
             summaries.append(summary)
@@ -3559,7 +3591,8 @@ def get_generated_price_lists(
         stmt = stmt.where((PriceList.number.ilike(like)) | (PriceFormat.code.ilike(like)) | (PriceFormat.name.ilike(like)))
     rows = db.execute(stmt.limit(200)).all()
     rows = [(pl, pf) for pl, pf in rows if user_can_access_branch(current_user, _branch_id_for_name(pf.branch), pf.branch)]
-    return [_generated_price_list_summary(db, pl, pf) for pl, pf in rows]
+    counts = _generated_price_list_counts(db, [int(pl.id) for pl, _pf in rows])
+    return [_generated_price_list_summary(db, pl, pf, counts=counts) for pl, pf in rows]
 
 
 @app.get("/api/generated-price-lists/{price_list_id}")
@@ -5703,6 +5736,17 @@ def get_competitors_available():
     return data.COMPETITORS_AVAILABLE
 
 
+def _require_diagnostics_access(current_user: AppUser) -> None:
+    """Keep diagnostics usable in development but admin-only in production."""
+    if settings.environment.strip().lower() in {"prod", "production"} and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="admin required for production diagnostics")
+
+
+def _authoritative_price_list_item_counts(rows: list[CompetitorPriceList]) -> dict[int, int]:
+    """Return importer-maintained counts without rereading the large item table."""
+    return {int(row.id): int(row.items_count or 0) for row in rows}
+
+
 @app.get("/api/debug/matching")
 def debug_matching(
     format_code: str | None = Query(None),
@@ -5710,7 +5754,10 @@ def debug_matching(
     row_limit: int = Query(50, ge=0, le=500),
     vidman_limit: int = Query(10, ge=0, le=50),
     db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
 ):
+    _require_diagnostics_access(current_user)
+    started_at = time.perf_counter()
     pf = None
     if format_code:
         pf = db.execute(select(PriceFormat).where(PriceFormat.code == format_code)).scalars().first()
@@ -5972,7 +6019,7 @@ def debug_matching(
                 }
             )
 
-    return {
+    result = {
         "formatCode": format_code or "",
         "products": int(db.scalar(select(func.count(Product.id))) or 0),
         "priceLists": len(lists),
@@ -5994,6 +6041,13 @@ def debug_matching(
         else [],
         "bySource": by_source,
     }
+    logger.debug(
+        "[PERF] operation=debug_matching elapsed_ms=%.2f list_ids=%s rows=%s",
+        (time.perf_counter() - started_at) * 1000,
+        len(list_ids),
+        int(items_total),
+    )
+    return result
 
 
 @app.get("/api/price-formats/{format_code}/competitors")
@@ -6394,7 +6448,10 @@ def get_provisor_diagnostics(
     format_code: str = Query(..., min_length=1),
     region: str | None = Query(None),
     db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
 ):
+    _require_diagnostics_access(current_user)
+    started_at = time.perf_counter()
     pf = db.execute(select(PriceFormat).where(PriceFormat.code == format_code)).scalars().first()
     if pf is None:
         raise HTTPException(status_code=404, detail="price format not found")
@@ -6491,7 +6548,7 @@ def get_provisor_diagnostics(
     visible_ids = {int(row.id) for row in deduped.values()}
     selected_ids = {int(row.id) for _, row in assignments}
 
-    return {
+    result = {
         "formatCode": format_code,
         "branch": region or pf.branch or "",
         "visibility": {
@@ -6518,6 +6575,13 @@ def get_provisor_diagnostics(
         },
         "referenceFilialCoverage": _provisor_reference_filial_audit(db),
     }
+    logger.debug(
+        "[PERF] operation=provisor_diagnostics elapsed_ms=%.2f list_ids=%s rows=%s",
+        (time.perf_counter() - started_at) * 1000,
+        len(row_ids),
+        sum(int(value or 0) for value in item_counts.values()),
+    )
+    return result
 
 
 @app.get("/api/competitors/percentiles")
@@ -9705,17 +9769,13 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                             .scalars()
                             .all()
                         )
-                    existing_ids = [int(row.id) for row in existing_rows]
-                    item_counts = (
-                        dict(
-                            db.execute(
-                                select(CompetitorPriceListItem.price_list_id, func.count(CompetitorPriceListItem.id))
-                                .where(CompetitorPriceListItem.price_list_id.in_(existing_ids))
-                                .group_by(CompetitorPriceListItem.price_list_id)
-                            ).all()
-                        )
-                        if existing_ids
-                        else {}
+                    state_started_at = time.perf_counter()
+                    item_counts = _authoritative_price_list_item_counts(existing_rows)
+                    logger.debug(
+                        "[PERF] operation=price_list_refresh_local_state elapsed_ms=%.2f list_ids=%s rows=%s",
+                        (time.perf_counter() - state_started_at) * 1000,
+                        len(existing_rows),
+                        sum(item_counts.values()),
                     )
                     for row in existing_rows:
                         state = (

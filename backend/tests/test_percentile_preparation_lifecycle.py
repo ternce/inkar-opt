@@ -185,6 +185,7 @@ def test_failed_preparation_preserves_old_percentile_rows(monkeypatch):
         status = percentile_preparation_to_dict(db, int(pf.id))
         values = db.execute(select(CompetitorPricePercentile.value).where(CompetitorPricePercentile.price_format_id == pf.id)).scalars().all()
         assert status["status"] == "failed"
+        assert status["rowsCount"] == 1
         assert values == [Decimal("77.00")]
 
 
