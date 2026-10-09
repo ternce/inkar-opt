@@ -22,7 +22,7 @@ from ...models import (
     ManualMatchingAssignment,
 )
 from ..competitor_assignments import get_assigned_competitor_price_lists
-from ..competitor_read_models import refresh_price_list_item_counters
+from ..competitor_read_models import matched_positive_item_filter
 from ..provisor_goods import ProvisorGoodsCandidate
 
 logger = logging.getLogger(__name__)
@@ -2617,34 +2617,94 @@ def apply_mapping_to_matching_items(
         changed_checks.append(item.match_key.is_distinct_from(values["match_key"]))
     changed_condition = or_(*changed_checks)
     target_condition = and_(source_scope, identity_condition, changed_condition)
+    counter_refresh_started_at = time.perf_counter()
+    # A goodsId-targeted Provisor row already satisfies the identity arm of the
+    # matched-positive predicate. This update changes neither goodsId nor price,
+    # so mapping, remapping, rejecting, and unmapping cannot change its counter.
+    matched_positive_is_invariant = platform == "provisor" and goods_id is not None
+
     started_at = time.perf_counter()
-    price_list_ids = {
+    matched_before = (
+        {}
+        if matched_positive_is_invariant
+        else dict(
+            db.execute(
+                select(item.price_list_id, func.count())
+                .where(source_scope, identity_condition)
+                .where(*matched_positive_item_filter())
+                .group_by(item.price_list_id)
+            ).all()
+        )
+    )
+    log_timing("calculate_counter_delta_before", time.perf_counter() - started_at, len(matched_before))
+
+    started_at = time.perf_counter()
+    updated_price_list_ids = [
         int(price_list_id)
         for price_list_id in db.execute(
-            select(item.price_list_id).where(target_condition).distinct()
+            update(item)
+            .where(target_condition)
+            .values(**values)
+            .returning(item.price_list_id)
+            .execution_options(synchronize_session=False)
         ).scalars()
-    }
-    log_timing("select_affected_price_list_ids", time.perf_counter() - started_at, len(price_list_ids))
-    if not price_list_ids:
-        log_timing("update_competitor_price_list_items", 0.0, 0)
-        log_timing("refresh_price_list_item_counters", 0.0, 0)
-        return 0
-    started_at = time.perf_counter()
-    result = db.execute(
-        update(item)
-        .where(target_condition)
-        .values(**values)
-        .execution_options(synchronize_session=False)
-    )
-    affected_rows = int(result.rowcount or 0)
+    ]
+    affected_rows = len(updated_price_list_ids)
     log_timing("update_competitor_price_list_items", time.perf_counter() - started_at, affected_rows)
+
+    price_list_ids = set(updated_price_list_ids)
+    if not price_list_ids:
+        log_timing("calculate_counter_delta_after", 0.0, 0)
+        log_timing("apply_counter_deltas", 0.0, 0)
+        log_timing("refresh_price_list_item_counters", time.perf_counter() - counter_refresh_started_at, 0)
+        return 0
+
     started_at = time.perf_counter()
-    refresh_price_list_item_counters(
-        db=db,
-        price_list_ids=price_list_ids,
-        timing_callback=log_timing,
+    matched_after = (
+        {}
+        if matched_positive_is_invariant
+        else dict(
+            db.execute(
+                select(item.price_list_id, func.count())
+                .where(source_scope, identity_condition, item.price_list_id.in_(price_list_ids))
+                .where(*matched_positive_item_filter())
+                .group_by(item.price_list_id)
+            ).all()
+        )
     )
-    log_timing("refresh_price_list_item_counters", time.perf_counter() - started_at, len(price_list_ids))
+    log_timing("calculate_counter_delta_after", time.perf_counter() - started_at, len(matched_after))
+
+    counter_deltas = (
+        {}
+        if matched_positive_is_invariant
+        else {
+            price_list_id: int(matched_after.get(price_list_id, 0) or 0)
+            - int(matched_before.get(price_list_id, 0) or 0)
+            for price_list_id in price_list_ids
+        }
+    )
+    nonzero_deltas = {price_list_id: delta for price_list_id, delta in counter_deltas.items() if delta}
+    started_at = time.perf_counter()
+    counter_rows_updated = 0
+    if nonzero_deltas:
+        counter_result = db.execute(
+            update(CompetitorPriceList)
+            .where(CompetitorPriceList.id.in_(nonzero_deltas))
+            .values(
+                matched_positive_items_count=(
+                    func.coalesce(CompetitorPriceList.matched_positive_items_count, 0)
+                    + case(nonzero_deltas, value=CompetitorPriceList.id, else_=0)
+                )
+            )
+            .execution_options(synchronize_session=False)
+        )
+        counter_rows_updated = int(counter_result.rowcount or 0)
+    log_timing("apply_counter_deltas", time.perf_counter() - started_at, counter_rows_updated)
+    log_timing(
+        "refresh_price_list_item_counters",
+        time.perf_counter() - counter_refresh_started_at,
+        len(price_list_ids),
+    )
     return affected_rows
 
 

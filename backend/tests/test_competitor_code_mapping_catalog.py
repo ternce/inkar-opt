@@ -849,10 +849,10 @@ def test_provisor_manual_mapping_bulk_updates_by_goods_id_without_loading_items(
         "mapping_upsert",
         "product_lookup",
         "product_provisor_goods_id_update",
-        "select_affected_price_list_ids",
+        "calculate_counter_delta_before",
         "update_competitor_price_list_items",
-        "refresh_counters_select_total_counts",
-        "refresh_counters_select_matched_counts",
+        "calculate_counter_delta_after",
+        "apply_counter_deltas",
         "refresh_price_list_item_counters",
         "apply_mapping_to_matching_items",
         "flush_before_commit",
@@ -863,6 +863,197 @@ def test_provisor_manual_mapping_bulk_updates_by_goods_id_without_loading_items(
     assert all("platform=provisor" in message and "product_id=" in message and "goods_id=" in message for message in timing_messages)
     assert any("goods_id=424242" in message for message in timing_messages)
     assert all("Bulk source" not in message for message in timing_messages)
+    assert not any("refresh_counters_select_total_counts" in message for message in timing_messages)
+    assert not any("refresh_counters_select_matched_counts" in message for message in timing_messages)
+
+
+def test_provisor_mapping_preserves_items_count_and_does_not_double_count_positive_identity():
+    db = _session()
+    pf = _price_format(db, "COUNTER-PROVISOR")
+    price_list = _price_list(db, pf, source_key="counter-provisor", price_date=date(2026, 1, 1))
+    product = _product(db, "COUNTER-P", "Counter product")
+    replacement_product = _product(db, "COUNTER-P2", "Replacement counter product")
+    positive = _item(db, price_list, 515151, name="Positive")
+    positive.distributor_price = 25
+    zero = _item(db, price_list, 515151, name="Zero")
+    zero.distributor_price = 0
+    null_price = _item(db, price_list, 515151, name="Null")
+    null_price.distributor_price = None
+    price_list.items_count = 73
+    price_list.matched_positive_items_count = 1
+    db.commit()
+
+    payload = {
+        "platform": "provisor",
+        "status": "mapped",
+        "sourceExternalKey": "515151",
+        "sourceMatchKey": "provisor:515151",
+        "sourceName": "Counter source",
+        "ourProductId": product.id,
+    }
+    first = create_competitor_code_mapping(payload, db, _admin())
+    db.refresh(price_list)
+    assert first["touchedItems"] == 3
+    assert price_list.items_count == 73
+    assert price_list.matched_positive_items_count == 1
+
+    remap_payload = {**payload, "ourProductId": replacement_product.id}
+    remapped = create_competitor_code_mapping(remap_payload, db, _admin())
+    db.refresh(price_list)
+    assert remapped["touchedItems"] == 3
+    assert price_list.items_count == 73
+    assert price_list.matched_positive_items_count == 1
+
+    confidence_payload = {**remap_payload, "confidence": 87}
+    rescored = create_competitor_code_mapping(confidence_payload, db, _admin())
+    db.refresh(price_list)
+    assert rescored["touchedItems"] == 3
+    assert price_list.matched_positive_items_count == 1
+
+    second = create_competitor_code_mapping(confidence_payload, db, _admin())
+    db.refresh(price_list)
+    assert second["touchedItems"] == 0
+    assert price_list.items_count == 73
+    assert price_list.matched_positive_items_count == 1
+
+
+def test_incremental_counter_deltas_are_independent_per_historical_list_and_reverse_on_unmap():
+    db = _session()
+    pf = _price_format(db, "COUNTER-VIDMAN")
+    first_list = _price_list(db, pf, source_key="counter-vidman-1", price_date=date(2025, 1, 1))
+    second_list = _price_list(db, pf, source_key="counter-vidman-2", price_date=date(2026, 1, 1))
+    first_list.source_type = "vidman"
+    second_list.source_type = "vidman"
+    first_list.items_count = 41
+    second_list.items_count = 42
+    product = _product(db, "COUNTER-VID", "Vidman counter product")
+
+    def add_row(price_list, price):
+        row = CompetitorPriceListItem(
+            price_list_id=price_list.id,
+            provisor_goods_id=None,
+            distributor_goods_id="",
+            distributor_price=price,
+            normalized_name="normalized source",
+            normalized_manufacturer="MAKER",
+            match_type="unmatched",
+            matched_sku="",
+        )
+        db.add(row)
+        db.flush()
+
+    add_row(first_list, 10)
+    add_row(first_list, 20)
+    add_row(first_list, 0)
+    add_row(second_list, 30)
+    add_row(second_list, None)
+    db.commit()
+
+    mapping = CompetitorCodeMapping(
+        platform="vidman",
+        source_match_key="vidman:name:normalized source|manufacturer:maker",
+        source_name="Normalized source",
+        source_manufacturer="Maker",
+        source_normalized_name="normalized source",
+        status="mapped",
+        confidence=100,
+    )
+    statements: list[str] = []
+
+    def capture_sql(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement.lower())
+
+    event.listen(db.get_bind(), "before_cursor_execute", capture_sql)
+    try:
+        touched = code_mappings_service.apply_mapping_to_matching_items(
+            db=db, mapping=mapping, product=product, clear=False,
+        )
+    finally:
+        event.remove(db.get_bind(), "before_cursor_execute", capture_sql)
+    db.flush()
+    db.refresh(first_list)
+    db.refresh(second_list)
+    assert touched == 5
+    assert (first_list.matched_positive_items_count, second_list.matched_positive_items_count) == (2, 1)
+    assert (first_list.items_count, second_list.items_count) == (41, 42)
+    assert len([statement for statement in statements if "count(" in statement]) == 2
+    assert len([
+        statement for statement in statements
+        if statement.lstrip().startswith("update competitor_price_lists")
+    ]) == 1
+    assert not any(
+        statement.lstrip().startswith("select competitor_price_lists.")
+        and "competitor_price_lists.id =" in statement
+        for statement in statements
+    )
+
+    mapping.status = "unmapped"
+    touched = code_mappings_service.apply_mapping_to_matching_items(
+        db=db, mapping=mapping, product=None, clear=True,
+    )
+    db.flush()
+    db.refresh(first_list)
+    db.refresh(second_list)
+    assert touched == 5
+    assert (first_list.matched_positive_items_count, second_list.matched_positive_items_count) == (0, 0)
+    assert (first_list.items_count, second_list.items_count) == (41, 42)
+
+
+def test_mapping_across_more_than_100_lists_uses_update_returning_without_counter_scans(monkeypatch):
+    from backend.app.services import competitor_read_models
+
+    db = _session()
+    pf = _price_format(db, "COUNTER-MANY")
+    product = _product(db, "COUNTER-MANY-P", "Many lists product")
+    for index in range(105):
+        price_list = _price_list(
+            db,
+            pf,
+            source_key=f"counter-many-{index}",
+            price_date=date(2026, 1, 1),
+        )
+        row = _item(db, price_list, 616161, name=f"Many {index}")
+        row.distributor_price = 10
+        price_list.items_count = index + 1000
+        price_list.matched_positive_items_count = 1
+    db.commit()
+
+    monkeypatch.setattr(
+        competitor_read_models,
+        "live_price_list_item_counts",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("full-list recount must not run")),
+    )
+    statements: list[str] = []
+
+    def capture_sql(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement.lower())
+
+    mapping = CompetitorCodeMapping(
+        platform="provisor",
+        source_external_key="616161",
+        source_match_key="provisor:616161",
+        status="mapped",
+        confidence=100,
+    )
+    event.listen(db.get_bind(), "before_cursor_execute", capture_sql)
+    try:
+        touched = code_mappings_service.apply_mapping_to_matching_items(
+            db=db, mapping=mapping, product=product, clear=False,
+        )
+    finally:
+        event.remove(db.get_bind(), "before_cursor_execute", capture_sql)
+
+    count_statements = [statement for statement in statements if "count(" in statement]
+    price_list_pk_lookups = [
+        statement
+        for statement in statements
+        if statement.lstrip().startswith("select competitor_price_lists.")
+        and "competitor_price_lists.id =" in statement
+    ]
+    assert touched == 105
+    assert count_statements == []
+    assert not any("select distinct" in statement for statement in statements)
+    assert price_list_pk_lookups == []
 
 
 def test_non_provisor_manual_mapping_keeps_existing_item_update_semantics():
