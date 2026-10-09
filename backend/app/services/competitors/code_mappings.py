@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import re
+import time
 from datetime import datetime
 from decimal import Decimal
 
@@ -22,6 +24,8 @@ from ...models import (
 from ..competitor_assignments import get_assigned_competitor_price_lists
 from ..competitor_read_models import refresh_price_list_item_counters
 from ..provisor_goods import ProvisorGoodsCandidate
+
+logger = logging.getLogger(__name__)
 
 SUPPORTED_PLATFORMS = {"provisor", "vidman"}
 PRODUCT_CATALOG_CANDIDATE_LIMIT = 5
@@ -2531,6 +2535,19 @@ def apply_mapping_to_matching_items(
         if platform == "provisor"
         else None
     )
+    product_id = int(product.id) if product is not None else int(mapping.our_product_id or 0) or None
+
+    def log_timing(stage: str, elapsed_sec: float, affected_rows: int | None = None) -> None:
+        logger.info(
+            "[MAPPING_CONFIRM_TIMING] stage=%s elapsed_sec=%.6f platform=%s product_id=%s goods_id=%s affected_rows=%s",
+            stage,
+            elapsed_sec,
+            platform,
+            product_id,
+            goods_id,
+            affected_rows,
+        )
+
     external_key = str(mapping.source_external_key or "").strip()
     if platform == "provisor":
         match_goods = re.fullmatch(r"provisor:(\d+)", str(mapping.source_match_key or ""))
@@ -2600,22 +2617,35 @@ def apply_mapping_to_matching_items(
         changed_checks.append(item.match_key.is_distinct_from(values["match_key"]))
     changed_condition = or_(*changed_checks)
     target_condition = and_(source_scope, identity_condition, changed_condition)
+    started_at = time.perf_counter()
     price_list_ids = {
         int(price_list_id)
         for price_list_id in db.execute(
             select(item.price_list_id).where(target_condition).distinct()
         ).scalars()
     }
+    log_timing("select_affected_price_list_ids", time.perf_counter() - started_at, len(price_list_ids))
     if not price_list_ids:
+        log_timing("update_competitor_price_list_items", 0.0, 0)
+        log_timing("refresh_price_list_item_counters", 0.0, 0)
         return 0
+    started_at = time.perf_counter()
     result = db.execute(
         update(item)
         .where(target_condition)
         .values(**values)
         .execution_options(synchronize_session=False)
     )
-    refresh_price_list_item_counters(db=db, price_list_ids=price_list_ids)
-    return int(result.rowcount or 0)
+    affected_rows = int(result.rowcount or 0)
+    log_timing("update_competitor_price_list_items", time.perf_counter() - started_at, affected_rows)
+    started_at = time.perf_counter()
+    refresh_price_list_item_counters(
+        db=db,
+        price_list_ids=price_list_ids,
+        timing_callback=log_timing,
+    )
+    log_timing("refresh_price_list_item_counters", time.perf_counter() - started_at, len(price_list_ids))
+    return affected_rows
 
 
 def apply_manual_mappings_to_items(*, db: Session, price_list: CompetitorPriceList, items: list[CompetitorPriceListItem]) -> dict:

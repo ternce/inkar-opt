@@ -1,6 +1,7 @@
 from datetime import date
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Lock
+import logging
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -779,7 +780,8 @@ def test_mapping_save_uses_selected_product_and_row_disappears_from_unmapped_lis
     unmap_competitor_code_mapping(saved["id"], db, _admin())
 
 
-def test_provisor_manual_mapping_bulk_updates_by_goods_id_without_loading_items(monkeypatch):
+def test_provisor_manual_mapping_bulk_updates_by_goods_id_without_loading_items(monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
     db = _session()
     pf = _price_format(db, "BULK")
     price_list = _price_list(db, pf, source_key="bulk", price_date=date(2026, 1, 1))
@@ -840,6 +842,27 @@ def test_provisor_manual_mapping_bulk_updates_by_goods_id_without_loading_items(
     assert other.product_id is None
     assert other.match_key == ""
     assert other.match_type == "unmatched"
+    timing_messages = [record.getMessage() for record in caplog.records if "[MAPPING_CONFIRM_TIMING]" in record.getMessage()]
+    expected_stages = {
+        "request_validation_permission_checks",
+        "existing_mapping_lookup_for_update",
+        "mapping_upsert",
+        "product_lookup",
+        "product_provisor_goods_id_update",
+        "select_affected_price_list_ids",
+        "update_competitor_price_list_items",
+        "refresh_counters_select_total_counts",
+        "refresh_counters_select_matched_counts",
+        "refresh_price_list_item_counters",
+        "apply_mapping_to_matching_items",
+        "flush_before_commit",
+        "commit",
+        "total_request",
+    }
+    assert expected_stages.issubset({message.split("stage=", 1)[1].split(" ", 1)[0] for message in timing_messages})
+    assert all("platform=provisor" in message and "product_id=" in message and "goods_id=" in message for message in timing_messages)
+    assert any("goods_id=424242" in message for message in timing_messages)
+    assert all("Bulk source" not in message for message in timing_messages)
 
 
 def test_non_provisor_manual_mapping_keeps_existing_item_update_semantics():

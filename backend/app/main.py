@@ -459,6 +459,26 @@ def _timing(operation: str, step: str, started_at: float) -> None:
     logger.info("[TIMING] operation=%s step=%s elapsed_ms=%s", operation, step, round((time.perf_counter() - started_at) * 1000, 2))
 
 
+def _mapping_confirm_timing(
+    stage: str,
+    started_at: float,
+    *,
+    platform: str,
+    product_id: int | None,
+    goods_id: int | None,
+    affected_rows: int | None = None,
+) -> None:
+    logger.info(
+        "[MAPPING_CONFIRM_TIMING] stage=%s elapsed_sec=%.6f platform=%s product_id=%s goods_id=%s affected_rows=%s",
+        stage,
+        time.perf_counter() - started_at,
+        platform,
+        product_id,
+        goods_id,
+        affected_rows,
+    )
+
+
 def _provisor_health_key(account_id: object, filial_id: object) -> tuple[str, str]:
     return str(account_id or ""), str(filial_id or "")
 
@@ -7753,6 +7773,8 @@ def create_competitor_code_mapping(
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(require_write_access),
 ):
+    request_started_at = time.perf_counter()
+    stage_started_at = request_started_at
     try:
         platform = platform_from_value(payload.get("platform"))
     except ValueError as e:
@@ -7767,24 +7789,79 @@ def create_competitor_code_mapping(
     )
     _ensure_mapping_item_format_access(db, payload.get("itemId") or payload.get("item_id"), int(pf.id) if pf is not None else None)
     product = None
-    product_id = payload.get("ourProductId") or payload.get("productId") or payload.get("our_product_id")
+    product_id_value = payload.get("ourProductId") or payload.get("productId") or payload.get("our_product_id")
+    product_id = int(product_id_value) if product_id_value not in (None, "") else None
+    goods_id = None
+    _mapping_confirm_timing(
+        "request_validation_permission_checks",
+        stage_started_at,
+        platform=platform,
+        product_id=product_id,
+        goods_id=goods_id,
+    )
+
+    stage_started_at = time.perf_counter()
     if status == "mapped" or (current_user.role != "admin" and status in {"rejected", "unmapped"}):
-        if product_id in (None, ""):
+        if product_id is None:
             raise HTTPException(status_code=400, detail="productId is required for a manual task decision")
-        product = db.get(Product, int(product_id))
+        product = db.get(Product, product_id)
         if product is None:
             raise HTTPException(status_code=404, detail="product not found")
-    assignment = (
-        lock_manual_matching_task(db, int(product_id), current_user, require_unmapped=current_user.role != "admin")
-        if product_id not in (None, "") else None
+    _mapping_confirm_timing(
+        "product_lookup",
+        stage_started_at,
+        platform=platform,
+        product_id=product_id,
+        goods_id=goods_id,
+        affected_rows=1 if product is not None else 0,
     )
+
+    stage_started_at = time.perf_counter()
+    assignment = (
+        lock_manual_matching_task(db, product_id, current_user, require_unmapped=current_user.role != "admin")
+        if product_id is not None else None
+    )
+    _mapping_confirm_timing(
+        "manual_task_lock_permission_checks",
+        stage_started_at,
+        platform=platform,
+        product_id=product_id,
+        goods_id=goods_id,
+        affected_rows=1 if assignment is not None else 0,
+    )
+
+    stage_started_at = time.perf_counter()
     source_payload = _code_mapping_source_payload(payload, platform, db)
+    if platform == "provisor":
+        goods_id = provisor_goods_id_from_mapping_keys(
+            source_external_key=source_payload.get("source_external_key"),
+            source_match_key_value=source_payload.get("source_match_key"),
+        )
+    _mapping_confirm_timing(
+        "source_payload_lookup",
+        stage_started_at,
+        platform=platform,
+        product_id=product_id,
+        goods_id=goods_id,
+    )
+
+    stage_started_at = time.perf_counter()
     existing_mapping = db.scalar(select(CompetitorCodeMapping).where(
         CompetitorCodeMapping.platform == platform,
         CompetitorCodeMapping.source_match_key == str(source_payload.get("source_match_key") or ""),
     ).with_for_update())
+    _mapping_confirm_timing(
+        "existing_mapping_lookup_for_update",
+        stage_started_at,
+        platform=platform,
+        product_id=product_id,
+        goods_id=goods_id,
+        affected_rows=1 if existing_mapping is not None else 0,
+    )
     if current_user.role != "admin" and existing_mapping is not None and existing_mapping.our_product_id not in (None, int(product_id)):
         raise HTTPException(status_code=409, detail="source item is already mapped to another product")
+
+    stage_started_at = time.perf_counter()
     row = upsert_code_mapping(
         db=db,
         platform=platform,
@@ -7794,30 +7871,115 @@ def create_competitor_code_mapping(
         confidence=payload.get("confidence", 100),
         created_by=current_user.username or "",
     )
+    _mapping_confirm_timing(
+        "mapping_upsert",
+        stage_started_at,
+        platform=platform,
+        product_id=product_id,
+        goods_id=goods_id,
+        affected_rows=1,
+    )
+
+    stage_started_at = time.perf_counter()
+    product_goods_id_updated = 0
     if platform == "provisor" and status == "mapped" and product is not None:
-        goods_id = provisor_goods_id_from_mapping_keys(
-            source_external_key=source_payload.get("source_external_key"),
-            source_match_key_value=source_payload.get("source_match_key"),
-        )
         if goods_id is not None:
             product.provisor_goods_id = goods_id
+            product_goods_id_updated = 1
         else:
             item_id = payload.get("itemId") or payload.get("item_id")
             source_item = db.get(CompetitorPriceListItem, int(item_id)) if item_id not in (None, "") else None
             if source_item is not None and source_item.provisor_goods_id is not None:
-                product.provisor_goods_id = int(source_item.provisor_goods_id)
+                goods_id = int(source_item.provisor_goods_id)
+                product.provisor_goods_id = goods_id
+                product_goods_id_updated = 1
+    _mapping_confirm_timing(
+        "product_provisor_goods_id_update",
+        stage_started_at,
+        platform=platform,
+        product_id=product_id,
+        goods_id=goods_id,
+        affected_rows=product_goods_id_updated,
+    )
+
+    stage_started_at = time.perf_counter()
     db.flush()
+    _mapping_confirm_timing(
+        "flush_mapping_and_product",
+        stage_started_at,
+        platform=platform,
+        product_id=product_id,
+        goods_id=goods_id,
+    )
+
+    stage_started_at = time.perf_counter()
     try:
         touched = apply_mapping_to_matching_items(db=db, mapping=row, product=product, clear=status == "unmapped")
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _mapping_confirm_timing(
+        "apply_mapping_to_matching_items",
+        stage_started_at,
+        platform=platform,
+        product_id=product_id,
+        goods_id=goods_id,
+        affected_rows=touched,
+    )
+
+    stage_started_at = time.perf_counter()
     if status == "mapped":
         complete_manual_matching_task(assignment, current_user)
+    _mapping_confirm_timing(
+        "complete_manual_matching_task",
+        stage_started_at,
+        platform=platform,
+        product_id=product_id,
+        goods_id=goods_id,
+        affected_rows=1 if assignment is not None and status == "mapped" else 0,
+    )
+
+    stage_started_at = time.perf_counter()
+    db.flush()
+    _mapping_confirm_timing(
+        "flush_before_commit",
+        stage_started_at,
+        platform=platform,
+        product_id=product_id,
+        goods_id=goods_id,
+    )
+
+    stage_started_at = time.perf_counter()
     db.commit()
+    _mapping_confirm_timing(
+        "commit",
+        stage_started_at,
+        platform=platform,
+        product_id=product_id,
+        goods_id=goods_id,
+        affected_rows=touched,
+    )
+
+    stage_started_at = time.perf_counter()
     db.refresh(row)
     extra = db.get(ProductExtra, product.id) if product is not None else None
     data = mapping_to_dict(row, product, extra)
     data["touchedItems"] = touched
+    _mapping_confirm_timing(
+        "response_refresh_and_serialization",
+        stage_started_at,
+        platform=platform,
+        product_id=product_id,
+        goods_id=goods_id,
+        affected_rows=touched,
+    )
+    _mapping_confirm_timing(
+        "total_request",
+        request_started_at,
+        platform=platform,
+        product_id=product_id,
+        goods_id=goods_id,
+        affected_rows=touched,
+    )
     return data
 
 

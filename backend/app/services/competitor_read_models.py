@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+import time
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
@@ -37,25 +38,39 @@ def matched_positive_item_filter():
     )
 
 
-def live_price_list_item_counts(*, db: Session, price_list_ids: Iterable[int]) -> dict[int, tuple[int, int]]:
+def live_price_list_item_counts(
+    *,
+    db: Session,
+    price_list_ids: Iterable[int],
+    timing_callback: Callable[[str, float, int | None], None] | None = None,
+) -> dict[int, tuple[int, int]]:
     ids = _ids(price_list_ids)
     if not ids:
         return {}
-    item_counts = dict(
-        db.execute(
-            select(CompetitorPriceListItem.price_list_id, func.count())
-            .where(CompetitorPriceListItem.price_list_id.in_(ids))
-            .group_by(CompetitorPriceListItem.price_list_id)
-        ).all()
-    )
-    matched_counts = dict(
-        db.execute(
-            select(CompetitorPriceListItem.price_list_id, func.count())
-            .where(CompetitorPriceListItem.price_list_id.in_(ids))
-            .where(*matched_positive_item_filter())
-            .group_by(CompetitorPriceListItem.price_list_id)
-        ).all()
-    )
+    started_at = time.perf_counter()
+    item_count_rows = db.execute(
+        select(CompetitorPriceListItem.price_list_id, func.count())
+        .where(CompetitorPriceListItem.price_list_id.in_(ids))
+        .group_by(CompetitorPriceListItem.price_list_id)
+    ).all()
+    if timing_callback is not None:
+        timing_callback("refresh_counters_select_total_counts", time.perf_counter() - started_at, len(item_count_rows))
+    item_counts = dict(item_count_rows)
+
+    started_at = time.perf_counter()
+    matched_count_rows = db.execute(
+        select(CompetitorPriceListItem.price_list_id, func.count())
+        .where(CompetitorPriceListItem.price_list_id.in_(ids))
+        .where(*matched_positive_item_filter())
+        .group_by(CompetitorPriceListItem.price_list_id)
+    ).all()
+    if timing_callback is not None:
+        timing_callback(
+            "refresh_counters_select_matched_counts",
+            time.perf_counter() - started_at,
+            len(matched_count_rows),
+        )
+    matched_counts = dict(matched_count_rows)
     return {
         price_list_id: (
             int(item_counts.get(price_list_id, 0) or 0),
@@ -65,12 +80,24 @@ def live_price_list_item_counts(*, db: Session, price_list_ids: Iterable[int]) -
     }
 
 
-def refresh_price_list_item_counters(*, db: Session, price_list_ids: Iterable[int]) -> dict[int, tuple[int, int]]:
+def refresh_price_list_item_counters(
+    *,
+    db: Session,
+    price_list_ids: Iterable[int],
+    timing_callback: Callable[[str, float, int | None], None] | None = None,
+) -> dict[int, tuple[int, int]]:
     ids = _ids(price_list_ids)
-    counts = live_price_list_item_counts(db=db, price_list_ids=ids)
+    counts = live_price_list_item_counts(db=db, price_list_ids=ids, timing_callback=timing_callback)
     for price_list_id in ids:
         item_count, matched_count = counts.get(price_list_id, (0, 0))
+        started_at = time.perf_counter()
         row = db.get(CompetitorPriceList, price_list_id)
+        if timing_callback is not None:
+            timing_callback(
+                "refresh_counters_price_list_lookup",
+                time.perf_counter() - started_at,
+                1 if row is not None else 0,
+            )
         if row is not None:
             row.items_count = item_count
             row.matched_positive_items_count = matched_count
