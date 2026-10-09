@@ -21,6 +21,7 @@ from urllib.parse import quote
 from fastapi import Body, Cookie, Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 import httpx
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
@@ -295,6 +296,8 @@ from .services.competitors.code_mappings import (
     search_competitor_items_for_mapping as search_competitor_items_for_mapping_service,
     upsert_code_mapping,
 )
+from .services.provisor_candidate_search import official_external_search, official_product_candidates
+from .services.provisor_goods import ProvisorGoodsError
 from .services.vidman_review_api import (
     approve_review_match,
     list_review_queue,
@@ -7313,7 +7316,7 @@ def get_competitor_code_mappings_product_catalog(
 
 
 @app.get("/api/competitors/code-mappings/product-catalog/{product_id}/candidates")
-def get_competitor_code_mappings_product_catalog_candidates(
+async def get_competitor_code_mappings_product_catalog_candidates(
     product_id: int,
     platform: str = Query("all"),
     source: str | None = Query(None),
@@ -7325,10 +7328,34 @@ def get_competitor_code_mappings_product_catalog_candidates(
 ):
     require_manual_task_read(db, product_id, current_user)
     try:
+        requested_platform = source or platform
+        if str(requested_platform or "").strip().lower() == "provisor":
+            try:
+                return await official_product_candidates(
+                    db=db,
+                    product_id=product_id,
+                    format_code=format_code or formatCode,
+                    limit=limit,
+                )
+            except ProvisorGoodsError as exc:
+                if not exc.fallback_allowed:
+                    raise HTTPException(status_code=502, detail="Provisor goods search was rejected") from exc
+                logger.warning("Provisor official candidate search failed; using local fallback: %s", exc)
+                fallback = await run_in_threadpool(
+                    product_catalog_candidates_for_product,
+                    db=db,
+                    product_id=product_id,
+                    platform="provisor",
+                    format_code=format_code or formatCode,
+                    limit=limit,
+                )
+                for candidate in fallback:
+                    candidate["candidateSource"] = "local_fallback"
+                return fallback
         return product_catalog_candidates_for_product(
             db=db,
             product_id=product_id,
-            platform=source or platform,
+            platform=requested_platform,
             format_code=format_code or formatCode,
             limit=limit,
         )
@@ -7610,7 +7637,7 @@ def post_vidman_review_mark_unmatched(
 
 
 @app.get("/api/competitor-items/search")
-def search_competitor_items_for_mapping(
+async def search_competitor_items_for_mapping(
     platform: str = Query("provisor"),
     q: str = Query(..., min_length=1),
     format_code: str | None = Query(None),
@@ -7623,10 +7650,30 @@ def search_competitor_items_for_mapping(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     pf = _price_format_for_mapping_request(db, format_code, current_user)
+    price_format_id = int(pf.id) if pf is not None else None
+    if normalized_platform == "provisor":
+        db.rollback()
+        try:
+            return await official_external_search(db=db, query=q, limit=limit)
+        except ProvisorGoodsError as exc:
+            if not exc.fallback_allowed:
+                raise HTTPException(status_code=502, detail="Provisor goods search was rejected") from exc
+            logger.warning("Provisor official manual search failed; using local fallback: %s", exc)
+            fallback = await run_in_threadpool(
+                search_competitor_items_for_mapping_service,
+                db=db,
+                platform=normalized_platform,
+                price_format_id=price_format_id,
+                q=q,
+                limit=limit,
+            )
+            for candidate in fallback:
+                candidate["candidateSource"] = "local_fallback"
+            return fallback
     return search_competitor_items_for_mapping_service(
         db=db,
         platform=normalized_platform,
-        price_format_id=int(pf.id) if pf is not None else None,
+        price_format_id=price_format_id,
         q=q,
         limit=limit,
     )

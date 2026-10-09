@@ -504,7 +504,7 @@ def test_no_candidate_row_still_supports_manual_product_search_endpoint():
         main.app.dependency_overrides.clear()
 
 
-def test_competitor_items_search_finds_provisor_goods_id_and_deduplicates():
+def test_competitor_items_search_finds_provisor_goods_id_and_deduplicates(monkeypatch):
     db = _session()
     pf = _price_format(db, "SEARCH-EXT")
     first_list = _price_list(db, pf, source_key="external-a", price_date=date(2026, 1, 1))
@@ -523,6 +523,12 @@ def test_competitor_items_search_finds_provisor_goods_id_and_deduplicates():
 
     main.app.dependency_overrides[main.get_db] = override_db
     main.app.dependency_overrides[get_current_user] = _admin
+    async def unavailable(**_kwargs):
+        from backend.app.services.provisor_goods import ProvisorGoodsError
+
+        raise ProvisorGoodsError("offline")
+
+    monkeypatch.setattr(main, "official_external_search", unavailable)
     try:
         client = TestClient(main.app)
         by_goods = client.get("/api/competitor-items/search?platform=provisor&q=123456&format_code=SEARCH-EXT&limit=30")
@@ -1265,12 +1271,11 @@ def test_product_catalog_candidate_endpoint_generates_for_one_product(monkeypatc
     db.commit()
     seen: list[int] = []
 
-    def fake_candidates(db: Session, *, products: list[tuple[Product, ProductExtra | None]], platforms: list[str], assigned_ids=None, limit_per_product: int = 5):
-        seen.extend(int(product.id) for product, _extra in products)
-        product_id = int(products[0][0].id)
-        return {product_id: [{"platform": platforms[0], "sourceMatchKey": "provisor:1", "sourceExternalKey": "1", "sourceName": "One"}]}
+    async def fake_candidates(*, db: Session, product_id: int, format_code: str = "", limit: int = 5):
+        seen.append(int(product_id))
+        return [{"platform": "provisor", "sourceMatchKey": "provisor:1", "sourceExternalKey": "1", "sourceName": "One"}]
 
-    monkeypatch.setattr(code_mappings_service, "_product_catalog_source_candidates_for_products", fake_candidates)
+    monkeypatch.setattr(main, "official_product_candidates", fake_candidates)
 
     def override_db():
         try:

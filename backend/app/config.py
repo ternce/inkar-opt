@@ -20,6 +20,10 @@ class Settings(BaseModel):
     provisor_price_total_timeout_seconds: int
     provisor_price_read_timeout_seconds: int
     provisor_price_connect_timeout_seconds: int
+    provisor_goods_connect_timeout_seconds: float
+    provisor_goods_read_timeout_seconds: float
+    provisor_goods_total_timeout_seconds: float
+    provisor_goods_search_max_results: int
     provisor_auto_refresh_enabled: bool
     provisor_auto_refresh_cron: str
     provisor_auto_refresh_mode: str
@@ -106,6 +110,10 @@ def get_settings() -> Settings:
             int(os.getenv("PROVISOR_PRICE_TOTAL_TIMEOUT_SECONDS", "120")),
         ),
         provisor_price_connect_timeout_seconds=int(os.getenv("PROVISOR_PRICE_CONNECT_TIMEOUT_SECONDS", "10")),
+        provisor_goods_connect_timeout_seconds=max(0.1, float(os.getenv("PROVISOR_GOODS_CONNECT_TIMEOUT_SECONDS", "5"))),
+        provisor_goods_read_timeout_seconds=max(0.1, float(os.getenv("PROVISOR_GOODS_READ_TIMEOUT_SECONDS", "12"))),
+        provisor_goods_total_timeout_seconds=max(0.1, float(os.getenv("PROVISOR_GOODS_TOTAL_TIMEOUT_SECONDS", "15"))),
+        provisor_goods_search_max_results=max(1, min(100, int(os.getenv("PROVISOR_GOODS_SEARCH_MAX_RESULTS", "100")))),
         provisor_auto_refresh_enabled=env_bool("PROVISOR_AUTO_REFRESH_ENABLED", False),
         provisor_auto_refresh_cron=os.getenv("PROVISOR_AUTO_REFRESH_CRON", "0 2 * * *"),
         provisor_auto_refresh_mode=os.getenv("PROVISOR_AUTO_REFRESH_MODE", "selected").strip().lower() or "selected",

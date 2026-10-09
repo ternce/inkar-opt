@@ -54,6 +54,13 @@ test('rejected row cannot be confirmed', () => {
   assert.equal(canConfirmProductCatalogMapping({ ...row, status: 'rejected' }, candidate, false), false);
 });
 
+test('candidate already mapped to another product cannot be confirmed', () => {
+  const conflict = { ...candidate, mappingConflict: true, selectable: false };
+
+  assert.equal(canConfirmProductCatalogMapping(row, conflict, false), false);
+  assert.equal(buildProductCatalogMappingPayload(row, conflict, 'provisor'), null);
+});
+
 test('row candidate loading uses dedicated product-catalog candidate endpoint', () => {
   assert.equal(
     buildProductCatalogCandidateUrl(6177, 'provisor', 'INKAR', true),

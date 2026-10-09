@@ -289,6 +289,16 @@ type CodeMappingCandidate = {
   matchLevel?: 'exact' | 'characteristics' | string;
   manufacturerMismatch?: boolean;
   classification?: 'auto_match' | 'manual_review' | 'no_match' | string;
+  candidateSource?: 'provisor_api' | 'local_fallback' | string;
+  packageCount?: number | null;
+  dose?: string;
+  dosageForm?: string;
+  producer?: string;
+  mappingConflict?: boolean;
+  selectable?: boolean;
+  mappedProductId?: number | null;
+  mappedProductSku?: string;
+  mappedProductName?: string;
   explanation?: Array<{ label: string; status: 'match' | 'warning' | 'conflict' | string; message: string }>;
 };
 
@@ -1506,21 +1516,22 @@ export function CompetitorsTab({ formatCode, branch, currentUser }: Props) {
     setIsLoadingCandidates(true);
     setSelectedCandidate(null);
     try {
-      const res = await fetch(buildProductCatalogCandidateUrl(productId, mappingPlatform, formatCode, mappingFormatScope === 'current'), { signal: controller.signal });
+      const res = await fetch(buildProductCatalogCandidateUrl(productId, rowPlatformForMapping(row), formatCode, mappingFormatScope === 'current'), { signal: controller.signal });
       const text = await res.text();
       const data = parseJsonOrNull(text);
       if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить кандидатов');
       const candidates = Array.isArray(data) ? data : [];
+      const selectableCandidate = candidates.find((candidate: CodeMappingCandidate) => !candidate.mappingConflict && candidate.selectable !== false) || null;
       const fresh = {
         candidates,
         reviewCandidates: candidates,
-        bestCandidate: candidates[0] || null,
+        bestCandidate: selectableCandidate,
         candidatesCount: candidates.length,
         mappingStatus: candidates.length ? 'review' : row.mappingStatus,
         status: candidates.length ? 'review' : row.status,
       };
       setSelectedRow((current) => (Number(current?.productId) === productId ? { ...current, ...fresh } : current));
-      setSelectedCandidate(fresh.bestCandidate);
+      setSelectedCandidate(selectableCandidate);
       setCodeRows((current) => current.map((item) => (Number(item.productId) === productId ? { ...item, ...fresh } : item)));
     } catch (err: any) {
       if (err?.name !== 'AbortError') throw err;
@@ -2089,18 +2100,25 @@ export function CompetitorsTab({ formatCode, branch, currentUser }: Props) {
                     <button
                       key={`${row.ourProductId || row.productId}-${row.sourceMatchKey}`}
                       type="button"
+                      disabled={row.mappingConflict || row.selectable === false}
                       onClick={() => {
                         setSelectedCandidate(row);
                       }}
-                      className={`block w-full border-b border-gray-100 px-3 py-2 text-left text-sm hover:bg-gray-50 ${selectedCandidate?.sourceMatchKey === row.sourceMatchKey ? 'bg-blue-50' : ''}`}
+                      className={`block w-full border-b border-gray-100 px-3 py-2 text-left text-sm hover:bg-gray-50 disabled:cursor-not-allowed disabled:bg-red-50 ${selectedCandidate?.sourceMatchKey === row.sourceMatchKey ? 'bg-blue-50' : ''}`}
                     >
                       <div className="flex items-start justify-between gap-3">
                         <div className="min-w-0">
                           <div className="flex flex-wrap items-center gap-2 text-xs font-semibold uppercase tracking-wide text-gray-600">
                             <span>{sourcePlatformLabel(row.platform)}</span>
                             <span className="font-medium normal-case tracking-normal text-gray-500">goodsId: {row.sourceExternalKey || row.sourceMatchKey || '-'}</span>
+                            {row.candidateSource === 'local_fallback' ? <span className="status-pill normal-case">локальный резервный поиск</span> : null}
                           </div>
                           <div className="mt-1 font-semibold text-gray-900">{row.sourceName || '-'}</div>
+                          {row.dose || row.dosageForm || row.packageCount ? (
+                            <div className="mt-1 text-xs text-gray-600">
+                              {[row.dosageForm, row.dose, row.packageCount ? `№${row.packageCount}` : ''].filter(Boolean).join(' · ')}
+                            </div>
+                          ) : null}
                         </div>
                         <span className="shrink-0 text-xs text-gray-500">Уверенность: {fmtNumber(row.confidence)}%</span>
                       </div>
@@ -2121,6 +2139,11 @@ export function CompetitorsTab({ formatCode, branch, currentUser }: Props) {
                       ) : (
                         <div className="mt-1 text-xs text-gray-500">Производитель: {row.sourceManufacturer || 'не указан'}</div>
                       )}
+                      {row.mappingConflict ? (
+                        <div className="mt-2 rounded-md border border-red-300 bg-red-50 px-2 py-1 text-xs text-red-900">
+                          Этот goodsId уже сопоставлен: {row.mappedProductSku || `product ${row.mappedProductId || ''}`} {row.mappedProductName || ''}. Сначала разрешите конфликт отдельно.
+                        </div>
+                      ) : null}
                       {row.explanation?.length ? (
                         <div className="mt-2 grid gap-1 text-xs text-gray-600">
                           {row.explanation.map((item) => (
@@ -2188,15 +2211,22 @@ export function CompetitorsTab({ formatCode, branch, currentUser }: Props) {
                       <button
                         key={`${row.platform}-${row.sourceMatchKey}`}
                         type="button"
+                        disabled={row.mappingConflict || row.selectable === false}
                         onClick={() => setSelectedCandidate(row)}
-                        className={`block w-full border-b border-gray-100 px-3 py-2 text-left text-sm hover:bg-gray-50 ${selectedCandidate?.sourceMatchKey === row.sourceMatchKey ? 'bg-blue-50' : ''}`}
+                        className={`block w-full border-b border-gray-100 px-3 py-2 text-left text-sm hover:bg-gray-50 disabled:cursor-not-allowed disabled:bg-red-50 ${selectedCandidate?.sourceMatchKey === row.sourceMatchKey ? 'bg-blue-50' : ''}`}
                       >
                         <div className="flex flex-wrap items-center gap-2 text-xs font-semibold uppercase tracking-wide text-gray-600">
                           <span>{sourcePlatformLabel(row.platform)}</span>
                           <span className="font-medium normal-case tracking-normal text-gray-500">goodsId: {row.sourceExternalKey || row.sourceMatchKey || '-'}</span>
+                          {row.candidateSource === 'local_fallback' ? <span className="status-pill normal-case">локальный резервный поиск</span> : null}
                         </div>
                         <div className="mt-1 font-medium text-gray-900">{row.sourceName || '-'}</div>
                         <div className="mt-1 text-xs text-gray-500">Производитель: {row.sourceManufacturer || 'не указан'}</div>
+                        {row.mappingConflict ? (
+                          <div className="mt-2 text-xs font-medium text-red-800">
+                            Уже сопоставлен с {row.mappedProductSku || `product ${row.mappedProductId || ''}`} {row.mappedProductName || ''}
+                          </div>
+                        ) : null}
                       </button>
                     ))}
                   </div>

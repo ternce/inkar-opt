@@ -81,7 +81,7 @@ def _jwt_exp_unix(token: str) -> int | None:
         return None
 
 
-def _is_expired(exp_unix: int | None, skew_seconds: int = 30) -> bool:
+def _is_expired(exp_unix: int | None, skew_seconds: int = 60) -> bool:
     if exp_unix is None:
         return False
     return time.time() >= (exp_unix - skew_seconds)
@@ -102,6 +102,14 @@ class ProvisorAuthError(RuntimeError):
     pass
 
 
+async def invalidate_access_token(*, base_url: str, login: str | None) -> None:
+    """Drop cached credentials without exposing the token or account identifier."""
+
+    cache_key = (base_url.rstrip("/"), (login or "").strip())
+    async with _lock:
+        _tokens_by_key.pop(cache_key, None)
+
+
 async def _create_tokens(
     *,
     client: httpx.AsyncClient,
@@ -118,9 +126,14 @@ async def _create_tokens(
         timeout=timeout,
     )
     if resp.status_code >= 400:
-        raise ProvisorAuthError(f"Token/CreateAll failed: HTTP {resp.status_code}: {resp.text}")
+        raise ProvisorAuthError(f"Token/CreateAll failed: HTTP {resp.status_code}")
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    except Exception as exc:
+        raise ProvisorAuthError("Token/CreateAll returned invalid JSON") from exc
+    if not isinstance(data, dict):
+        raise ProvisorAuthError("Token/CreateAll returned an unexpected response")
     access = (data.get("accessToken") or "").strip()
     refresh = (data.get("refreshToken") or "").strip()
     if not access or not refresh:
@@ -145,9 +158,14 @@ async def _update_tokens(
         timeout=timeout,
     )
     if resp.status_code >= 400:
-        raise ProvisorAuthError(f"Token/Update failed: HTTP {resp.status_code}: {resp.text}")
+        raise ProvisorAuthError(f"Token/Update failed: HTTP {resp.status_code}")
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    except Exception as exc:
+        raise ProvisorAuthError("Token/Update returned invalid JSON") from exc
+    if not isinstance(data, dict):
+        raise ProvisorAuthError("Token/Update returned an unexpected response")
     new_access = (data.get("accessToken") or "").strip()
     new_refresh = (data.get("refreshToken") or "").strip()
     if not new_access or not new_refresh:
@@ -181,7 +199,7 @@ async def get_access_token(
     async with _lock:
         cached = _tokens_by_key.get(cache_key)
         if cached and cached.access and not _is_expired(cached.access_exp_unix):
-            logger.info("[PROVISOR_AUTH_TIMING] login=%s cache_hit=true auth_elapsed_sec=0.0", login_s)
+            logger.info("[PROVISOR_AUTH_TIMING] cache_hit=true auth_elapsed_sec=0.0")
             return cached.access
 
         timeout = httpx.Timeout(connect=10.0, read=timeout_seconds, write=30.0, pool=30.0)
@@ -198,8 +216,7 @@ async def get_access_token(
                     )
                     _tokens_by_key[cache_key] = updated
                     logger.info(
-                        "[PROVISOR_AUTH_TIMING] login=%s cache_hit=false token_refresh=true auth_elapsed_sec=%s",
-                        login_s,
+                        "[PROVISOR_AUTH_TIMING] cache_hit=false token_refresh=true auth_elapsed_sec=%s",
                         round(time.perf_counter() - auth_started_at, 3),
                     )
                     return updated.access
@@ -215,8 +232,7 @@ async def get_access_token(
             )
             _tokens_by_key[cache_key] = created
             logger.info(
-                "[PROVISOR_AUTH_TIMING] login=%s cache_hit=false token_refresh=false auth_elapsed_sec=%s",
-                login_s,
+                "[PROVISOR_AUTH_TIMING] cache_hit=false token_refresh=false auth_elapsed_sec=%s",
                 round(time.perf_counter() - auth_started_at, 3),
             )
             return created.access
@@ -299,8 +315,7 @@ async def get_filials_by_context(
             response_bytes = None
         logger.info("Provisor filials loaded: %s", len(data))
         logger.info(
-            "[PROVISOR_FILIAL_LIST_TIMING] login=%s http_status=%s filials_raw=%s filials_valid=%s response_size_mb=%s filial_list_request_elapsed_sec=%s filial_list_parse_elapsed_sec=%s",
-            (login or "").strip(),
+            "[PROVISOR_FILIAL_LIST_TIMING] http_status=%s filials_raw=%s filials_valid=%s response_size_mb=%s filial_list_request_elapsed_sec=%s filial_list_parse_elapsed_sec=%s",
             resp.status_code,
             len(data),
             len(rows),

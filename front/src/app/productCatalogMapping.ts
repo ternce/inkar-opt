@@ -15,6 +15,8 @@ export type ProductCatalogMappingCandidate = {
   sourceDosageForm?: string;
   sourceNormalizedName?: string;
   confidence?: number | null;
+  mappingConflict?: boolean;
+  selectable?: boolean;
 };
 
 export const productCatalogSelectedProductId = (row?: ProductCatalogMappingRow | null) =>
@@ -24,7 +26,14 @@ export const canConfirmProductCatalogMapping = (
   row: ProductCatalogMappingRow | null | undefined,
   candidate: ProductCatalogMappingCandidate | null | undefined,
   isLoading = false,
-) => Boolean(!isLoading && row?.status !== 'rejected' && productCatalogSelectedProductId(row) && candidate?.sourceMatchKey);
+) => Boolean(
+  !isLoading
+  && row?.status !== 'rejected'
+  && productCatalogSelectedProductId(row)
+  && candidate?.sourceMatchKey
+  && !candidate?.mappingConflict
+  && candidate?.selectable !== false,
+);
 
 export const buildProductCatalogMappingPayload = (
   row: ProductCatalogMappingRow,
@@ -32,7 +41,7 @@ export const buildProductCatalogMappingPayload = (
   fallbackPlatform: 'provisor' | 'vidman',
 ) => {
   const productId = productCatalogSelectedProductId(row);
-  if (!productId || !candidate.sourceMatchKey) return null;
+  if (!productId || !candidate.sourceMatchKey || candidate.mappingConflict || candidate.selectable === false) return null;
   const platform = candidate.platform === 'vidman' || candidate.platform === 'provisor' ? candidate.platform : fallbackPlatform;
   return {
     platform,

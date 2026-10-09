@@ -21,6 +21,7 @@ from ...models import (
 )
 from ..competitor_assignments import get_assigned_competitor_price_lists
 from ..competitor_read_models import refresh_price_list_item_counters
+from ..provisor_goods import ProvisorGoodsCandidate
 
 SUPPORTED_PLATFORMS = {"provisor", "vidman"}
 PRODUCT_CATALOG_CANDIDATE_LIMIT = 5
@@ -1394,6 +1395,167 @@ def _product_catalog_candidate_payload(product: Product, extra: ProductExtra | N
     return payload
 
 
+def provisor_goods_search_seeds(product_name: str) -> list[str]:
+    """Return one precise and at most one broader catalog query."""
+
+    from ..competitor_matching import parse_drug_structure
+
+    structure = parse_drug_structure(product_name)
+    base_name = str(structure.base_name or normalize_mapping_text(product_name)).strip()
+    if not base_name:
+        return []
+    seeds = [base_name]
+    first_token = base_name.split(" ", 1)[0].strip()
+    if len(first_token) >= 3 and normalize_mapping_text(first_token) != normalize_mapping_text(base_name):
+        seeds.append(first_token)
+    return seeds[:2]
+
+
+def _provisor_goods_scoring_name(candidate: ProvisorGoodsCandidate) -> str:
+    values = [candidate.name or candidate.brand, candidate.dosage_form, candidate.dose]
+    if candidate.package_count is not None:
+        values.append(f"N{candidate.package_count}")
+    return " ".join(value for value in values if value).strip()
+
+
+def _provisor_goods_source_payload(candidate: ProvisorGoodsCandidate) -> dict:
+    source_name = candidate.full_name or _provisor_goods_scoring_name(candidate)
+    manufacturer = candidate.producer or candidate.corporation
+    return {
+        "itemId": None,
+        "priceListId": None,
+        "priceListName": "Official Provisor catalog",
+        "platform": "provisor",
+        "matchType": "provisor_api_candidate",
+        "matchedSku": "",
+        "sourcePrice": None,
+        "priceDate": "",
+        "sourceExternalKey": str(candidate.goods_id),
+        "sourceMatchKey": f"provisor:{candidate.goods_id}",
+        "sourceName": source_name,
+        "sourceManufacturer": manufacturer,
+        "sourceDosageForm": candidate.dosage_form,
+        "sourceNormalizedName": normalize_mapping_text(source_name),
+        "candidateSource": "provisor_api",
+        "goodsId": candidate.goods_id,
+        "name": candidate.name,
+        "brand": candidate.brand,
+        "dose": candidate.dose,
+        "dosageForm": candidate.dosage_form,
+        "packageCount": candidate.package_count,
+        "producer": candidate.producer,
+        "corporation": candidate.corporation,
+        "inn": candidate.inn,
+        "atc": candidate.atc,
+        "fullName": candidate.full_name,
+        "barcodes": list(candidate.barcodes),
+    }
+
+
+def _provisor_mapping_owners(db: Session, goods_ids: list[int]) -> dict[int, tuple[CompetitorCodeMapping, Product | None]]:
+    if not goods_ids:
+        return {}
+    keys = [f"provisor:{goods_id}" for goods_id in goods_ids]
+    rows = db.execute(
+        select(CompetitorCodeMapping, Product)
+        .outerjoin(Product, Product.id == CompetitorCodeMapping.our_product_id)
+        .where(CompetitorCodeMapping.platform == "provisor")
+        .where(CompetitorCodeMapping.source_match_key.in_(keys))
+        .where(CompetitorCodeMapping.status.in_(["mapped", "rejected"]))
+    ).all()
+    out: dict[int, tuple[CompetitorCodeMapping, Product | None]] = {}
+    for mapping, product in rows:
+        goods_id = provisor_goods_id_from_mapping_keys(
+            source_external_key=mapping.source_external_key,
+            source_match_key_value=mapping.source_match_key,
+        )
+        if goods_id is not None:
+            out[int(goods_id)] = (mapping, product)
+    return out
+
+
+def rank_provisor_goods_candidates(
+    *,
+    db: Session,
+    product: Product,
+    extra: ProductExtra | None,
+    goods: list[ProvisorGoodsCandidate],
+    limit: int = PRODUCT_CATALOG_CANDIDATE_LIMIT,
+) -> list[dict]:
+    owners = _provisor_mapping_owners(db, [item.goods_id for item in goods])
+    candidates: list[dict] = []
+    for item in goods:
+        owner = owners.get(item.goods_id)
+        if owner is not None and owner[0].status == "rejected":
+            continue
+        source = _provisor_goods_source_payload(item)
+        level = _manual_candidate_level(
+            source_name=_provisor_goods_scoring_name(item),
+            source_manufacturer=source["sourceManufacturer"],
+            product_name=product.name,
+            product_manufacturer=(extra.manufacturer if extra else "") or "",
+        )
+        if level is None:
+            continue
+        candidate = _product_catalog_candidate_payload(product, extra, source, level)
+        candidate["manualSuggestion"]["structuredProvisorApi"] = True
+        candidate["manualSuggestion"]["packageCount"] = item.package_count
+        mapping, mapped_product = owner if owner is not None else (None, None)
+        conflict = bool(
+            mapping is not None
+            and mapping.status == "mapped"
+            and mapping.our_product_id is not None
+            and int(mapping.our_product_id) != int(product.id)
+        )
+        candidate.update(
+            {
+                "mappingConflict": conflict,
+                "selectable": not conflict,
+                "mappedProductId": int(mapping.our_product_id) if conflict and mapping and mapping.our_product_id else None,
+                "mappedProductSku": mapped_product.code if conflict and mapped_product else "",
+                "mappedProductName": mapped_product.name if conflict and mapped_product else "",
+            }
+        )
+        if conflict:
+            candidate["classification"] = "mapping_conflict"
+            candidate["explanation"].append(
+                {"label": "Existing mapping", "status": "conflict", "message": "goodsId is mapped to another internal product"}
+            )
+        candidates.append(candidate)
+    tier_rank = {"exact": 0, "characteristics": 1, "medium": 2, "fuzzy": 3}
+    return sorted(
+        candidates,
+        key=lambda item: (
+            tier_rank.get(str(item.get("matchLevel") or ""), 9),
+            -float(item.get("confidence") or 0),
+            -float(((item.get("manualSuggestion") or {}).get("nameScore")) or 0),
+            str(item.get("sourceMatchKey") or ""),
+        ),
+    )[: max(1, min(int(limit), 50))]
+
+
+def provisor_goods_search_payloads(*, db: Session, goods: list[ProvisorGoodsCandidate], limit: int) -> list[dict]:
+    owners = _provisor_mapping_owners(db, [item.goods_id for item in goods])
+    rows: list[dict] = []
+    for item in goods[: max(1, min(int(limit), 100))]:
+        payload = _provisor_goods_source_payload(item)
+        owner = owners.get(item.goods_id)
+        mapping, product = owner if owner is not None else (None, None)
+        conflict = bool(mapping is not None and mapping.status == "mapped" and mapping.our_product_id is not None)
+        payload.update(
+            {
+                "status": "mapped" if conflict else "unmapped",
+                "mappingConflict": conflict,
+                "selectable": not conflict,
+                "mappedProductId": int(mapping.our_product_id) if conflict and mapping and mapping.our_product_id else None,
+                "mappedProductSku": product.code if conflict and product else "",
+                "mappedProductName": product.name if conflict and product else "",
+            }
+        )
+        rows.append(payload)
+    return rows
+
+
 def _candidate_source_select():
     item = CompetitorPriceListItem
     price_list = CompetitorPriceList
@@ -1977,6 +2139,23 @@ def product_catalog_candidates_for_product(
         limit_per_product=limit,
     )
     return candidates.get(int(product.id), [])
+
+
+def product_catalog_product_for_candidates(
+    *, db: Session, product_id: int, format_code: str = ""
+) -> tuple[Product, ProductExtra | None] | None:
+    """Load the internal product using the same current-format eligibility rule."""
+
+    price_format_id = _product_catalog_resolve_price_format_id(db, format_code)
+    format_product_exists = _product_catalog_format_product_exists(price_format_id)
+    stmt = (
+        select(Product, ProductExtra)
+        .outerjoin(ProductExtra, ProductExtra.product_id == Product.id)
+        .where(Product.id == int(product_id))
+    )
+    if format_product_exists is not None:
+        stmt = stmt.where(format_product_exists)
+    return db.execute(stmt).first()
 
 
 def auto_match_product_catalog_code_mappings(
