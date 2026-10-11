@@ -95,6 +95,8 @@ def create_queued_price_format_refresh_job(
     refresh_source: str,
     payload: dict[str, Any],
     requested_by: str,
+    daily_run_id: int | None = None,
+    commit: bool = True,
 ) -> RefreshJob:
     now = db_now(db)
     source_type = "provisor" if refresh_source in {"provisor", "all"} else refresh_source
@@ -113,10 +115,14 @@ def create_queued_price_format_refresh_job(
         requested_by=requested_by,
         message="Competitor price-list refresh queued.",
         metadata_json=_metadata_with_queue_fields(metadata, queue_kind="price_format_refresh", requested_by=requested_by),
+        daily_run_id=daily_run_id,
     )
     db.add(job)
-    db.commit()
-    db.refresh(job)
+    if commit:
+        db.commit()
+        db.refresh(job)
+    else:
+        db.flush()
     return job
 
 
@@ -127,6 +133,8 @@ def create_queued_emit_refresh_job(
     filial_ids: list[int],
     requested_by: str,
     price_format_code: str | None = None,
+    daily_run_id: int | None = None,
+    commit: bool = True,
 ) -> RefreshJob:
     now = db_now(db)
     job = RefreshJob(
@@ -146,10 +154,14 @@ def create_queued_emit_refresh_job(
             queue_kind="emit_refresh",
             requested_by=requested_by,
         ),
+        daily_run_id=daily_run_id,
     )
     db.add(job)
-    db.commit()
-    db.refresh(job)
+    if commit:
+        db.commit()
+        db.refresh(job)
+    else:
+        db.flush()
     return job
 
 

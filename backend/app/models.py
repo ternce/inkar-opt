@@ -14,6 +14,7 @@ from sqlalchemy import (
     Boolean,
     Text,
     text,
+    CheckConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -1099,6 +1100,7 @@ class PriceSourceAccount(Base):
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     price_lists_count: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    run_in_morning_pipeline: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
@@ -1175,9 +1177,42 @@ class RefreshJob(Base):
     message: Mapped[str] = mapped_column(Text, default="")
     error_message: Mapped[str] = mapped_column(Text, default="")
     metadata_json: Mapped[str] = mapped_column(Text, default="{}")
+    daily_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("parser_daily_runs.id"), nullable=True, index=True
+    )
 
     __table_args__ = (
         Index("ix_refresh_jobs_source_status", "source_type", "status", "started_at"),
+    )
+
+
+class ParserDailyRun(Base):
+    __tablename__ = "parser_daily_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    business_date: Mapped[date] = mapped_column(Date, nullable=False, unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="PENDING", index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive, nullable=False)
+    emit_job_id: Mapped[int | None] = mapped_column(ForeignKey("refresh_jobs.id"), nullable=True)
+    emit_attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    plk_job_id: Mapped[int | None] = mapped_column(ForeignKey("refresh_jobs.id"), nullable=True)
+    suspicious_reason: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    requested_by: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    trigger_source: Mapped[str] = mapped_column(String(32), default="manual", nullable=False)
+    notification_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("business_date", name="uq_parser_daily_runs_business_date"),
+        CheckConstraint(
+            "status IN ('PENDING','EMIT_RUNNING','EMIT_VALIDATING','EMIT_SUSPICIOUS','EMIT_RETRYING','PLK_RUNNING','SUCCESS','SUSPICIOUS','FAILED','SKIPPED_ALREADY_RUNNING')",
+            name="ck_parser_daily_runs_status",
+        ),
+        Index("ix_parser_daily_runs_status_updated", "status", "updated_at"),
     )
 
 

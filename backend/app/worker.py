@@ -8,6 +8,7 @@ from .config import get_settings
 from .db import SessionLocal
 from .main import _execute_claimed_refresh_job, _worker_shutdown, _worker_startup
 from .services.refresh_queue import claim_next_queued_refresh_job, worker_identity
+from .services.parser_daily_orchestrator import advance_pending_daily_runs
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,7 @@ async def _poll_refresh_queue(*, stop_event: asyncio.Event, worker_id: str, poll
         had_error = False
         try:
             with SessionLocal() as db:
+                advance_pending_daily_runs(db)
                 job, token = claim_next_queued_refresh_job(db, worker_id=worker_id)
                 if job is not None and token:
                     claimed_id = int(job.id)

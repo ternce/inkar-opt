@@ -137,6 +137,18 @@ type ProvisorAccount = {
   status?: string;
   price_list_count?: number;
   last_success_at?: string | null;
+  run_in_morning_pipeline?: boolean;
+};
+
+type ParserDailyRun = {
+  id?: number;
+  businessDate?: string;
+  status: string;
+  emitStatus?: string | null;
+  emitAttemptCount?: number;
+  plkStatus?: string | null;
+  suspiciousReason?: string;
+  errorMessage?: string;
 };
 
 type VidmanRefreshResult = {
@@ -841,6 +853,7 @@ export function CompetitorsTab({ formatCode, branch, currentUser }: Props) {
   const [percentileDirection, setPercentileDirection] = useState<'asc' | 'desc'>('asc');
   const [provisorDiagnostics, setProvisorDiagnostics] = useState<ProvisorDiagnostics | null>(null);
   const [provisorAccounts, setProvisorAccounts] = useState<ProvisorAccount[]>([]);
+  const [parserDailyRun, setParserDailyRun] = useState<ParserDailyRun | null>(null);
   const [selectedProvisorAccountIds, setSelectedProvisorAccountIds] = useState<number[]>([]);
   const [provisorAccountSearch, setProvisorAccountSearch] = useState('');
   const [provisorAccountSelectorOpen, setProvisorAccountSelectorOpen] = useState(false);
@@ -970,6 +983,43 @@ export function CompetitorsTab({ formatCode, branch, currentUser }: Props) {
     setProvisorAccounts(Array.isArray(data) ? data : []);
   };
 
+  const loadParserDailyRun = async () => {
+    const res = await fetch('/api/parser-daily-run/current');
+    const text = await res.text();
+    const data = parseJsonOrNull(text);
+    if (!res.ok) throw new Error(data?.detail || text || 'Failed to load morning parser status');
+    setParserDailyRun(data || null);
+  };
+
+  const runParserDailyPipeline = async () => {
+    setIsLoading(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/parser-daily-run/run-now', { method: 'POST' });
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) throw new Error(data?.detail || text || 'Failed to start morning parser');
+      setParserDailyRun(data);
+      toast.success(data?.created ? 'Morning parser queued' : 'Today\'s morning parser already exists');
+    } catch (e: any) {
+      setError(e?.message || 'Failed to start morning parser');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const setMorningAccount = async (accountId: number, enabled: boolean) => {
+    const res = await fetch(`/api/price-source-accounts/${accountId}/morning-pipeline`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+    const text = await res.text();
+    const data = parseJsonOrNull(text);
+    if (!res.ok) throw new Error(data?.detail || text || 'Failed to update morning account');
+    await loadProvisorAccounts();
+  };
+
   const loadCodeMappings = async (signal?: AbortSignal) => {
     const params = new URLSearchParams({
       platform: mappingPlatform,
@@ -1017,7 +1067,7 @@ export function CompetitorsTab({ formatCode, branch, currentUser }: Props) {
     setIsLoading(true);
     setError(null);
     try {
-      await Promise.all([loadSources(), loadProvisorAccounts()]);
+      await Promise.all([loadSources(), loadProvisorAccounts(), loadParserDailyRun()]);
     } catch (e: any) {
       setError(e?.message || 'Ошибка загрузки');
     } finally {
@@ -1040,6 +1090,13 @@ export function CompetitorsTab({ formatCode, branch, currentUser }: Props) {
     void loadPriceListTab();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [formatCode, activeTab]);
+
+  useEffect(() => {
+    if (activeTab !== 'price-lists') return;
+    const timer = window.setInterval(() => { void loadParserDailyRun(); }, 10000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -1131,7 +1188,7 @@ export function CompetitorsTab({ formatCode, branch, currentUser }: Props) {
       if (!res.ok) throw new Error(data?.detail || text || 'Не удалось получить статус задачи');
       setActiveJob(data);
       if (data?.status === 'success') return data;
-      if (data?.status === 'error' || data?.status === 'cancelled') {
+      if (['error', 'failed', 'cancelled', 'partial_success', 'interrupted'].includes(data?.status)) {
         throw new Error(data?.error || data?.message || 'Задача завершилась с ошибкой');
       }
       await new Promise((resolve) => window.setTimeout(resolve, 1500));
@@ -1818,6 +1875,7 @@ export function CompetitorsTab({ formatCode, branch, currentUser }: Props) {
                 </div>
                 {filteredProvisorAccountOptions.map((account) => {
                   const checked = selectedProvisorAccountIds.includes(account.id);
+                  const sourceAccount = provisorAccounts.find((item) => item.id === account.id);
                   return (
                     <label
                       key={account.id}
@@ -1830,6 +1888,15 @@ export function CompetitorsTab({ formatCode, branch, currentUser }: Props) {
                       />
                       <span className="min-w-0 flex-1 truncate text-gray-900">{account.label}</span>
                       <span className="shrink-0 tabular-nums text-gray-500">{account.count} ПЛК</span>
+                      <span className="flex shrink-0 items-center gap-1 text-xs text-gray-600" onClick={(event) => event.stopPropagation()}>
+                        <Checkbox
+                          checked={Boolean(sourceAccount?.run_in_morning_pipeline)}
+                          onCheckedChange={(value) => { void setMorningAccount(account.id, value === true).catch((e) => setError(e?.message || String(e))); }}
+                          aria-label={`Morning pipeline ${account.label}`}
+                          disabled={currentUser.role === 'viewer'}
+                        />
+                        morning
+                      </span>
                     </label>
                   );
                 })}
@@ -2270,6 +2337,25 @@ export function CompetitorsTab({ formatCode, branch, currentUser }: Props) {
   return (
     <div className="space-y-4">
       {error ? <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</div> : null}
+      <div className="admin-card p-4 text-sm">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="font-medium text-gray-900">Morning parser pipeline</div>
+            <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-gray-600">
+              <span>Date: {parserDailyRun?.businessDate || '—'}</span>
+              <span>Status: {parserDailyRun?.status || 'IDLE'}</span>
+              <span>Emit: {parserDailyRun?.emitStatus || '—'} (attempt {parserDailyRun?.emitAttemptCount || 0})</span>
+              <span>PLK: {parserDailyRun?.plkStatus || '—'}</span>
+            </div>
+            {parserDailyRun?.suspiciousReason ? <div className="mt-1 text-amber-700">{parserDailyRun.suspiciousReason}</div> : null}
+            {parserDailyRun?.errorMessage ? <div className="mt-1 text-red-700">{parserDailyRun.errorMessage}</div> : null}
+          </div>
+          <Button variant="outline" size="sm" onClick={runParserDailyPipeline} disabled={isLoading || currentUser.role === 'viewer'}>
+            <RefreshCw className={`mr-2 h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} />
+            Run morning pipeline
+          </Button>
+        </div>
+      </div>
       {activeJob && ['pending', 'running'].includes(activeJob.status) ? (
         <div className="admin-card p-4">
           <div className="mb-2 flex items-center justify-between text-sm">

@@ -64,6 +64,7 @@ from .models import (
     BranchStock,
     Job,
     PriceSourceAccount,
+    ParserDailyRun,
     PriceFormat,
     PriceFormatCompetitorAssignment,
     PriceList,
@@ -400,6 +401,11 @@ from .services.refresh_queue import (
     recover_expired_orphan_locks,
     recover_stale_parser_jobs,
 )
+from .services.parser_daily_orchestrator import (
+    create_or_get_daily_run,
+    current_business_date,
+    daily_run_to_dict,
+)
 
 
 logging.basicConfig(
@@ -420,6 +426,7 @@ _provisor_auto_refresh_scheduler_renew_task = None
 _emit_refresh_scheduler = None
 _emit_refresh_scheduler_token: str | None = None
 _emit_refresh_scheduler_renew_task = None
+_parser_daily_scheduler = None
 _emit_worker: EmitWorker | None = None
 
 settings = get_settings()
@@ -945,11 +952,39 @@ def _seed_price_formats_if_missing() -> None:
         traceback.print_exc()
 
 
+def _validate_parser_daily_scheduler_configuration(*, role: str | None = None) -> None:
+    process_role = role or _process_role()
+    if not settings.parser_daily_schedule_enabled:
+        return
+    conflicts: list[str] = []
+    if settings.provisor_auto_refresh_enabled:
+        conflicts.append("PROVISOR_AUTO_REFRESH_ENABLED")
+    if settings.emit_worker_enabled:
+        conflicts.append("EMIT_WORKER_ENABLED")
+    if conflicts:
+        logger.error(
+            "[PARSER_DAILY_SCHEDULER] legacy_schedule_conflict flags=%s role=%s",
+            ",".join(conflicts),
+            process_role,
+        )
+        raise RuntimeError(
+            "PARSER_DAILY_SCHEDULE_ENABLED cannot be combined with legacy " + " or ".join(conflicts)
+        )
+    if process_role == "all":
+        logger.error("[PARSER_DAILY_SCHEDULER] unsupported_process_role role=all")
+        raise RuntimeError(
+            "PARSER_DAILY_SCHEDULE_ENABLED requires PROCESS_ROLE=worker; PROCESS_ROLE=all is not supported"
+        )
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     if _process_role() == "worker":
         raise RuntimeError("PROCESS_ROLE=worker must be started with: python -m app.worker")
+    _validate_parser_daily_scheduler_configuration()
     logger.info("[PROCESS_ROLE] role=%s startup=fastapi", _process_role())
+    if settings.parser_daily_schedule_enabled and _process_role() == "web":
+        logger.info("[PARSER_DAILY_SCHEDULER] enabled=true registration=skipped role=web")
     try:
         if _startup_runs_web_initialization():
             init_db()
@@ -983,6 +1018,7 @@ def _worker_startup() -> None:
     if _process_role() != "worker":
         raise RuntimeError("app.worker requires PROCESS_ROLE=worker")
     logger.info("[PROCESS_ROLE] role=%s startup=worker", _process_role())
+    _validate_parser_daily_scheduler_configuration()
     try:
         with SessionLocal() as db:
             recover_stale_parser_jobs(
@@ -993,6 +1029,7 @@ def _worker_startup() -> None:
             recover_expired_orphan_locks(db)
         _start_provisor_auto_refresh_scheduler()
         _start_emit_refresh_scheduler()
+        _start_parser_daily_scheduler()
     except Exception:
         import traceback
 
@@ -1002,6 +1039,7 @@ def _worker_startup() -> None:
 
 
 def _worker_shutdown() -> None:
+    _shutdown_parser_daily_scheduler()
     _shutdown_provisor_auto_refresh_scheduler()
     _shutdown_emit_refresh_scheduler()
 
@@ -1139,6 +1177,181 @@ def _scheduler_loop_info() -> tuple[bool, int | None]:
 def _create_task_on_running_loop(coro_func, *args, **kwargs):
     loop = asyncio.get_running_loop()
     return loop.create_task(coro_func(*args, **kwargs))
+
+
+def _parser_daily_local_now(now: datetime | None = None) -> datetime:
+    timezone = ZoneInfo(settings.app_timezone)
+    if now is None:
+        return datetime.now(timezone)
+    if now.tzinfo is None:
+        return now.replace(tzinfo=timezone)
+    return now.astimezone(timezone)
+
+
+def _trigger_parser_daily_run(
+    *,
+    trigger_source: str,
+    requested_by: str,
+    now: datetime | None = None,
+) -> tuple[ParserDailyRun | None, bool, date, str]:
+    local_now = _parser_daily_local_now(now)
+    business_date = current_business_date(settings, now=local_now)
+    until_date = settings.parser_daily_schedule_until_date
+    if until_date is not None and business_date > until_date:
+        logger.info(
+            "[PARSER_DAILY_SCHEDULER] trigger_skipped reason=after_until_date business_date=%s until_date=%s source=%s",
+            business_date.isoformat(),
+            until_date.isoformat(),
+            trigger_source,
+        )
+        return None, False, business_date, "after_until_date"
+    with SessionLocal() as db:
+        row, created = create_or_get_daily_run(
+            db,
+            business_date=business_date,
+            requested_by=requested_by,
+            trigger_source=trigger_source,
+        )
+        run_id = int(row.id)
+    logger.info(
+        "[PARSER_DAILY_SCHEDULER] trigger_completed source=%s business_date=%s daily_run_id=%s result=%s",
+        trigger_source,
+        business_date.isoformat(),
+        run_id,
+        "created" if created else "reused",
+    )
+    return row, created, business_date, ""
+
+
+async def _run_scheduled_parser_daily() -> None:
+    local_now = _parser_daily_local_now()
+    logger.info(
+        "[PARSER_DAILY_SCHEDULER] scheduled_trigger_fired business_date=%s timezone=%s",
+        current_business_date(settings, now=local_now).isoformat(),
+        settings.app_timezone,
+    )
+    _trigger_parser_daily_run(
+        trigger_source="scheduled",
+        requested_by="scheduler",
+        now=local_now,
+    )
+
+
+def _latest_parser_daily_fire_today(trigger, *, now: datetime) -> datetime | None:
+    local_now = _parser_daily_local_now(now)
+    day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    cursor = day_start - timedelta(microseconds=1)
+    previous = None
+    latest = None
+    for _ in range(1500):
+        candidate = trigger.get_next_fire_time(previous, cursor)
+        if candidate is None or candidate > local_now or candidate.date() != local_now.date():
+            break
+        latest = candidate
+        previous = candidate
+        cursor = candidate
+    return latest
+
+
+def _run_parser_daily_startup_catchup(trigger, *, now: datetime | None = None) -> None:
+    local_now = _parser_daily_local_now(now)
+    business_date = current_business_date(settings, now=local_now)
+    until_date = settings.parser_daily_schedule_until_date
+    if until_date is not None and business_date > until_date:
+        logger.info(
+            "[PARSER_DAILY_SCHEDULER] catchup_skipped reason=after_until_date business_date=%s until_date=%s",
+            business_date.isoformat(),
+            until_date.isoformat(),
+        )
+        return
+    with SessionLocal() as db:
+        existing_id = db.execute(
+            select(ParserDailyRun.id).where(ParserDailyRun.business_date == business_date)
+        ).scalar()
+    if existing_id is not None:
+        logger.info(
+            "[PARSER_DAILY_SCHEDULER] catchup_skipped reason=daily_run_exists business_date=%s daily_run_id=%s",
+            business_date.isoformat(),
+            existing_id,
+        )
+        return
+    scheduled_fire = _latest_parser_daily_fire_today(trigger, now=local_now)
+    if scheduled_fire is None:
+        logger.info(
+            "[PARSER_DAILY_SCHEDULER] catchup_skipped reason=scheduled_time_not_passed business_date=%s",
+            business_date.isoformat(),
+        )
+        return
+    delay_hours = max(0.0, (local_now - scheduled_fire).total_seconds() / 3600)
+    if delay_hours > settings.parser_daily_catchup_max_hours:
+        logger.info(
+            "[PARSER_DAILY_SCHEDULER] catchup_skipped reason=outside_window business_date=%s delay_hours=%.3f max_hours=%s",
+            business_date.isoformat(),
+            delay_hours,
+            settings.parser_daily_catchup_max_hours,
+        )
+        return
+    logger.info(
+        "[PARSER_DAILY_SCHEDULER] catchup_trigger business_date=%s scheduled_time=%s delay_hours=%.3f",
+        business_date.isoformat(),
+        scheduled_fire.isoformat(),
+        delay_hours,
+    )
+    _trigger_parser_daily_run(
+        trigger_source="catchup",
+        requested_by="scheduler-catchup",
+        now=local_now,
+    )
+
+
+def _start_parser_daily_scheduler() -> None:
+    global _parser_daily_scheduler
+    if not settings.parser_daily_schedule_enabled:
+        logger.info("[PARSER_DAILY_SCHEDULER] enabled=false registration=skipped role=%s", _process_role())
+        return
+    if _process_role() != "worker":
+        logger.info("[PARSER_DAILY_SCHEDULER] enabled=true registration=skipped role=%s", _process_role())
+        return
+    _validate_parser_daily_scheduler_configuration()
+    if _parser_daily_scheduler is not None:
+        return
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.triggers.cron import CronTrigger
+
+    timezone_name = settings.app_timezone
+    trigger = CronTrigger.from_crontab(settings.parser_daily_schedule_cron, timezone=timezone_name)
+    scheduler = AsyncIOScheduler(timezone=timezone_name)
+    scheduler.add_job(
+        _run_scheduled_parser_daily,
+        trigger=trigger,
+        id="parser_daily_morning",
+        name="Parser daily morning orchestration trigger",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+        replace_existing=True,
+    )
+    scheduler.start()
+    _parser_daily_scheduler = scheduler
+    logger.info(
+        "[PARSER_DAILY_SCHEDULER] enabled=true registration=started cron=%s timezone=%s next_run=%s",
+        settings.parser_daily_schedule_cron,
+        timezone_name,
+        _scheduler_next_run_iso(scheduler, "parser_daily_morning"),
+    )
+    try:
+        _run_parser_daily_startup_catchup(trigger)
+    except Exception:
+        logger.exception("[PARSER_DAILY_SCHEDULER] catchup_failed")
+
+
+def _shutdown_parser_daily_scheduler() -> None:
+    global _parser_daily_scheduler
+    if _parser_daily_scheduler is None:
+        return
+    _parser_daily_scheduler.shutdown(wait=False)
+    _parser_daily_scheduler = None
+    logger.info("[PARSER_DAILY_SCHEDULER] scheduler_shutdown")
 
 
 async def _run_scheduled_provisor_refresh(*, mode: str) -> None:
@@ -1403,7 +1616,14 @@ async def _run_queued_price_format_refresh_job(job_id: int, *, owner_token: str)
         if job is not None:
             _update_queued_price_format_progress(db, job, result, owner_token=owner_token)
             errors = result.get("errors") if isinstance(result, dict) else []
-            status = "failed" if errors and not int(job.success_count or 0) else "success"
+            has_failures = bool(errors) or int(job.failed_count or 0) > 0
+            status = (
+                "failed"
+                if has_failures and not int(job.success_count or 0)
+                else "partial_success"
+                if has_failures
+                else "success"
+            )
             finish_refresh_job(
                 db,
                 job,
@@ -1705,7 +1925,7 @@ def _refresh_job_to_legacy_job_dict(job: RefreshJob) -> dict:
         "normalizing": "running",
         "saving": "running",
         "success": "success",
-        "partial_success": "success",
+        "partial_success": "error",
         "failed": "error",
         "error": "error",
         "interrupted": "error",
@@ -8465,9 +8685,71 @@ def get_provisor_accounts(db: Session = Depends(get_db)):
             "status": row.status or "not_checked",
             "price_list_count": int(price_list_counts.get(str(row.id)) if price_list_counts.get(str(row.id)) is not None else row.price_lists_count or 0),
             "last_success_at": row.last_success_at.isoformat() if row.last_success_at else None,
+            "run_in_morning_pipeline": bool(row.run_in_morning_pipeline),
         }
         for row in rows
     ]
+
+
+@app.put("/api/price-source-accounts/{account_id}/morning-pipeline")
+def set_price_source_account_morning_pipeline(
+    account_id: int,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+):
+    row = db.get(PriceSourceAccount, account_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="account not found")
+    if row.source_type != "provisor":
+        raise HTTPException(status_code=400, detail="morning pipeline supports Provisor accounts only")
+    enabled = bool(payload.get("enabled"))
+    if enabled and not row.is_active:
+        raise HTTPException(status_code=409, detail="inactive account cannot join morning pipeline")
+    row.run_in_morning_pipeline = enabled
+    row.updated_at = now_kz_naive()
+    db.commit()
+    db.refresh(row)
+    return account_to_dict(row)
+
+
+@app.post("/api/parser-daily-run/run-now", status_code=202)
+def run_parser_daily_pipeline_now(
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+):
+    row, created = create_or_get_daily_run(
+        db,
+        business_date=current_business_date(settings),
+        requested_by=current_user.username or str(current_user.id),
+        trigger_source="manual",
+    )
+    return {**daily_run_to_dict(row, db), "created": created}
+
+
+@app.get("/api/parser-daily-run/current")
+def get_current_parser_daily_pipeline(
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    row = db.execute(
+        select(ParserDailyRun)
+        .where(ParserDailyRun.business_date == current_business_date(settings))
+        .order_by(ParserDailyRun.id.desc())
+    ).scalars().first()
+    return daily_run_to_dict(row, db)
+
+
+@app.get("/api/parser-daily-run/{run_id}")
+def get_parser_daily_pipeline(
+    run_id: int,
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    row = db.get(ParserDailyRun, run_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="daily parser run not found")
+    return daily_run_to_dict(row, db)
 
 
 @app.post("/api/price-source-accounts")
@@ -9092,7 +9374,13 @@ async def _run_provisor_refresh_job(job_id: int, *, mode: str, requested_by: str
         job = db.get(RefreshJob, job_id)
         if job is not None:
             failed = int(aggregate["failed"] or 0)
-            status = "failed" if failed and not int(aggregate["success"] or 0) else "success"
+            status = (
+                "failed"
+                if failed and not int(aggregate["success"] or 0)
+                else "partial_success"
+                if failed
+                else "success"
+            )
             message = f"Обновление Provisor завершено: успешно={aggregate['success']}, ошибок={aggregate['failed']}, пропущено={aggregate['skipped']}." if status == "success" else "Обновление Provisor завершилось с ошибкой."
             finished = finish_refresh_job(
                 db,

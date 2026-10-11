@@ -395,6 +395,10 @@ def _ensure_compatible_columns() -> None:
             ("message", "TEXT DEFAULT ''"),
             ("error_message", "TEXT DEFAULT ''"),
             ("metadata_json", "TEXT DEFAULT '{}'"),
+            ("daily_run_id", "INTEGER"),
+        ],
+        "price_source_accounts": [
+            ("run_in_morning_pipeline", "BOOLEAN NOT NULL DEFAULT FALSE"),
         ],
         "refresh_locks": [
             ("name", "VARCHAR(128)"),

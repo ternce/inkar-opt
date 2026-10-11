@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from datetime import date
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
@@ -51,6 +52,13 @@ class Settings(BaseModel):
     parser_worker_poll_interval_seconds: float
     parser_worker_concurrency: int
     parser_worker_stale_heartbeat_seconds: int
+    parser_daily_schedule_enabled: bool
+    parser_daily_schedule_cron: str
+    parser_daily_catchup_max_hours: float
+    parser_daily_schedule_until_date: date | None
+    parser_daily_baseline_window: int
+    parser_daily_baseline_min_samples: int
+    parser_daily_baseline_ratio: float
     vidman_base_url: str
     vidman_login_path: str
     vidman_price_base_url: str
@@ -93,6 +101,12 @@ def get_settings() -> Settings:
             except Exception:
                 continue
         return list(dict.fromkeys(out))
+
+    schedule_until_raw = os.getenv("PARSER_DAILY_SCHEDULE_UNTIL_DATE", "").strip()
+    try:
+        parser_daily_schedule_until_date = date.fromisoformat(schedule_until_raw) if schedule_until_raw else None
+    except ValueError as exc:
+        raise ValueError("PARSER_DAILY_SCHEDULE_UNTIL_DATE must use YYYY-MM-DD format") from exc
 
     return Settings(
         process_role=process_role,
@@ -144,6 +158,13 @@ def get_settings() -> Settings:
         parser_worker_poll_interval_seconds=max(0.5, float(os.getenv("PARSER_WORKER_POLL_INTERVAL_SECONDS", "5"))),
         parser_worker_concurrency=max(1, int(os.getenv("PARSER_WORKER_CONCURRENCY", "1"))),
         parser_worker_stale_heartbeat_seconds=max(30, int(os.getenv("PARSER_WORKER_STALE_HEARTBEAT_SECONDS", "180"))),
+        parser_daily_schedule_enabled=env_bool("PARSER_DAILY_SCHEDULE_ENABLED", False),
+        parser_daily_schedule_cron=os.getenv("PARSER_DAILY_SCHEDULE_CRON", "0 2 * * *").strip() or "0 2 * * *",
+        parser_daily_catchup_max_hours=max(0.0, float(os.getenv("PARSER_DAILY_CATCHUP_MAX_HOURS", "6"))),
+        parser_daily_schedule_until_date=parser_daily_schedule_until_date,
+        parser_daily_baseline_window=max(1, int(os.getenv("PARSER_DAILY_BASELINE_WINDOW", "7"))),
+        parser_daily_baseline_min_samples=max(1, int(os.getenv("PARSER_DAILY_BASELINE_MIN_SAMPLES", "3"))),
+        parser_daily_baseline_ratio=max(0.0, min(1.0, float(os.getenv("PARSER_DAILY_BASELINE_RATIO", "0.65")))),
         vidman_base_url=os.getenv("VIDMAN_BASE_URL", "https://1.provizor.kz"),
         vidman_login_path=os.getenv("VIDMAN_LOGIN_PATH", "/pages/login"),
         vidman_price_base_url=os.getenv("VIDMAN_PRICE_BASE_URL", "https://prv.kz"),

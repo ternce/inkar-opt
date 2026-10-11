@@ -39,6 +39,7 @@ def account_to_dict(row: PriceSourceAccount) -> dict[str, Any]:
         "lastSuccessAt": row.last_success_at.isoformat() if row.last_success_at else "",
         "priceListsCount": int(row.price_lists_count or 0),
         "isActive": bool(row.is_active),
+        "runInMorningPipeline": bool(row.run_in_morning_pipeline),
         "createdAt": row.created_at.isoformat() if row.created_at else "",
         "updatedAt": row.updated_at.isoformat() if row.updated_at else "",
         "config": config,
