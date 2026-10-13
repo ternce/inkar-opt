@@ -39,6 +39,7 @@ from .emit_percentile_resolver import (
     has_global_emit_percentile_rows,
 )
 from .jobs import job_to_dict, update_job
+from .pricing_workflow.locks import acquire_transaction_write_locks
 
 
 logger = logging.getLogger(__name__)
@@ -475,6 +476,12 @@ def run_percentile_preparation_job(job_id: str) -> dict[str, Any] | None:
         row.updated_at = row.started_at
         db.commit()
 
+        acquire_transaction_write_locks(
+            db,
+            price_format_ids=[price_format_id],
+            retry_timeout_seconds=5.0,
+            retry_interval_seconds=0.2,
+        )
         summary = recalculate_competitor_percentiles(db=db, price_format_id=price_format_id)
         _covered_emit, missing_emit, _local_required = _canonical_emit_reuse_state(db, price_format_id)
         if missing_emit:

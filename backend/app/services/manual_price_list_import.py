@@ -30,6 +30,7 @@ from .competitor_matching import rebuild_competitor_prices_for_selected, rematch
 from .competitor_percentiles import DEFAULT_BRANCH
 from .competitor_read_models import refresh_price_list_matched_item_counters
 from .percentile_preparation import enqueue_percentile_preparation
+from .pricing_workflow.locks import PricingWorkflowTransactionLockLease
 from .sku import normalize_sku, normalize_sku_variants
 from ..timezone import now_kz_naive
 from .competitor_assignments import selected_price_format_ids_for_competitor_price_list
@@ -498,6 +499,18 @@ def import_manual_price_list(
             db.commit()
             return {"ok": False, "status": "error", "importId": history.id, **_summary(parsed)}
 
+        transaction_locks = PricingWorkflowTransactionLockLease(db, retry_timeout_seconds=5.0)
+        if existing is not None:
+            affected_price_format_ids = selected_price_format_ids_for_competitor_price_list(
+                db=db,
+                competitor_price_list_id=int(existing.id),
+            )
+            transaction_locks.acquire(
+                price_format_ids=affected_price_format_ids,
+                source_ids=[int(existing.id)],
+            )
+        else:
+            affected_price_format_ids = []
         now = now_kz_naive()
         if existing is None:
             source_key = f"manual:{uuid.uuid4()}"
@@ -525,6 +538,7 @@ def import_manual_price_list(
             )
             db.add(row)
             db.flush()
+            transaction_locks.acquire(source_ids=[int(row.id)])
         else:
             row = existing
             source_key = row.source_key
@@ -591,12 +605,12 @@ def import_manual_price_list(
             error_summary=row.last_refresh_message,
             metadata={"priceListId": int(row.id), "sourceKey": source_key},
         )
-        affected_price_format_ids = selected_price_format_ids_for_competitor_price_list(
-            db=db,
-            competitor_price_list_id=int(row.id),
-        )
         for price_format_id in affected_price_format_ids:
-            rebuild_competitor_prices_for_selected(db=db, price_format_id=price_format_id)
+            rebuild_competitor_prices_for_selected(
+                db=db,
+                price_format_id=price_format_id,
+                lock_lease=transaction_locks,
+            )
         db.commit()
         for price_format_id in affected_price_format_ids:
             enqueue_percentile_preparation(db=db, price_format_id=price_format_id, reason="manual_price_list_imported")
@@ -715,6 +729,8 @@ def deactivate_manual_price_list(*, db: Session, price_list_id: int) -> dict[str
         db=db,
         competitor_price_list_id=int(row.id),
     )
+    transaction_locks = PricingWorkflowTransactionLockLease(db, retry_timeout_seconds=5.0)
+    transaction_locks.acquire(price_format_ids=affected_price_format_ids, source_ids=[int(row.id)])
     for assignment in db.execute(
         select(PriceFormatCompetitorAssignment).where(PriceFormatCompetitorAssignment.competitor_price_list_id == row.id)
     ).scalars():
@@ -724,7 +740,7 @@ def deactivate_manual_price_list(*, db: Session, price_list_id: int) -> dict[str
     row.last_refresh_message = "manual price list deactivated"
     row.updated_at = now_kz_naive()
     for price_format_id in affected_price_format_ids:
-        rebuild_competitor_prices_for_selected(db=db, price_format_id=price_format_id)
+        rebuild_competitor_prices_for_selected(db=db, price_format_id=price_format_id, lock_lease=transaction_locks)
     db.commit()
     return {"ok": True, "id": row.id, "status": "inactive"}
 
@@ -742,6 +758,7 @@ def delete_manual_price_list(*, db: Session, price_list_id: int) -> dict[str, An
     )
     if active_assignments:
         raise ValueError("manual price list has active assignments; deactivate it first")
+    PricingWorkflowTransactionLockLease(db, retry_timeout_seconds=5.0).acquire(source_ids=[int(row.id)])
     import_ids = [
         int(x)
         for x in db.execute(select(ManualPriceListImport.id).where(ManualPriceListImport.competitor_price_list_id == row.id)).scalars()

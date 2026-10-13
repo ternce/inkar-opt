@@ -8,6 +8,8 @@ from typing import Any, Iterable
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from .pricing_workflow.locks import acquire_transaction_write_locks
+
 from .. import data
 from ..models import CompetitorPrice, PriceFormat, Product
 from .competitor_source_config import canonical_provisor_source_key
@@ -84,6 +86,7 @@ def persist_phcenter_report(
     as_of: date | None = None,
 ) -> PersistStats:
     pf = _ensure_price_format(db, price_format_code)
+    acquire_transaction_write_locks(db, price_format_ids=[int(pf.id)], retry_timeout_seconds=5.0)
     today = as_of or date.today()
 
     # 1) ensure sources configs exist
@@ -247,6 +250,7 @@ def persist_provisor_prices(
     as_of: date | None = None,
 ) -> PersistStats:
     pf = _ensure_price_format(db, price_format_code)
+    acquire_transaction_write_locks(db, price_format_ids=[int(pf.id)], retry_timeout_seconds=5.0)
     today = as_of or date.today()
 
     source_key = canonical_provisor_source_key(account_id, filial_id)

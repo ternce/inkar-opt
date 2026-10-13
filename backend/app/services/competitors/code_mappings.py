@@ -9,6 +9,8 @@ from decimal import Decimal
 from sqlalchemy import String, and_, case, cast, desc, exists, func, literal, or_, select, update
 from sqlalchemy.orm import Session
 
+from ..pricing_workflow.locks import acquire_transaction_write_locks
+
 from ...models import (
     CompetitorCodeMapping,
     CompetitorPriceList,
@@ -2617,6 +2619,17 @@ def apply_mapping_to_matching_items(
         changed_checks.append(item.match_key.is_distinct_from(values["match_key"]))
     changed_condition = or_(*changed_checks)
     target_condition = and_(source_scope, identity_condition, changed_condition)
+    target_source_ids = [
+        int(source_id)
+        for source_id in db.execute(
+            select(item.price_list_id).where(source_scope, identity_condition).distinct()
+        ).scalars()
+    ]
+    acquire_transaction_write_locks(
+        db,
+        source_ids=target_source_ids,
+        retry_timeout_seconds=0.0,
+    )
     counter_refresh_started_at = time.perf_counter()
     # A goodsId-targeted Provisor row already satisfies the identity arm of the
     # matched-positive predicate. This update changes neither goodsId nor price,

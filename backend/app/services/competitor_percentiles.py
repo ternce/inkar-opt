@@ -22,6 +22,7 @@ from ..models import (
 )
 from ..timezone import now_kz_naive
 from .competitor_assignments import get_assigned_competitor_price_lists
+from .pricing_workflow.locks import acquire_transaction_write_locks
 from .competitor_read_models import (
     refresh_emit_percentile_source_summaries,
     refresh_regular_percentile_source_summaries,
@@ -242,6 +243,7 @@ def recalculate_competitor_percentiles(
     source_price_list_ids: list[int] | None = None,
     require_assignment: bool = True,
 ) -> dict[str, Any]:
+    acquire_transaction_write_locks(db, price_format_ids=[int(price_format_id)], retry_timeout_seconds=5.0)
     if (db.get_bind().dialect.name or "").lower() == "postgresql":
         summary = _recalculate_competitor_percentiles_postgresql(
             db=db,
@@ -424,6 +426,13 @@ def recalculate_emit_percentiles_globally(
             "canonical_price_format_id": None,
             "percentile_total_elapsed": round(time.perf_counter() - started_at, 3),
         }
+
+    acquire_transaction_write_locks(
+        db,
+        price_format_ids=target_ids,
+        source_ids=scoped_ids,
+        retry_timeout_seconds=5.0,
+    )
 
     canonical_price_format_id = global_emit_percentile_storage_price_format_id()
     calculation_started = time.perf_counter()

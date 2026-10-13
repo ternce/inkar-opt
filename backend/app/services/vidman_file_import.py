@@ -49,6 +49,7 @@ from .competitor_matching import rebuild_competitor_prices_for_selected
 from .competitor_price_lists import sync_selected_competitor_configs
 from .competitor_read_models import refresh_price_list_matched_item_counters
 from .percentile_preparation import enqueue_percentile_preparation
+from .pricing_workflow.locks import acquire_transaction_write_locks
 from .vidman_normalization import _canonical_from_parsed, parse_vidman_product, process_vidman_stage2
 from .vidman_product_matching import (
     AUTO_MATCHED,
@@ -903,6 +904,7 @@ def set_vidman_update_mode(*, db: Session, competitor_price_list_id: int, update
     price_list = db.get(CompetitorPriceList, int(competitor_price_list_id))
     if price_list is None or str(price_list.source_type or "").lower() not in {"vidman", "manual_vidman"}:
         raise ValueError("Vidman price list not found")
+    acquire_transaction_write_locks(db, source_ids=[int(price_list.id)])
     price_list.update_mode = mode
     price_list.updated_at = now_kz_naive()
     if price_list.source_type == "vidman":
@@ -1504,6 +1506,12 @@ def import_vidman_multi_source_file(
                         )
                         db.add(price_list)
                         db.flush()
+                    acquire_transaction_write_locks(
+                        db,
+                        source_ids=[int(price_list.id)],
+                        retry_timeout_seconds=5.0,
+                        retry_interval_seconds=0.2,
+                    )
                     now = now_kz_naive()
                     price_list.display_name = f"{target_branch} — {source.name} — vidman-file"
                     price_list.supplier = source.name

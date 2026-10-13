@@ -18,6 +18,7 @@ from ..models import (
     CompetitorPrice,
 )
 from .sku import normalize_sku
+from .pricing_workflow.locks import acquire_transaction_write_locks
 
 
 def _norm_header(value: object) -> str:
@@ -192,6 +193,7 @@ def import_excel(*, db: Session, content: bytes) -> dict[str, int]:
                     pf = PriceFormat(code=code_s, name=str(name).strip() if name else code_s)
                     db.add(pf)
                     db.flush()
+                acquire_transaction_write_locks(db, price_format_ids=[int(pf.id)])
 
                 if name not in (None, ""):
                     pf.name = str(name).strip()
@@ -226,6 +228,7 @@ def import_excel(*, db: Session, content: bytes) -> dict[str, int]:
                 pf = db.execute(select(PriceFormat).where(PriceFormat.code == str(pf_val).strip())).scalars().first()
                 if not pf:
                     continue
+                acquire_transaction_write_locks(db, price_format_ids=[int(pf.id)])
 
                 cost_from_d = _as_decimal(cost_from)
                 if cost_from_d is None:
@@ -362,6 +365,7 @@ def import_excel(*, db: Session, content: bytes) -> dict[str, int]:
                 pf = db.execute(select(PriceFormat).where(PriceFormat.code == str(pf_code).strip())).scalars().first()
                 if not pf:
                     continue
+                acquire_transaction_write_locks(db, price_format_ids=[int(pf.id)])
 
                 src = str(source_name).strip()
                 coeff = _as_decimal(coefficient, Decimal("1")) or Decimal("1")
@@ -403,6 +407,7 @@ def import_excel(*, db: Session, content: bytes) -> dict[str, int]:
                 pf = db.execute(select(PriceFormat).where(PriceFormat.code == str(pf_code).strip())).scalars().first()
                 if not pf:
                     continue
+                acquire_transaction_write_locks(db, price_format_ids=[int(pf.id)])
 
                 sku = normalize_sku(product_code) or str(product_code).strip()
                 p = db.execute(select(Product).where(Product.code == sku)).scalars().first()

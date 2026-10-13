@@ -56,6 +56,11 @@ from .emit_percentile_resolver import (
 )
 from .references.types import branch_display_name, canonical_branch_id
 from .regions import allowed_provisor_source_names_for_city_id, city_id_from_branch
+from .pricing_workflow.locks import (
+    PricingWorkflowLockLease,
+    PricingWorkflowTransactionLockLease,
+    acquire_transaction_write_locks,
+)
 
 LIST_TYPE_FIXED_PRICE = "fixed_price"
 LIST_TYPE_MIN_PRICE = "min_price"
@@ -2818,6 +2823,7 @@ def calculate_prices(
     user: str,
     region_id: int | None = None,
     force_new_price_list: bool = False,
+    lock_lease: PricingWorkflowLockLease | PricingWorkflowTransactionLockLease | None = None,
 ) -> int:
     pf = db.execute(select(PriceFormat).where(PriceFormat.code == price_format_code)).scalars().first()
     if not pf:
@@ -2840,6 +2846,13 @@ def calculate_prices(
 
         db.add(pf)
         db.flush()
+
+    # Direct/legacy generation must serialize with workflow generation too.
+    # The function's existing final commit releases this transaction lock.
+    if lock_lease is None:
+        acquire_transaction_write_locks(db, price_format_ids=[int(pf.id)])
+    else:
+        lock_lease.acquire(price_format_ids=[int(pf.id)])
 
     def _get_defaults() -> dict:
         return data.PRICING_SETTINGS_BY_FORMAT.get(price_format_code) or data.PRICING_SETTINGS_BY_FORMAT.get(

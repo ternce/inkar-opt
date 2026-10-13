@@ -30,6 +30,7 @@ from .competitor_assignments import selected_price_format_ids_for_competitor_pri
 from .competitor_read_models import refresh_price_list_matched_item_counters
 from .competitor_source_config import canonical_competitor_source_key
 from .percentile_preparation import enqueue_percentile_preparation
+from .pricing_workflow.locks import PricingWorkflowTransactionLockLease
 from .vidman_product_matching import AUTO_MATCHED, MANUALLY_APPROVED
 
 
@@ -458,6 +459,15 @@ def build_vidman_competitor_price_list(
         db.add(price_list)
         db.flush()
     summary.competitor_price_list_id = int(price_list.id)
+    affected_price_format_ids = selected_price_format_ids_for_competitor_price_list(
+        db=db,
+        competitor_price_list_id=int(price_list.id),
+    )
+    transaction_locks = PricingWorkflowTransactionLockLease(db, retry_timeout_seconds=5.0)
+    transaction_locks.acquire(
+        price_format_ids=affected_price_format_ids,
+        source_ids=[int(price_list.id)],
+    )
     display = f"{source.branch_name} - {source.competitor_name} - {account_login}"
     price_list.source_key = source_key
     price_list.display_name = display
@@ -548,13 +558,13 @@ def build_vidman_competitor_price_list(
     summary.rows_written = len(mappings)
 
     _replace_legacy_price_rows_for_list(db=db, price_list=price_list)
-    affected_price_format_ids = selected_price_format_ids_for_competitor_price_list(
-        db=db,
-        competitor_price_list_id=int(price_list.id),
-    )
     for price_format_id in affected_price_format_ids:
         sync_selected_competitor_configs(db=db, price_format_id=price_format_id)
-        rebuild_competitor_prices_for_selected(db=db, price_format_id=price_format_id)
+        rebuild_competitor_prices_for_selected(
+            db=db,
+            price_format_id=price_format_id,
+            lock_lease=transaction_locks,
+        )
         if commit:
             enqueue_percentile_preparation(db=db, price_format_id=price_format_id, reason="vidman_price_list_built")
     if commit:

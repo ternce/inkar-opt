@@ -38,6 +38,7 @@ from .percentile_preparation import mark_percentile_preparation_ready_for_catalo
 from .competitor_read_models import refresh_price_list_matched_item_counters
 from .competitor_source_config import canonical_competitor_source_key, emit_display_name
 from .competitor_persist import _ensure_price_format
+from .pricing_workflow.locks import acquire_transaction_write_locks
 from .manufacturers import _clean_text, _extract_manufacturer_cleaned, _normalize_manufacturer_cleaned, resolve_manufacturer
 from .provisor import get_access_token
 from .provisor_auto_refresh import (
@@ -2641,6 +2642,12 @@ def replace_emit_price_list_from_staging(
         )
         db.add(row)
         db.flush()
+    acquire_transaction_write_locks(
+        db,
+        source_ids=[int(row.id)],
+        retry_timeout_seconds=5.0,
+        retry_interval_seconds=0.2,
+    )
     display_name = emit_display_name(filial_id, filial_name)
     row.price_format_id = None
     row.display_name = display_name
@@ -3187,6 +3194,13 @@ def _recalculate_percentiles_for_emit_rows(
         )
 
     scoped_ids = sorted(set(ids))
+    acquire_transaction_write_locks(
+        db,
+        price_format_ids=all_price_format_ids,
+        source_ids=scoped_ids,
+        retry_timeout_seconds=5.0,
+        retry_interval_seconds=0.2,
+    )
     result = recalculate_emit_percentiles_globally(
         db=db,
         source_price_list_ids=scoped_ids if scope_to_price_list_ids else None,

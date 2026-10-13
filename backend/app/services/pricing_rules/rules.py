@@ -24,6 +24,7 @@ from ...models import (
 )
 from .common import touch
 from .templates import rounding_to_dict, template_to_dict
+from ..pricing_workflow.locks import acquire_transaction_write_locks
 from ...timezone import local_iso, now_kz_naive
 
 
@@ -35,6 +36,15 @@ DEFAULT_COMPETITOR_GAP_TIERS = (
     (Decimal("10000"), Decimal("25000"), Decimal("7")),
     (Decimal("25000"), None, Decimal("5")),
 )
+
+
+def _lock_price_formats_for_rule(db: Session, rule_id: int) -> None:
+    format_ids = db.execute(
+        select(PriceFormat.id)
+        .where(PriceFormat.pricing_rule_id == int(rule_id))
+        .order_by(PriceFormat.id.asc())
+    ).scalars()
+    acquire_transaction_write_locks(db, price_format_ids=[int(item) for item in format_ids])
 
 
 def competitor_gap_tier_to_dict(row: PricingRuleCompetitorGapTier) -> dict:
@@ -67,6 +77,7 @@ def ensure_competitor_gap_defaults_for_rule(*, db: Session, rule: PricingRule) -
     ).first()
     if existing is not None:
         return False
+    _lock_price_formats_for_rule(db, int(rule.id))
     for idx, (min_price, max_price, max_gap_percent) in enumerate(DEFAULT_COMPETITOR_GAP_TIERS):
         db.add(
             PricingRuleCompetitorGapTier(
@@ -202,6 +213,8 @@ def upsert_pricing_rule(*, db: Session, payload: dict, rule_id: int | None = Non
     existing = db.execute(select(PricingRule).where(PricingRule.code == code)).scalars().first()
     if existing is not None and (rule_id is None or int(existing.id) != int(rule_id)):
         raise ValueError("code must be unique")
+    if rule_id is not None:
+        _lock_price_formats_for_rule(db, int(rule_id))
     row = db.get(PricingRule, rule_id) if rule_id is not None else None
     if row is None:
         row = PricingRule(code=code, name=name)
@@ -275,6 +288,7 @@ def validate_competitor_gap_thresholds(rows: list[dict]) -> list[dict]:
 
 
 def update_competitor_gap_thresholds(*, db: Session, rule: PricingRule, rows: list[dict]) -> None:
+    _lock_price_formats_for_rule(db, int(rule.id))
     normalized = validate_competitor_gap_thresholds(rows)
     old_rows = db.execute(
         select(PricingRuleCompetitorGapTier).where(PricingRuleCompetitorGapTier.pricing_rule_id == rule.id)
@@ -372,6 +386,7 @@ def delete_pricing_rule(*, db: Session, rule_id: int) -> None:
     row = db.get(PricingRule, rule_id)
     if row is None:
         raise ValueError("pricing rule not found")
+    _lock_price_formats_for_rule(db, int(rule_id))
     db.delete(row)
     db.commit()
 
@@ -537,6 +552,7 @@ def apply_pricing_rule_to_format(*, db: Session, format_code: str, rule_id: int)
         pf = PriceFormat(code=format_code, name=format_code)
         db.add(pf)
         db.flush()
+    acquire_transaction_write_locks(db, price_format_ids=[int(pf.id)])
     rule = get_pricing_rule(db=db, rule_id=rule_id)
     pf.pricing_rule_id = rule.id
     pf.pricing_rule = rule.code

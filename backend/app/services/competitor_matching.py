@@ -34,6 +34,12 @@ from .competitor_coefficients import effective_price_coefficient
 from .competitor_source_config import MULTI_PRICE_PERCENTILE_MODE, default_percentile_mode_for_source, effective_percentile_mode
 from .manufacturers import normalize_manufacturer
 from .sku import normalize_external_sku, normalize_sku, normalize_sku_variants
+from .pricing_workflow.locks import (
+    PricingWorkflowLockLease,
+    PricingWorkflowConcurrencySlot,
+    PricingWorkflowTransactionLockLease,
+    acquire_transaction_write_locks,
+)
 
 logger = logging.getLogger(__name__)
 PROVISOR_REFERENCE_FILIAL_ID = 128
@@ -2413,6 +2419,11 @@ def rematch_price_list_items(
     flush: bool = True,
 ) -> dict:
     started_at = time.perf_counter()
+    acquire_transaction_write_locks(
+        db,
+        source_ids=[int(price_list.id)],
+        retry_timeout_seconds=5.0,
+    )
     if price_list.source_type == "provisor":
         _sync_provisor_reference_mapping_from_items(db, account_id=price_list.account_id or "existing")
     indexes = product_indexes or _product_indexes(db)
@@ -3817,8 +3828,17 @@ def rematch_price_list_items_by_product(
     price_list: CompetitorPriceList,
     product_indexes: ProductIndexes | None = None,
     flush: bool = True,
+    lock_lease: PricingWorkflowLockLease | PricingWorkflowTransactionLockLease | None = None,
 ) -> dict:
     started_at = time.perf_counter()
+    if lock_lease is None:
+        acquire_transaction_write_locks(
+            db,
+            source_ids=[int(price_list.id)],
+            retry_timeout_seconds=5.0,
+        )
+    else:
+        lock_lease.acquire(source_ids=[int(price_list.id)])
     if price_list.source_type == "provisor" and product_indexes is None:
         _sync_provisor_reference_mapping_from_items(db, account_id=price_list.account_id or "existing")
     indexes = product_indexes or _product_indexes(db)
@@ -4723,12 +4743,47 @@ def rebuild_competitor_prices_for_selected(
     db: Session,
     price_format_id: int,
     commit_between_lists: bool = False,
+    expected_source_ids: list[int] | None = None,
+    lock_lease: PricingWorkflowLockLease | PricingWorkflowTransactionLockLease | None = None,
 ) -> dict[str, dict]:
+    if commit_between_lists and getattr(lock_lease, "transaction_scoped", False):
+        raise ValueError("transaction-scoped workflow locks cannot be used across intermediate commits")
+    if lock_lease is None:
+        with PricingWorkflowConcurrencySlot(db):
+            with PricingWorkflowLockLease(db) as owned_lease:
+                # Lock the format before reading its assignments.  That makes the
+                # assignment read and subsequent source locks one consistent unit.
+                owned_lease.acquire(price_format_ids=[price_format_id])
+                source_ids = (
+                    expected_source_ids
+                    if expected_source_ids is not None
+                    else [
+                        int(item.price_list.id)
+                        for item in get_assigned_competitor_price_lists(db=db, price_format_id=price_format_id)
+                    ]
+                )
+                owned_lease.acquire(source_ids=source_ids)
+                return rebuild_competitor_prices_for_selected(
+                    db=db,
+                    price_format_id=price_format_id,
+                    commit_between_lists=commit_between_lists,
+                    expected_source_ids=expected_source_ids,
+                    lock_lease=owned_lease,
+                )
     total_started_at = time.perf_counter()
     operation = f"rebuild_competitor_prices:{price_format_id}"
     _timing(operation, "start_selection/rebuild", total_started_at)
     repair_manual_vidman_assignment_modes(db=db, price_format_id=price_format_id)
     assigned = get_assigned_competitor_price_lists(db=db, price_format_id=price_format_id)
+    assigned_source_ids = sorted(int(item.price_list.id) for item in assigned)
+    if expected_source_ids is not None:
+        expected = sorted({int(item) for item in expected_source_ids})
+        if assigned_source_ids != expected:
+            raise ValueError(
+                "pricing workflow source snapshot mismatch: "
+                f"expected={expected} active={assigned_source_ids}"
+            )
+    lock_lease.acquire(source_ids=assigned_source_ids)
     skipped_aggregated = [
         item
         for item in assigned
@@ -4742,6 +4797,9 @@ def rebuild_competitor_prices_for_selected(
     _timing(operation, "load_selected_price_lists", total_started_at)
 
     summary: dict[str, dict] = {}
+    stage_timings: list[dict] = []
+    matching_started_at = time.perf_counter()
+    commit_duration_ms = 0.0
     audit_rows: list[dict] = []
     unmatched_audit_rows: list[dict] = []
     manufacturer_alias_rows: list[dict] = []
@@ -4762,6 +4820,9 @@ def rebuild_competitor_prices_for_selected(
             .where(CompetitorPrice.product_id.is_not(None))
         )
         db.flush()
+        stage_timings.append({"stage": "competitor_matching", "durationMs": round((time.perf_counter() - matching_started_at) * 1000, 3), "inputRows": 0, "outputRows": 0, "success": True})
+        stage_timings.append({"stage": "competitor_price_materialization", "durationMs": 0.0, "inputRows": 0, "outputRows": 0, "success": True})
+        summary["_stageTimings"] = stage_timings
         _timing(operation, "skipped_all_aggregated_percentile_sources", total_started_at)
         return summary
     index_started_at = time.perf_counter()
@@ -4772,7 +4833,13 @@ def rebuild_competitor_prices_for_selected(
     rematch_ms: dict[str, float] = {}
     for price_list in selected:
         rematch_started_at = time.perf_counter()
-        stats = rematch_price_list_items_by_product(db=db, price_list=price_list, product_indexes=product_indexes, flush=False)
+        stats = rematch_price_list_items_by_product(
+            db=db,
+            price_list=price_list,
+            product_indexes=product_indexes,
+            flush=False,
+            lock_lease=lock_lease,
+        )
         matched_rows = stats.pop("_matchedRows", [])
         audit_rows.extend(stats.pop("_auditRows", []))
         unmatched_audit_rows.extend(stats.pop("_unmatchedAuditRows", []))
@@ -4785,6 +4852,7 @@ def rebuild_competitor_prices_for_selected(
         if commit_between_lists:
             commit_started_at = time.perf_counter()
             db.commit()
+            commit_duration_ms += (time.perf_counter() - commit_started_at) * 1000
             _timing(f"{operation}:{src}", "flush/commit", commit_started_at)
         matched_by_source.append(
             (
@@ -4795,6 +4863,15 @@ def rebuild_competitor_prices_for_selected(
                 matched_rows,
             )
         )
+    stage_timings.append(
+        {
+            "stage": "competitor_matching",
+            "durationMs": round((time.perf_counter() - matching_started_at) * 1000, 3),
+            "inputRows": len(selected),
+            "outputRows": sum(len(item[4]) for item in matched_by_source),
+            "success": True,
+        }
+    )
     _timing(operation, "collect_matched_items", total_started_at)
 
     delete_started_at = time.perf_counter()
@@ -4845,6 +4922,15 @@ def rebuild_competitor_prices_for_selected(
         db.bulk_save_objects(new_rows)
         db.flush()
     insert_finished_at = time.perf_counter()
+    stage_timings.append(
+        {
+            "stage": "competitor_price_materialization",
+            "durationMs": round((insert_finished_at - delete_started_at) * 1000, 3),
+            "inputRows": sum(len(item[4]) for item in matched_by_source),
+            "outputRows": len(new_rows),
+            "success": True,
+        }
+    )
     selected_total = sum(int(stats.get("matchedProducts") or stats.get("matched") or 0) for stats in summary.values())
     unmatched_with_top3 = 0
     unmatched_without_top3 = 0
@@ -4877,6 +4963,7 @@ def rebuild_competitor_prices_for_selected(
         "fuzzy_count": sum(int(stats.get("matchedByFuzzy") or stats.get("fuzzy") or 0) for stats in summary.values()),
     }
     audit_path = os.path.abspath(os.path.join(os.getcwd(), "suspicious_matches.xlsx"))
+    audit_started_at = time.perf_counter()
     _write_matching_audit_xlsx(
         path=audit_path,
         selected_rows=audit_rows,
@@ -4884,6 +4971,25 @@ def rebuild_competitor_prices_for_selected(
         manufacturer_rows=manufacturer_alias_rows,
         summary=audit_summary,
     )
+    stage_timings.append(
+        {
+            "stage": "excel_audit_generation",
+            "durationMs": round((time.perf_counter() - audit_started_at) * 1000, 3),
+            "inputRows": len(audit_rows) + len(unmatched_audit_rows) + len(manufacturer_alias_rows),
+            "outputRows": 1,
+            "success": True,
+        }
+    )
+    if commit_duration_ms:
+        stage_timings.append(
+            {
+                "stage": "database_commits",
+                "durationMs": round(commit_duration_ms, 3),
+                "inputRows": len(selected),
+                "success": True,
+            }
+        )
+    summary["_stageTimings"] = stage_timings
     summary["_audit"] = {"path": audit_path, **audit_summary}
     _verbose_debug("[MATCH_AUDIT] path=%s rows=%s summary=%s", audit_path, len(audit_rows), audit_summary)
     _timing(operation, "insert_new_competitor_prices", insert_started_at)

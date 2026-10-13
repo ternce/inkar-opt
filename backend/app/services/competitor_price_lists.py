@@ -54,6 +54,12 @@ from .competitor_read_models import refresh_price_list_item_counters, refresh_pr
 from .competitor_coefficients import effective_price_coefficient, validate_price_coefficient
 from .competitor_percentiles import DEFAULT_BRANCH
 from .percentile_preparation import enqueue_percentile_preparation
+from .pricing_workflow.locks import (
+    PricingWorkflowLockLease,
+    PricingWorkflowConcurrencySlot,
+    PricingWorkflowTransactionLockLease,
+    acquire_transaction_write_locks,
+)
 from .competitor_source_config import (
     canonical_provisor_source_key,
     emit_display_name_from_source_key,
@@ -313,12 +319,13 @@ def _refresh_selected_price_formats_for_source(
     db: Session,
     row: CompetitorPriceList,
     rebuild: bool = True,
+    lock_lease: PricingWorkflowLockLease | PricingWorkflowTransactionLockLease | None = None,
 ) -> list[int]:
     price_format_ids = _selected_price_format_ids_for_refreshed_source(db, row)
     for price_format_id in price_format_ids:
         sync_selected_competitor_configs(db=db, price_format_id=price_format_id)
         if rebuild:
-            rebuild_competitor_prices_for_selected(db=db, price_format_id=price_format_id)
+            rebuild_competitor_prices_for_selected(db=db, price_format_id=price_format_id, lock_lease=lock_lease)
     return price_format_ids
 
 
@@ -748,6 +755,16 @@ def relink_provisor_items_from_product_goods_ids(
     if not provisor_price_list_ids:
         return {"priceListIds": [], "relinkedItems": 0, "conflictItems": 0, "ambiguousGoodsIds": 0, "ambiguousItems": 0}
 
+    # Matching fields on source rows are shared by every price format that uses
+    # this list. Lock at the service boundary so background/direct callers cannot
+    # bypass workflow serialization.
+    acquire_transaction_write_locks(
+        db=db,
+        source_ids=provisor_price_list_ids,
+        retry_timeout_seconds=5.0,
+        retry_interval_seconds=0.2,
+    )
+
     product_goods = (
         select(
             Product.provisor_goods_id.label("goods_id"),
@@ -950,6 +967,10 @@ def upsert_provisor_price_list(
         db.add(row)
         db.flush()
 
+    affected_price_format_ids = _selected_price_format_ids_for_refreshed_source(db, row)
+    transaction_locks = PricingWorkflowTransactionLockLease(db, retry_timeout_seconds=5.0)
+    transaction_locks.acquire(price_format_ids=affected_price_format_ids, source_ids=[int(row.id)])
+
     row.source_key = source_key
     row.display_name = display_name
     row.supplier = display_name
@@ -1045,7 +1066,11 @@ def upsert_provisor_price_list(
         rematch_price_list_items_by_product(db=db, price_list=row)
         refresh_price_list_matched_item_counters(db=db, item_counts={int(row.id): inserted_items_count})
         _replace_legacy_price_rows_for_list(db=db, price_list=row)
-        affected_price_format_ids = _refresh_selected_price_formats_for_source(db=db, row=row)
+        affected_price_format_ids = _refresh_selected_price_formats_for_source(
+            db=db,
+            row=row,
+            lock_lease=transaction_locks,
+        )
     else:
         refresh_price_list_matched_item_counters(db=db, item_counts={int(row.id): inserted_items_count})
         affected_price_format_ids = []
@@ -1131,6 +1156,10 @@ def upsert_unified_price_list(
         )
         db.add(row)
         db.flush()
+
+    affected_price_format_ids = _selected_price_format_ids_for_refreshed_source(db, row)
+    transaction_locks = PricingWorkflowTransactionLockLease(db, retry_timeout_seconds=5.0)
+    transaction_locks.acquire(price_format_ids=affected_price_format_ids, source_ids=[int(row.id)])
 
     row.source_key = source_key
     branch_name = getattr(price_list, "branch_name", "") or "Без филиала"
@@ -1449,7 +1478,11 @@ def upsert_unified_price_list(
         rematch_price_list_items_by_product(db=db, price_list=row)
         refresh_price_list_matched_item_counters(db=db, item_counts={int(row.id): inserted_rows_count})
         _replace_legacy_price_rows_for_list(db=db, price_list=row)
-        affected_price_format_ids = _refresh_selected_price_formats_for_source(db=db, row=row)
+        affected_price_format_ids = _refresh_selected_price_formats_for_source(
+            db=db,
+            row=row,
+            lock_lease=transaction_locks,
+        )
     else:
         affected_price_format_ids = []
         refresh_price_list_matched_item_counters(db=db, item_counts={int(row.id): inserted_rows_count})
@@ -1562,6 +1595,8 @@ def upsert_unified_price_list_metadata(
         db.flush()
         created = True
 
+    PricingWorkflowTransactionLockLease(db, retry_timeout_seconds=5.0).acquire(source_ids=[int(row.id)])
+
     row.source_key = source_key
     branch_name = getattr(price_list, "branch_name", "") or "Р‘РµР· С„РёР»РёР°Р»Р°"
     competitor_name = getattr(price_list, "competitor_name", "") or price_list.distributor_name or price_list.price_list_name
@@ -1660,6 +1695,7 @@ def mark_unified_price_list_checked(
     if row is None:
         return None
 
+    PricingWorkflowTransactionLockLease(db, retry_timeout_seconds=5.0).acquire(source_ids=[int(row.id)])
     row.source_key = source_key
     checked_at = datetime.utcnow()
     source_updated_at = getattr(price_list, "source_updated_at", "") or ""
@@ -1901,7 +1937,20 @@ def set_selected_competitor_price_lists(
     price_format_code: str,
     selected_ids: list[int],
     coefficients: dict[int, float] | None = None,
+    lock_lease: PricingWorkflowLockLease | None = None,
 ) -> list[dict]:
+    if lock_lease is None:
+        pf = _ensure_price_format(db, price_format_code)
+        with PricingWorkflowConcurrencySlot(db):
+            with PricingWorkflowLockLease(db) as owned_lease:
+                owned_lease.acquire(price_format_ids=[int(pf.id)], source_ids=selected_ids)
+                return set_selected_competitor_price_lists(
+                    db=db,
+                    price_format_code=price_format_code,
+                    selected_ids=selected_ids,
+                    coefficients=coefficients,
+                    lock_lease=owned_lease,
+                )
     operation = f"set_selected_competitor_price_lists:{price_format_code}"
     started_at = time.perf_counter()
     _timing(operation, "start_selection/rebuild", started_at)
@@ -1910,14 +1959,21 @@ def set_selected_competitor_price_lists(
     _timing(operation, "load_selected_price_lists", started_at)
     counts = {int(row.id): int(getattr(row, "items_count", 0) or 0) for row in rows}
     selectable_ids = {int(row.id) for row in _visible_competitor_price_list_rows(rows, counts)}
-    set_competitor_assignments(db=db, price_format=pf, selected_ids=[x for x in selected_ids if int(x) in selectable_ids], coefficients=coefficients)
+    filtered_ids = [x for x in selected_ids if int(x) in selectable_ids]
+    set_competitor_assignments(db=db, price_format=pf, selected_ids=filtered_ids, coefficients=coefficients)
     sync_selected_competitor_configs(db=db, price_format_id=pf.id)
     commit_started_at = time.perf_counter()
     db.commit()
     _timing(operation, "flush/commit", commit_started_at)
 
     rebuild_started_at = time.perf_counter()
-    rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id, commit_between_lists=True)
+    rebuild_competitor_prices_for_selected(
+        db=db,
+        price_format_id=pf.id,
+        commit_between_lists=True,
+        expected_source_ids=filtered_ids,
+        lock_lease=lock_lease,
+    )
     _timing(operation, "rebuild_competitor_prices", rebuild_started_at)
     commit_started_at = time.perf_counter()
     db.commit()
@@ -1935,7 +1991,20 @@ def save_selected_competitor_price_lists_only(
     price_format_code: str,
     selected_ids: list[int],
     coefficients: dict[int, float] | None = None,
+    lock_lease: PricingWorkflowLockLease | None = None,
 ) -> int:
+    if lock_lease is None:
+        pf = _ensure_price_format(db, price_format_code)
+        with PricingWorkflowConcurrencySlot(db):
+            with PricingWorkflowLockLease(db) as owned_lease:
+                owned_lease.acquire(price_format_ids=[int(pf.id)], source_ids=selected_ids)
+                return save_selected_competitor_price_lists_only(
+                    db=db,
+                    price_format_code=price_format_code,
+                    selected_ids=selected_ids,
+                    coefficients=coefficients,
+                    lock_lease=owned_lease,
+                )
     pf = _ensure_price_format(db, price_format_code)
     rows = list_global_competitor_price_lists_for_format(db=db, price_format=pf)
     counts = {int(row.id): int(getattr(row, "items_count", 0) or 0) for row in rows}

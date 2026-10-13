@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from ...models import (
@@ -12,9 +12,12 @@ from ...models import (
     MarkupTemplateRow,
     NoCompetitorMarkupTemplate,
     NoCompetitorMarkupTemplateRow,
+    PriceFormat,
+    PricingRule,
     RoundingRule,
 )
 from .common import touch, validate_ranges
+from ..pricing_workflow.locks import acquire_transaction_write_locks
 from ...timezone import local_iso, now_kz_naive
 
 
@@ -23,6 +26,41 @@ TEMPLATE_SPECS = {
     "bend": (BendTemplate, BendTemplateRow, "bend_percent", "bendPercent"),
     "no_competitor": (NoCompetitorMarkupTemplate, NoCompetitorMarkupTemplateRow, "markup_percent", "markupPercent"),
 }
+
+
+def _lock_formats_using_template(db: Session, *, kind: str, config_id: int) -> None:
+    rule_column = {
+        "markup": PricingRule.markup_template_id,
+        "bend": PricingRule.bend_template_id,
+        "no_competitor": PricingRule.no_competitor_template_id,
+    }[kind]
+    format_column = {
+        "markup": PriceFormat.applied_markup_template_id,
+        "bend": PriceFormat.applied_bend_template_id,
+        "no_competitor": PriceFormat.applied_no_competitor_template_id,
+    }[kind]
+    rule_ids = select(PricingRule.id).where(rule_column == int(config_id))
+    format_ids = db.execute(
+        select(PriceFormat.id)
+        .where(or_(format_column == int(config_id), PriceFormat.pricing_rule_id.in_(rule_ids)))
+        .order_by(PriceFormat.id.asc())
+    ).scalars()
+    acquire_transaction_write_locks(db, price_format_ids=[int(item) for item in format_ids])
+
+
+def _lock_formats_using_rounding_rule(db: Session, *, rule_id: int) -> None:
+    pricing_rule_ids = select(PricingRule.id).where(PricingRule.rounding_rule_id == int(rule_id))
+    format_ids = db.execute(
+        select(PriceFormat.id)
+        .where(
+            or_(
+                PriceFormat.rounding_rule_id == int(rule_id),
+                PriceFormat.pricing_rule_id.in_(pricing_rule_ids),
+            )
+        )
+        .order_by(PriceFormat.id.asc())
+    ).scalars()
+    acquire_transaction_write_locks(db, price_format_ids=[int(item) for item in format_ids])
 
 
 def row_to_dict(row, value_attr: str, value_key: str) -> dict:
@@ -80,6 +118,8 @@ def upsert_template(*, db: Session, kind: str, payload: dict, template_id: int |
     existing = db.execute(select(model).where(model.code == code)).scalars().first()
     if existing is not None and (template_id is None or int(existing.id) != int(template_id)):
         raise ValueError("code must be unique")
+    if template_id is not None:
+        _lock_formats_using_template(db, kind=kind, config_id=int(template_id))
 
     row = db.get(model, template_id) if template_id is not None else None
     if row is None:
@@ -162,6 +202,8 @@ def upsert_rounding_rule(*, db: Session, payload: dict, rule_id: int | None = No
     existing = db.execute(select(RoundingRule).where(RoundingRule.code == code)).scalars().first()
     if existing is not None and (rule_id is None or int(existing.id) != int(rule_id)):
         raise ValueError("code must be unique")
+    if rule_id is not None:
+        _lock_formats_using_rounding_rule(db, rule_id=int(rule_id))
 
     row = db.get(RoundingRule, rule_id) if rule_id is not None else None
     if row is None:

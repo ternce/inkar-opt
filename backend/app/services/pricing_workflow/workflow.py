@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from datetime import date, datetime
 
 from sqlalchemy import select
@@ -24,7 +26,17 @@ from ..pricing import AMBIGUOUS_LIST_TYPES, calculate_price_zone, calculate_pric
 from ...timezone import local_iso, now_kz_naive
 from .analytics import build_workflow_analytics
 from .snapshot import build_generate_snapshot, dumps_snapshot, loads_snapshot
+from .locks import (
+    PricingWorkflowCapacityExceeded,
+    PricingWorkflowConflict,
+    PricingWorkflowConcurrencySlot,
+    PricingWorkflowLockLease,
+)
+from .timing import WorkflowTimingRecorder, sanitize_error_message
 from ..pricing_rules.rules import resolve_price_format_pricing_rule
+
+
+logger = logging.getLogger(__name__)
 
 
 def _json(value: object) -> str:
@@ -104,6 +116,70 @@ def _apply_snapshot(target: object, snapshot: dict) -> None:
     setattr(target, "run_snapshot_json", dumps_snapshot(snapshot))
 
 
+def _with_workflow_metadata(snapshot: dict, *, frozen_input: dict, timing: WorkflowTimingRecorder) -> dict:
+    result = dict(snapshot)
+    result["workflowInput"] = frozen_input
+    result["performance"] = timing.metadata()
+    return result
+
+
+def _persist_timing_metadata(run: PricingWorkflowRun, timing: WorkflowTimingRecorder, frozen_input: dict) -> None:
+    snapshot = loads_snapshot(run.run_snapshot_json, {})
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    run.run_snapshot_json = dumps_snapshot(_with_workflow_metadata(snapshot, frozen_input=frozen_input, timing=timing))
+
+
+def _persist_success_timing_best_effort(
+    *,
+    db: Session,
+    run_id: int,
+    price_list_id: int,
+    timing: WorkflowTimingRecorder,
+    frozen_input: dict,
+    fallback_run: PricingWorkflowRun,
+) -> PricingWorkflowRun:
+    """Persist post-commit metrics without changing an already committed outcome."""
+    try:
+        persisted_run = db.get(PricingWorkflowRun, run_id)
+        persisted_price_list = db.get(PriceList, price_list_id)
+        if persisted_run is not None:
+            _persist_timing_metadata(persisted_run, timing, frozen_input)
+        if persisted_price_list is not None:
+            snapshot = loads_snapshot(persisted_price_list.run_snapshot_json, {})
+            if not isinstance(snapshot, dict):
+                snapshot = {}
+            _apply_snapshot(
+                persisted_price_list,
+                _with_workflow_metadata(snapshot, frozen_input=frozen_input, timing=timing),
+            )
+        db.commit()
+        if persisted_run is not None:
+            db.refresh(persisted_run)
+            return persisted_run
+    except Exception:
+        db.rollback()
+        # Metrics must never turn a durable business success into a failed run.
+        logger.exception(
+            "pricing workflow timing metadata persistence failed after business commit workflow_id=%s",
+            run_id,
+        )
+    try:
+        persisted_run = db.get(PricingWorkflowRun, run_id)
+        if persisted_run is not None:
+            db.refresh(persisted_run)
+            return persisted_run
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "pricing workflow could not reload durable success after timing failure workflow_id=%s",
+            run_id,
+        )
+    # Never let post-commit observability work enter the outer failure path,
+    # which would incorrectly rewrite an already committed success.
+    return fallback_run
+
+
 def price_format_to_workflow_dict(*, db: Session, row: PriceFormat) -> dict:
     pricing_rule = resolve_price_format_pricing_rule(db=db, pf=row)
     return {
@@ -144,6 +220,7 @@ def _unique_price_list_number(*, db: Session, requested: str, run_id: int) -> st
 
 
 def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
+    initialization_started_at = time.perf_counter()
     context_id = int(payload.get("pricing_context_id") or payload.get("pricingContextId") or 0)
     price_format_id = int(payload.get("price_format_id") or payload.get("priceFormatId") or 0)
     context = db.get(PricingContext, context_id)
@@ -166,6 +243,10 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
         raise ValueError("competitor_sources must be list")
     if not isinstance(percentile_sources, list):
         raise ValueError("percentile_sources must be list")
+    # Detach the workflow input from the mutable request object.  Only this
+    # canonical copy is persisted and used after the workflow starts.
+    competitor_sources = _loads(_json(competitor_sources), [])
+    percentile_sources = _loads(_json(percentile_sources), [])
     user = str(payload.get("user") or "Workflow").strip()
 
     selected_ids: list[int] = []
@@ -176,7 +257,8 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
         source_id = int(item.get("id") or 0)
         if source_id <= 0:
             continue
-        selected_ids.append(source_id)
+        if source_id not in selected_ids:
+            selected_ids.append(source_id)
         try:
             coefficients[source_id] = float(item.get("coefficient") or 1)
         except Exception:
@@ -198,12 +280,6 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
             is not None
         )
     mode = _price_mode(pf)
-    if mode == "regular" and not selected_ids:
-        raise ValueError("select at least one competitor source")
-    if mode == "percentile" and selected_percentile_count <= 0:
-        raise ValueError("select at least one percentile source")
-    if mode == "mixed" and not selected_ids and selected_percentile_count <= 0:
-        raise ValueError("select at least one competitor or percentile source")
 
     run = PricingWorkflowRun(
         pricing_context_id=context.id,
@@ -219,17 +295,38 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
     db.commit()
     db.refresh(run)
 
+    frozen_input = {
+        "priceFormatId": int(pf.id),
+        "competitorSourceIds": list(selected_ids),
+        "competitorSources": competitor_sources,
+        "percentileSources": percentile_sources,
+        "coefficients": {str(key): value for key, value in sorted(coefficients.items())},
+        "competitorPriceMode": mode,
+    }
+    timing = WorkflowTimingRecorder(
+        workflow_id=int(run.id),
+        price_format_id=int(pf.id),
+        selected_source_ids=list(selected_ids),
+    )
+    http_preparation_ms = payload.get("_http_preparation_ms")
+    if isinstance(http_preparation_ms, (int, float)):
+        timing.extend([{"stage": "http_request_preparation", "durationMs": round(float(http_preparation_ms), 3), "success": True}])
+    timing.record("workflow_initialization", initialization_started_at, success=True, input_rows=len(selected_ids))
+    lease = PricingWorkflowLockLease(db)
+    capacity_slot = PricingWorkflowConcurrencySlot(db)
+
     try:
-        save_selected_competitor_price_lists_only(
-            db=db,
-            price_format_code=pf.code,
-            selected_ids=selected_ids,
-            coefficients=coefficients,
-        )
-        if has_percentile_payload:
-            selected_percentile_count = _save_selected_percentile_configs(db=db, pf=pf, percentile_sources=percentile_sources)
-            enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="workflow_percentile_selection_changed")
-        else:
+        capacity_slot.__enter__()
+        lease.__enter__()
+        lease.acquire(price_format_ids=[int(pf.id)], source_ids=selected_ids)
+        # Everything read before the lock was only preliminary request
+        # validation. Refresh configuration under the format lock so execution
+        # branches and the immutable snapshot observe one configuration version.
+        db.refresh(pf)
+        mode = _price_mode(pf)
+        run.pricing_rule_id = pf.pricing_rule_id
+        frozen_input["competitorPriceMode"] = mode
+        if not has_percentile_payload:
             selected_percentile_count = int(
                 db.execute(
                     select(CompetitorPrice.id)
@@ -240,16 +337,82 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
                 ).scalar()
                 is not None
             )
-        selected_count = len(get_assigned_competitor_price_lists(db=db, price_format_id=int(pf.id)))
+        if mode == "regular" and not selected_ids:
+            raise ValueError("select at least one competitor source")
+        if mode == "percentile" and selected_percentile_count <= 0:
+            raise ValueError("select at least one percentile source")
+        if mode == "mixed" and not selected_ids and selected_percentile_count <= 0:
+            raise ValueError("select at least one competitor or percentile source")
+        assignment_started_at = time.perf_counter()
+        try:
+            save_selected_competitor_price_lists_only(
+                db=db,
+                price_format_code=pf.code,
+                selected_ids=selected_ids,
+                coefficients=coefficients,
+                lock_lease=lease,
+            )
+            if has_percentile_payload:
+                selected_percentile_count = _save_selected_percentile_configs(db=db, pf=pf, percentile_sources=percentile_sources)
+                enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="workflow_percentile_selection_changed")
+            else:
+                selected_percentile_count = int(
+                    db.execute(
+                        select(CompetitorPrice.id)
+                        .where(CompetitorPrice.price_format_id == pf.id)
+                        .where(CompetitorPrice.product_id.is_(None))
+                        .where(CompetitorPrice.source_name.like("percentile:%"))
+                        .limit(1)
+                    ).scalar()
+                    is not None
+                )
+            assigned = get_assigned_competitor_price_lists(db=db, price_format_id=int(pf.id))
+            active_source_ids = sorted(int(item.price_list.id) for item in assigned)
+            if active_source_ids != sorted(selected_ids):
+                raise ValueError(
+                    "pricing workflow source snapshot mismatch: "
+                    f"requested={sorted(selected_ids)} active={active_source_ids}"
+                )
+        except BaseException as exc:
+            timing.record("source_assignment_and_snapshot", assignment_started_at, success=False, input_rows=len(selected_ids), error=str(exc))
+            raise
+        timing.record(
+            "source_assignment_and_snapshot",
+            assignment_started_at,
+            success=True,
+            input_rows=len(selected_ids),
+            output_rows=len(active_source_ids),
+        )
+        selected_count = len(active_source_ids)
         if mode == "regular" and selected_count <= 0:
             raise ValueError("selected competitor sources are not available for calculation")
         if mode == "percentile" and selected_percentile_count <= 0:
             raise ValueError("selected percentile sources are not available for calculation")
         if mode in {"regular", "mixed"}:
-            rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id, commit_between_lists=True)
+            matching_started_at = time.perf_counter()
+            try:
+                rebuild_summary = rebuild_competitor_prices_for_selected(
+                    db=db,
+                    price_format_id=pf.id,
+                    commit_between_lists=True,
+                    expected_source_ids=active_source_ids,
+                    lock_lease=lease,
+                )
+            except BaseException as exc:
+                timing.record("competitor_matching", matching_started_at, success=False, input_rows=len(active_source_ids), error=str(exc))
+                raise
+            timing.extend(rebuild_summary.pop("_stageTimings", []))
+        commit_started_at = time.perf_counter()
         db.commit()
-        if mode in {"percentile", "mixed"} or selected_percentile_count > 0:
-            ensure_percentile_ready_for_generation(db, pf)
+        timing.record("database_commits", commit_started_at, success=True)
+        percentile_started_at = time.perf_counter()
+        try:
+            if mode in {"percentile", "mixed"} or selected_percentile_count > 0:
+                ensure_percentile_ready_for_generation(db, pf)
+        except BaseException as exc:
+            timing.record("percentile_preparation", percentile_started_at, success=False, error=str(exc))
+            raise
+        timing.record("percentile_preparation", percentile_started_at, success=True, input_rows=selected_percentile_count)
 
         activation_date = None
         raw_activation = payload.get("activation_date") or payload.get("activationDate")
@@ -263,6 +426,7 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
         region_id = int(context.branch_id) if str(context.branch_id).isdigit() else None
         reference_branch_id = reference_branch_id_for_price_format(pf, region_id)
 
+        snapshot_started_at = time.perf_counter()
         snapshot = build_generate_snapshot(
             db=db,
             price_format=pf,
@@ -273,19 +437,39 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
             requested_competitor_sources=competitor_sources,
             requested_percentile_sources=percentile_sources,
         )
-        _apply_snapshot(run, snapshot)
-        db.commit()
-
-        calculated_count = calculate_prices(
-            db=db,
-            price_format_code=pf.code,
-            price_list_number=price_list_number,
-            as_of=as_of,
-            activation_date=activation_date,
-            user=user,
-            region_id=region_id,
-            force_new_price_list=True,
+        snapshot_source_ids = sorted(
+            int(item.get("id") or 0)
+            for item in (snapshot.get("runSources") or {}).get("selectedCompetitorSources", [])
         )
+        if snapshot_source_ids != active_source_ids:
+            raise ValueError(
+                "pricing workflow source snapshot changed before calculation: "
+                f"expected={active_source_ids} snapshot={snapshot_source_ids}"
+            )
+        timing.record("snapshot_validation", snapshot_started_at, success=True, output_rows=len(snapshot_source_ids))
+        snapshot = _with_workflow_metadata(snapshot, frozen_input=frozen_input, timing=timing)
+        _apply_snapshot(run, snapshot)
+        commit_started_at = time.perf_counter()
+        db.commit()
+        timing.record("database_commits", commit_started_at, success=True)
+
+        calculation_started_at = time.perf_counter()
+        try:
+            calculated_count = calculate_prices(
+                db=db,
+                price_format_code=pf.code,
+                price_list_number=price_list_number,
+                as_of=as_of,
+                activation_date=activation_date,
+                user=user,
+                region_id=region_id,
+                force_new_price_list=True,
+                lock_lease=lease,
+            )
+        except BaseException as exc:
+            timing.record("price_calculation", calculation_started_at, success=False, error=str(exc))
+            raise
+        timing.record("price_calculation", calculation_started_at, success=True, output_rows=calculated_count)
         if calculated_count <= 0:
             raise ValueError("Нет товаров для расчёта. Сначала загрузите номенклатуру.")
 
@@ -294,27 +478,55 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
             raise ValueError("price list was not created")
         _apply_snapshot(pl, snapshot)
         db.flush()
-        analytics = build_workflow_analytics(db=db, price_list_id=pl.id)
+        analytics_started_at = time.perf_counter()
+        try:
+            analytics = build_workflow_analytics(db=db, price_list_id=pl.id)
+        except BaseException as exc:
+            timing.record("analytics_generation", analytics_started_at, success=False, error=str(exc))
+            raise
+        timing.record("analytics_generation", analytics_started_at, success=True)
         run.price_list_id = pl.id
         run.price_list_number = pl.number
+        snapshot = _with_workflow_metadata(snapshot, frozen_input=frozen_input, timing=timing)
+        _apply_snapshot(pl, snapshot)
         _apply_snapshot(run, snapshot)
         run.analytics_json = _json(analytics)
         run.status = "success"
         run.finished_at = now_kz_naive()
+        commit_started_at = time.perf_counter()
         db.commit()
-        db.refresh(run)
-        return run
+        timing.record("database_commits", commit_started_at, success=True)
+        return _persist_success_timing_best_effort(
+            db=db,
+            run_id=int(run.id),
+            price_list_id=int(pl.id),
+            timing=timing,
+            frozen_input=frozen_input,
+            fallback_run=run,
+        )
     except Exception as exc:
         db.rollback()
         run = db.get(PricingWorkflowRun, run.id)
         if run is not None:
-            run.status = "error"
-            run.error = str(exc)
+            run.status = (
+                "conflict"
+                if isinstance(exc, PricingWorkflowConflict)
+                else "capacity"
+                if isinstance(exc, PricingWorkflowCapacityExceeded)
+                else "error"
+            )
+            run.error = sanitize_error_message(exc)
             run.finished_at = now_kz_naive()
+            _persist_timing_metadata(run, timing, frozen_input)
             db.commit()
             db.refresh(run)
             return run
         raise
+    finally:
+        try:
+            lease.release()
+        finally:
+            capacity_slot.release()
 
 
 def run_to_dict(*, db: Session, run: PricingWorkflowRun, include_items: bool = False) -> dict:

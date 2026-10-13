@@ -18,9 +18,9 @@ from inspect import iscoroutinefunction
 from threading import current_thread
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
-from fastapi import Body, Cookie, Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile
+from fastapi import Body, Cookie, Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 import httpx
 from sqlalchemy import delete, func, or_, select, update
@@ -68,6 +68,7 @@ from .models import (
     PriceFormat,
     PriceFormatCompetitorAssignment,
     PriceList,
+    PricingRule,
     PricingContext,
     PricingWorkflowRun,
     Product,
@@ -350,6 +351,11 @@ from .services.pricing_workflow.workflow import (
     price_format_to_workflow_dict,
     run_to_dict,
 )
+from .services.pricing_workflow.locks import (
+    PricingWorkflowCapacityExceeded,
+    PricingWorkflowConflict,
+    acquire_transaction_write_locks,
+)
 from .services.provisor_auto_refresh import (
     active_or_stale_refresh_job,
     all_refresh_targets,
@@ -428,6 +434,16 @@ _emit_refresh_scheduler_token: str | None = None
 _emit_refresh_scheduler_renew_task = None
 _parser_daily_scheduler = None
 _emit_worker: EmitWorker | None = None
+
+
+@app.exception_handler(PricingWorkflowConflict)
+async def pricing_workflow_conflict_handler(_request: Request, exc: PricingWorkflowConflict):
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+@app.exception_handler(PricingWorkflowCapacityExceeded)
+async def pricing_workflow_capacity_handler(_request: Request, exc: PricingWorkflowCapacityExceeded):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 settings = get_settings()
 PRICE_LISTS_FETCH_TIMEOUT_SECONDS = 30
@@ -2364,6 +2380,11 @@ def delete_price_format(
     if pf is None:
         raise HTTPException(status_code=404, detail="price format not found")
     _ensure_price_format_access(pf, current_user)
+    try:
+        acquire_transaction_write_locks(db, price_format_ids=[int(pf.id)])
+    except PricingWorkflowConflict as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc))
     preview = price_format_delete_preview(db, int(pf.id))
     dependencies = price_format_business_dependency_counts(db, int(pf.id))
     if dependencies:
@@ -2737,6 +2758,7 @@ def post_pricing_workflow_generate_batch(
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(require_write_access),
 ):
+    http_preparation_started_at = time.perf_counter()
     branch_id = str(payload.get("branch_id") or payload.get("branchId") or "").strip()
     if branch_id and not user_can_access_branch(current_user, _branch_id_for_name(branch_id), branch_id):
         raise HTTPException(status_code=403, detail="branch is not assigned to current user")
@@ -2750,6 +2772,7 @@ def post_pricing_workflow_generate_batch(
     items: list[dict] = []
     completed = 0
     failed = 0
+    conflicts = 0
 
     for idx, code in enumerate(codes, start=1):
         pf = db.execute(select(PriceFormat).where(PriceFormat.code == str(code))).scalars().first()
@@ -2779,6 +2802,7 @@ def post_pricing_workflow_generate_batch(
                     "activation_date": activation_date,
                     "user": current_user.username,
                     "comment": comment,
+                    "_http_preparation_ms": (time.perf_counter() - http_preparation_started_at) * 1000,
                 },
             )
             if run.status == "success":
@@ -2786,9 +2810,15 @@ def post_pricing_workflow_generate_batch(
                 status = "success"
                 message = "Прайс-лист сформирован"
                 error = ""
+            elif run.status == "conflict":
+                failed += 1
+                conflicts += 1
+                status = "conflict"
+                message = "Ценовой формат уже рассчитывается или его источники обновляются"
+                error = run.error or ""
             else:
                 failed += 1
-                status = "failed"
+                status = "capacity" if run.status == "capacity" else "failed"
                 message = "Расчёт завершился с ошибкой"
                 error = run.error or ""
             items.append(
@@ -2829,7 +2859,8 @@ def post_pricing_workflow_generate_batch(
         "items": items,
     }
     if failed and not completed:
-        raise HTTPException(status_code=400, detail={"message": "Не удалось сформировать выбранные ценовые форматы", "items": items})
+        status_code = 409 if conflicts == failed else 503 if all(item.get("status") == "capacity" for item in items) else 400
+        raise HTTPException(status_code=status_code, detail={"message": "Не удалось сформировать выбранные ценовые форматы", "items": items})
     return result
 
 
@@ -5740,14 +5771,16 @@ def post_pricing_workflow_generate(
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(require_write_access),
 ):
+    http_preparation_started_at = time.perf_counter()
     try:
         payload = payload or {}
         pf = db.get(PriceFormat, int(payload.get("price_format_id") or payload.get("priceFormatId") or 0))
         if pf is not None:
             _ensure_price_format_access(pf, current_user)
         payload["user"] = current_user.username
+        payload["_http_preparation_ms"] = (time.perf_counter() - http_preparation_started_at) * 1000
         run = create_workflow_run(db=db, payload=payload)
-        status_code = 200 if run.status == "success" else 400
+        status_code = 200 if run.status == "success" else 409 if run.status == "conflict" else 503 if run.status == "capacity" else 400
         result = run_to_dict(db=db, run=run, include_items=True)
         if status_code != 200:
             raise HTTPException(status_code=status_code, detail=result.get("error") or "workflow failed")
@@ -5983,6 +6016,45 @@ def _require_diagnostics_access(current_user: AppUser) -> None:
     """Keep diagnostics usable in development but admin-only in production."""
     if settings.environment.strip().lower() in {"prod", "production"} and current_user.role != "admin":
         raise HTTPException(status_code=403, detail="admin required for production diagnostics")
+
+
+def _acquire_price_format_config_locks_or_409(db: Session, price_format_ids) -> None:
+    try:
+        acquire_transaction_write_locks(db, price_format_ids=price_format_ids)
+    except PricingWorkflowConflict as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+def _price_format_ids_for_rule(db: Session, rule_id: int) -> list[int]:
+    return [
+        int(item)
+        for item in db.execute(
+            select(PriceFormat.id).where(PriceFormat.pricing_rule_id == int(rule_id)).order_by(PriceFormat.id.asc())
+        ).scalars()
+    ]
+
+
+def _price_format_ids_for_shared_config(db: Session, kind: str, config_id: int) -> list[int]:
+    rule_column = {
+        "markup": PricingRule.markup_template_id,
+        "bend": PricingRule.bend_template_id,
+        "no_competitor": PricingRule.no_competitor_template_id,
+        "rounding": PricingRule.rounding_rule_id,
+    }[kind]
+    format_column = {
+        "markup": PriceFormat.applied_markup_template_id,
+        "bend": PriceFormat.applied_bend_template_id,
+        "no_competitor": PriceFormat.applied_no_competitor_template_id,
+        "rounding": PriceFormat.rounding_rule_id,
+    }[kind]
+    rule_ids = select(PricingRule.id).where(rule_column == int(config_id))
+    rows = db.execute(
+        select(PriceFormat.id)
+        .where(or_(format_column == int(config_id), PriceFormat.pricing_rule_id.in_(rule_ids)))
+        .order_by(PriceFormat.id.asc())
+    ).scalars()
+    return [int(item) for item in rows]
 
 
 def _authoritative_price_list_item_counts(rows: list[CompetitorPriceList]) -> dict[int, int]:
@@ -6334,6 +6406,11 @@ def set_competitors_assigned(
     if pf is None:
         raise HTTPException(status_code=404, detail="price format not found")
     _ensure_price_format_access(pf, current_user)
+    try:
+        acquire_transaction_write_locks(db, price_format_ids=[int(pf.id)], source_ids=ids)
+    except PricingWorkflowConflict as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc))
     set_competitor_assignments(db=db, price_format=pf, selected_ids=ids)
     sync_selected_competitor_configs(db=db, price_format_id=pf.id)
     db.commit()
@@ -7216,6 +7293,11 @@ def post_competitor_assignment(format_code: str, payload: dict = Body(...), db: 
 
     if source_type == "percentile":
         try:
+            acquire_transaction_write_locks(db, price_format_ids=[int(pf.id)])
+        except PricingWorkflowConflict as exc:
+            db.rollback()
+            raise HTTPException(status_code=409, detail=str(exc))
+        try:
             coefficient = _percentile_assignment_coefficient(payload)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -7257,6 +7339,11 @@ def post_competitor_assignment(format_code: str, payload: dict = Body(...), db: 
     row = db.get(CompetitorPriceList, source_id_int)
     if row is None:
         raise HTTPException(status_code=404, detail="source not found")
+    try:
+        acquire_transaction_write_locks(db, price_format_ids=[int(pf.id)], source_ids=[source_id_int])
+    except PricingWorkflowConflict as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc))
     ensure_canonical_source_key(row)
     if "priceCoefficient" in payload or "coefficient" in payload:
         try:
@@ -7282,6 +7369,11 @@ def patch_competitor_assignment(format_code: str, assignment_id: str, payload: d
     active = payload.get("active")
 
     if assignment_id.startswith("percentile:"):
+        try:
+            acquire_transaction_write_locks(db, price_format_ids=[int(pf.id)])
+        except PricingWorkflowConflict as exc:
+            db.rollback()
+            raise HTTPException(status_code=409, detail=str(exc))
         try:
             coefficient = _percentile_assignment_coefficient(payload)
         except ValueError as e:
@@ -7316,6 +7408,11 @@ def patch_competitor_assignment(format_code: str, assignment_id: str, payload: d
         source_id_int = int(assignment_id)
     except Exception:
         raise HTTPException(status_code=400, detail="assignment id must be int or percentile source id")
+    try:
+        acquire_transaction_write_locks(db, price_format_ids=[int(pf.id)], source_ids=[source_id_int])
+    except PricingWorkflowConflict as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc))
     row = db.get(CompetitorPriceList, source_id_int)
     assignment = get_assignment(db=db, price_format_id=int(pf.id), competitor_price_list_id=source_id_int)
     if row is None or assignment is None:
@@ -7343,6 +7440,11 @@ def delete_competitor_assignment(format_code: str, assignment_id: str, db: Sessi
         raise HTTPException(status_code=404, detail="price format not found")
     _ensure_price_format_access(pf, current_user)
     if assignment_id.startswith("percentile:"):
+        try:
+            acquire_transaction_write_locks(db, price_format_ids=[int(pf.id)])
+        except PricingWorkflowConflict as exc:
+            db.rollback()
+            raise HTTPException(status_code=409, detail=str(exc))
         source_name = _assignment_percentile_source_name(assignment_id.removeprefix("percentile:"))
         cfg = (
             db.execute(
@@ -7363,6 +7465,11 @@ def delete_competitor_assignment(format_code: str, assignment_id: str, db: Sessi
         source_id_int = int(assignment_id)
     except Exception:
         raise HTTPException(status_code=400, detail="assignment id must be int or percentile source id")
+    try:
+        acquire_transaction_write_locks(db, price_format_ids=[int(pf.id)], source_ids=[source_id_int])
+    except PricingWorkflowConflict as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc))
     row = db.get(CompetitorPriceList, source_id_int)
     assignment = get_assignment(db=db, price_format_id=int(pf.id), competitor_price_list_id=source_id_int)
     if row is None or assignment is None:
@@ -8315,6 +8422,7 @@ def create_markup_template(payload: dict = Body(...), db: Session = Depends(get_
 @app.patch("/api/pricing-rules/markup-templates/{template_id}")
 def patch_markup_template(template_id: int, payload: dict = Body(...), db: Session = Depends(get_db), current_user: AppUser = Depends(require_write_access)):
     try:
+        _acquire_price_format_config_locks_or_409(db, _price_format_ids_for_shared_config(db, "markup", template_id))
         return template_to_dict(upsert_template(db=db, kind="markup", template_id=template_id, payload=payload), "markup")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -8346,6 +8454,7 @@ def create_bend_template(payload: dict = Body(...), db: Session = Depends(get_db
 @app.patch("/api/pricing-rules/bend-templates/{template_id}")
 def patch_bend_template(template_id: int, payload: dict = Body(...), db: Session = Depends(get_db), current_user: AppUser = Depends(require_write_access)):
     try:
+        _acquire_price_format_config_locks_or_409(db, _price_format_ids_for_shared_config(db, "bend", template_id))
         return template_to_dict(upsert_template(db=db, kind="bend", template_id=template_id, payload=payload), "bend")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -8377,6 +8486,7 @@ def create_no_competitor_template(payload: dict = Body(...), db: Session = Depen
 @app.patch("/api/pricing-rules/no-competitor-templates/{template_id}")
 def patch_no_competitor_template(template_id: int, payload: dict = Body(...), db: Session = Depends(get_db), current_user: AppUser = Depends(require_write_access)):
     try:
+        _acquire_price_format_config_locks_or_409(db, _price_format_ids_for_shared_config(db, "no_competitor", template_id))
         return template_to_dict(upsert_template(db=db, kind="no_competitor", template_id=template_id, payload=payload), "no_competitor")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -8408,6 +8518,7 @@ def create_rounding_rule(payload: dict = Body(...), db: Session = Depends(get_db
 @app.patch("/api/pricing-rules/rounding-rules/{rule_id}")
 def patch_rounding_rule(rule_id: int, payload: dict = Body(...), db: Session = Depends(get_db), current_user: AppUser = Depends(require_write_access)):
     try:
+        _acquire_price_format_config_locks_or_409(db, _price_format_ids_for_shared_config(db, "rounding", rule_id))
         return rounding_to_dict(upsert_rounding_rule(db=db, rule_id=rule_id, payload=payload))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -8442,6 +8553,7 @@ def get_pricing_rule_endpoint(rule_id: int, db: Session = Depends(get_db)):
 @app.patch("/api/pricing-rules/{rule_id}")
 def patch_pricing_rule(rule_id: int, payload: dict = Body(...), db: Session = Depends(get_db), current_user: AppUser = Depends(require_write_access)):
     try:
+        _acquire_price_format_config_locks_or_409(db, _price_format_ids_for_rule(db, rule_id))
         return pricing_rule_to_dict(upsert_pricing_rule(db=db, rule_id=rule_id, payload=payload))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -8450,6 +8562,7 @@ def patch_pricing_rule(rule_id: int, payload: dict = Body(...), db: Session = De
 @app.delete("/api/pricing-rules/{rule_id}")
 def delete_pricing_rule_endpoint(rule_id: int, db: Session = Depends(get_db), current_user: AppUser = Depends(require_write_access)):
     try:
+        _acquire_price_format_config_locks_or_409(db, _price_format_ids_for_rule(db, rule_id))
         delete_pricing_rule(db=db, rule_id=rule_id)
         return {"status": "ok"}
     except ValueError as e:
@@ -8476,6 +8589,7 @@ def apply_pricing_rule_endpoint(
         pf = db.execute(select(PriceFormat).where(PriceFormat.code == format_code)).scalars().first()
         if pf is not None:
             _ensure_price_format_access(pf, current_user)
+            _acquire_price_format_config_locks_or_409(db, [int(pf.id)])
         return apply_pricing_rule_to_format(db=db, format_code=format_code, rule_id=int(payload.get("pricingRuleId")))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -8863,6 +8977,9 @@ async def post_competitor_price_list_selection(format_code: str, payload: dict =
         _timing(operation, "finish", selection_started_at)
         _timing(operation, "total_ms", selection_started_at)
         return {"job_id": job.id, "status": job.status}
+    except PricingWorkflowConflict as e:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(e))
     except OperationalError as e:
         db.rollback()
         logger.exception("[TIMING] operation=%s step=exception elapsed_ms=%s", operation, round((time.perf_counter() - selection_started_at) * 1000, 2))
@@ -12247,6 +12364,7 @@ def put_settings_for_format(
     if pf is None:
         raise HTTPException(status_code=404, detail="price format not found")
     _ensure_price_format_access(pf, current_user)
+    _acquire_price_format_config_locks_or_409(db, [int(pf.id)])
     percentile_relevant_change = False
     repair_generated_code = bool(payload.get("repairGeneratedCode") or payload.get("repair_generated_code"))
 
@@ -12433,7 +12551,11 @@ async def upload_excel(file: UploadFile = File(...), db: Session = Depends(get_d
     try:
         counts = import_excel(db=db, content=content)
         return UploadExcelResponse(**counts)
+    except PricingWorkflowConflict as e:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
+        db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -12575,6 +12697,11 @@ def _refresh_provisor_substitute_prices_for_product(
         selected_lists = [item.price_list for item in assigned if item.price_list.source_type == "provisor"]
         touched_price_format_ids = sorted({int(item.assignment.price_format_id) for item in assigned})
     selected_sources = [f"{row.source_type}:{row.source_key}" for row in selected_lists]
+    acquire_transaction_write_locks(
+        db,
+        price_format_ids=touched_price_format_ids,
+        source_ids=[int(row.id) for row in selected_lists],
+    )
     if selected_sources:
         db.execute(
             delete(CompetitorPrice)
