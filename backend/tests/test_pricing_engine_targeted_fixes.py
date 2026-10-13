@@ -2325,6 +2325,162 @@ def test_selected_emit_and_regular_percentiles_merge_with_physical_candidates():
     assert prices[product.id][emit_p10]["price"] == pytest.approx(1850.372)
 
 
+def test_targeted_percentile_cache_preserves_all_calculated_price_fields(monkeypatch):
+    import backend.app.services.pricing as pricing_service
+
+    db = _session()
+    formats = []
+    scenario_products = [
+        _product(db, code="CACHE-PARITY-PHYSICAL", cost=100),
+        _product(db, code="CACHE-PARITY-EMIT", cost=100),
+        _product(db, code="CACHE-PARITY-REGULAR", cost=100),
+        _product(db, code="CACHE-PARITY-MISSING", cost=100),
+    ]
+    physical_product, emit_product, regular_product, missing_product = scenario_products
+    bulk_products = [
+        Product(code=f"CACHE-PARITY-BULK-{index:04d}", name=f"Cache parity bulk {index}", cost=100)
+        for index in range(1_196)
+    ]
+    db.add_all(bulk_products)
+    db.flush()
+    products = [*scenario_products, *bulk_products]
+
+    for index, coefficient in enumerate((Decimal("1.00"), Decimal("1.07")), start=1):
+        pf = _format(db)
+        pf.code = f"CACHE-PARITY-{index}"
+        pf.name = pf.code
+        pf.competitor_price_mode = "mixed"
+        formats.append(pf)
+        for product, price in zip(scenario_products, (180, 250, 300, 220), strict=True):
+            _competitor(db, pf, product, f"manual:physical:{index}", Decimal(price))
+
+        _assign_emit_percentile_config(
+            db,
+            pf,
+            source_key="emit:1106",
+            region="Kazakhstan",
+            competitor="Emit International 1106",
+            percentile=10,
+            coefficient=coefficient,
+        )
+        _assign_emit_percentile_config(
+            db,
+            pf,
+            source_key="emit:1108",
+            region="Kazakhstan",
+            competitor="Emit International 1108",
+            percentile=10,
+            coefficient=Decimal("0.97"),
+        )
+        _stored_percentile(
+            db,
+            pf,
+            emit_product,
+            source_key="emit:1106",
+            region="Kazakhstan",
+            competitor="Emit International 1106",
+            percentile=10,
+            value=Decimal("190"),
+        )
+        _stored_percentile(
+            db,
+            pf,
+            emit_product,
+            source_key="emit:1108",
+            region="Kazakhstan",
+            competitor="Emit International 1108",
+            percentile=10,
+            value=Decimal("205"),
+        )
+        _assign_regular_percentile_config(
+            db,
+            pf,
+            identity="parity-regular",
+            competitor="Parity Regular",
+            percentile=30,
+            coefficient=Decimal("0.91"),
+        )
+        _assign_regular_percentile_config(
+            db,
+            pf,
+            identity="parity-missing",
+            competitor="Parity Missing",
+            percentile=40,
+            coefficient=Decimal("1.13"),
+        )
+
+    _stored_regular_percentile(
+        db,
+        regular_product,
+        identity="parity-regular",
+        competitor="Parity Regular",
+        percentile=30,
+        value=Decimal("210"),
+    )
+    db.add_all(
+        [BranchStock(branch_id="1", product_id=product.id, sku=product.code, stock=1) for product in products]
+    )
+    db.add_all(
+        [BranchCost(branch_id="1", product_id=product.id, sku=product.code, cost=100) for product in products]
+    )
+    _active_stock_reference(db, rows_count=len(products))
+    _active_cost_reference(db, rows_count=len(products))
+    db.commit()
+
+    original_loader = pricing_service.load_percentile_price_cache
+
+    def legacy_full_cache(session, price_format_id, **_kwargs):
+        return original_loader(session, price_format_id)
+
+    monkeypatch.setattr(pricing_service, "load_percentile_price_cache", legacy_full_cache)
+    for pf in formats:
+        calculate_prices(
+            db=db,
+            price_format_code=pf.code,
+            price_list_number=f"{pf.code}-LEGACY",
+            as_of=date.today(),
+            activation_date=None,
+            user="test",
+            force_new_price_list=True,
+        )
+
+    monkeypatch.setattr(pricing_service, "load_percentile_price_cache", original_loader)
+    for pf in formats:
+        calculate_prices(
+            db=db,
+            price_format_code=pf.code,
+            price_list_number=f"{pf.code}-TARGETED",
+            as_of=date.today(),
+            activation_date=None,
+            user="test",
+            force_new_price_list=True,
+        )
+
+    business_columns = [
+        column.name
+        for column in CalculatedPrice.__table__.columns
+        if column.name not in {"id", "price_list_id", "created_at"}
+    ]
+
+    def output_for(price_list_number):
+        rows = (
+            db.query(CalculatedPrice)
+            .join(PriceList)
+            .filter(PriceList.number == price_list_number)
+            .order_by(CalculatedPrice.product_id.asc())
+            .all()
+        )
+        return [{column: getattr(row, column) for column in business_columns} for row in rows]
+
+    for pf in formats:
+        legacy_output = output_for(f"{pf.code}-LEGACY")
+        targeted_output = output_for(f"{pf.code}-TARGETED")
+        assert len(legacy_output) == len(products)
+        assert targeted_output == legacy_output
+
+    assert physical_product.id != emit_product.id != regular_product.id != missing_product.id
+
+
 def test_unselected_percentile_value_does_not_participate_in_generation():
     db = _session()
     pf = _format(db)

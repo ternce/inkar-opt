@@ -427,6 +427,120 @@ def test_global_emit_resolver_reads_pf4_rows_for_assigned_target_without_fanout(
     assert load_percentile_price_cache(db, int(other.id)) == {}
 
 
+def test_pricing_percentile_cache_targets_requested_products_and_preserves_results():
+    db = _session()
+    canonical, target, _other, requested_product, first_price_list = _global_emit_fixture(db)
+    second_price_list = _price_list(
+        db,
+        canonical,
+        source_key="emit:1108",
+        branch="Emit International 1108",
+        competitor="Emit International 1108",
+        account_id="1108",
+    )
+    _assign(db, target, second_price_list, percentile_mode=MULTI_PRICE_PERCENTILE_MODE)
+    db.add(
+        CompetitorPrice(
+            price_format_id=target.id,
+            product_id=None,
+            source_name=_emit_percentile_config_name(
+                int(target.id),
+                "emit:1108",
+                "Emit International 1108",
+                "Emit International 1108",
+                40,
+            ),
+            supplier="Emit International 1108 P40",
+            coefficient=1.0,
+        )
+    )
+    db.add(
+        CompetitorPricePercentile(
+            price_format_id=canonical.id,
+            product_id=requested_product.id,
+            competitor_price_list_id=second_price_list.id,
+            source_type="provisor",
+            source_key="emit:1108",
+            branch_name="Emit International 1108",
+            competitor_name="Emit International 1108",
+            percentile_scope="regional",
+            percentile=40,
+            value=105,
+            source_count=3,
+            price_count=3,
+            used_price_count=3,
+            status="Calculated",
+        )
+    )
+
+    unrelated_products = [
+        Product(
+            id=10_000 + index,
+            code=f"SKU-PERCENTILE-BULK-{index}",
+            name=f"Bulk percentile product {index}",
+            provisor_goods_id=2_000_000 + index,
+            cost=100,
+        )
+        for index in range(1_200)
+    ]
+    db.add_all(unrelated_products)
+    db.flush()
+    missing_product = unrelated_products[0]
+    included_product = unrelated_products[1]
+    db.add_all(
+        [
+            CompetitorPricePercentile(
+                price_format_id=canonical.id,
+                product_id=product.id,
+                competitor_price_list_id=first_price_list.id,
+                source_type="provisor",
+                source_key="emit:1106",
+                branch_name="Emit International 1106",
+                competitor_name="Emit International 1106",
+                percentile_scope="regional",
+                percentile=40,
+                value=None if product.id == missing_product.id else 110,
+                source_count=1,
+                price_count=1,
+                used_price_count=1,
+                status="No data" if product.id == missing_product.id else "Calculated",
+            )
+            for product in unrelated_products
+        ]
+    )
+    db.commit()
+
+    full_cache = load_percentile_price_cache(db, int(target.id))
+    expected = resolve_percentile_prices_from_cache(full_cache, int(requested_product.id), percentile_number=40)
+    statements: list[str] = []
+
+    def capture_percentile_select(_conn, _cursor, statement, _parameters, _context, _executemany):
+        normalized = statement.lower()
+        if normalized.lstrip().startswith("select") and "from competitor_price_percentiles" in normalized:
+            statements.append(normalized)
+
+    event.listen(db.get_bind(), "before_cursor_execute", capture_percentile_select)
+    try:
+        requested_ids = {int(requested_product.id), int(included_product.id), int(missing_product.id)}
+        targeted_cache = load_percentile_price_cache(db, int(target.id), product_ids=requested_ids)
+        repeated_cache = load_percentile_price_cache(db, int(target.id), product_ids=requested_ids)
+    finally:
+        event.remove(db.get_bind(), "before_cursor_execute", capture_percentile_select)
+
+    actual = resolve_percentile_prices_from_cache(targeted_cache, int(requested_product.id), percentile_number=40)
+    repeated = resolve_percentile_prices_from_cache(repeated_cache, int(requested_product.id), percentile_number=40)
+    assert actual == expected
+    assert repeated == expected
+    assert len(actual.prices) == 2
+    assert set(targeted_cache) == {int(requested_product.id), int(included_product.id)}
+    assert len(full_cache) == 1_200
+    assert sum(len(entries) for buckets in full_cache.values() for entries in buckets.values()) == 1_205
+    assert sum(len(entries) for buckets in targeted_cache.values() for entries in buckets.values()) == 7
+    assert statements
+    assert all("product_id in" in statement for statement in statements)
+    assert all("source_count" not in statement and "status" not in statement for statement in statements)
+
+
 def test_global_emit_saved_legacy_source_name_resolves_after_display_normalization():
     db = _session()
     display = emit_display_name(1106)

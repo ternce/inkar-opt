@@ -8,7 +8,7 @@ from datetime import date, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 
 from sqlalchemy import select, delete, func, or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from ..models import (
     BranchCost,
@@ -1169,29 +1169,54 @@ def _regular_selected_percentile_configs(
     return out
 
 
-def load_percentile_price_cache(db: Session, price_format_id: int) -> PercentilePriceCache:
+def load_percentile_price_cache(
+    db: Session,
+    price_format_id: int,
+    *,
+    product_ids: list[int] | set[int] | None = None,
+) -> PercentilePriceCache:
+    requested_product_ids = (
+        sorted({int(product_id) for product_id in product_ids if int(product_id) > 0})
+        if product_ids is not None
+        else None
+    )
+    if requested_product_ids == []:
+        return {}
+
     active_groups = assigned_emit_percentile_group_keys(db=db, target_price_format_id=price_format_id)
     assigned_configs = _assigned_percentile_configs(db=db, price_format_id=price_format_id)
     if not active_groups and not assigned_configs:
         return {}
-    target_rows = (
-        db.execute(
-            select(CompetitorPricePercentile)
-            .where(CompetitorPricePercentile.price_format_id == price_format_id)
-            .where(CompetitorPricePercentile.value.is_not(None))
-            .order_by(
-                CompetitorPricePercentile.product_id.asc(),
-                CompetitorPricePercentile.percentile.asc(),
-                CompetitorPricePercentile.value.asc(),
+    target_stmt = (
+        select(CompetitorPricePercentile)
+        .options(
+            load_only(
+                CompetitorPricePercentile.product_id,
+                CompetitorPricePercentile.source_key,
+                CompetitorPricePercentile.branch_name,
+                CompetitorPricePercentile.competitor_name,
+                CompetitorPricePercentile.percentile_scope,
+                CompetitorPricePercentile.percentile,
+                CompetitorPricePercentile.value,
             )
         )
-        .scalars()
-        .all()
+        .where(CompetitorPricePercentile.price_format_id == price_format_id)
+        .where(CompetitorPricePercentile.value.is_not(None))
+        .order_by(
+            CompetitorPricePercentile.product_id.asc(),
+            CompetitorPricePercentile.percentile.asc(),
+            CompetitorPricePercentile.value.asc(),
+        )
     )
+    if requested_product_ids is not None:
+        target_stmt = target_stmt.where(CompetitorPricePercentile.product_id.in_(requested_product_ids))
+    target_rows = db.execute(target_stmt).scalars().all()
     global_emit_rows = load_global_emit_percentile_rows(
         db=db,
         target_price_format_id=price_format_id,
+        product_ids=requested_product_ids,
         require_value=True,
+        pricing_projection=True,
     )
     rows = [row for row in target_rows if not global_emit_rows or not emit_row_matches_assigned_group(row, active_groups)]
     rows.extend(global_emit_rows)
@@ -1217,16 +1242,24 @@ def load_percentile_price_cache(db: Session, price_format_id: int) -> Percentile
     if regular_keys:
         identities = sorted({identity for identity, _pct in regular_keys})
         percentiles = sorted({pct for _identity, pct in regular_keys})
-        regular_rows = (
-            db.execute(
-                select(RegularCompetitorPricePercentile)
-                .where(RegularCompetitorPricePercentile.competitor_identity.in_(identities))
-                .where(RegularCompetitorPricePercentile.percentile.in_(percentiles))
-                .where(RegularCompetitorPricePercentile.value.is_not(None))
+        regular_stmt = (
+            select(RegularCompetitorPricePercentile)
+            .options(
+                load_only(
+                    RegularCompetitorPricePercentile.product_id,
+                    RegularCompetitorPricePercentile.competitor_identity,
+                    RegularCompetitorPricePercentile.competitor_name,
+                    RegularCompetitorPricePercentile.percentile,
+                    RegularCompetitorPricePercentile.value,
+                )
             )
-            .scalars()
-            .all()
+            .where(RegularCompetitorPricePercentile.competitor_identity.in_(identities))
+            .where(RegularCompetitorPricePercentile.percentile.in_(percentiles))
+            .where(RegularCompetitorPricePercentile.value.is_not(None))
         )
+        if requested_product_ids is not None:
+            regular_stmt = regular_stmt.where(RegularCompetitorPricePercentile.product_id.in_(requested_product_ids))
+        regular_rows = db.execute(regular_stmt).scalars().all()
         for row in regular_rows:
             identity = str(row.competitor_identity or "").strip()
             pct = int(row.percentile)
@@ -3075,7 +3108,11 @@ def calculate_prices(
         active_lists=active_lists,
         branch_id=branch_id,
     )
-    percentile_price_cache = load_percentile_price_cache(db, pf.id) if percentile_mode else None
+    percentile_price_cache = (
+        load_percentile_price_cache(db, pf.id, product_ids=[int(product.id) for product in products])
+        if percentile_mode
+        else None
+    )
     existing_by_product_id = {
         int(row.product_id): row
         for row in db.execute(select(CalculatedPrice).where(CalculatedPrice.price_list_id == pl.id)).scalars().all()

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from ..models import CompetitorPriceList, CompetitorPricePercentile, PriceFormatCompetitorAssignment
 from .competitor_source_config import (
@@ -311,6 +311,7 @@ def load_global_emit_percentile_rows(
     product_id: int | None = None,
     percentile: int | None = None,
     require_value: bool = True,
+    pricing_projection: bool = False,
 ) -> list[CompetitorPricePercentile]:
     stmt = global_emit_percentile_base_stmt(
         db=db,
@@ -319,6 +320,18 @@ def load_global_emit_percentile_rows(
     )
     if stmt is None:
         return []
+    if pricing_projection:
+        stmt = stmt.options(
+            load_only(
+                CompetitorPricePercentile.product_id,
+                CompetitorPricePercentile.source_key,
+                CompetitorPricePercentile.branch_name,
+                CompetitorPricePercentile.competitor_name,
+                CompetitorPricePercentile.percentile_scope,
+                CompetitorPricePercentile.percentile,
+                CompetitorPricePercentile.value,
+            )
+        )
     if product_id is not None:
         stmt = stmt.where(CompetitorPricePercentile.product_id == int(product_id))
     elif product_ids is not None:
