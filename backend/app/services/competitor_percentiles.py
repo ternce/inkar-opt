@@ -44,6 +44,16 @@ from .competitors.identity import (
     regular_competitor_alias_obsolete_identities,
     regular_competitor_display_name,
 )
+from .percentile_differential_publication import (
+    DifferentialPublicationStats,
+    percentile_differential_publication_enabled,
+    prepare_emit_percentile_stage,
+    prepare_emit_summary_stage,
+    prepare_regular_percentile_stage,
+    publish_emit_percentile_stage,
+    publish_emit_summary_stage,
+    publish_regular_percentile_stage,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -889,23 +899,30 @@ def _fanout_emit_percentiles_postgresql(
         ).scalar()
         or 0
     )
-    deleted_rows = int(
-        db.execute(
-            text(
-                f"""
-                DELETE FROM competitor_price_percentiles cpp
-                WHERE cpp.price_format_id = :target_price_format_id
-                  AND ({scope_sql})
-                """
-            ),
-            params,
-        ).rowcount
-        or 0
-    )
+    differential = percentile_differential_publication_enabled()
+    publication_table = "competitor_price_percentiles"
+    if differential:
+        publication_table = "tmp_emit_percentile_fanout_publication"
+        prepare_emit_percentile_stage(db, table_name=publication_table)
+        deleted_rows = 0
+    else:
+        deleted_rows = int(
+            db.execute(
+                text(
+                    f"""
+                    DELETE FROM competitor_price_percentiles cpp
+                    WHERE cpp.price_format_id = :target_price_format_id
+                      AND ({scope_sql})
+                    """
+                ),
+                params,
+            ).rowcount
+            or 0
+        )
     insert_result = db.execute(
         text(
             f"""
-            INSERT INTO competitor_price_percentiles (
+            INSERT INTO {publication_table} (
                 price_format_id,
                 product_id,
                 competitor_price_list_id,
@@ -945,7 +962,21 @@ def _fanout_emit_percentiles_postgresql(
         ),
         params,
     )
-    inserted = int(insert_result.rowcount or 0)
+    staged_rows = int(insert_result.rowcount or 0)
+    publication_stats = DifferentialPublicationStats(staged_rows, 0, deleted_rows, 0)
+    if differential:
+        publication_stats = publish_emit_percentile_stage(
+            db,
+            table_name=publication_table,
+            scope_sql=(
+                "t.price_format_id = :target_price_format_id AND ("
+                + scope_sql.replace("cpp.", "t.")
+                + ")"
+            ),
+            params=params,
+        )
+    inserted = publication_stats.inserted
+    deleted_rows = publication_stats.deleted
     stats = db.execute(
         text(
             f"""
@@ -968,11 +999,16 @@ def _fanout_emit_percentiles_postgresql(
         "products_with_competitors": products_with_competitors,
         "products_without_competitors": max(0, products_processed - products_with_competitors),
         "rows_created": inserted,
-        "rows_updated": 0,
-        "rows_skipped": 0,
+        "rows_updated": publication_stats.updated,
+        "rows_skipped": publication_stats.unchanged,
         "rows_deleted": deleted_rows,
         "execution_time_seconds": round(time.perf_counter() - started_at, 3),
-        "engine": "fanout_postgresql",
+        "engine": "fanout_postgresql_differential" if differential else "fanout_postgresql",
+        "publication_strategy": (
+            "replacement_threshold" if publication_stats.replacement_used
+            else "differential" if differential
+            else "legacy_replacement"
+        ),
         "source_price_format_id": source_price_format_id,
         "rows_before": existing_rows,
         "compatibility_rows_created": inserted,
@@ -1158,35 +1194,43 @@ def _fanout_emit_percentiles_postgresql_multi_target(
         or 0
     )
 
+    differential = percentile_differential_publication_enabled()
+    publication_table = "competitor_price_percentiles"
+    rows_deleted_by_target: dict[int, int] = {}
     delete_started = time.perf_counter()
-    rows_deleted_by_target = {
-        int(row["price_format_id"]): int(row["rows_deleted"] or 0)
-        for row in db.execute(
-            text(
-                f"""
-                WITH deleted AS (
-                    DELETE FROM competitor_price_percentiles cpp
-                    USING tmp_emit_percentile_fanout_targets t
-                    WHERE cpp.price_format_id = t.target_price_format_id
-                      AND ({scope_sql})
-                    RETURNING cpp.price_format_id
-                )
-                SELECT price_format_id, count(*) AS rows_deleted
-                FROM deleted
-                GROUP BY price_format_id
-                """
-            ),
-            params,
-        ).mappings()
-    }
+    if differential:
+        publication_table = "tmp_emit_percentile_multi_fanout_publication"
+        prepare_emit_percentile_stage(db, table_name=publication_table)
+        deleted_rows = 0
+    else:
+        rows_deleted_by_target = {
+            int(row["price_format_id"]): int(row["rows_deleted"] or 0)
+            for row in db.execute(
+                text(
+                    f"""
+                    WITH deleted AS (
+                        DELETE FROM competitor_price_percentiles cpp
+                        USING tmp_emit_percentile_fanout_targets t
+                        WHERE cpp.price_format_id = t.target_price_format_id
+                          AND ({scope_sql})
+                        RETURNING cpp.price_format_id
+                    )
+                    SELECT price_format_id, count(*) AS rows_deleted
+                    FROM deleted
+                    GROUP BY price_format_id
+                    """
+                ),
+                params,
+            ).mappings()
+        }
+        deleted_rows = sum(rows_deleted_by_target.values())
     delete_elapsed = round(time.perf_counter() - delete_started, 3)
-    deleted_rows = sum(rows_deleted_by_target.values())
 
     insert_started = time.perf_counter()
     insert_result = db.execute(
         text(
             f"""
-            INSERT INTO competitor_price_percentiles (
+            INSERT INTO {publication_table} (
                 price_format_id,
                 product_id,
                 competitor_price_list_id,
@@ -1227,23 +1271,69 @@ def _fanout_emit_percentiles_postgresql_multi_target(
         ),
         params,
     )
-    inserted = int(insert_result.rowcount or 0)
+    staged_rows = int(insert_result.rowcount or 0)
+    publication_stats = DifferentialPublicationStats(staged_rows, 0, deleted_rows, 0)
+    if differential:
+        target_scope = (
+            "t.price_format_id IN (SELECT target_price_format_id "
+            "FROM tmp_emit_percentile_fanout_targets) AND ("
+            + scope_sql.replace("cpp.", "t.")
+            + ")"
+        )
+        rows_deleted_by_target = {
+            int(row["price_format_id"]): int(row["rows_deleted"] or 0)
+            for row in db.execute(
+                text(
+                    f"""
+                    SELECT t.price_format_id, count(*) AS rows_deleted
+                    FROM competitor_price_percentiles t
+                    WHERE {target_scope}
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM {publication_table} s
+                        WHERE t.price_format_id = s.price_format_id
+                          AND t.product_id = s.product_id
+                          AND t.source_key IS NOT DISTINCT FROM s.source_key
+                          AND t.branch_name IS NOT DISTINCT FROM s.branch_name
+                          AND t.competitor_name IS NOT DISTINCT FROM s.competitor_name
+                          AND t.percentile_scope = s.percentile_scope
+                          AND t.percentile = s.percentile
+                      )
+                    GROUP BY t.price_format_id
+                    """
+                ),
+                params,
+            ).mappings()
+        }
+        publication_stats = publish_emit_percentile_stage(
+            db,
+            table_name=publication_table,
+            scope_sql=target_scope,
+            params=params,
+        )
+        deleted_rows = publication_stats.deleted
+    inserted = publication_stats.inserted
     insert_elapsed = round(time.perf_counter() - insert_started, 3)
 
     summary_started = time.perf_counter()
-    db.execute(
-        text(
-            """
-            DELETE FROM competitor_price_percentile_source_summaries s
-            USING tmp_emit_percentile_fanout_targets t
-            WHERE s.price_format_id = t.target_price_format_id
-            """
+    summary_table = "competitor_price_percentile_source_summaries"
+    if differential:
+        summary_table = "tmp_emit_percentile_multi_fanout_summaries"
+        prepare_emit_summary_stage(db, table_name=summary_table)
+    else:
+        db.execute(
+            text(
+                """
+                DELETE FROM competitor_price_percentile_source_summaries s
+                USING tmp_emit_percentile_fanout_targets t
+                WHERE s.price_format_id = t.target_price_format_id
+                """
+            )
         )
-    )
     summary_result = db.execute(
         text(
-            """
-            INSERT INTO competitor_price_percentile_source_summaries (
+            f"""
+            INSERT INTO {summary_table} (
                 price_format_id,
                 source_type,
                 source_key,
@@ -1287,6 +1377,19 @@ def _fanout_emit_percentiles_postgresql_multi_target(
         {"updated_at": now_kz_naive()},
     )
     summary_rows_refreshed = int(summary_result.rowcount or 0)
+    summary_publication_stats = DifferentialPublicationStats(
+        summary_rows_refreshed, 0, 0, 0
+    )
+    if differential:
+        summary_publication_stats = publish_emit_summary_stage(
+            db,
+            table_name=summary_table,
+            scope_sql=(
+                "t.price_format_id IN (SELECT target_price_format_id "
+                "FROM tmp_emit_percentile_fanout_targets)"
+            ),
+            params={},
+        )
     summary_elapsed = round(time.perf_counter() - summary_started, 3)
 
     validation_started = time.perf_counter()
@@ -1379,11 +1482,20 @@ def _fanout_emit_percentiles_postgresql_multi_target(
         "products_with_competitors": products_with_competitors,
         "products_without_competitors": max(0, products_processed - products_with_competitors),
         "rows_created": inserted,
-        "rows_updated": 0,
-                "rows_skipped": 0,
+        "rows_updated": publication_stats.updated,
+        "rows_skipped": publication_stats.unchanged,
         "rows_deleted": deleted_rows,
         "execution_time_seconds": total_elapsed,
-        "engine": "fanout_postgresql_multi_target",
+        "engine": (
+            "fanout_postgresql_multi_target_differential"
+            if differential
+            else "fanout_postgresql_multi_target"
+        ),
+        "publication_strategy": (
+            "replacement_threshold" if publication_stats.replacement_used
+            else "differential" if differential
+            else "legacy_replacement"
+        ),
         "source_price_format_id": source_price_format_id,
         "target_price_format_ids": target_ids,
         "target_price_format_count": len(target_ids),
@@ -1393,6 +1505,10 @@ def _fanout_emit_percentiles_postgresql_multi_target(
         "rows_before_by_target": rows_before_by_target,
         "rows_deleted_by_target": rows_deleted_by_target,
         "summary_rows_refreshed": summary_rows_refreshed,
+        "summary_rows_inserted": summary_publication_stats.inserted,
+        "summary_rows_updated": summary_publication_stats.updated,
+        "summary_rows_deleted": summary_publication_stats.deleted,
+        "summary_rows_unchanged": summary_publication_stats.unchanged,
         "setup_elapsed_sec": setup_elapsed,
         "delete_elapsed_sec": delete_elapsed,
         "insert_elapsed_sec": insert_elapsed,
@@ -1523,49 +1639,56 @@ def _recalculate_competitor_percentiles_postgresql(
         or 0
     )
 
-    deleted_rows = int(
-        db.execute(
-            text(
-                """
-                DELETE FROM competitor_price_percentiles cpp
-                WHERE cpp.price_format_id = :price_format_id
-                  AND (
-                    (
-                      cpp.percentile_scope = :regional_scope
-                      AND EXISTS (
-                        SELECT 1
-                        FROM tmp_emit_percentile_sources s
-                        WHERE (
-                            cpp.source_key = s.source_key
-                            OR (
-                                coalesce(cpp.source_key, '') = ''
-                                AND cpp.branch_name = s.branch_name
-                                AND cpp.competitor_name = s.competitor_name
+    differential = percentile_differential_publication_enabled()
+    publication_table = "competitor_price_percentiles"
+    if differential:
+        publication_table = "tmp_emit_percentile_publication"
+        prepare_emit_percentile_stage(db, table_name=publication_table)
+        deleted_rows = 0
+    else:
+        deleted_rows = int(
+            db.execute(
+                text(
+                    """
+                    DELETE FROM competitor_price_percentiles cpp
+                    WHERE cpp.price_format_id = :price_format_id
+                      AND (
+                        (
+                          cpp.percentile_scope = :regional_scope
+                          AND EXISTS (
+                            SELECT 1
+                            FROM tmp_emit_percentile_sources s
+                            WHERE (
+                                cpp.source_key = s.source_key
+                                OR (
+                                    coalesce(cpp.source_key, '') = ''
+                                    AND cpp.branch_name = s.branch_name
+                                    AND cpp.competitor_name = s.competitor_name
+                                )
                             )
+                          )
+                        )
+                        OR (
+                          cpp.percentile_scope = :kazakhstan_scope
+                          AND cpp.branch_name = :kazakhstan_region
+                          AND EXISTS (
+                            SELECT 1
+                            FROM tmp_emit_percentile_sources s
+                            WHERE cpp.competitor_name = s.competitor_name
+                          )
                         )
                       )
-                    )
-                    OR (
-                      cpp.percentile_scope = :kazakhstan_scope
-                      AND cpp.branch_name = :kazakhstan_region
-                      AND EXISTS (
-                        SELECT 1
-                        FROM tmp_emit_percentile_sources s
-                        WHERE cpp.competitor_name = s.competitor_name
-                      )
-                    )
-                  )
-                """
-            ),
-            {
-                "price_format_id": price_format_id,
-                "regional_scope": REGIONAL_SCOPE,
-                "kazakhstan_scope": KAZAKHSTAN_SCOPE,
-                "kazakhstan_region": KAZAKHSTAN_REGION,
-            },
-        ).rowcount
-        or 0
-    )
+                    """
+                ),
+                {
+                    "price_format_id": price_format_id,
+                    "regional_scope": REGIONAL_SCOPE,
+                    "kazakhstan_scope": KAZAKHSTAN_SCOPE,
+                    "kazakhstan_region": KAZAKHSTAN_REGION,
+                },
+            ).rowcount
+            or 0
+        )
 
     for source in selected_sources:
         logger.info(
@@ -1594,7 +1717,7 @@ def _recalculate_competitor_percentiles_postgresql(
 
     regional_result = db.execute(
         text(
-            """
+            f"""
             WITH matched_prices AS (
                 SELECT
                     coalesce(i.product_id, p_goods.id, p_sku.id, p_distributor.id) AS product_id,
@@ -1721,7 +1844,7 @@ def _recalculate_competitor_percentiles_postgresql(
                  AND c.source_key = sg.source_key
                  AND c.percentile = pct.percentile
             )
-            INSERT INTO competitor_price_percentiles (
+            INSERT INTO {publication_table} (
                 price_format_id,
                 product_id,
                 competitor_price_list_id,
@@ -1755,7 +1878,7 @@ def _recalculate_competitor_percentiles_postgresql(
                 status,
                 updated_at
             FROM insert_rows
-            """
+            f"""
         ),
         params,
     )
@@ -1763,21 +1886,21 @@ def _recalculate_competitor_percentiles_postgresql(
 
     kazakhstan_result = db.execute(
         text(
-            """
+            f"""
             WITH regional_values AS (
                 SELECT
                     product_id,
                     competitor_name,
                     percentile,
                     value::numeric AS value
-                FROM competitor_price_percentiles
+                FROM {publication_table}
                 WHERE price_format_id = :price_format_id
                   AND percentile_scope = :regional_scope
                   AND value IS NOT NULL
                   AND EXISTS (
                     SELECT 1
                     FROM tmp_emit_percentile_sources s
-                    WHERE competitor_price_percentiles.competitor_name = s.competitor_name
+                    WHERE {publication_table}.competitor_name = s.competitor_name
                   )
             ),
             calculated AS (
@@ -1822,7 +1945,7 @@ def _recalculate_competitor_percentiles_postgresql(
                  AND calc.competitor_name = c.competitor_name
                  AND calc.percentile = pct.percentile
             )
-            INSERT INTO competitor_price_percentiles (
+            INSERT INTO {publication_table} (
                 price_format_id,
                 product_id,
                 competitor_price_list_id,
@@ -1861,7 +1984,47 @@ def _recalculate_competitor_percentiles_postgresql(
         params,
     )
     kazakhstan_inserted = int(kazakhstan_result.rowcount or 0)
-    inserted = regional_inserted + kazakhstan_inserted
+    staged_rows = regional_inserted + kazakhstan_inserted
+    publication_stats = DifferentialPublicationStats(
+        inserted=staged_rows,
+        updated=0,
+        deleted=deleted_rows,
+        unchanged=0,
+    )
+    if differential:
+        scope_sql = """
+            t.price_format_id = :price_format_id
+            AND (
+              (
+                t.percentile_scope = :regional_scope
+                AND EXISTS (
+                  SELECT 1 FROM tmp_emit_percentile_sources s
+                  WHERE t.source_key = s.source_key
+                     OR (
+                       coalesce(t.source_key, '') = ''
+                       AND t.branch_name = s.branch_name
+                       AND t.competitor_name = s.competitor_name
+                     )
+                )
+              )
+              OR (
+                t.percentile_scope = :kazakhstan_scope
+                AND t.branch_name = :kazakhstan_region
+                AND EXISTS (
+                  SELECT 1 FROM tmp_emit_percentile_sources s
+                  WHERE t.competitor_name = s.competitor_name
+                )
+              )
+            )
+        """
+        publication_stats = publish_emit_percentile_stage(
+            db,
+            table_name=publication_table,
+            scope_sql=scope_sql,
+            params=params,
+        )
+    inserted = publication_stats.inserted
+    deleted_rows = publication_stats.deleted
 
     stats = db.execute(
         text(
@@ -2000,11 +2163,16 @@ def _recalculate_competitor_percentiles_postgresql(
         "products_without_competitors": max(0, products_processed - products_with_competitors_count),
         "raw_price_rows": int(stats["raw_price_rows"] or 0),
         "rows_created": inserted,
-        "rows_updated": 0,
-        "rows_skipped": 0,
+        "rows_updated": publication_stats.updated,
+        "rows_skipped": publication_stats.unchanged,
         "rows_deleted": deleted_rows,
         "execution_time_seconds": round(time.perf_counter() - started_at, 3),
-        "engine": "postgresql",
+        "engine": "postgresql_differential" if differential else "postgresql",
+        "publication_strategy": (
+            "replacement_threshold" if publication_stats.replacement_used
+            else "differential" if differential
+            else "legacy_replacement"
+        ),
     }
 
     for row in inventory_rows:
@@ -2679,18 +2847,25 @@ def _recalculate_regular_competitor_percentiles_postgresql(
             alias_mappings,
         )
     selected_identities = {str(row["competitor_identity"]) for row in source_mappings}
-    canonical_rows_deleted = int(
-        db.execute(
-            text(
-                """
-                DELETE FROM regular_competitor_price_percentiles
-                WHERE (SELECT count(*) FROM tmp_regular_percentile_identities) = 0
-                   OR competitor_identity IN (SELECT identity FROM tmp_regular_percentile_identities)
-                """
-            )
-        ).rowcount
-        or 0
-    )
+    differential = percentile_differential_publication_enabled()
+    publication_table = "regular_competitor_price_percentiles"
+    if differential:
+        publication_table = "tmp_regular_percentile_publication"
+        prepare_regular_percentile_stage(db, table_name=publication_table)
+        canonical_rows_deleted = 0
+    else:
+        canonical_rows_deleted = int(
+            db.execute(
+                text(
+                    """
+                    DELETE FROM regular_competitor_price_percentiles
+                    WHERE (SELECT count(*) FROM tmp_regular_percentile_identities) = 0
+                       OR competitor_identity IN (SELECT identity FROM tmp_regular_percentile_identities)
+                    """
+                )
+            ).rowcount
+            or 0
+        )
     result = db.execute(
         text(
             f"""
@@ -2753,7 +2928,7 @@ def _recalculate_regular_competitor_percentiles_postgresql(
                 FROM matched_prices
                 GROUP BY competitor_identity, product_id
             )
-            INSERT INTO regular_competitor_price_percentiles (
+            INSERT INTO {publication_table} (
                 competitor_identity,
                 competitor_name,
                 product_id,
@@ -2790,7 +2965,21 @@ def _recalculate_regular_competitor_percentiles_postgresql(
             "calculated_at": now_kz_naive(),
         },
     )
-    written = int(result.rowcount or 0)
+    staged_rows = int(result.rowcount or 0)
+    publication_stats = DifferentialPublicationStats(
+        inserted=staged_rows,
+        updated=0,
+        deleted=canonical_rows_deleted,
+        unchanged=0,
+    )
+    if differential:
+        publication_stats = publish_regular_percentile_stage(
+            db,
+            table_name=publication_table,
+            all_identities=not requested_identities,
+        )
+        canonical_rows_deleted = publication_stats.deleted
+    written = publication_stats.inserted + publication_stats.updated
     alias_delete_counts = db.execute(
         text(
             """
@@ -2908,8 +3097,10 @@ def _recalculate_regular_competitor_percentiles_postgresql(
         "regularCompetitorsProcessed": len(selected_identities),
         "regularPercentileRowsDeleted": canonical_rows_deleted + total_alias_rows_deleted,
         "regularPercentileRowsWritten": written,
+        "regularPercentileRowsUpdated": publication_stats.updated,
+        "regularPercentileRowsUnchanged": publication_stats.unchanged,
         "regularPercentileElapsedSec": round(time.perf_counter() - started_at, 3),
-        "regularEngine": "postgresql",
+        "regularEngine": "postgresql_differential" if differential else "postgresql",
         "totalAliasIdentitiesDeleted": sum(len(items) for items in alias_identities_found_by_identity.values()),
         "totalAliasRowsDeleted": total_alias_rows_deleted,
     }

@@ -35,6 +35,10 @@ from .sku import normalize_sku, normalize_sku_variants
 from ..timezone import now_kz_naive
 from .competitor_assignments import selected_price_format_ids_for_competitor_price_list
 from .matching_cache.capture import capture_and_publish_legacy_source_version
+from .matching_cache.source_noop import (
+    source_semantic_metadata,
+    validate_unchanged_source_import,
+)
 
 
 MAX_MANUAL_PLK_FILE_SIZE_BYTES = 15 * 1024 * 1024
@@ -512,6 +516,9 @@ def import_manual_price_list(
             )
         else:
             affected_price_format_ids = []
+        semantic_metadata_before = (
+            source_semantic_metadata(existing) if existing is not None else None
+        )
         now = now_kz_naive()
         if existing is None:
             source_key = f"manual:{uuid.uuid4()}"
@@ -573,11 +580,29 @@ def import_manual_price_list(
                     raw_json=json.dumps(item.raw, ensure_ascii=False, default=str),
                 )
             )
-        db.execute(delete(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == row.id))
-        db.add_all(replacement_items)
+        noop = validate_unchanged_source_import(
+            db=db,
+            source=row,
+            incoming_rows=replacement_items,
+            semantic_metadata_before=(
+                semantic_metadata_before
+                if semantic_metadata_before is not None
+                else source_semantic_metadata(row)
+            ),
+        )
+        if not noop.reusable:
+            db.execute(delete(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == row.id))
+            db.add_all(replacement_items)
         db.flush()
 
-        match_stats = rematch_price_list_items_by_product(db=db, price_list=row)
+        match_stats = (
+            {
+                "matched": int(row.matched_positive_items_count or 0),
+                "sourceNoop": True,
+            }
+            if noop.reusable
+            else rematch_price_list_items_by_product(db=db, price_list=row)
+        )
         refresh_price_list_matched_item_counters(
             db=db, item_counts={int(row.id): len(parsed.valid_rows)}
         )
@@ -613,11 +638,12 @@ def import_manual_price_list(
                 lock_lease=transaction_locks,
                 allow_matching_cache=False,
             )
-        capture_and_publish_legacy_source_version(
-            db=db,
-            competitor_price_list_id=int(row.id),
-            source_metadata={"importer": "manual_excel_csv", "sourceKey": source_key},
-        )
+        if not noop.reusable:
+            capture_and_publish_legacy_source_version(
+                db=db,
+                competitor_price_list_id=int(row.id),
+                source_metadata={"importer": "manual_excel_csv", "sourceKey": source_key},
+            )
         db.commit()
         for price_format_id in affected_price_format_ids:
             enqueue_percentile_preparation(db=db, price_format_id=price_format_id, reason="manual_price_list_imported")
@@ -645,6 +671,8 @@ def import_manual_price_list(
             "id": int(row.id),
             "sourceKey": source_key,
             "importId": int(history.id),
+            "sourceNoop": noop.reusable,
+            "sourceNoopReason": noop.reason,
             **_summary(parsed, matched=matched, persisted=persisted),
         }
     except Exception:

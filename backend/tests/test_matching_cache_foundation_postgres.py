@@ -52,7 +52,11 @@ from backend.app.services.matching_cache.dependencies import (
     bump_dependency_revision,
     ensure_dependency_revision,
 )
-from backend.app.services.matching_cache.fingerprints import canonical_source_content
+from backend.app.services.matching_cache.fingerprints import (
+    LEGACY_FIELD_ALIASES,
+    SOURCE_CONTENT_FIELDS,
+    canonical_source_content,
+)
 from backend.app.services.matching_cache.dependency_tracking import DEPENDENCY_MODEL_COVERAGE
 from backend.app.services.matching_cache.versions import (
     create_or_reuse_pending_source_version,
@@ -2096,11 +2100,10 @@ def test_end_to_end_materialization_calculation_analytics_and_excel_parity(
             ))
             db.flush()
             original_items[int(item.id)] = {
-                "product_id": item.product_id,
-                "match_key": item.match_key,
-                "match_type": item.match_type,
-                "match_score": item.match_score,
-                "matched_sku": item.matched_sku,
+                LEGACY_FIELD_ALIASES.get(field, field): getattr(
+                    item, LEGACY_FIELD_ALIASES.get(field, field)
+                )
+                for field in SOURCE_CONTENT_FIELDS
             }
             capture = capture_and_publish_legacy_source_version(
                 db=db, competitor_price_list_id=int(source.id)
@@ -2170,6 +2173,16 @@ def test_end_to_end_materialization_calculation_analytics_and_excel_parity(
             for field, value in values.items():
                 setattr(item, field, value)
         db.flush()
+        # Phase 3B invalidates physical lineage on matching-relevant row
+        # UPDATEs.  The rows now exactly match the original immutable
+        # generation again, so republish its one-to-one physical lineage
+        # before exercising the required-cache workflow.
+        for source in sources:
+            republished = capture_and_publish_legacy_source_version(
+                db=db, competitor_price_list_id=int(source.id)
+            )
+            assert republished.succeeded and republished.reused
+        db.commit()
         db.execute(delete(CompetitorPrice).where(
             CompetitorPrice.price_format_id == price_format.id,
             CompetitorPrice.product_id.is_not(None),

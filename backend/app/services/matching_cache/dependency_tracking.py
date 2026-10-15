@@ -46,12 +46,19 @@ DEPENDENCY_MODEL_COVERAGE = {
 
 REQUIRED_DATABASE_TRIGGERS = frozenset({
     "trg_match_cache_products",
+    "trg_match_cache_products_update",
     "trg_match_cache_product_extras",
+    "trg_match_cache_product_extras_update",
     "trg_match_cache_internal_normalized",
+    "trg_match_cache_internal_normalized_update",
     "trg_match_cache_competitor_code_mappings",
+    "trg_match_cache_competitor_code_mappings_update",
     "trg_match_cache_provisor_goods_map",
+    "trg_match_cache_provisor_goods_map_update",
     "trg_match_cache_product_substitutes",
+    "trg_match_cache_product_substitutes_update",
     "trg_match_cache_vidman_matches",
+    "trg_match_cache_vidman_matches_update",
     "trg_match_cache_approved_source_goods",
 })
 
@@ -101,6 +108,9 @@ def _scopes_for(obj: object) -> set[str]:
         if _changed(
             obj,
             (
+                "product_id",
+                "raw_name",
+                "raw_manufacturer",
                 "normalized_name",
                 "base_name",
                 "normalized_manufacturer",
@@ -113,11 +123,15 @@ def _scopes_for(obj: object) -> set[str]:
                 "volume_unit",
                 "weight_value",
                 "weight_unit",
+                "package_volume",
+                "package_weight",
                 "pack_count",
                 "dosage_form",
                 "variant_text",
                 "identity_tokens_json",
                 "normalized_signature",
+                "parse_warnings_json",
+                "parse_confidence",
             ),
         ):
             scopes.add(PRODUCT_CATALOG)
@@ -150,6 +164,8 @@ def _scopes_for(obj: object) -> set[str]:
                 "source_type",
                 "source_goods_id",
                 "source_distributor_goods_id",
+                "source_name",
+                "source_manufacturer",
                 "status",
                 "priority",
             ),

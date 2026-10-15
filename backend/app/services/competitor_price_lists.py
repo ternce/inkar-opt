@@ -70,6 +70,10 @@ from .price_sources import UnifiedPriceItem, UnifiedPriceList
 from .sku import normalize_external_sku, normalize_sku, normalize_sku_variants
 from .provisor import process_memory_snapshot
 from .matching_cache.capture import capture_and_publish_legacy_source_version
+from .matching_cache.source_noop import (
+    source_semantic_metadata,
+    validate_unchanged_source_import,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -976,6 +980,7 @@ def upsert_provisor_price_list(
     affected_price_format_ids = _selected_price_format_ids_for_refreshed_source(db, row)
     transaction_locks = PricingWorkflowTransactionLockLease(db, retry_timeout_seconds=5.0)
     transaction_locks.acquire(price_format_ids=affected_price_format_ids, source_ids=[int(row.id)])
+    semantic_metadata_before = source_semantic_metadata(row)
 
     row.source_key = source_key
     row.display_name = display_name
@@ -1061,14 +1066,36 @@ def upsert_provisor_price_list(
             )
         )
 
-    db.execute(delete(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == row.id))
-    db.add_all(replacement_items)
+    noop = validate_unchanged_source_import(
+        db=db,
+        source=row,
+        incoming_rows=replacement_items,
+        semantic_metadata_before=semantic_metadata_before,
+        require_snapshot=run_matching,
+    )
+    if not noop.reusable:
+        db.execute(delete(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == row.id))
+        db.add_all(replacement_items)
     inserted_items_count = len(replacement_items)
 
     db.flush()
     if int(filial_id) in PROVISOR_REFERENCE_FILIAL_IDS:
         _sync_provisor_reference_mapping_from_items(db, account_id="")
-    if run_matching:
+    if noop.reusable:
+        refresh_price_list_matched_item_counters(
+            db=db, item_counts={int(row.id): inserted_items_count}
+        )
+        if run_matching:
+            _replace_legacy_price_rows_for_list(db=db, price_list=row)
+            for price_format_id in affected_price_format_ids:
+                sync_selected_competitor_configs(db=db, price_format_id=price_format_id)
+                rebuild_competitor_prices_for_selected(
+                    db=db,
+                    price_format_id=price_format_id,
+                    lock_lease=transaction_locks,
+                    allow_matching_cache=False,
+                )
+    elif run_matching:
         rematch_price_list_items_by_product(db=db, price_list=row)
         refresh_price_list_matched_item_counters(db=db, item_counts={int(row.id): inserted_items_count})
         _replace_legacy_price_rows_for_list(db=db, price_list=row)
@@ -1080,11 +1107,13 @@ def upsert_provisor_price_list(
     else:
         refresh_price_list_matched_item_counters(db=db, item_counts={int(row.id): inserted_items_count})
         affected_price_format_ids = []
-    capture_and_publish_legacy_source_version(
-        db=db,
-        competitor_price_list_id=int(row.id),
-        source_metadata={"importer": "provisor", "sourceKey": row.source_key},
-    )
+    if not noop.reusable:
+        capture_and_publish_legacy_source_version(
+            db=db,
+            competitor_price_list_id=int(row.id),
+            source_metadata={"importer": "provisor", "sourceKey": row.source_key},
+        )
+    setattr(row, "_source_noop", noop)
     db.commit()
     if run_matching:
         _enqueue_percentile_preparation_for_price_formats(
@@ -1171,6 +1200,7 @@ def upsert_unified_price_list(
     affected_price_format_ids = _selected_price_format_ids_for_refreshed_source(db, row)
     transaction_locks = PricingWorkflowTransactionLockLease(db, retry_timeout_seconds=5.0)
     transaction_locks.acquire(price_format_ids=affected_price_format_ids, source_ids=[int(row.id)])
+    semantic_metadata_before = source_semantic_metadata(row)
 
     row.source_key = source_key
     branch_name = getattr(price_list, "branch_name", "") or "Без филиала"
@@ -1291,15 +1321,66 @@ def upsert_unified_price_list(
     }
     _prepare_rows_timing(price_list_id=row.id, stage="resolve_manufacturers_bulk_or_cache", rows=len(manufacturer_cache), started_at=stage_started_at)
 
-    stage_started_at = time.perf_counter()
-    delete_result = db.execute(
-        delete(CompetitorPriceListItem)
-        .where(CompetitorPriceListItem.price_list_id == row.id)
-        .execution_options(synchronize_session=False)
+    def incoming_noop_rows():
+        for index, item in enumerate(items):
+            item_name = item_names[index]
+            raw_manufacturer = manufacturer_cache.get(
+                _manufacturer_cache_key(item.manufacturer, item_name), ""
+            )
+            raw = item.raw if isinstance(item.raw, dict) else {}
+            raw_json = ""
+            if STORE_PROVISOR_RAW_JSON or item.source != "provisor":
+                raw_json = json.dumps(
+                    {
+                        "source": item.source,
+                        "accountId": item.account_id,
+                        "priceListId": item.price_list_id,
+                        "priceListName": item.price_list_name,
+                        "distributorName": item.distributor_name,
+                        "manufacturer": raw_manufacturer,
+                        "expiryDate": item.expiry_date,
+                        "raw": item.raw,
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+            yield {
+                "provisor_id": _as_int(raw.get("id")),
+                "provisor_goods_id": _as_int(raw.get("goodsId")),
+                "filial_id": _as_int(item.price_list_id) if item.source == "provisor" else None,
+                "name": item_name,
+                "reg_number": item.registration_number,
+                "distributor_goods_name": item.distributor_product_name or item.product_name,
+                "distributor_goods_id": item.distributor_product_id,
+                "distributor_price": float(item.distributor_price) if item.distributor_price is not None and item.distributor_price > 0 else None,
+                "stock": float(item.stock) if item.stock is not None else None,
+                "package_count": float(item.pack_quantity) if item.pack_quantity is not None else None,
+                "expiry_date": _clean_expiry_date(item.expiry_date),
+                "raw_name": item_name,
+                "raw_manufacturer": raw_manufacturer,
+                "raw_json": raw_json,
+            }
+
+    noop = validate_unchanged_source_import(
+        db=db,
+        source=row,
+        incoming_rows=incoming_noop_rows(),
+        semantic_metadata_before=semantic_metadata_before,
     )
+
+    stage_started_at = time.perf_counter()
+    delete_result = None
+    if not noop.reusable:
+        delete_result = db.execute(
+            delete(CompetitorPriceListItem)
+            .where(CompetitorPriceListItem.price_list_id == row.id)
+            .execution_options(synchronize_session=False)
+        )
     benchmark["delete_old_items_sec"] = round(time.perf_counter() - stage_started_at, 6)
-    benchmark["deleted_rows_count"] = int(delete_result.rowcount or 0)
-    _db_save_timing(price_list_id=row.id, stage="delete_old_items", rows=int(delete_result.rowcount or 0), started_at=stage_started_at)
+    benchmark["deleted_rows_count"] = int(delete_result.rowcount or 0) if delete_result is not None else 0
+    benchmark["source_noop"] = noop.reusable
+    benchmark["source_noop_reason"] = noop.reason
+    _db_save_timing(price_list_id=row.id, stage="delete_old_items", rows=int(delete_result.rowcount or 0) if delete_result is not None else 0, started_at=stage_started_at)
 
     stage_started_at = time.perf_counter()
     empty_structure_fields = _empty_match_structure_fields()
@@ -1314,6 +1395,10 @@ def upsert_unified_price_list(
             return
         batch_size = len(row_mappings)
         max_batch_size = max(max_batch_size, batch_size)
+        if noop.reusable:
+            inserted_rows_count += batch_size
+            row_mappings.clear()
+            return
         batch_started_at = time.perf_counter()
         db.bulk_insert_mappings(CompetitorPriceListItem, row_mappings)
         db.flush()
@@ -1436,8 +1521,13 @@ def upsert_unified_price_list(
 
     flush_batch()
     benchmark["bulk_insert_sec"] = round(bulk_insert_sec, 6)
-    benchmark["inserted_rows_count"] = inserted_rows_count
-    _db_save_timing(price_list_id=row.id, stage="bulk_insert", rows=inserted_rows_count, started_at=prepare_total_started_at)
+    benchmark["inserted_rows_count"] = 0 if noop.reusable else inserted_rows_count
+    _db_save_timing(
+        price_list_id=row.id,
+        stage="bulk_insert",
+        rows=0 if noop.reusable else inserted_rows_count,
+        started_at=prepare_total_started_at,
+    )
     _db_memory_snapshot(
         db=db,
         price_list_id=row.id,
@@ -1460,7 +1550,7 @@ def upsert_unified_price_list(
     relink_started_at = time.perf_counter()
     relink_summary = (
         relink_provisor_items_from_product_goods_ids(db=db, price_list_ids=[int(row.id)])
-        if price_list.source == "provisor" and not run_matching
+        if price_list.source == "provisor" and not run_matching and not noop.reusable
         else {"priceListIds": [], "relinkedItems": 0, "conflictItems": 0, "ambiguousGoodsIds": 0, "ambiguousItems": 0}
     )
     benchmark["relink_sec"] = round(time.perf_counter() - relink_started_at, 6)
@@ -1485,7 +1575,26 @@ def upsert_unified_price_list(
     if price_list.source == "provisor" and _as_int(price_list.price_list_id) in PROVISOR_REFERENCE_FILIAL_IDS:
         _sync_provisor_reference_mapping_from_items(db, account_id=price_list.account_id)
     counters_started_at = time.perf_counter()
-    if run_matching:
+    if noop.reusable:
+        refresh_price_list_matched_item_counters(db=db, item_counts={int(row.id): inserted_rows_count})
+        if run_matching:
+            _replace_legacy_price_rows_for_list(db=db, price_list=row)
+            for price_format_id in affected_price_format_ids:
+                sync_selected_competitor_configs(db=db, price_format_id=price_format_id)
+                rebuild_competitor_prices_for_selected(
+                    db=db,
+                    price_format_id=price_format_id,
+                    lock_lease=transaction_locks,
+                    allow_matching_cache=False,
+                )
+        else:
+            materialized_price_format_ids = (
+                _replace_assigned_competitor_price_rows_for_list(db=db, price_list=row)
+                if price_list.source == "provisor"
+                else []
+            )
+            benchmark["exact_goods_id_materialized_price_format_ids"] = materialized_price_format_ids
+    elif run_matching:
         rematch_price_list_items_by_product(db=db, price_list=row)
         refresh_price_list_matched_item_counters(db=db, item_counts={int(row.id): inserted_rows_count})
         _replace_legacy_price_rows_for_list(db=db, price_list=row)
@@ -1506,11 +1615,13 @@ def upsert_unified_price_list(
         )
         benchmark["materialize_prices_sec"] = round(time.perf_counter() - materialize_started_at, 6)
         benchmark["exact_goods_id_materialized_price_format_ids"] = materialized_price_format_ids
-    capture_and_publish_legacy_source_version(
-        db=db,
-        competitor_price_list_id=int(row.id),
-        source_metadata={"importer": "unified", "sourceType": price_list.source, "sourceKey": row.source_key},
-    )
+    if not noop.reusable:
+        capture_and_publish_legacy_source_version(
+            db=db,
+            competitor_price_list_id=int(row.id),
+            source_metadata={"importer": "unified", "sourceType": price_list.source, "sourceKey": row.source_key},
+        )
+    setattr(row, "_source_noop", noop)
     stage_started_at = time.perf_counter()
     db.commit()
     if run_matching:

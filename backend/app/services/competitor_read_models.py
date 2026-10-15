@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 import time
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -19,6 +19,7 @@ from .emit_percentile_resolver import (
     global_emit_percentile_base_stmt,
     is_global_emit_percentile_storage_price_format,
 )
+from .percentile_differential_publication import percentile_differential_publication_enabled
 
 
 def _ids(values: Iterable[int | None]) -> list[int]:
@@ -200,6 +201,97 @@ def live_emit_percentile_source_summary_rows(*, db: Session, price_format_id: in
 
 
 def refresh_emit_percentile_source_summaries(*, db: Session, price_format_id: int | None = None) -> int:
+    rows = live_emit_percentile_source_summary_rows(db=db, price_format_id=price_format_id)
+    derived_from_global = False
+    if price_format_id is not None and not is_global_emit_percentile_storage_price_format(int(price_format_id)):
+        base_stmt = global_emit_percentile_base_stmt(
+            db=db,
+            target_price_format_id=int(price_format_id),
+            require_value=False,
+        )
+        derived_from_global = (
+            base_stmt is not None
+            and int(db.scalar(select(func.count()).select_from(base_stmt.subquery())) or 0) > 0
+        )
+    publication_rows = [] if derived_from_global else rows
+    if (
+        percentile_differential_publication_enabled()
+        and db.get_bind().dialect.name == "postgresql"
+    ):
+        db.execute(text("DROP TABLE IF EXISTS tmp_emit_percentile_summary_publication"))
+        db.execute(text(
+            "CREATE TEMP TABLE tmp_emit_percentile_summary_publication "
+            "(LIKE competitor_price_percentile_source_summaries INCLUDING DEFAULTS) ON COMMIT DROP"
+        ))
+        db.execute(text("""
+            CREATE UNIQUE INDEX ON tmp_emit_percentile_summary_publication (
+                price_format_id, source_type, source_key,
+                coalesce(competitor_price_list_id, -1), branch_name,
+                competitor_name, percentile_scope, percentile
+            )
+        """))
+        if publication_rows:
+            db.execute(text("""
+                INSERT INTO tmp_emit_percentile_summary_publication (
+                    price_format_id, source_type, source_key,
+                    competitor_price_list_id, branch_name, competitor_name,
+                    percentile_scope, percentile, sku_count, source_count,
+                    generated_at, updated_at
+                ) VALUES (
+                    :price_format_id, :source_type, :source_key,
+                    :competitor_price_list_id, :branch_name, :competitor_name,
+                    :percentile_scope, :percentile, :sku_count, :source_count,
+                    :generated_at, :updated_at
+                )
+            """), publication_rows)
+        scope = (
+            "TRUE" if price_format_id is None
+            else "t.price_format_id = :price_format_id"
+        )
+        params = {} if price_format_id is None else {"price_format_id": int(price_format_id)}
+        key = """
+            t.price_format_id = s.price_format_id
+            AND t.source_type = s.source_type
+            AND t.source_key IS NOT DISTINCT FROM s.source_key
+            AND t.competitor_price_list_id IS NOT DISTINCT FROM s.competitor_price_list_id
+            AND t.branch_name IS NOT DISTINCT FROM s.branch_name
+            AND t.competitor_name IS NOT DISTINCT FROM s.competitor_name
+            AND t.percentile_scope = s.percentile_scope
+            AND t.percentile = s.percentile
+        """
+        db.execute(text(f"""
+            UPDATE competitor_price_percentile_source_summaries t
+            SET sku_count=s.sku_count, source_count=s.source_count,
+                generated_at=s.generated_at, updated_at=s.updated_at
+            FROM tmp_emit_percentile_summary_publication s
+            WHERE {key}
+              AND ROW(t.sku_count,t.source_count,t.generated_at)
+                  IS DISTINCT FROM ROW(s.sku_count,s.source_count,s.generated_at)
+        """), params)
+        db.execute(text(f"""
+            DELETE FROM competitor_price_percentile_source_summaries t
+            WHERE {scope}
+              AND NOT EXISTS (
+                SELECT 1 FROM tmp_emit_percentile_summary_publication s WHERE {key}
+              )
+        """), params)
+        db.execute(text(f"""
+            INSERT INTO competitor_price_percentile_source_summaries (
+                price_format_id, source_type, source_key,
+                competitor_price_list_id, branch_name, competitor_name,
+                percentile_scope, percentile, sku_count, source_count,
+                generated_at, updated_at
+            )
+            SELECT s.price_format_id, s.source_type, s.source_key,
+                   s.competitor_price_list_id, s.branch_name, s.competitor_name,
+                   s.percentile_scope, s.percentile, s.sku_count, s.source_count,
+                   s.generated_at, s.updated_at
+            FROM tmp_emit_percentile_summary_publication s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM competitor_price_percentile_source_summaries t WHERE {key}
+            )
+        """), params)
+        return len(rows)
     if price_format_id is None:
         db.execute(delete(CompetitorPricePercentileSourceSummary))
     else:
@@ -208,15 +300,8 @@ def refresh_emit_percentile_source_summaries(*, db: Session, price_format_id: in
                 CompetitorPricePercentileSourceSummary.price_format_id == int(price_format_id)
             )
         )
-    rows = live_emit_percentile_source_summary_rows(db=db, price_format_id=price_format_id)
-    if price_format_id is not None and not is_global_emit_percentile_storage_price_format(int(price_format_id)):
-        base_stmt = global_emit_percentile_base_stmt(
-            db=db,
-            target_price_format_id=int(price_format_id),
-            require_value=False,
-        )
-        if base_stmt is not None and int(db.scalar(select(func.count()).select_from(base_stmt.subquery())) or 0) > 0:
-            return len(rows)
+    if derived_from_global:
+        return len(rows)
     if rows:
         db.bulk_insert_mappings(CompetitorPricePercentileSourceSummary, rows)
     return len(rows)
@@ -260,6 +345,67 @@ def refresh_regular_percentile_source_summaries(
     competitor_identities: set[str] | None = None,
 ) -> int:
     identities = {str(item or "").strip() for item in (competitor_identities or set()) if str(item or "").strip()}
+    rows = live_regular_percentile_source_summary_rows(db=db, competitor_identities=identities)
+    if (
+        percentile_differential_publication_enabled()
+        and db.get_bind().dialect.name == "postgresql"
+    ):
+        db.execute(text("DROP TABLE IF EXISTS tmp_regular_percentile_summary_publication"))
+        db.execute(text(
+            "CREATE TEMP TABLE tmp_regular_percentile_summary_publication "
+            "(LIKE regular_competitor_price_percentile_source_summaries INCLUDING DEFAULTS) ON COMMIT DROP"
+        ))
+        db.execute(text(
+            "CREATE UNIQUE INDEX ON tmp_regular_percentile_summary_publication "
+            "(competitor_identity, percentile)"
+        ))
+        if rows:
+            db.execute(text("""
+                INSERT INTO tmp_regular_percentile_summary_publication (
+                    competitor_identity, competitor_name, percentile, sku_count,
+                    source_count, generated_at, updated_at
+                ) VALUES (
+                    :competitor_identity, :competitor_name, :percentile, :sku_count,
+                    :source_count, :generated_at, :updated_at
+                )
+            """), rows)
+        scope = (
+            "TRUE" if not identities
+            else "t.competitor_identity = ANY(:identities)"
+        )
+        params = {} if not identities else {"identities": sorted(identities)}
+        key = "t.competitor_identity=s.competitor_identity AND t.percentile=s.percentile"
+        db.execute(text(f"""
+            UPDATE regular_competitor_price_percentile_source_summaries t
+            SET competitor_name=s.competitor_name, sku_count=s.sku_count,
+                source_count=s.source_count, generated_at=s.generated_at,
+                updated_at=s.updated_at
+            FROM tmp_regular_percentile_summary_publication s
+            WHERE {key}
+              AND ROW(t.competitor_name,t.sku_count,t.source_count,t.generated_at)
+                  IS DISTINCT FROM
+                  ROW(s.competitor_name,s.sku_count,s.source_count,s.generated_at)
+        """), params)
+        db.execute(text(f"""
+            DELETE FROM regular_competitor_price_percentile_source_summaries t
+            WHERE {scope}
+              AND NOT EXISTS (
+                SELECT 1 FROM tmp_regular_percentile_summary_publication s WHERE {key}
+              )
+        """), params)
+        db.execute(text(f"""
+            INSERT INTO regular_competitor_price_percentile_source_summaries (
+                competitor_identity, competitor_name, percentile, sku_count,
+                source_count, generated_at, updated_at
+            )
+            SELECT s.competitor_identity, s.competitor_name, s.percentile,
+                   s.sku_count, s.source_count, s.generated_at, s.updated_at
+            FROM tmp_regular_percentile_summary_publication s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM regular_competitor_price_percentile_source_summaries t WHERE {key}
+            )
+        """), params)
+        return len(rows)
     if identities:
         db.execute(
             delete(RegularCompetitorPricePercentileSourceSummary).where(
@@ -268,7 +414,6 @@ def refresh_regular_percentile_source_summaries(
         )
     else:
         db.execute(delete(RegularCompetitorPricePercentileSourceSummary))
-    rows = live_regular_percentile_source_summary_rows(db=db, competitor_identities=identities)
     if rows:
         db.bulk_insert_mappings(RegularCompetitorPricePercentileSourceSummary, rows)
     return len(rows)

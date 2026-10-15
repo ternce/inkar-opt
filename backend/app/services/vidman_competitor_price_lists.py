@@ -33,6 +33,10 @@ from .percentile_preparation import enqueue_percentile_preparation
 from .pricing_workflow.locks import PricingWorkflowTransactionLockLease
 from .vidman_product_matching import AUTO_MATCHED, MANUALLY_APPROVED
 from .matching_cache.capture import capture_and_publish_legacy_source_version
+from .matching_cache.source_noop import (
+    source_semantic_metadata,
+    validate_unchanged_source_import,
+)
 
 
 TRUSTED_VIDMAN_PRICE_STATUSES = frozenset({AUTO_MATCHED, MANUALLY_APPROVED})
@@ -74,6 +78,8 @@ class VidmanBuildSummary:
     previous_items_count: int = 0
     previous_matched_positive_items_count: int = 0
     preserved_previous_snapshot: bool = False
+    source_noop: bool = False
+    source_noop_reason: str = ""
     skipped_reason: str = ""
     warnings: list[str] = field(default_factory=list)
     preview: list[VidmanBuildMappingPreview] = field(default_factory=list)
@@ -100,6 +106,8 @@ class VidmanBuildSummary:
             "previous_items_count": self.previous_items_count,
             "previous_matched_positive_items_count": self.previous_matched_positive_items_count,
             "preserved_previous_snapshot": self.preserved_previous_snapshot,
+            "source_noop": self.source_noop,
+            "source_noop_reason": self.source_noop_reason,
             "skipped_reason": self.skipped_reason,
             "warnings": list(self.warnings),
             "preview": [
@@ -469,6 +477,7 @@ def build_vidman_competitor_price_list(
         price_format_ids=affected_price_format_ids,
         source_ids=[int(price_list.id)],
     )
+    semantic_metadata_before = source_semantic_metadata(price_list)
     display = f"{source.branch_name} - {source.competitor_name} - {account_login}"
     price_list.source_key = source_key
     price_list.display_name = display
@@ -542,12 +551,20 @@ def build_vidman_competitor_price_list(
                 ),
             }
         )
-    db.execute(
-        delete(CompetitorPriceListItem)
-        .where(CompetitorPriceListItem.price_list_id == price_list.id)
-        .execution_options(synchronize_session=False)
+    noop = validate_unchanged_source_import(
+        db=db,
+        source=price_list,
+        incoming_rows=mappings,
+        semantic_metadata_before=semantic_metadata_before,
+        authoritative_input=True,
     )
-    db.bulk_insert_mappings(CompetitorPriceListItem, mappings)
+    if not noop.reusable:
+        db.execute(
+            delete(CompetitorPriceListItem)
+            .where(CompetitorPriceListItem.price_list_id == price_list.id)
+            .execution_options(synchronize_session=False)
+        )
+        db.bulk_insert_mappings(CompetitorPriceListItem, mappings)
     db.flush()
     refresh_price_list_matched_item_counters(
         db=db, item_counts={int(price_list.id): len(mappings)}
@@ -558,7 +575,20 @@ def build_vidman_competitor_price_list(
     source.updated_at = datetime.utcnow()
     summary.rows_written = len(mappings)
 
-    _replace_legacy_price_rows_for_list(db=db, price_list=price_list)
+    if not noop.reusable:
+        _replace_legacy_price_rows_for_list(db=db, price_list=price_list)
+        capture_and_publish_legacy_source_version(
+            db=db,
+            competitor_price_list_id=int(price_list.id),
+            source_metadata={
+                "importer": "vidman",
+                "accountId": account_id,
+                "mainId": main_id,
+                "importRunId": import_run_id,
+            },
+        )
+    else:
+        _replace_legacy_price_rows_for_list(db=db, price_list=price_list)
     for price_format_id in affected_price_format_ids:
         sync_selected_competitor_configs(db=db, price_format_id=price_format_id)
         rebuild_competitor_prices_for_selected(
@@ -569,16 +599,8 @@ def build_vidman_competitor_price_list(
         )
         if commit:
             enqueue_percentile_preparation(db=db, price_format_id=price_format_id, reason="vidman_price_list_built")
-    capture_and_publish_legacy_source_version(
-        db=db,
-        competitor_price_list_id=int(price_list.id),
-        source_metadata={
-            "importer": "vidman",
-            "accountId": account_id,
-            "mainId": main_id,
-            "importRunId": import_run_id,
-        },
-    )
+    summary.source_noop = noop.reusable
+    summary.source_noop_reason = noop.reason
     if commit:
         db.commit()
     else:

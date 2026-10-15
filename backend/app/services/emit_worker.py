@@ -56,6 +56,10 @@ from .provisor_auto_refresh import (
     try_acquire_lock,
 )
 from .matching_cache.capture import capture_and_publish_legacy_source_version
+from .matching_cache.source_noop import (
+    source_semantic_metadata,
+    validate_unchanged_source_import,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2649,6 +2653,7 @@ def replace_emit_price_list_from_staging(
         retry_timeout_seconds=5.0,
         retry_interval_seconds=0.2,
     )
+    semantic_metadata_before = source_semantic_metadata(row)
     display_name = emit_display_name(filial_id, filial_name)
     row.price_format_id = None
     row.display_name = display_name
@@ -2669,6 +2674,52 @@ def replace_emit_price_list_from_staging(
     row.last_refresh_message = _json_dumps(stats.to_dict())[:512]
     row.price_date = date.today()
     row.updated_at = now
+
+    empty_match_fields = _empty_match_structure_fields()
+
+    def incoming_noop_rows() -> Iterator[dict[str, Any]]:
+        for batch in iter_stage_rows(staging_path, batch_size=config.batch_insert_size):
+            for item in batch:
+                yield _mapping_from_stage_item(
+                    item,
+                    price_list_id=int(row.id),
+                    filial_id=filial_id,
+                    empty_fields=empty_match_fields,
+                )
+
+    noop = validate_unchanged_source_import(
+        db=db,
+        source=row,
+        incoming_rows=incoming_noop_rows(),
+        semantic_metadata_before=semantic_metadata_before,
+        require_snapshot=False,
+    )
+    if noop.reusable:
+        stats.replacement_strategy = "verified_identical_noop"
+        stats.deleted_old_row_count = 0
+        stats.final_inserted_row_count = 0
+        stats.final_production_row_count = final_count
+        stats.final_rows_saved = final_count
+        stats.db_replace_elapsed_sec = round(time.perf_counter() - started, 3)
+        flush_started = time.perf_counter()
+        db.flush()
+        refresh_price_list_matched_item_counters(
+            db=db,
+            item_counts={int(row.id): final_count},
+        )
+        _add_elapsed(stats, "flush_elapsed", flush_started)
+        commit_started = time.perf_counter()
+        db.commit()
+        _add_elapsed(stats, "commit_elapsed", commit_started)
+        setattr(row, "_source_noop", noop)
+        logger.info(
+            "[EMIT_DB_REPLACE_NOOP] filial_id=%s price_list_id=%s rows=%s elapsed_sec=%s",
+            filial_id,
+            row.id,
+            final_count,
+            stats.db_replace_elapsed_sec,
+        )
+        return row
 
     used_copy, copy_backend, copy_fallback_reason, temp_table, copied_rows = _copy_items_from_stage_postgresql(
         db=db,

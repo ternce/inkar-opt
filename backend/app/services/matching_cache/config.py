@@ -40,3 +40,12 @@ def matching_cache_worker_enabled() -> bool:
 
 def matching_cache_shadow_enabled() -> bool:
     return matching_cache_enabled() and _enabled("MATCH_CACHE_SHADOW_ENABLED")
+
+
+def matching_cache_source_noop_enabled() -> bool:
+    """Conservative source-import no-op optimization; disabled by default."""
+
+    return (
+        matching_cache_dual_write_enabled()
+        and _enabled("MATCH_CACHE_SOURCE_NOOP_ENABLED")
+    )

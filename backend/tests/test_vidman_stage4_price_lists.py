@@ -33,6 +33,7 @@ from backend.app.services.vidman_competitor_price_lists import (
 )
 from backend.app.services import vidman_competitor_price_lists as vidman_price_list_module
 from backend.app.services.vidman_product_matching import AUTO_MATCHED, MANUALLY_APPROVED, REVIEW_REQUIRED
+from backend.app.services.matching_cache.source_noop import SourceNoopDecision
 
 
 def _session():
@@ -210,6 +211,31 @@ def test_same_snapshot_rerun_is_idempotent():
 
     assert first.competitor_price_list_id == second.competitor_price_list_id
     assert db.query(CompetitorPriceListItem).count() == 1
+
+
+def test_verified_vidman_noop_preserves_physical_item_and_skips_capture(monkeypatch):
+    db = _session()
+    _, account, plk, run, product_a, _ = _seed(db)
+    _raw_link_match(db, account=account, plk=plk, run=run, product=product_a, price="10")
+    first = _build(db, account, plk, apply=True, run=run)
+    original_item_id = db.scalar(select(CompetitorPriceListItem.id))
+
+    monkeypatch.setattr(
+        vidman_price_list_module,
+        "validate_unchanged_source_import",
+        lambda **_kwargs: SourceNoopDecision(True, "verified_identical_source"),
+    )
+    monkeypatch.setattr(
+        vidman_price_list_module,
+        "capture_and_publish_legacy_source_version",
+        lambda **_kwargs: pytest.fail("verified no-op must not rebuild source lineage"),
+    )
+    second = _build(db, account, plk, apply=True, run=run)
+
+    assert first.competitor_price_list_id == second.competitor_price_list_id
+    assert second.source_noop is True
+    assert second.source_noop_reason == "verified_identical_source"
+    assert db.scalar(select(CompetitorPriceListItem.id)) == original_item_id
 
 
 def test_manual_transaction_can_roll_back_publication_replacement():
