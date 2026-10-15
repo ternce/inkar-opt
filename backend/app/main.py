@@ -13079,6 +13079,9 @@ def generate_price_list(payload: dict = Body(...), db: Session = Depends(get_db)
         )
     except HTTPException:
         raise
+    except (PricingWorkflowConflict, PricingWorkflowCapacityExceeded):
+        db.rollback()
+        raise
     except ValueError as e:
         logger.exception("generate-price-list validation error for format=%s", price_format_code)
         raise HTTPException(status_code=400, detail=str(e))

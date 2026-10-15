@@ -34,6 +34,7 @@ from .pricing_workflow.locks import PricingWorkflowTransactionLockLease
 from .sku import normalize_sku, normalize_sku_variants
 from ..timezone import now_kz_naive
 from .competitor_assignments import selected_price_format_ids_for_competitor_price_list
+from .matching_cache.capture import capture_and_publish_legacy_source_version
 
 
 MAX_MANUAL_PLK_FILE_SIZE_BYTES = 15 * 1024 * 1024
@@ -610,7 +611,13 @@ def import_manual_price_list(
                 db=db,
                 price_format_id=price_format_id,
                 lock_lease=transaction_locks,
+                allow_matching_cache=False,
             )
+        capture_and_publish_legacy_source_version(
+            db=db,
+            competitor_price_list_id=int(row.id),
+            source_metadata={"importer": "manual_excel_csv", "sourceKey": source_key},
+        )
         db.commit()
         for price_format_id in affected_price_format_ids:
             enqueue_percentile_preparation(db=db, price_format_id=price_format_id, reason="manual_price_list_imported")

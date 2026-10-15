@@ -6,14 +6,16 @@ import os
 import re
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from difflib import SequenceMatcher
+from functools import lru_cache
 
 from openpyxl import Workbook
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import set_committed_value
 
 from ..models import (
     BranchCost,
@@ -39,6 +41,11 @@ from .pricing_workflow.locks import (
     PricingWorkflowConcurrencySlot,
     PricingWorkflowTransactionLockLease,
     acquire_transaction_write_locks,
+)
+from .matching_cache.config import matching_cache_read_mode
+from .matching_cache.materialization import (
+    CacheMaterializationResult,
+    materialize_ready_snapshots,
 )
 
 logger = logging.getLogger(__name__)
@@ -1517,7 +1524,7 @@ def _vidman_candidate_result(
     }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ProductCandidate:
     id: int
     sku: str
@@ -1530,9 +1537,9 @@ class ProductCandidate:
     structure: DrugStructure
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SupplierItemCandidate:
-    item: CompetitorPriceListItem
+    item: CompetitorPriceListItem | LightweightPriceListItem
     name_norm: str
     base_name_norm: str
     manufacturer_norm: str
@@ -1540,21 +1547,20 @@ class SupplierItemCandidate:
     structure: DrugStructure
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SupplierSkuCandidate:
     candidate: SupplierItemCandidate
     kind: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SupplierIndexes:
-    candidates: list[SupplierItemCandidate]
     token_index: dict[str, list[SupplierItemCandidate]]
     sku_index: dict[str, list[SupplierSkuCandidate]]
     composite_index: dict[str, list[SupplierItemCandidate]]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ProductIndexes:
     code_to_id: dict[str, int]
     candidates: list[ProductCandidate]
@@ -1562,6 +1568,51 @@ class ProductIndexes:
     token_index: dict[str, list[ProductCandidate]]
     sku_to_candidate: dict[str, ProductCandidate]
     id_to_candidate: dict[int, ProductCandidate]
+
+
+@dataclass(slots=True)
+class LightweightPriceListItem:
+    """Matcher-only row which is not retained in SQLAlchemy's identity map."""
+
+    id: int
+    price_list_id: int
+    product_id: int | None
+    provisor_id: int | None
+    provisor_goods_id: int | None
+    filial_id: int | None
+    name: str
+    reg_number: str
+    distributor_goods_name: str
+    distributor_goods_id: str
+    distributor_price: object
+    stock: object
+    package_count: object
+    expiry_date: str
+    match_key: str
+    match_type: str
+    match_score: object
+    matched_sku: str
+    raw_name: str
+    raw_manufacturer: str
+    normalized_name: str
+    normalized_manufacturer: str
+    parsed_base_name: str
+    parsed_form: str
+    parsed_forms_json: str
+    parsed_dosage: object
+    parsed_dosage_volume: object
+    parsed_quantity: int | None
+    parsed_volume: object
+    parsed_weight: object
+    parsed_percent_strength: object
+    parsed_concentration: object
+    parsed_iu_dosage: object
+    parsed_strength_signature: str
+    parsed_dimensions_json: str
+    parsed_critical_tokens_json: str
+    raw_json: str
+    _original_decision_state: tuple[object, ...] = field(default=(), repr=False)
+    _materialization_dirty: bool = field(default=False, repr=False)
 
 
 def _tokens(value: str) -> frozenset[str]:
@@ -2006,12 +2057,137 @@ def _sync_provisor_reference_mapping_from_items(
     return stats
 
 
-def _raw_payload(item: CompetitorPriceListItem) -> dict:
+@lru_cache(maxsize=4096)
+def _parse_raw_payload(value: str) -> dict:
     try:
-        data = json.loads(item.raw_json or "{}")
+        data = json.loads(value or "{}")
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _raw_payload(item: CompetitorPriceListItem | LightweightPriceListItem) -> dict:
+    return _parse_raw_payload(str(item.raw_json or "{}"))
+
+
+_MATCH_ITEM_COLUMNS = tuple(CompetitorPriceListItem.__table__.columns)
+_MATCH_MUTABLE_FIELDS = (
+    "product_id",
+    "expiry_date",
+    "match_key",
+    "match_type",
+    "match_score",
+    "matched_sku",
+    "raw_name",
+    "raw_manufacturer",
+    "normalized_name",
+    "normalized_manufacturer",
+    "parsed_base_name",
+    "parsed_form",
+    "parsed_forms_json",
+    "parsed_dosage",
+    "parsed_dosage_volume",
+    "parsed_quantity",
+    "parsed_volume",
+    "parsed_weight",
+    "parsed_percent_strength",
+    "parsed_concentration",
+    "parsed_iu_dosage",
+    "parsed_strength_signature",
+    "parsed_dimensions_json",
+    "parsed_critical_tokens_json",
+)
+_MATCH_DECISION_FIELDS = (
+    "product_id",
+    "match_key",
+    "match_type",
+    "match_score",
+    "matched_sku",
+)
+_MATCH_MATERIALIZATION_FIELDS = tuple(
+    field_name
+    for field_name in _MATCH_MUTABLE_FIELDS
+    if field_name not in _MATCH_DECISION_FIELDS
+)
+
+
+def _item_state(
+    item: LightweightPriceListItem, fields: tuple[str, ...]
+) -> tuple[object, ...]:
+    return tuple(getattr(item, field_name) for field_name in fields)
+
+
+def _load_lightweight_match_items(
+    *, db: Session, price_list_id: int, batch_size: int = 2000
+) -> list[LightweightPriceListItem]:
+    result = db.execute(
+        select(*_MATCH_ITEM_COLUMNS)
+        .where(CompetitorPriceListItem.price_list_id == int(price_list_id))
+        .order_by(CompetitorPriceListItem.id.asc())
+        .execution_options(yield_per=batch_size, stream_results=True)
+    )
+    items: list[LightweightPriceListItem] = []
+    for row in result:
+        item = LightweightPriceListItem(**dict(row._mapping))
+        item._original_decision_state = _item_state(item, _MATCH_DECISION_FIELDS)
+        items.append(item)
+    return items
+
+
+def _persist_lightweight_match_items(
+    *,
+    db: Session,
+    items: list[LightweightPriceListItem],
+    persist_materialized_fields: bool = True,
+    batch_size: int = 2000,
+) -> int:
+    decision_batch: list[dict[str, object]] = []
+    full_batch: list[dict[str, object]] = []
+    changed_count = 0
+
+    def persist_batch(batch: list[dict[str, object]], fields: tuple[str, ...]) -> None:
+        if not batch:
+            return
+        db.execute(
+            update(CompetitorPriceListItem),
+            batch,
+            execution_options={"synchronize_session": False},
+        )
+        mapper = CompetitorPriceListItem.__mapper__
+        for values in batch:
+            loaded = db.identity_map.get(mapper.identity_key_from_primary_key((values["id"],)))
+            if loaded is None:
+                continue
+            for field_name in fields:
+                set_committed_value(loaded, field_name, values[field_name])
+        batch.clear()
+
+    for item in items:
+        decision_state = _item_state(item, _MATCH_DECISION_FIELDS)
+        decision_changed = decision_state != item._original_decision_state
+        if not decision_changed and not (
+            persist_materialized_fields and item._materialization_dirty
+        ):
+            continue
+        if persist_materialized_fields:
+            current = _item_state(item, _MATCH_MUTABLE_FIELDS)
+            full_batch.append({
+                "id": int(item.id),
+                **dict(zip(_MATCH_MUTABLE_FIELDS, current)),
+            })
+        else:
+            decision_batch.append({
+                "id": int(item.id),
+                **dict(zip(_MATCH_DECISION_FIELDS, decision_state)),
+            })
+        changed_count += 1
+        if len(full_batch) >= batch_size:
+            persist_batch(full_batch, _MATCH_MUTABLE_FIELDS)
+        if len(decision_batch) >= batch_size:
+            persist_batch(decision_batch, _MATCH_DECISION_FIELDS)
+    persist_batch(full_batch, _MATCH_MUTABLE_FIELDS)
+    persist_batch(decision_batch, _MATCH_DECISION_FIELDS)
+    return changed_count
 
 
 def _price_decimal(value: object) -> Decimal | None:
@@ -3015,14 +3191,19 @@ def _supplier_name_for_matching(item: CompetitorPriceListItem, raw_inner: dict) 
 def _build_supplier_indexes(
     *,
     price_list: CompetitorPriceList,
-    items: list[CompetitorPriceListItem],
+    items: list[CompetitorPriceListItem | LightweightPriceListItem],
 ) -> SupplierIndexes:
-    supplier_candidates: list[SupplierItemCandidate] = []
     token_index: dict[str, list[SupplierItemCandidate]] = defaultdict(list)
     sku_index: dict[str, list[SupplierSkuCandidate]] = defaultdict(list)
     composite_index: dict[str, list[SupplierItemCandidate]] = defaultdict(list)
+    normalization_cache: dict[
+        tuple[object, ...],
+        tuple[DrugStructure, str, str, str, frozenset[str], tuple[object, ...]],
+    ] = {}
+    normalized_fields = _MATCH_MUTABLE_FIELDS[8:]
 
     for item in items:
+        materialization_before = _item_state(item, _MATCH_MATERIALIZATION_FIELDS)
         raw = _raw_payload(item)
         raw_inner = raw.get("raw") if isinstance(raw.get("raw"), dict) else raw
         item.raw_name = _supplier_name_for_matching(item, raw_inner)
@@ -3040,19 +3221,43 @@ def _build_supplier_indexes(
         item.match_key = ""
         item.product_id = None
 
-        structure = _cached_structure_from_item(item)
-        name_norm = item.normalized_name or normalize_text(normalize_drug_text(item.raw_name))
-        manufacturer_norm = item.normalized_manufacturer or normalize_manufacturer_text(item.raw_manufacturer)
-        base_name_norm = item.parsed_base_name or normalize_text(structure.base_name) or name_norm
+        cache_key = (
+            item.raw_name,
+            item.raw_manufacturer,
+            *(getattr(item, field_name) for field_name in normalized_fields),
+        )
+        cached = normalization_cache.get(cache_key)
+        if cached is None:
+            structure = _cached_structure_from_item(item)
+            name_norm = item.normalized_name or normalize_text(normalize_drug_text(item.raw_name))
+            manufacturer_norm = item.normalized_manufacturer or normalize_manufacturer_text(item.raw_manufacturer)
+            base_name_norm = item.parsed_base_name or normalize_text(structure.base_name) or name_norm
+            tokens = _tokens(base_name_norm)
+            normalized_state = tuple(getattr(item, field_name) for field_name in normalized_fields)
+            if len(normalization_cache) < 8192:
+                normalization_cache[cache_key] = (
+                    structure,
+                    name_norm,
+                    manufacturer_norm,
+                    base_name_norm,
+                    tokens,
+                    normalized_state,
+                )
+        else:
+            structure, name_norm, manufacturer_norm, base_name_norm, tokens, normalized_state = cached
+            for field_name, value in zip(normalized_fields, normalized_state):
+                setattr(item, field_name, value)
+        item._materialization_dirty = (
+            _item_state(item, _MATCH_MATERIALIZATION_FIELDS) != materialization_before
+        )
         cand = SupplierItemCandidate(
             item=item,
             name_norm=name_norm,
             base_name_norm=base_name_norm,
             manufacturer_norm=manufacturer_norm,
-            tokens=_tokens(base_name_norm),
+            tokens=tokens,
             structure=structure,
         )
-        supplier_candidates.append(cand)
 
         first_word = base_name_norm.split(" ", 1)[0]
         _add_index(token_index, f"first:{first_word}" if first_word else None, cand)
@@ -3087,7 +3292,6 @@ def _build_supplier_indexes(
                 sku_index[key].append(SupplierSkuCandidate(candidate=cand, kind="sku"))
 
     return SupplierIndexes(
-        candidates=supplier_candidates,
         token_index=token_index,
         sku_index=sku_index,
         composite_index=composite_index,
@@ -3828,6 +4032,8 @@ def rematch_price_list_items_by_product(
     price_list: CompetitorPriceList,
     product_indexes: ProductIndexes | None = None,
     flush: bool = True,
+    collect_matched_rows: bool = True,
+    persist_materialized_fields: bool = True,
     lock_lease: PricingWorkflowLockLease | PricingWorkflowTransactionLockLease | None = None,
 ) -> dict:
     started_at = time.perf_counter()
@@ -3844,11 +4050,7 @@ def rematch_price_list_items_by_product(
     indexes = product_indexes or _product_indexes(db)
     products = indexes.candidates
     indexed_at = time.perf_counter()
-    items = (
-        db.execute(select(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == price_list.id))
-        .scalars()
-        .all()
-    )
+    items = _load_lightweight_match_items(db=db, price_list_id=int(price_list.id))
     loaded_at = time.perf_counter()
     authoritative_manual_vidman_matches = {
         int(item.id): (
@@ -3865,7 +4067,6 @@ def rematch_price_list_items_by_product(
         and str(item.match_type or "").startswith("manual_vidman_")
     }
     supplier_indexes = _build_supplier_indexes(price_list=price_list, items=items)
-    supplier_candidates = supplier_indexes.candidates
     supplier_token_index = supplier_indexes.token_index
     supplier_sku_index = supplier_indexes.sku_index
     supplier_composite_index = supplier_indexes.composite_index
@@ -4542,11 +4743,12 @@ def rematch_price_list_items_by_product(
         if int(stats["candidatePoolCount"])
         else 0
     )
-    stats["_matchedRows"] = [
-        _matched_price_row(item)
-        for item in matched_items
-        if item.distributor_price is not None
-    ]
+    if collect_matched_rows:
+        stats["_matchedRows"] = [
+            _matched_price_row(item)
+            for item in matched_items
+            if item.distributor_price is not None
+        ]
     stats["topUnmatched"] = []
     debugged_at = time.perf_counter()
     stats["timingMs"] = {
@@ -4661,8 +4863,17 @@ def rematch_price_list_items_by_product(
             stats.get("missingProductGoodsId", 0),
             stats["coverage"],
         )
+    persistence_started_at = time.perf_counter()
+    stats["persistedDecisionRows"] = _persist_lightweight_match_items(
+        db=db,
+        items=items,
+        persist_materialized_fields=persist_materialized_fields,
+    )
     if flush:
         db.flush()
+    stats["timingMs"]["persistDecisions"] = round(
+        (time.perf_counter() - persistence_started_at) * 1000, 2
+    )
     return stats
 
 
@@ -4745,6 +4956,7 @@ def rebuild_competitor_prices_for_selected(
     commit_between_lists: bool = False,
     expected_source_ids: list[int] | None = None,
     lock_lease: PricingWorkflowLockLease | PricingWorkflowTransactionLockLease | None = None,
+    allow_matching_cache: bool = True,
 ) -> dict[str, dict]:
     if commit_between_lists and getattr(lock_lease, "transaction_scoped", False):
         raise ValueError("transaction-scoped workflow locks cannot be used across intermediate commits")
@@ -4769,6 +4981,7 @@ def rebuild_competitor_prices_for_selected(
                     commit_between_lists=commit_between_lists,
                     expected_source_ids=expected_source_ids,
                     lock_lease=owned_lease,
+                    allow_matching_cache=allow_matching_cache,
                 )
     total_started_at = time.perf_counter()
     operation = f"rebuild_competitor_prices:{price_format_id}"
@@ -4812,7 +5025,13 @@ def rebuild_competitor_prices_for_selected(
             "reason": "aggregated_percentile_source",
             "percentileMode": effective_percentile_mode(price_list, item.assignment.percentile_mode),
         }
-    _sync_provisor_reference_mapping_from_items(db, price_list_ids=[int(row.id) for row in selected])
+    configured_read_mode = matching_cache_read_mode()
+    read_mode = configured_read_mode if allow_matching_cache else "disabled"
+    cache_disabled_reason = (
+        "cache_disabled"
+        if allow_matching_cache
+        else "cache_bypassed_during_source_publication"
+    )
     if not selected:
         db.execute(
             delete(CompetitorPrice)
@@ -4823,8 +5042,81 @@ def rebuild_competitor_prices_for_selected(
         stage_timings.append({"stage": "competitor_matching", "durationMs": round((time.perf_counter() - matching_started_at) * 1000, 3), "inputRows": 0, "outputRows": 0, "success": True})
         stage_timings.append({"stage": "competitor_price_materialization", "durationMs": 0.0, "inputRows": 0, "outputRows": 0, "success": True})
         summary["_stageTimings"] = stage_timings
+        summary["_matchingCache"] = {
+            "mode": read_mode,
+            "hit": read_mode != "disabled",
+            "reason": "no_physical_sources",
+            "sourceVersionIds": [],
+            "matchingSnapshotIds": [],
+            "materializationId": None,
+            "materializationFingerprint": "",
+            "materializationReused": False,
+            "materializedRows": 0,
+            "cacheLookupDurationMs": 0.0,
+            "materializationDurationMs": 0.0,
+            "fullRematchInvocationCount": 0,
+            "rawSourceRowsRead": 0,
+        }
         _timing(operation, "skipped_all_aggregated_percentile_sources", total_started_at)
         return summary
+    physical_assigned = [
+        item
+        for item in assigned
+        if effective_percentile_mode(item.price_list, item.assignment.percentile_mode)
+        != MULTI_PRICE_PERCENTILE_MODE
+    ]
+    cache_result: CacheMaterializationResult | None = None
+    if read_mode != "disabled":
+        cache_result = materialize_ready_snapshots(
+            db=db,
+            price_format_id=int(price_format_id),
+            assigned=physical_assigned,
+            read_mode=read_mode,
+        )
+        if cache_result.used_cache:
+            for source_name, cached_stats in cache_result.source_stats:
+                source_summary = dict(cached_stats)
+                source_summary["cacheHit"] = True
+                summary[source_name] = source_summary
+            stage_timings.extend(
+                [
+                    {
+                        "stage": "matching_cache_lookup",
+                        "durationMs": round(cache_result.cache_lookup_ms, 3),
+                        "inputRows": len(selected),
+                        "outputRows": len(cache_result.snapshot_ids),
+                        "success": True,
+                    },
+                    {
+                        "stage": "competitor_matching",
+                        "durationMs": 0.0,
+                        "inputRows": len(selected),
+                        "outputRows": cache_result.row_count,
+                        "success": True,
+                        "cacheHit": True,
+                    },
+                    {
+                        "stage": "competitor_price_materialization",
+                        "durationMs": round(cache_result.materialization_ms, 3),
+                        "inputRows": cache_result.row_count,
+                        "outputRows": cache_result.row_count,
+                        "success": True,
+                        "reused": cache_result.materialization_reused,
+                    },
+                ]
+            )
+            summary["_stageTimings"] = stage_timings
+            summary["_matchingCache"] = cache_result.metadata(
+                full_rematch_invocations=0,
+                raw_source_rows_read=0,
+            )
+            _timing(operation, "matching_cache_hit", total_started_at)
+            return summary
+
+    # Legacy fallback starts only after cache resolution has established that
+    # the required artifact is safely absent.  From here onward the original
+    # matching and Provisor synchronization path is unchanged.
+    _sync_provisor_reference_mapping_from_items(db, price_list_ids=[int(row.id) for row in selected])
     index_started_at = time.perf_counter()
     product_indexes = _product_indexes(db)
     index_finished_at = time.perf_counter()
@@ -4990,6 +5282,23 @@ def rebuild_competitor_prices_for_selected(
             }
         )
     summary["_stageTimings"] = stage_timings
+    fallback_reason = cache_result.reason if cache_result is not None else cache_disabled_reason
+    fallback_lookup_ms = cache_result.cache_lookup_ms if cache_result is not None else 0.0
+    summary["_matchingCache"] = {
+        "mode": read_mode,
+        "hit": False,
+        "reason": fallback_reason,
+        "sourceVersionIds": [],
+        "matchingSnapshotIds": [],
+        "materializationId": None,
+        "materializationFingerprint": "",
+        "materializationReused": False,
+        "materializedRows": len(new_rows),
+        "cacheLookupDurationMs": round(fallback_lookup_ms, 3),
+        "materializationDurationMs": round((insert_finished_at - delete_started_at) * 1000, 3),
+        "fullRematchInvocationCount": len(selected),
+        "rawSourceRowsRead": sum(int(stats.get("incoming") or 0) for stats in summary.values() if isinstance(stats, dict)),
+    }
     summary["_audit"] = {"path": audit_path, **audit_summary}
     _verbose_debug("[MATCH_AUDIT] path=%s rows=%s summary=%s", audit_path, len(audit_rows), audit_summary)
     _timing(operation, "insert_new_competitor_prices", insert_started_at)

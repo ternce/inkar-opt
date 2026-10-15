@@ -1845,6 +1845,14 @@ def test_global_emit_percentile_postgresql_dispatch_skips_physical_fanout_in_glo
         def get_bind(self):
             return self.Bind()
 
+        def execute(self, *_args, **_kwargs):
+            class LockResult:
+                @staticmethod
+                def scalar():
+                    return True
+
+            return LockResult()
+
         def get(self, model, item_id):
             return PriceFormat(id=item_id, code=f"PF-{item_id}", name=f"PF-{item_id}", branch="Aktau")
 
@@ -1922,6 +1930,14 @@ def test_global_emit_percentile_postgresql_dispatch_can_use_multi_target_fanout_
 
         def get_bind(self):
             return self.Bind()
+
+        def execute(self, *_args, **_kwargs):
+            class LockResult:
+                @staticmethod
+                def scalar():
+                    return True
+
+            return LockResult()
 
         def get(self, model, item_id):
             return PriceFormat(id=item_id, code=f"PF-{item_id}", name=f"PF-{item_id}", branch="Aktau")

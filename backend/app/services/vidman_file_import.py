@@ -59,6 +59,7 @@ from .vidman_product_matching import (
     decide_match,
     process_vidman_product_matches,
 )
+from .matching_cache.capture import capture_and_publish_legacy_source_version
 from .vidman_raw_collector import VidmanRawRow, make_row_hash, parse_expiry_date
 
 
@@ -1590,6 +1591,15 @@ def import_vidman_multi_source_file(
                     db.add(history)
                     db.flush()
                     source_result = {"name": source.name, "stableKey": source.stable_key, "competitorPriceListId": int(price_list.id), "importId": int(history.id), "status": history.status, "matchedRows": len(matched_rows), "unmatchedRows": unmatched, "rowsWritten": len(matched_rows), "updateMode": "manual", "preservedAssignments": True}
+                capture_and_publish_legacy_source_version(
+                    db=db,
+                    competitor_price_list_id=int(price_list.id),
+                    source_metadata={
+                        "importer": "manual_vidman_multi_source",
+                        "batchId": batch_id,
+                        "sourceKey": source.stable_key,
+                    },
+                )
                 db.commit()
                 affected_price_formats.update(source_affected_ids)
                 results.append(source_result)

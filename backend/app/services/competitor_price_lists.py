@@ -69,6 +69,7 @@ from .manufacturers import resolve_manufacturer
 from .price_sources import UnifiedPriceItem, UnifiedPriceList
 from .sku import normalize_external_sku, normalize_sku, normalize_sku_variants
 from .provisor import process_memory_snapshot
+from .matching_cache.capture import capture_and_publish_legacy_source_version
 
 logger = logging.getLogger(__name__)
 
@@ -325,7 +326,12 @@ def _refresh_selected_price_formats_for_source(
     for price_format_id in price_format_ids:
         sync_selected_competitor_configs(db=db, price_format_id=price_format_id)
         if rebuild:
-            rebuild_competitor_prices_for_selected(db=db, price_format_id=price_format_id, lock_lease=lock_lease)
+            rebuild_competitor_prices_for_selected(
+                db=db,
+                price_format_id=price_format_id,
+                lock_lease=lock_lease,
+                allow_matching_cache=False,
+            )
     return price_format_ids
 
 
@@ -1074,6 +1080,11 @@ def upsert_provisor_price_list(
     else:
         refresh_price_list_matched_item_counters(db=db, item_counts={int(row.id): inserted_items_count})
         affected_price_format_ids = []
+    capture_and_publish_legacy_source_version(
+        db=db,
+        competitor_price_list_id=int(row.id),
+        source_metadata={"importer": "provisor", "sourceKey": row.source_key},
+    )
     db.commit()
     if run_matching:
         _enqueue_percentile_preparation_for_price_formats(
@@ -1495,6 +1506,11 @@ def upsert_unified_price_list(
         )
         benchmark["materialize_prices_sec"] = round(time.perf_counter() - materialize_started_at, 6)
         benchmark["exact_goods_id_materialized_price_format_ids"] = materialized_price_format_ids
+    capture_and_publish_legacy_source_version(
+        db=db,
+        competitor_price_list_id=int(row.id),
+        source_metadata={"importer": "unified", "sourceType": price_list.source, "sourceKey": row.source_key},
+    )
     stage_started_at = time.perf_counter()
     db.commit()
     if run_matching:
@@ -2149,6 +2165,11 @@ def import_manual_price_list_excel(
     db.flush()
     _replace_legacy_price_rows_for_list(db=db, price_list=row)
     refresh_price_list_item_counters(db=db, price_list_ids=[int(row.id)])
+    capture_and_publish_legacy_source_version(
+        db=db,
+        competitor_price_list_id=int(row.id),
+        source_metadata={"importer": "legacy_manual_excel", "sourceKey": row.source_key},
+    )
     db.commit()
     enqueue_percentile_preparation(db=db, price_format_id=int(pf.id), reason="price_list_imported")
     return row

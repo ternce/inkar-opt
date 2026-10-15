@@ -15,6 +15,8 @@ from sqlalchemy import (
     Text,
     text,
     CheckConstraint,
+    DDL,
+    event,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -450,6 +452,474 @@ class CompetitorPriceListItem(Base):
         Index("ix_competitor_price_list_items_pl_provisor_goods", "price_list_id", "provisor_goods_id"),
         Index("ix_cpli_distributor_goods_id", "distributor_goods_id"),
         Index("ix_cpli_normalized_identity", "normalized_name", "normalized_manufacturer"),
+    )
+
+
+class CompetitorSourceVersion(Base):
+    """Immutable, unpublished-by-default generation of one competitor source."""
+
+    __tablename__ = "competitor_source_versions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    competitor_price_list_id: Mapped[int] = mapped_column(
+        ForeignKey("competitor_price_lists.id"), nullable=False, index=True
+    )
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    matching_input_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    row_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
+    source_metadata_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    error: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_kz_naive)
+    matching_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "competitor_price_list_id",
+            "generation",
+            name="uq_comp_source_version_generation",
+        ),
+        UniqueConstraint(
+            "competitor_price_list_id",
+            "content_sha256",
+            name="uq_comp_source_version_content",
+        ),
+        CheckConstraint(
+            "status IN ('pending','matching','ready','published','failed','superseded')",
+            name="ck_comp_source_version_status",
+        ),
+        Index(
+            "ix_comp_source_version_source_status",
+            "competitor_price_list_id",
+            "status",
+            "generation",
+        ),
+        Index(
+            "uq_comp_source_version_published",
+            "competitor_price_list_id",
+            unique=True,
+            postgresql_where=text("status = 'published'"),
+            sqlite_where=text("status = 'published'"),
+        ),
+    )
+
+
+class CompetitorSourceVersionItem(Base):
+    """Frozen normalized row used to reproduce a source matching decision."""
+
+    __tablename__ = "competitor_source_version_items"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    source_version_id: Mapped[int] = mapped_column(
+        ForeignKey("competitor_source_versions.id"), nullable=False, index=True
+    )
+    source_row_key: Mapped[str] = mapped_column(Text, nullable=False)
+    source_ordinal: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    duplicate_ordinal: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    row_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    matching_input_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    legacy_source_item_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    authoritative_product_id: Mapped[int | None] = mapped_column(
+        ForeignKey("products.id"), nullable=True
+    )
+    provisor_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    provisor_goods_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    filial_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    name: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    reg_number: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    distributor_goods_name: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    distributor_goods_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    distributor_price: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    stock: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    package_count: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    expiry_date: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    authoritative_match_key: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    authoritative_match_type: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    authoritative_match_score: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    authoritative_matched_sku: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    raw_name: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    raw_manufacturer: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    normalized_name: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    normalized_manufacturer: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    parsed_base_name: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    parsed_form: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    parsed_forms_json: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    parsed_dosage: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    parsed_dosage_volume: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    parsed_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    parsed_volume: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    parsed_weight: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    parsed_percent_strength: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    parsed_concentration: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    parsed_iu_dosage: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    parsed_strength_signature: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    parsed_dimensions_json: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    parsed_critical_tokens_json: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    raw_json: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "source_version_id",
+            "source_ordinal",
+            name="uq_comp_source_version_item_ordinal",
+        ),
+        UniqueConstraint(
+            "source_version_id",
+            "source_row_key",
+            "duplicate_ordinal",
+            name="uq_comp_source_version_item_identity",
+        ),
+        Index("ix_comp_source_version_item_product", "source_version_id", "authoritative_product_id"),
+        Index("ix_comp_source_version_item_goods", "source_version_id", "provisor_goods_id"),
+        Index("ix_comp_source_version_item_distributor", "source_version_id", "distributor_goods_id"),
+        Index("ix_comp_source_version_item_hash", "source_version_id", "matching_input_sha256"),
+    )
+
+
+class CompetitorSourcePublication(Base):
+    """One physical publication of an immutable source content version."""
+
+    __tablename__ = "competitor_source_publications"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    competitor_price_list_id: Mapped[int] = mapped_column(
+        ForeignKey("competitor_price_lists.id"), nullable=False, index=True
+    )
+    source_version_id: Mapped[int] = mapped_column(
+        ForeignKey("competitor_source_versions.id"), nullable=False, index=True
+    )
+    row_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
+    error: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_kz_naive)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','published','failed','superseded')",
+            name="ck_comp_source_publication_status",
+        ),
+        Index(
+            "ix_comp_source_publication_source_status",
+            "competitor_price_list_id",
+            "status",
+            "id",
+        ),
+        Index(
+            "uq_comp_source_publication_published",
+            "competitor_price_list_id",
+            unique=True,
+            postgresql_where=text("status = 'published'"),
+            sqlite_where=text("status = 'published'"),
+        ),
+    )
+
+
+class CompetitorSourcePublicationItem(Base):
+    """One-to-one lineage from a version item to a physical row for a publication."""
+
+    __tablename__ = "competitor_source_publication_items"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    source_publication_id: Mapped[int] = mapped_column(
+        ForeignKey("competitor_source_publications.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    source_version_item_id: Mapped[int] = mapped_column(
+        ForeignKey("competitor_source_version_items.id"), nullable=False, index=True
+    )
+    physical_source_item_id: Mapped[int] = mapped_column(
+        ForeignKey("competitor_price_list_items.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "source_publication_id",
+            "source_version_item_id",
+            name="uq_comp_source_publication_version_item",
+        ),
+        UniqueConstraint(
+            "source_publication_id",
+            "physical_source_item_id",
+            name="uq_comp_source_publication_physical_item",
+        ),
+    )
+
+
+_invalidate_source_publications_from_rows = DDL(
+    """
+    CREATE OR REPLACE FUNCTION invalidate_comp_source_publications_from_rows()
+    RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        UPDATE competitor_source_publications
+        SET status = 'failed',
+            error = 'physical source rows changed before lineage republication',
+            failed_at = CURRENT_TIMESTAMP
+        WHERE status = 'published'
+          AND competitor_price_list_id IN (
+              SELECT DISTINCT price_list_id FROM changed_source_rows
+          );
+        RETURN NULL;
+    END
+    $$
+    """
+).execute_if(dialect="postgresql")
+
+_invalidate_source_publications_from_lineage = DDL(
+    """
+    CREATE OR REPLACE FUNCTION invalidate_comp_source_publications_from_lineage()
+    RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        UPDATE competitor_source_publications
+        SET status = 'failed',
+            error = 'physical source lineage became incomplete',
+            failed_at = CURRENT_TIMESTAMP
+        WHERE status = 'published'
+          AND id IN (
+              SELECT DISTINCT source_publication_id FROM deleted_lineage_rows
+          );
+        RETURN NULL;
+    END
+    $$
+    """
+).execute_if(dialect="postgresql")
+
+_invalidate_all_source_publications = DDL(
+    """
+    CREATE OR REPLACE FUNCTION invalidate_all_comp_source_publications()
+    RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        UPDATE competitor_source_publications
+        SET status = 'failed',
+            error = 'physical source table was truncated before lineage republication',
+            failed_at = CURRENT_TIMESTAMP
+        WHERE status = 'published';
+        RETURN NULL;
+    END
+    $$
+    """
+).execute_if(dialect="postgresql")
+
+event.listen(
+    CompetitorSourcePublicationItem.__table__,
+    "after_create",
+    _invalidate_source_publications_from_rows,
+)
+event.listen(
+    CompetitorSourcePublicationItem.__table__,
+    "after_create",
+    _invalidate_source_publications_from_lineage,
+)
+event.listen(
+    CompetitorSourcePublicationItem.__table__,
+    "after_create",
+    _invalidate_all_source_publications,
+)
+for operation, transition in (("INSERT", "NEW"), ("DELETE", "OLD")):
+    event.listen(
+        CompetitorSourcePublicationItem.__table__,
+        "after_create",
+        DDL(
+            f"""
+            CREATE TRIGGER trg_comp_source_rows_{operation.casefold()}_invalidate
+            AFTER {operation} ON competitor_price_list_items
+            REFERENCING {transition} TABLE AS changed_source_rows
+            FOR EACH STATEMENT
+            EXECUTE FUNCTION invalidate_comp_source_publications_from_rows()
+            """
+        ).execute_if(dialect="postgresql"),
+    )
+event.listen(
+    CompetitorSourcePublicationItem.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_comp_source_lineage_delete_invalidate
+        AFTER DELETE ON competitor_source_publication_items
+        REFERENCING OLD TABLE AS deleted_lineage_rows
+        FOR EACH STATEMENT
+        EXECUTE FUNCTION invalidate_comp_source_publications_from_lineage()
+        """
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    CompetitorSourcePublicationItem.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_comp_source_rows_truncate_invalidate
+        AFTER TRUNCATE ON competitor_price_list_items
+        FOR EACH STATEMENT
+        EXECUTE FUNCTION invalidate_all_comp_source_publications()
+        """
+    ).execute_if(dialect="postgresql"),
+)
+
+
+class CompetitorMatchDependencyRevision(Base):
+    __tablename__ = "competitor_match_dependency_revisions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    scope_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    scope_key: Mapped[str] = mapped_column(Text, nullable=False, default="global")
+    revision: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    metadata_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_kz_naive)
+
+    __table_args__ = (
+        UniqueConstraint("scope_type", "scope_key", name="uq_comp_match_dependency_scope"),
+        CheckConstraint("revision >= 1", name="ck_comp_match_dependency_revision"),
+        Index("ix_comp_match_dependency_scope_revision", "scope_type", "scope_key", "revision"),
+    )
+
+
+class CompetitorMatchSnapshot(Base):
+    __tablename__ = "competitor_match_snapshots"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    source_version_id: Mapped[int] = mapped_column(
+        ForeignKey("competitor_source_versions.id"), nullable=False, index=True
+    )
+    dependency_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    dependency_vector_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    product_catalog_revision: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    manual_code_mapping_revision: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    provisor_reference_revision: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    provisor_substitute_revision: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    vidman_authoritative_revision: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    matcher_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    normalization_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
+    input_row_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    matched_row_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    unmatched_row_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    stats_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    error: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_kz_naive)
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "source_version_id",
+            "dependency_fingerprint",
+            "matcher_version",
+            "normalization_version",
+            name="uq_comp_match_snapshot_key",
+        ),
+        CheckConstraint(
+            "status IN ('pending','running','ready','published','failed','superseded')",
+            name="ck_comp_match_snapshot_status",
+        ),
+        Index("ix_comp_match_snapshot_source_status", "source_version_id", "status"),
+    )
+
+
+class CompetitorMatchSnapshotItem(Base):
+    __tablename__ = "competitor_match_snapshot_items"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    match_snapshot_id: Mapped[int] = mapped_column(
+        ForeignKey("competitor_match_snapshots.id"), nullable=False, index=True
+    )
+    source_version_item_id: Mapped[int] = mapped_column(
+        ForeignKey("competitor_source_version_items.id"), nullable=False
+    )
+    product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id"), nullable=True)
+    match_key: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    match_type: Mapped[str] = mapped_column(String(64), nullable=False, default="unmatched")
+    match_score: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    matched_sku: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    is_manual: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_rejected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_authoritative: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    audit_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+
+    __table_args__ = (
+        UniqueConstraint("match_snapshot_id", "source_version_item_id", name="uq_comp_match_snapshot_item"),
+        Index("ix_comp_match_snapshot_item_product", "match_snapshot_id", "product_id"),
+        Index("ix_comp_match_snapshot_item_type", "match_snapshot_id", "match_type"),
+    )
+
+
+class CompetitorMatchJob(Base):
+    __tablename__ = "competitor_match_jobs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    source_version_id: Mapped[int] = mapped_column(
+        ForeignKey("competitor_source_versions.id"), nullable=False, index=True
+    )
+    match_snapshot_id: Mapped[int | None] = mapped_column(
+        ForeignKey("competitor_match_snapshots.id"), nullable=True, index=True
+    )
+    dependency_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    available_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_kz_naive)
+    claimed_by: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    error: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_kz_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_kz_naive)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','running','succeeded','failed','cancelled')",
+            name="ck_comp_match_job_status",
+        ),
+        CheckConstraint("max_attempts >= 1", name="ck_comp_match_job_max_attempts"),
+        Index("ix_comp_match_job_claim", "status", "available_at", "id"),
+        Index("ix_comp_match_job_recovery", "status", "lease_expires_at"),
+    )
+
+
+class PriceFormatCompetitorMaterialization(Base):
+    __tablename__ = "price_format_competitor_materializations"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    price_format_id: Mapped[int] = mapped_column(ForeignKey("price_formats.id"), nullable=False, index=True)
+    materialization_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    assignment_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_snapshot_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    row_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    error: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_kz_naive)
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("price_format_id", "materialization_key", name="uq_pf_comp_materialization_key"),
+        CheckConstraint(
+            "status IN ('pending','building','ready','published','failed','superseded')",
+            name="ck_pf_comp_materialization_status",
+        ),
+        Index("ix_pf_comp_materialization_current", "price_format_id", "is_current"),
+        Index(
+            "uq_pf_comp_materialization_current",
+            "price_format_id",
+            unique=True,
+            postgresql_where=text("is_current IS TRUE"),
+            sqlite_where=text("is_current = 1"),
+        ),
     )
 
 

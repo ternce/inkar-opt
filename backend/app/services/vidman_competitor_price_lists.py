@@ -32,6 +32,7 @@ from .competitor_source_config import canonical_competitor_source_key
 from .percentile_preparation import enqueue_percentile_preparation
 from .pricing_workflow.locks import PricingWorkflowTransactionLockLease
 from .vidman_product_matching import AUTO_MATCHED, MANUALLY_APPROVED
+from .matching_cache.capture import capture_and_publish_legacy_source_version
 
 
 TRUSTED_VIDMAN_PRICE_STATUSES = frozenset({AUTO_MATCHED, MANUALLY_APPROVED})
@@ -564,9 +565,20 @@ def build_vidman_competitor_price_list(
             db=db,
             price_format_id=price_format_id,
             lock_lease=transaction_locks,
+            allow_matching_cache=False,
         )
         if commit:
             enqueue_percentile_preparation(db=db, price_format_id=price_format_id, reason="vidman_price_list_built")
+    capture_and_publish_legacy_source_version(
+        db=db,
+        competitor_price_list_id=int(price_list.id),
+        source_metadata={
+            "importer": "vidman",
+            "accountId": account_id,
+            "mainId": main_id,
+            "importRunId": import_run_id,
+        },
+    )
     if commit:
         db.commit()
     else:

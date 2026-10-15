@@ -31,6 +31,7 @@ from backend.app.services.vidman_competitor_price_lists import (
     ensure_vidman_competitor_price_list_source,
     vidman_competitor_source_key,
 )
+from backend.app.services import vidman_competitor_price_lists as vidman_price_list_module
 from backend.app.services.vidman_product_matching import AUTO_MATCHED, MANUALLY_APPROVED, REVIEW_REQUIRED
 
 
@@ -135,16 +136,25 @@ def _build(db, account, plk, *, apply=False, run=None, require_active=True):
     )
 
 
-def test_auto_matched_and_manually_approved_are_published():
+def test_auto_matched_and_manually_approved_are_published(monkeypatch):
     db = _session()
     _, account, plk, run, product_a, product_b = _seed(db)
     _raw_link_match(db, account=account, plk=plk, run=run, product=product_a, status=AUTO_MATCHED, row_number=1)
     _raw_link_match(db, account=account, plk=plk, run=run, product=product_b, status=MANUALLY_APPROVED, row_number=2)
+    captures = []
+    monkeypatch.setattr(
+        vidman_price_list_module,
+        "capture_and_publish_legacy_source_version",
+        lambda **kwargs: captures.append(kwargs),
+    )
 
     summary = _build(db, account, plk, apply=True, run=run)
 
     assert summary.rows_written == 2
     assert db.query(CompetitorPriceListItem).count() == 2
+    assert len(captures) == 1
+    assert captures[0]["competitor_price_list_id"] == summary.competitor_price_list_id
+    assert captures[0]["source_metadata"]["importer"] == "vidman"
 
 
 @pytest.mark.parametrize("status", [REVIEW_REQUIRED, "UNMATCHED", "REJECTED", "MANUAL_UNMATCHED", "MANUAL_NO_VIDMAN_MATCH"])

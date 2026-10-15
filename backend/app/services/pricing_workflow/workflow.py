@@ -314,6 +314,15 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
     timing.record("workflow_initialization", initialization_started_at, success=True, input_rows=len(selected_ids))
     lease = PricingWorkflowLockLease(db)
     capacity_slot = PricingWorkflowConcurrencySlot(db)
+    matching_cache_metadata: dict = {
+        "mode": "disabled",
+        "hit": False,
+        "reason": "physical_matching_not_run",
+        "sourceVersionIds": [],
+        "matchingSnapshotIds": [],
+        "materializationFingerprint": "",
+        "fullRematchInvocationCount": 0,
+    }
 
     try:
         capacity_slot.__enter__()
@@ -402,6 +411,9 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
                 timing.record("competitor_matching", matching_started_at, success=False, input_rows=len(active_source_ids), error=str(exc))
                 raise
             timing.extend(rebuild_summary.pop("_stageTimings", []))
+            cache_details = rebuild_summary.pop("_matchingCache", {})
+            if isinstance(cache_details, dict):
+                matching_cache_metadata = cache_details
         commit_started_at = time.perf_counter()
         db.commit()
         timing.record("database_commits", commit_started_at, success=True)
@@ -437,6 +449,7 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
             requested_competitor_sources=competitor_sources,
             requested_percentile_sources=percentile_sources,
         )
+        snapshot["matchingCache"] = matching_cache_metadata
         snapshot_source_ids = sorted(
             int(item.get("id") or 0)
             for item in (snapshot.get("runSources") or {}).get("selectedCompetitorSources", [])

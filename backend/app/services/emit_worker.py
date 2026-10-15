@@ -55,6 +55,7 @@ from .provisor_auto_refresh import (
     try_acquire_global_refresh_lock,
     try_acquire_lock,
 )
+from .matching_cache.capture import capture_and_publish_legacy_source_version
 
 logger = logging.getLogger(__name__)
 
@@ -2787,6 +2788,12 @@ def replace_emit_price_list_from_staging(
         )
         stats.trace = trace
         logger.info("[EMIT_TRACE] stage=db_replace filial_id=%s price_list_id=%s trace=%s", filial_id, row.id, trace)
+    capture_and_publish_legacy_source_version(
+        db=db,
+        competitor_price_list_id=int(row.id),
+        source_metadata={"importer": "emit_compatibility", "filialId": filial_id},
+        batch_size=max(1000, int(config.batch_insert_size)),
+    )
     commit_started = time.perf_counter()
     db.commit()
     _add_elapsed(stats, "commit_elapsed", commit_started)

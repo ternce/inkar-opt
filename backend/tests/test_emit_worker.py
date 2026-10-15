@@ -1194,9 +1194,15 @@ def test_failed_parse_keeps_old_data(tmp_path):
     assert item.name == "Old Item"
 
 
-def test_successful_parse_creates_selectable_competitor_price_list(tmp_path):
+def test_successful_parse_creates_selectable_competitor_price_list(monkeypatch, tmp_path):
     db = _session()
     _seed_format(db)
+    captures = []
+    monkeypatch.setattr(
+        emit_worker_module,
+        "capture_and_publish_legacy_source_version",
+        lambda **kwargs: captures.append(kwargs),
+    )
     staging = tmp_path / "stage.sqlite"
     source = tmp_path / "emit.ndjson"
     source.write_text(
@@ -1232,6 +1238,12 @@ def test_successful_parse_creates_selectable_competitor_price_list(tmp_path):
     assert row.last_refresh_status == "success"
     assert row.account_id == ""
     assert db.scalar(select(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == row.id).with_only_columns(CompetitorPriceListItem.id).limit(1)) is not None
+    assert len(captures) == 1
+    assert captures[0]["competitor_price_list_id"] == row.id
+    assert captures[0]["source_metadata"] == {
+        "importer": "emit_compatibility",
+        "filialId": 1106,
+    }
 
 
 def test_emit_db_replace_preserves_stage_values_and_other_price_lists(tmp_path):

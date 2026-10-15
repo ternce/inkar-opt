@@ -1,0 +1,9 @@
+DROP TRIGGER IF EXISTS trg_comp_source_rows_insert_invalidate ON competitor_price_list_items;
+DROP TRIGGER IF EXISTS trg_comp_source_rows_update_invalidate ON competitor_price_list_items;
+DROP TRIGGER IF EXISTS trg_comp_source_rows_delete_invalidate ON competitor_price_list_items;
+DROP TRIGGER IF EXISTS trg_comp_source_rows_truncate_invalidate ON competitor_price_list_items;
+DROP TABLE IF EXISTS competitor_source_publication_items;
+DROP TABLE IF EXISTS competitor_source_publications;
+DROP FUNCTION IF EXISTS invalidate_comp_source_publications_from_lineage();
+DROP FUNCTION IF EXISTS invalidate_comp_source_publications_from_rows();
+DROP FUNCTION IF EXISTS invalidate_all_comp_source_publications();

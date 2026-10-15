@@ -172,6 +172,51 @@ def test_success_survives_best_effort_timing_metadata_failure(monkeypatch):
     assert db.execute(select(PriceList).where(PriceList.id == run.price_list_id)).scalars().first() is not None
 
 
+def test_workflow_snapshot_records_matching_cache_observability(monkeypatch):
+    db, payload = _workflow_fixture()
+    cache_metadata = {
+        "mode": "required",
+        "hit": True,
+        "reason": "materialization_unchanged",
+        "sourceVersionIds": [101],
+        "matchingSnapshotIds": [202],
+        "materializationId": 303,
+        "materializationFingerprint": "f" * 64,
+        "materializationReused": True,
+        "materializedRows": 1,
+        "cacheLookupDurationMs": 1.25,
+        "materializationDurationMs": 0.0,
+        "fullRematchInvocationCount": 0,
+        "rawSourceRowsRead": 0,
+    }
+    monkeypatch.setattr(
+        workflow_module,
+        "rebuild_competitor_prices_for_selected",
+        lambda **kwargs: {
+            "_stageTimings": [],
+            "_matchingCache": dict(cache_metadata),
+        },
+    )
+
+    def fake_calculate_prices(**kwargs):
+        db.add(PriceList(
+            number=kwargs["price_list_number"],
+            price_format_id=int(payload["priceFormatId"]),
+            activation_date=kwargs.get("activation_date"),
+            user=kwargs.get("user") or "test",
+        ))
+        db.flush()
+        return 1
+
+    monkeypatch.setattr(workflow_module, "calculate_prices", fake_calculate_prices)
+    run = workflow_module.create_workflow_run(db=db, payload=payload)
+
+    assert run.status == "success"
+    assert json.loads(run.run_snapshot_json)["matchingCache"] == cache_metadata
+    price_list = db.get(PriceList, run.price_list_id)
+    assert json.loads(price_list.run_snapshot_json)["matchingCache"] == cache_metadata
+
+
 def test_batch_all_conflicts_returns_409(monkeypatch):
     db, payload = _workflow_fixture()
     pf = db.get(workflow_module.PriceFormat, payload["priceFormatId"])
