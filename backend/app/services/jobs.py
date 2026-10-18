@@ -163,7 +163,7 @@ def update_job(
         job.status = status
         if status == "running" and job.started_at is None:
             job.started_at = now
-        if status in {"success", "error", "cancelled"}:
+        if status in {"success", "partial_success", "error", "cancelled"}:
             job.finished_at = now
     if progress is not None:
         job.progress = max(0, min(100, int(progress)))
@@ -197,7 +197,7 @@ async def run_job(
             result = await result
         db.expire_all()
         job = db.get(Job, job_id)
-        if job is not None and job.status not in {"error", "cancelled"}:
+        if job is not None and job.status not in {"partial_success", "error", "cancelled"}:
             final_message = job.message or "Готово"
             update_job(db, job, status="success", progress=100, message=final_message, result=result, log_level="info")
     except asyncio.CancelledError:

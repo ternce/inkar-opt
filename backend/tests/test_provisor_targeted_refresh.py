@@ -18,7 +18,7 @@ from backend.app.models import (
     PriceFormatCompetitorAssignment,
     PriceSourceAccount,
 )
-from backend.app.services.provisor import ProvisorAuthError
+from backend.app.services.provisor import ProvisorAuthError, ProvisorRequestError
 from backend.app.services.price_sources import UnifiedPriceItem, UnifiedPriceList
 
 
@@ -128,6 +128,23 @@ class _ManyPlkProvisorAdapter(_FakeProvisorAdapter):
         ]
 
 
+class _RequestFailureProvisorAdapter(_ManyPlkProvisorAdapter):
+    def __init__(self, ids: list[int], failing_ids: set[int]):
+        super().__init__(ids)
+        self.failing_ids = {str(value) for value in failing_ids}
+
+    async def fetch_price_list_items(self, account, price_list):
+        if str(price_list.price_list_id) in self.failing_ids:
+            self.fetched_item_ids.append(str(price_list.price_list_id))
+            self.fetched_account_item_ids.append(f"{account.id}:{price_list.price_list_id}")
+            raise ProvisorRequestError(
+                "Price/GetByFilialId failed: HTTP 400: Upstream server error",
+                status_code=400,
+                retryable=True,
+            )
+        return await super().fetch_price_list_items(account, price_list)
+
+
 class _AccountScopedPlkAdapter(_FakeProvisorAdapter):
     def __init__(self, ids_by_account: dict[int, list[int]]):
         super().__init__()
@@ -175,6 +192,23 @@ class _AccountScopedPlkAdapter(_FakeProvisorAdapter):
 
     async def test_connection(self, account):
         return True, "ok"
+
+
+class _AccountFailureProvisorAdapter(_AccountScopedPlkAdapter):
+    def __init__(self, ids_by_account: dict[int, list[int]], failing_accounts: set[int]):
+        super().__init__(ids_by_account)
+        self.failing_accounts = failing_accounts
+
+    async def fetch_price_list_items(self, account, price_list):
+        if int(account.id) in self.failing_accounts:
+            self.fetched_item_ids.append(str(price_list.price_list_id))
+            self.fetched_account_item_ids.append(f"{account.id}:{price_list.price_list_id}")
+            raise ProvisorRequestError(
+                "Price/GetByFilialId failed: HTTP 503: unavailable",
+                status_code=503,
+                retryable=True,
+            )
+        return await super().fetch_price_list_items(account, price_list)
 
 
 class _TimeoutProvisorAdapter(_FakeProvisorAdapter):
@@ -473,7 +507,7 @@ def test_provisor_actual_401_sets_auth_error(monkeypatch):
 
     db = _session()
     _seed(db)
-    adapter = _AuthErrorProvisorAdapter([128])
+    adapter = _AuthErrorProvisorAdapter([128, 129, 130])
     monkeypatch.setattr(main, "adapter_for_source", lambda source: adapter)
     monkeypatch.setattr(main, "credentials_from_row", _fake_credentials)
 
@@ -487,6 +521,8 @@ def test_provisor_actual_401_sets_auth_error(monkeypatch):
 
     assert adapter.fetched_account_item_ids == ["3:128"]
     assert result["progress"]["skipped_auth_error_count"] == 1
+    assert result["progress"]["processed"] == 1
+    assert result["progress"]["unattempted"] == 2
     account = db.get(PriceSourceAccount, 3)
     assert account is not None
     assert account.status == "auth_error"
@@ -542,6 +578,177 @@ def test_one_provisor_plk_failure_does_not_cancel_remaining(monkeypatch):
     assert result["provisorAudit"]["invariant_ok"] is True
     saved = sorted(db.execute(select(CompetitorPriceList.external_price_list_id)).scalars().all())
     assert saved == ["100", "105"]
+
+
+def test_upstream_http_400_failure_preserves_existing_rows_and_continues(monkeypatch):
+    import backend.app.main as main
+
+    db = _session()
+    pf, _account = _seed(db)
+    existing = CompetitorPriceList(
+        price_format_id=pf.id,
+        source_type="provisor",
+        source_key="account:3:plk:134",
+        display_name="Interpharma",
+        account_id="3",
+        external_price_list_id="134",
+    )
+    db.add(existing)
+    db.flush()
+    db.add(
+        CompetitorPriceListItem(
+            price_list_id=existing.id,
+            name="Previously published",
+            distributor_goods_id="OLD-134",
+            distributor_price=Decimal("17"),
+        )
+    )
+    db.commit()
+    adapter = _RequestFailureProvisorAdapter([134, 135], {134})
+    monkeypatch.setattr(main, "adapter_for_source", lambda source: adapter)
+    monkeypatch.setattr(main, "credentials_from_row", _fake_credentials)
+
+    result = asyncio.run(
+        main._run_refresh_price_lists_logic(
+            format_code="FMT",
+            payload={"source": "provisor", "accountId": 3, "forceRefresh": True},
+            db=db,
+        )
+    )
+
+    assert adapter.fetched_account_item_ids == ["3:134", "3:135"]
+    assert result["progress"]["success"] == 1
+    assert result["progress"]["failed"] == 1
+    assert result["progress"]["unattempted"] == 0
+    assert result["inventory"]["preserved_previous_snapshots"] == 1
+    previous = db.execute(
+        select(CompetitorPriceListItem).where(CompetitorPriceListItem.price_list_id == existing.id)
+    ).scalar_one()
+    assert previous.name == "Previously published"
+
+
+def test_all_price_lists_failing_is_not_reported_as_success(monkeypatch):
+    import backend.app.main as main
+
+    db = _session()
+    _seed(db)
+    adapter = _RequestFailureProvisorAdapter([134, 135], {134, 135})
+    monkeypatch.setattr(main, "adapter_for_source", lambda source: adapter)
+    monkeypatch.setattr(main, "credentials_from_row", _fake_credentials)
+
+    result = asyncio.run(
+        main._run_refresh_price_lists_logic(
+            format_code="FMT",
+            payload={"source": "provisor", "accountId": 3, "forceRefresh": True},
+            db=db,
+        )
+    )
+
+    assert result["progress"]["success"] == 0
+    assert result["progress"]["failed"] == 2
+    assert result["progress"]["processed"] == 2
+    assert result["accounts"][0]["ok"] is False
+
+
+def test_one_account_failure_does_not_cancel_other_account(monkeypatch):
+    import backend.app.main as main
+
+    db = _session()
+    _seed(db)
+    _add_account(db, 4, "Second")
+    adapter = _AccountFailureProvisorAdapter({3: [134], 4: [135]}, {3})
+    monkeypatch.setattr(main, "adapter_for_source", lambda source: adapter)
+    monkeypatch.setattr(main, "credentials_from_row", _fake_credentials)
+
+    result = asyncio.run(
+        main._run_refresh_price_lists_logic(
+            format_code="FMT",
+            payload={"source": "provisor", "accountIds": [3, 4], "forceRefresh": True},
+            db=db,
+        )
+    )
+
+    assert sorted(adapter.fetched_account_item_ids) == ["3:134", "4:135"]
+    assert result["progress"]["success"] == 1
+    assert result["progress"]["failed"] == 1
+    statuses = {row["accountId"]: row for row in result["accounts"]}
+    assert statuses[3]["ok"] is False
+    assert statuses[4]["ok"] is True
+
+
+def test_partial_refresh_job_keeps_terminal_partial_success_status(monkeypatch):
+    import backend.app.main as main
+
+    db = _session()
+    job = main.create_job(
+        db=db,
+        job_type="refresh_price_lists:provisor",
+        format_code="FMT",
+        message="queued",
+    )
+
+    async def partial_result(**_kwargs):
+        return {
+            "progress": {
+                "success": 1,
+                "failed": 1,
+                "timed_out": 0,
+                "unattempted": 2,
+            }
+        }
+
+    monkeypatch.setattr(main, "_run_refresh_price_lists_logic", partial_result)
+    asyncio.run(
+        main._run_refresh_price_lists_job(
+            db,
+            job,
+            format_code="FMT",
+            payload={"source": "provisor"},
+        )
+    )
+
+    db.refresh(job)
+    assert job.status == "partial_success"
+    assert job.finished_at is not None
+    assert "successful=1" in job.message
+    assert "unattempted=2" in job.message
+
+
+def test_all_failed_refresh_job_uses_terminal_error_status(monkeypatch):
+    import backend.app.main as main
+
+    db = _session()
+    job = main.create_job(
+        db=db,
+        job_type="refresh_price_lists:provisor",
+        format_code="FMT",
+        message="queued",
+    )
+
+    async def failed_result(**_kwargs):
+        return {
+            "progress": {
+                "success": 0,
+                "failed": 2,
+                "timed_out": 0,
+                "unattempted": 0,
+            }
+        }
+
+    monkeypatch.setattr(main, "_run_refresh_price_lists_logic", failed_result)
+    asyncio.run(
+        main._run_refresh_price_lists_job(
+            db,
+            job,
+            format_code="FMT",
+            payload={"source": "provisor"},
+        )
+    )
+
+    db.refresh(job)
+    assert job.status == "error"
+    assert job.finished_at is not None
+    assert job.error == job.message
 
 
 def test_same_provisor_plk_external_id_is_account_scoped(monkeypatch):
@@ -1076,6 +1283,7 @@ def test_provisor_same_inserted_date_with_changed_content_refreshes_items(monkey
         account_login="Aksai4/83",
         external_price_list_id="128",
         source_updated_at="2026-05-01T10:00:00",
+        items_count=1,
     )
     db.add(existing)
     db.flush()
@@ -1148,6 +1356,7 @@ def test_provisor_same_inserted_date_with_matching_content_updates_checked_statu
         account_login="Aksai4/83",
         external_price_list_id="128",
         source_updated_at="2026-05-01T10:00:00",
+        items_count=1,
     )
     db.add(existing)
     db.flush()
@@ -1265,6 +1474,7 @@ def test_provisor_zero_response_does_not_wipe_existing_items(monkeypatch, caplog
         display_name="Existing",
         account_id="3",
         external_price_list_id="1397",
+        items_count=1,
     )
     db.add(existing)
     db.flush()

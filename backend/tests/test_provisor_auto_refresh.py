@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import types
 from concurrent.futures import ThreadPoolExecutor
@@ -114,6 +115,32 @@ def test_global_refresh_lock_released_after_finish():
 
     next_token = svc.new_owner_token()
     assert svc.try_acquire_global_refresh_lock(db, owner_token=next_token, source="emit", requested_by="test") is True
+
+
+def test_refresh_job_progress_counts_failed_timed_out_and_unattempted_separately():
+    db = _session()
+    job, _, token = svc.try_create_refresh_job(db, mode="selected", requested_by="test")
+    assert job is not None and token is not None
+    assert svc.start_job(db, job, total_accounts=1, total_plk=5, metadata={}, owner_token=token)
+
+    result = {
+        "accounts": [{"accountId": 1}],
+        "progress": {
+            "processed": 3,
+            "success": 1,
+            "failed": 1,
+            "timed_out": 1,
+            "unattempted": 2,
+            "skipped": 1,
+        },
+    }
+    assert svc.update_progress_from_result(db, job, result, owner_token=token)
+
+    db.refresh(job)
+    assert job.processed_plk == 3
+    assert job.success_count == 1
+    assert job.failed_count == 4
+    assert job.skipped_count == 1
 
 
 def test_generic_refresh_mutex_released_after_exception(monkeypatch, tmp_path):
@@ -236,6 +263,54 @@ def test_scheduler_and_manual_overlap_blocked_by_refresh_lock():
     assert manual_token is None
     assert blocker is not None
     assert blocker.id == scheduled.id
+
+
+def test_completed_scheduler_run_blocks_duplicate_on_same_local_business_date(monkeypatch, tmp_path):
+    import backend.app.main as main
+
+    Session = _session_factory(tmp_path / "scheduled-daily-dedupe.db")
+    with Session() as db:
+        db.add(
+            RefreshJob(
+                source_type="provisor",
+                mode="selected",
+                status="partial_success",
+                started_at=datetime.utcnow(),
+                finished_at=datetime.utcnow(),
+                heartbeat_at=datetime.utcnow(),
+                requested_by="scheduler",
+            )
+        )
+        db.commit()
+
+    monkeypatch.setattr(main, "SessionLocal", Session)
+    asyncio.run(main._start_provisor_refresh_background(mode="selected", requested_by="scheduler"))
+
+    with Session() as db:
+        rows = db.query(RefreshJob).filter(RefreshJob.source_type == "provisor").order_by(RefreshJob.id).all()
+        assert len(rows) == 2
+        assert rows[0].status == "partial_success"
+        assert rows[1].status == "skipped"
+        assert json.loads(rows[1].metadata_json)["reason"] == "duplicate_scheduled_business_date"
+        assert str(rows[0].id) in rows[1].message
+
+
+def test_daily_scheduler_dedupe_does_not_block_manual_jobs():
+    db = _session()
+    db.add(
+        RefreshJob(
+            source_type="provisor",
+            mode="selected",
+            status="success",
+            started_at=datetime.utcnow(),
+            finished_at=datetime.utcnow(),
+            heartbeat_at=datetime.utcnow(),
+            requested_by="manual",
+        )
+    )
+    db.commit()
+
+    assert svc.scheduled_refresh_for_local_date(db, timezone_name="Asia/Qyzylorda") is None
 
 
 def test_multiple_scheduler_ownership_only_one_wins(tmp_path):

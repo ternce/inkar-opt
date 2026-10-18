@@ -2376,6 +2376,8 @@ export function CompetitorsTab({ formatCode, branch, currentUser }: Props) {
             <span><strong>Обновлено:</strong> {activeJob.result.updated_count || 0}</span>
             <span><strong>Без изменений:</strong> {activeJob.result.skipped_unchanged || 0}</span>
             <span><strong>Тайм-аут:</strong> {activeJob.result.skipped_timeout || 0}</span>
+            <span><strong>Ошибки:</strong> {activeJob.result.progress?.failed || activeJob.result.error_count || 0}</span>
+            <span><strong>Не запущено:</strong> {activeJob.result.progress?.unattempted || 0}</span>
           </div>
         </div>
       ) : null}

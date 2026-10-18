@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
@@ -360,7 +361,14 @@ def active_or_stale_refresh_job(db: Session) -> RefreshJob | None:
     )
 
 
-def create_skipped_job(db: Session, *, mode: str, requested_by: str, message: str) -> RefreshJob:
+def create_skipped_job(
+    db: Session,
+    *,
+    mode: str,
+    requested_by: str,
+    message: str,
+    reason: str = "overlap_guard",
+) -> RefreshJob:
     now = datetime.utcnow()
     job = RefreshJob(
         source_type=SOURCE_TYPE,
@@ -372,12 +380,45 @@ def create_skipped_job(db: Session, *, mode: str, requested_by: str, message: st
         requested_by=requested_by,
         message=message,
         skipped_count=1,
-        metadata_json=_json_dumps({"reason": "overlap_guard"}),
+        metadata_json=_json_dumps({"reason": reason}),
     )
     db.add(job)
     db.commit()
     db.refresh(job)
     return job
+
+
+def scheduled_refresh_for_local_date(
+    db: Session,
+    *,
+    timezone_name: str,
+    now: datetime | None = None,
+) -> RefreshJob | None:
+    """Return a non-skipped scheduler run for the current local business date."""
+
+    zone = ZoneInfo(timezone_name)
+    current = now or datetime.now(zone)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=zone)
+    else:
+        current = current.astimezone(zone)
+    local_start = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    local_end = local_start + timedelta(days=1)
+    start_utc = local_start.astimezone(timezone.utc).replace(tzinfo=None)
+    end_utc = local_end.astimezone(timezone.utc).replace(tzinfo=None)
+    return (
+        db.execute(
+            select(RefreshJob)
+            .where(RefreshJob.source_type == SOURCE_TYPE)
+            .where(RefreshJob.requested_by == "scheduler")
+            .where(RefreshJob.status != "skipped")
+            .where(RefreshJob.started_at >= start_utc)
+            .where(RefreshJob.started_at < end_utc)
+            .order_by(RefreshJob.started_at.desc(), RefreshJob.id.desc())
+        )
+        .scalars()
+        .first()
+    )
 
 
 def try_create_refresh_job(db: Session, *, mode: str, requested_by: str) -> tuple[RefreshJob | None, RefreshJob | None, str | None]:
@@ -463,7 +504,11 @@ def update_progress_from_result(db: Session, job: RefreshJob, result: dict[str, 
     job.processed_accounts = min(int(job.total_accounts or processed_accounts), processed_accounts)
     job.processed_plk = int((progress or {}).get("processed") or job.processed_plk or 0)
     job.success_count = int((progress or {}).get("success") or 0)
-    job.failed_count = int((progress or {}).get("errors") or 0)
+    job.failed_count = (
+        int((progress or {}).get("failed") or (progress or {}).get("errors") or 0)
+        + int((progress or {}).get("timed_out") or (progress or {}).get("timeout") or 0)
+        + int((progress or {}).get("unattempted") or 0)
+    )
     job.skipped_count = int((progress or {}).get("skipped") or 0)
     job.heartbeat_at = datetime.utcnow()
     db.commit()

@@ -112,7 +112,12 @@ from .services.pricing import (
     normalize_list_type,
     reference_branch_id_for_price_format,
 )
-from .services.provisor import ProvisorAuthError, get_prices_by_filial_id, process_memory_snapshot
+from .services.provisor import (
+    ProvisorAuthError,
+    ProvisorRequestError,
+    get_prices_by_filial_id,
+    process_memory_snapshot,
+)
 from .services.auth import (
     SESSION_COOKIE_NAME,
     create_session,
@@ -382,6 +387,7 @@ from .services.provisor_auto_refresh import (
     refresh_job_to_status,
     release_global_refresh_lock,
     REFRESH_MODE_BUSINESS_RULES as PROVISOR_REFRESH_MODE_BUSINESS_RULES,
+    scheduled_refresh_for_local_date,
     selected_refresh_targets,
     start_job as start_refresh_job,
     target_counts as refresh_target_counts,
@@ -822,6 +828,8 @@ def _log_provisor_plk_benchmark(benchmark: dict[str, object] | None) -> dict[str
 
 
 def _is_price_source_auth_failure(exc: BaseException) -> bool:
+    if isinstance(exc, ProvisorAuthError):
+        return True
     message = str(exc or "").strip().lower()
     return any(
         marker in message
@@ -1110,6 +1118,7 @@ def _start_provisor_auto_refresh_scheduler() -> None:
         max_instances=1,
         coalesce=True,
         misfire_grace_time=300,
+        replace_existing=True,
     )
     scheduler.start()
     _provisor_auto_refresh_scheduler = scheduler
@@ -9845,7 +9854,17 @@ async def _run_provisor_refresh_job(job_id: int, *, mode: str, requested_by: str
 
         heartbeat_task = asyncio.create_task(beat())
         logger.info("[PROVISOR_AUTO_REFRESH] job started id=%s mode=%s requested_by=%s", job_id, mode, requested_by)
-        aggregate = {"results": [], "errors": [], "accounts": set(), "processed_plk": 0, "success": 0, "failed": 0, "skipped": 0}
+        aggregate = {
+            "results": [],
+            "errors": [],
+            "accounts": set(),
+            "processed_plk": 0,
+            "success": 0,
+            "failed": 0,
+            "timed_out": 0,
+            "unattempted": 0,
+            "skipped": 0,
+        }
         for format_code, by_account in targets.items():
             for account_id, filial_ids in by_account.items():
                 db.expire_all()
@@ -9864,7 +9883,9 @@ async def _run_provisor_refresh_job(job_id: int, *, mode: str, requested_by: str
                 aggregate["accounts"].add(account_id)
                 aggregate["processed_plk"] += int(progress.get("processed") or 0)
                 aggregate["success"] += int(progress.get("success") or 0)
-                aggregate["failed"] += int(progress.get("errors") or 0)
+                aggregate["failed"] += int(progress.get("failed") or progress.get("errors") or 0)
+                aggregate["timed_out"] += int(progress.get("timed_out") or progress.get("timeout") or 0)
+                aggregate["unattempted"] += int(progress.get("unattempted") or 0)
                 aggregate["skipped"] += int(progress.get("skipped") or 0)
                 db.expire_all()
                 job = db.get(RefreshJob, job_id)
@@ -9875,7 +9896,7 @@ async def _run_provisor_refresh_job(job_id: int, *, mode: str, requested_by: str
                     job.processed_accounts = min(int(job.total_accounts or 0), len(aggregate["accounts"]))
                     job.processed_plk = int(aggregate["processed_plk"])
                     job.success_count = int(aggregate["success"])
-                    job.failed_count = int(aggregate["failed"])
+                    job.failed_count = int(aggregate["failed"]) + int(aggregate["timed_out"]) + int(aggregate["unattempted"])
                     job.skipped_count = int(aggregate["skipped"])
                     job.heartbeat_at = now_kz_naive()
                     db.commit()
@@ -9883,7 +9904,11 @@ async def _run_provisor_refresh_job(job_id: int, *, mode: str, requested_by: str
         db.expire_all()
         job = db.get(RefreshJob, job_id)
         if job is not None:
-            failed = int(aggregate["failed"] or 0)
+            failed = (
+                int(aggregate["failed"] or 0)
+                + int(aggregate["timed_out"] or 0)
+                + int(aggregate["unattempted"] or 0)
+            )
             status = (
                 "failed"
                 if failed and not int(aggregate["success"] or 0)
@@ -9898,7 +9923,12 @@ async def _run_provisor_refresh_job(job_id: int, *, mode: str, requested_by: str
                 status=status,
                 message=message,
                 error="; ".join(str(x) for x in aggregate["errors"][:5]),
-                metadata={"result_count": len(aggregate["results"])},
+                metadata={
+                    "result_count": len(aggregate["results"]),
+                    "failed_price_lists": int(aggregate["failed"]),
+                    "timed_out_price_lists": int(aggregate["timed_out"]),
+                    "unattempted_price_lists": int(aggregate["unattempted"]),
+                },
                 owner_token=owner_token,
                 allowed_statuses={"running"},
                 release_refresh=True,
@@ -10135,6 +10165,30 @@ def get_emit_refresh_job(job_id: int, db: Session = Depends(get_db)):
 async def _start_provisor_refresh_background(*, mode: str, requested_by: str, run_inline: bool = False) -> None:
     db = SessionLocal()
     try:
+        if requested_by == "scheduler":
+            previous_scheduled = scheduled_refresh_for_local_date(
+                db,
+                timezone_name=settings.provisor_auto_refresh_timezone,
+            )
+            if previous_scheduled is not None:
+                message = (
+                    "Scheduled Provisor refresh already ran for this local business date "
+                    f"(job {previous_scheduled.id}, status={previous_scheduled.status})."
+                )
+                create_skipped_job(
+                    db,
+                    mode=mode,
+                    requested_by=requested_by,
+                    message=message,
+                    reason="duplicate_scheduled_business_date",
+                )
+                logger.warning(
+                    "[PROVISOR_AUTO_REFRESH] action=skip reason=duplicate_scheduled_business_date "
+                    "previous_job_id=%s previous_status=%s",
+                    previous_scheduled.id,
+                    previous_scheduled.status,
+                )
+                return
         emit_blocker = active_emit_job(db, config=EmitConfig.from_settings(settings))
         if emit_blocker is not None:
             message = "Emit refresh is currently running. Provisor refresh cannot start at the same time."
@@ -10344,6 +10398,9 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
         "success": 0,
         "skipped": 0,
         "errors": 0,
+        "failed": 0,
+        "timed_out": 0,
+        "unattempted": 0,
         "skipped_heavy": 0,
         "skipped_heavy_filials": [],
         "skipped_auth_error_count": 0,
@@ -10506,6 +10563,9 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
             "success": 0,
             "skipped": 0,
             "errors": 0,
+            "failed": 0,
+            "timed_out": 0,
+            "unattempted": 0,
             "processed": 0,
             "total": 0,
             "message": "",
@@ -11589,6 +11649,14 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                         except ProvisorAuthError as e:
                             elapsed_ms = round((time.perf_counter() - fetch_items_started_at) * 1000, 2)
                             if _is_price_source_auth_failure(e):
+                                provisor_audit.result(
+                                    account_id=int(account.id),
+                                    filial_id=price_list_id,
+                                    outcome=PROVISOR_AUDIT_AUTH_FAILED,
+                                    reason_code="auth_error",
+                                    previous_rows=local_items_count,
+                                    download_elapsed_sec=round(elapsed_ms / 1000, 3),
+                                )
                                 logger.warning(
                                     "[REFRESH] SKIP price_list=%s reason=auth_error elapsed_ms=%s",
                                     price_list_id,
@@ -11608,6 +11676,45 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                     skip_reason="auth_error",
                                 )
                             raise
+                        except ProvisorRequestError as e:
+                            elapsed_ms = round((time.perf_counter() - fetch_items_started_at) * 1000, 2)
+                            outcome, reason_code, http_status = classify_provisor_audit_exception(e)
+                            provisor_audit.result(
+                                account_id=int(account.id),
+                                filial_id=price_list_id,
+                                outcome=outcome,
+                                reason_code=reason_code,
+                                http_status=http_status,
+                                previous_rows=local_items_count,
+                                download_elapsed_sec=round(elapsed_ms / 1000, 3),
+                            )
+                            logger.warning(
+                                "[PROVISOR_PRICE_FAILED] account_id=%s filial_id=%s http_status=%s "
+                                "retryable=%s previous_rows=%s elapsed_ms=%s",
+                                account.id,
+                                price_list_id,
+                                e.status_code,
+                                e.retryable,
+                                local_items_count,
+                                elapsed_ms,
+                            )
+                            return finish_result(
+                                {
+                                    "ok": False,
+                                    "failed": True,
+                                    "priceList": price_list,
+                                    "items": [],
+                                    "elapsed_ms": elapsed_ms,
+                                    "timeout_limit_seconds": price_list_timeout,
+                                    "error": str(e),
+                                    "httpStatus": e.status_code,
+                                    "retryable": e.retryable,
+                                    "preservedPreviousSnapshot": True,
+                                    "preservedPreviousRows": local_items_count,
+                                },
+                                outcome="failed",
+                                skip_reason=e.__class__.__name__,
+                            )
                         except Exception as e:
                             elapsed_ms = round((time.perf_counter() - fetch_items_started_at) * 1000, 2)
                             logger.warning(
@@ -11680,6 +11787,9 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                                     log_level="info",
                                     log_meta={"processed": processed_now, "total": total_price_lists},
                                 )
+                            if isinstance(result, dict) and result.get("auth_error"):
+                                status["unattempted"] = max(0, len(price_lists) - processed_now)
+                                break
                     for done in asyncio.as_completed(tasks):
                         result = await done
                         results.append(result)
@@ -11722,6 +11832,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                         )
                     if isinstance(result, Exception):
                         status["errors"] += 1
+                        status["failed"] += 1
                         status["results"].append({"ok": False, "error": str(result)})
                     elif result.get("ok"):
                         status["success"] += 1
@@ -11736,6 +11847,7 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                         status["skipped"] += 1
                         status["skipped_timeout"] += 1
                         status["timeout"] += 1
+                        status["timed_out"] += 1
                         if account.source_type == "provisor":
                             inventory["timed_out"] = int(inventory.get("timed_out") or 0) + 1
                         if result.get("skippedInfo"):
@@ -11759,8 +11871,11 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                         status["results"].append(result)
                     else:
                         status["errors"] += 1
+                        status["failed"] += 1
                         if account.source_type == "provisor":
                             inventory["failed"] = int(inventory.get("failed") or 0) + 1
+                            if result.get("preservedPreviousSnapshot"):
+                                inventory["preserved_previous_snapshots"] = int(inventory.get("preserved_previous_snapshots") or 0) + 1
                         status["results"].append(result)
 
                 if any(isinstance(result, dict) and result.get("auth_error") for result in results):
@@ -11772,13 +11887,12 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                             "priceListsCount": 0,
                             "priceLists": 0,
                             "items": 0,
-                            "success": 0,
-                            "skipped": 1,
+                            "skipped": int(status.get("skipped") or 0) + 1,
                             "skipped_auth_error_count": 1,
-                            "errors": 0,
+                            "errors": max(1, int(status.get("errors") or 0)),
+                            "failed": max(1, int(status.get("failed") or 0)),
                             "message": "Неверный логин или пароль",
                             "statusMessage": "Неверный логин или пароль",
-                            "results": [],
                         }
                     )
                 else:
@@ -11869,6 +11983,9 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
                 "success": 0,
                 "skipped": 0,
                 "errors": 1,
+                "failed": 1,
+                "timed_out": 0,
+                "unattempted": 0,
                 "processed": 0,
                     "total": 0,
                     "message": str(status),
@@ -12296,9 +12413,18 @@ async def _run_refresh_price_lists_logic(format_code: str, payload: dict, db: Se
 
         source_summary = progress["bySource"].setdefault(
             account_source_type,
-            {"total": 0, "processed": 0, "success": 0, "skipped": 0, "errors": 0},
+            {
+                "total": 0,
+                "processed": 0,
+                "success": 0,
+                "skipped": 0,
+                "errors": 0,
+                "failed": 0,
+                "timed_out": 0,
+                "unattempted": 0,
+            },
         )
-        for key in ("total", "processed", "success", "skipped", "errors"):
+        for key in ("total", "processed", "success", "skipped", "errors", "failed", "timed_out", "unattempted"):
             source_summary[key] += int(status.get(key) or 0)
             progress[key] += int(status.get(key) or 0)
         source_summary["skipped_timeout"] = int(source_summary.get("skipped_timeout") or 0) + int(status.get("skipped_timeout") or 0)
@@ -12520,13 +12646,31 @@ async def _run_refresh_price_lists_job(db: Session, job: Job, *, format_code: st
     result = await _run_refresh_price_lists_logic(format_code=format_code, payload=payload, db=db, job=job)
     job = db.get(Job, job.id)
     if job is not None:
-        skipped_timeout = int((result.get("progress") or {}).get("skipped_timeout") or 0) if isinstance(result, dict) else 0
-        message = (
-            f"Обновление завершено, но {skipped_timeout} прайсов пропущено по таймауту"
-            if skipped_timeout
-            else "Обновление прайс-листов готово"
+        progress = (result.get("progress") or {}) if isinstance(result, dict) else {}
+        failed = int(progress.get("failed") or progress.get("errors") or 0)
+        timed_out = int(progress.get("timed_out") or progress.get("timeout") or 0)
+        unattempted = int(progress.get("unattempted") or 0)
+        success = int(progress.get("success") or 0)
+        adverse = failed + timed_out + unattempted
+        if adverse:
+            terminal_status = "partial_success" if success else "error"
+            message = (
+                f"Refresh incomplete: successful={success}, failed={failed}, "
+                f"timed_out={timed_out}, unattempted={unattempted}."
+            )
+        else:
+            terminal_status = "running"
+            message = "Обновление прайс-листов готово"
+        update_job(
+            db,
+            job,
+            status=terminal_status,
+            progress=100,
+            message=message,
+            result=result,
+            error=message if terminal_status == "error" else None,
+            log_level="warning" if adverse else "info",
         )
-        update_job(db, job, status="running", progress=100, message=message, result=result, log_level="warning" if skipped_timeout else "info")
     return result
 
 
