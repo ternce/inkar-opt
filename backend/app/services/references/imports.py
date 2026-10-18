@@ -24,7 +24,8 @@ from ...models import (
 from ...timezone import now_kz_naive
 from ..manufacturers import resolve_manufacturer
 from ..sku import normalize_sku
-from .parsers import as_decimal, as_int, parse_excel_rows
+from .parsers import as_decimal, as_int, parse_csv_rows, parse_excel_rows
+from .stock_snapshots import CanonicalStockRow, publish_stock_snapshot
 from .types import REFERENCE_TYPE_BY_CODE, branch_display_name, canonical_branch_id
 from .validators import required_columns_for
 
@@ -293,7 +294,11 @@ def import_reference_excel(
     staged_stock_by_branch: dict[str, dict[int, tuple[Product, str, Decimal | None]]] = {}
     staged_cost_by_branch: dict[str, dict[int, tuple[Product, str, Decimal | None]]] = {}
     try:
-        rows, headers = parse_excel_rows(content)
+        rows, headers = (
+            parse_csv_rows(content)
+            if str(filename or "").lower().endswith(".csv")
+            else parse_excel_rows(content)
+        )
         required = required_columns_for(data_type)
         missing = [key for key in required if key not in headers]
         if missing:
@@ -449,30 +454,30 @@ def import_reference_excel(
         if job.status == "success" and data_type == "stock":
             activation_branch_ids = set(branch_ids) | set(staged_stock_by_branch)
             for branch_id in activation_branch_ids:
-                db.execute(delete(BranchStock).where(BranchStock.branch_id == branch_id))
-                for _product_id, (product, sku, stock) in staged_stock_by_branch.get(branch_id, {}).items():
-                    db.add(
-                        BranchStock(
-                            branch_id=branch_id,
-                            product_id=product.id,
-                            sku=sku,
-                            stock=float(stock) if stock is not None else None,
-                            source_type="excel",
-                            updated_at=now_kz_naive(),
+                staged_rows = staged_stock_by_branch.get(branch_id, {})
+                publish_stock_snapshot(
+                    db,
+                    branch_id=branch_id,
+                    source_type="manual",
+                    effective_date=now_kz_naive().date(),
+                    rows=[
+                        CanonicalStockRow(
+                            material=sku,
+                            normalized_sku=sku,
+                            product_id=int(product.id),
+                            quantity=stock,
+                            raw={"filename": filename},
                         )
-                    )
+                        for _product_id, (product, sku, stock) in staged_rows.items()
+                    ],
+                    import_job=job,
+                    metadata={"filename": filename, "user_name": user_name},
+                )
+                for _product_id, (product, _sku, stock) in staged_rows.items():
                     if len(activation_branch_ids) == 1:
                         extra = _get_extra(db, product.id)
                         extra.stock = float(stock) if stock is not None else None
                         extra.updated_at = now_kz_naive()
-                _upsert_status(
-                    db=db,
-                    branch_id=branch_id,
-                    data_type=data_type,
-                    rows_count=len(staged_stock_by_branch.get(branch_id, {})),
-                    status="success",
-                    job_id=job.id,
-                )
         elif job.status == "success" and data_type == "cost":
             activation_branch_ids = set(branch_ids) | set(staged_cost_by_branch)
             for branch_id in activation_branch_ids:

@@ -25,7 +25,14 @@ type ReferenceStatus = {
   status: string;
   freshness: 'fresh' | 'stale' | 'error' | 'running' | 'missing';
   error: string;
+  activeSource?: string;
+  stockEffectiveDate?: string;
+  lastSuccessfulRefresh?: string;
+  lastFailedRefresh?: string;
+  lastFailureReason?: string;
 };
+
+type SapPlant = { plant: string; name: string; branchId: string; lgort: string; enabled: boolean };
 
 type ReadinessMatrix = {
   columns: ReferenceType[];
@@ -113,6 +120,9 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
   const [branches, setBranches] = useState<Branch[]>([]);
   const [matrix, setMatrix] = useState<ReadinessMatrix>({ columns: [], rows: [] });
   const [imports, setImports] = useState<ImportJob[]>([]);
+  const [sapPlants, setSapPlants] = useState<SapPlant[]>([]);
+  const [selectedSapPlant, setSelectedSapPlant] = useState('');
+  const [sapRefreshes, setSapRefreshes] = useState<any[]>([]);
 
   const [selectedType, setSelectedType] = useState('');
   const [selectedBranchIds, setSelectedBranchIds] = useState<string[]>([]);
@@ -135,32 +145,43 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
     setIsLoading(true);
     setError(null);
     try {
-      const [typesRes, branchesRes, matrixRes, importsRes] = await Promise.all([
+      const [typesRes, branchesRes, matrixRes, importsRes, sapPlantsRes, sapStatusRes] = await Promise.all([
         fetch('/api/references/types'),
         fetch('/api/references/branches'),
         fetch('/api/references/readiness-matrix'),
         fetch('/api/references/imports'),
+        fetch('/api/references/sap/plants'),
+        fetch('/api/references/sap/status'),
       ]);
-      const [typesText, branchesText, matrixText, importsText] = await Promise.all([
+      const [typesText, branchesText, matrixText, importsText, sapPlantsText, sapStatusText] = await Promise.all([
         typesRes.text(),
         branchesRes.text(),
         matrixRes.text(),
         importsRes.text(),
+        sapPlantsRes.text(),
+        sapStatusRes.text(),
       ]);
       const typesData = parseJsonOrNull(typesText);
       const branchesData = parseJsonOrNull(branchesText);
       const matrixData = parseJsonOrNull(matrixText);
       const importsData = parseJsonOrNull(importsText);
+      const sapPlantsData = parseJsonOrNull(sapPlantsText);
+      const sapStatusData = parseJsonOrNull(sapStatusText);
       if (!typesRes.ok) throw new Error(typesData?.detail || typesText || 'Не удалось загрузить типы');
       if (!branchesRes.ok) throw new Error(branchesData?.detail || branchesText || 'Не удалось загрузить филиалы');
       if (!matrixRes.ok) throw new Error(matrixData?.detail || matrixText || 'Не удалось загрузить матрицу');
       if (!importsRes.ok) throw new Error(importsData?.detail || importsText || 'Не удалось загрузить историю');
+      if (!sapPlantsRes.ok) throw new Error(sapPlantsData?.detail || sapPlantsText || 'Не удалось загрузить SAP-филиалы');
+      if (!sapStatusRes.ok) throw new Error(sapStatusData?.detail || sapStatusText || 'Не удалось загрузить статус SAP');
 
       const nextTypes = Array.isArray(typesData) ? typesData : [];
       setTypes(nextTypes);
       setBranches(Array.isArray(branchesData) ? branchesData : []);
       setMatrix(matrixData && Array.isArray(matrixData.rows) ? matrixData : { columns: nextTypes, rows: [] });
       setImports(Array.isArray(importsData) ? importsData : []);
+      setSapPlants(Array.isArray(sapPlantsData) ? sapPlantsData : []);
+      setSelectedSapPlant((prev) => prev || sapPlantsData?.[0]?.plant || '');
+      setSapRefreshes(Array.isArray(sapStatusData) ? sapStatusData : []);
       setSelectedType((prev) => prev || nextTypes[0]?.code || '');
     } catch (e: any) {
       setError(e?.message || 'Ошибка загрузки справочников');
@@ -226,6 +247,25 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
       else toast.success('Справочник загружен');
     } catch (e: any) {
       setError(e?.message || 'Ошибка импорта');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const refreshFromSap = async () => {
+    if (isReadOnly || !selectedSapPlant) return;
+    setIsLoading(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams({ plant: selectedSapPlant });
+      const res = await fetch(`/api/references/sap/refresh?${params.toString()}`, { method: 'POST' });
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) throw new Error(data?.detail || text || 'Не удалось запустить обновление из SAP');
+      toast.success('Обновление остатков из SAP поставлено в очередь');
+      await loadAll();
+    } catch (e: any) {
+      setError(e?.message || 'Ошибка запуска SAP GetBalance');
     } finally {
       setIsLoading(false);
     }
@@ -336,6 +376,38 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
         <TabsContent value="upload" className="m-0 pt-4">
           <div className="grid grid-cols-1 gap-4">
             <div className="admin-card p-4">
+              <div className="mb-4 text-sm font-semibold text-gray-900">SAP GetBalance · остатки</div>
+              <div className="grid gap-3 md:grid-cols-[minmax(240px,1fr)_auto]">
+                <Select value={selectedSapPlant} onValueChange={setSelectedSapPlant}>
+                  <SelectTrigger><SelectValue placeholder="Выберите SAP plant" /></SelectTrigger>
+                  <SelectContent>
+                    {sapPlants.map((plant) => (
+                      <SelectItem key={plant.plant} value={plant.plant}>
+                        {plant.plant} · {plant.name} · LGORT {plant.lgort}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={refreshFromSap}
+                  disabled={isLoading || isReadOnly || !selectedSapPlant || !sapPlants.find((row) => row.plant === selectedSapPlant)?.enabled}
+                >
+                  <RefreshCw className="mr-2 h-4 w-4" />
+                  Обновить из SAP
+                </Button>
+              </div>
+              {!sapPlants.some((row) => row.enabled) ? (
+                <div className="mt-2 text-xs text-gray-500">Интеграция и расписание SAP отключены конфигурацией.</div>
+              ) : null}
+              {sapRefreshes[0] ? (
+                <div className="mt-2 text-xs text-gray-600">
+                  Последнее задание: {sapRefreshes[0].status} · {sapRefreshes[0].message || 'без сообщения'}
+                </div>
+              ) : null}
+            </div>
+            <div className="admin-card p-4">
               <div className="mb-4 flex items-center justify-between gap-3">
                 <div className="text-sm font-semibold text-gray-900">Одиночная загрузка</div>
                 <FileUp className="h-4 w-4 text-gray-400" />
@@ -359,7 +431,7 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
                   </div>
                   <div>
                     <div className="mb-2 text-sm font-semibold text-gray-900">Файл для загрузки</div>
-                    <Input type="file" accept=".xlsx" onChange={(event) => setFile(event.target.files?.[0] ?? null)} />
+                    <Input type="file" accept=".xlsx,.csv" onChange={(event) => setFile(event.target.files?.[0] ?? null)} />
                   </div>
                   {isTemplateSupported(selectedType) ? (
                     <Button type="button" variant="outline" onClick={() => downloadTemplate(selectedType)} className="w-full">
@@ -421,6 +493,11 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
                               <div className="font-medium">{freshnessLabel(cell?.freshness || 'missing')}</div>
                               <div className="text-xs">{fmtDate(cell?.lastUpdatedAt || '')}</div>
                               <div className="text-xs">Строк: {cell?.rowsCount || 0}</div>
+                              {type.code === 'stock' ? <div className="text-xs">Источник: {cell?.activeSource || '—'}</div> : null}
+                              {type.code === 'stock' && cell?.stockEffectiveDate ? <div className="text-xs">Дата остатков: {cell.stockEffectiveDate}</div> : null}
+                              {type.code === 'stock' && cell?.lastFailedRefresh ? (
+                                <div className="text-xs text-red-700" title={cell?.lastFailureReason || ''}>Ошибка: {fmtDate(cell.lastFailedRefresh)}</div>
+                              ) : null}
                             </div>
                           </td>
                         );

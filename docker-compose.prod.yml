@@ -44,6 +44,16 @@ x-backend-env: &backend-env
   PARSER_DAILY_BASELINE_WINDOW: ${PARSER_DAILY_BASELINE_WINDOW:-7}
   PARSER_DAILY_BASELINE_MIN_SAMPLES: ${PARSER_DAILY_BASELINE_MIN_SAMPLES:-3}
   PARSER_DAILY_BASELINE_RATIO: ${PARSER_DAILY_BASELINE_RATIO:-0.65}
+  SAP_BALANCE_ENABLED: ${SAP_BALANCE_ENABLED:-false}
+  SAP_BALANCE_SCHEDULE_ENABLED: ${SAP_BALANCE_SCHEDULE_ENABLED:-false}
+  SAP_BALANCE_BASE_URL: ${SAP_BALANCE_BASE_URL:-https://sap-piq.inkar.kz:53443/RESTAdapter/getBalance}
+  SAP_BALANCE_USERNAME: ${SAP_BALANCE_USERNAME:-}
+  SAP_BALANCE_PASSWORD: ${SAP_BALANCE_PASSWORD:-}
+  SAP_BALANCE_COMPANY_CODE: ${SAP_BALANCE_COMPANY_CODE:-}
+  SAP_BALANCE_CRON: "${SAP_BALANCE_CRON:-0 4 * * *}"
+  SAP_BALANCE_TIMEOUT_SECONDS: ${SAP_BALANCE_TIMEOUT_SECONDS:-120}
+  SAP_BALANCE_BRANCH_MAP_JSON: '${SAP_BALANCE_BRANCH_MAP_JSON:-{}}'
+  SAP_MANUAL_PRECEDENCE_HOURS: ${SAP_MANUAL_PRECEDENCE_HOURS:-24}
   # If frontend/backend are not on one origin, set the needed origin here.
   # CORS_ALLOW_ORIGINS: "http://10.10.1.77:8010"
 
@@ -89,9 +99,9 @@ services:
     <<: *backend-image
     container_name: inkar_opt_worker
     restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
+    # Server 77 points DATABASE_URL at the authoritative PostgreSQL on server 75.
+    # Keep this service independent of the local `db` service so it never starts
+    # a competing database as an implicit dependency.
     environment:
       <<: *backend-env
       PROCESS_ROLE: worker

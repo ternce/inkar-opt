@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import csv
 import re
 from decimal import Decimal
 from typing import Any
@@ -156,3 +157,56 @@ def parse_excel_rows(content: bytes) -> tuple[list[dict], set[str]]:
         row["_row"] = row_idx
         rows.append(row)
     return rows, set(headers)
+
+
+def parse_csv_rows(content: bytes) -> tuple[list[dict], set[str]]:
+    decoded = None
+    for encoding in ("utf-8-sig", "cp1251"):
+        try:
+            decoded = content.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if decoded is None:
+        raise ValueError("CSV encoding must be UTF-8 or Windows-1251")
+    try:
+        dialect = csv.Sniffer().sniff(decoded[:8192], delimiters=",;\t")
+    except csv.Error:
+        dialect = csv.excel
+        dialect.delimiter = ";"
+    raw_rows = list(csv.reader(io.StringIO(decoded), dialect))
+    header_index = next((index for index, row in enumerate(raw_rows[:30]) if any(str(value).strip() for value in row)), None)
+    if header_index is None:
+        raise ValueError("CSV file has no header row")
+    raw_headers = {_norm(value): index for index, value in enumerate(raw_rows[header_index])}
+    headers: dict[str, int] = {}
+    for canonical, aliases in HEADER_ALIASES.items():
+        for alias in aliases:
+            if _norm(alias) in raw_headers:
+                headers[canonical] = raw_headers[_norm(alias)]
+                break
+    if "stock" not in headers:
+        stock_aliases = {_norm(alias) for alias in HEADER_ALIASES["stock"]}
+        for raw_header, column in raw_headers.items():
+            if _stock_header_base(raw_header) in stock_aliases:
+                headers["stock"] = column
+                break
+    if not headers:
+        raise ValueError("CSV header row is not recognized")
+    rows: list[dict] = []
+    for row_number, values in enumerate(raw_rows[header_index + 1 :], start=header_index + 2):
+        row = {
+            key: values[column] if column < len(values) else None
+            for key, column in headers.items()
+        }
+        if not any(value not in (None, "") for value in row.values()):
+            continue
+        row["_row"] = row_number
+        rows.append(row)
+    return rows, set(headers)
+
+
+def parse_reference_rows(content: bytes, filename: str) -> tuple[list[dict], set[str]]:
+    if str(filename or "").lower().endswith(".csv"):
+        return parse_csv_rows(content)
+    return parse_excel_rows(content)

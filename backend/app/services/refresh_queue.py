@@ -6,14 +6,14 @@ import os
 import socket
 import sys
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Iterable
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ..models import RefreshJob, RefreshLock
+from ..models import RefreshJob, RefreshLock, SapBalanceScheduledRun
 from .db_time import db_now
 from .emit_worker import LOCK_NAME as EMIT_REFRESH_LOCK_NAME
 from .emit_worker import cleanup_stale_emit_temp_files, EmitConfig
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 QUEUED_STATUS = "queued"
 RUNNING_STATUS = "running"
-PARSER_QUEUE_SOURCES = ("provisor", "emit", "vidman")
+PARSER_QUEUE_SOURCES = ("provisor", "emit", "vidman", "sap")
 ACTIVE_QUEUE_STATUSES = ("queued", "pending", "running", "downloading", "parsing", "normalizing", "saving", "stale")
 EXECUTING_STATUSES = ("pending", "running", "downloading", "parsing", "normalizing", "saving", "stale")
 TERMINAL_STATUSES = ("success", "failed", "error", "interrupted", "cancelled", "skipped", "partial_success")
@@ -162,6 +162,137 @@ def create_queued_emit_refresh_job(
         db.refresh(job)
     else:
         db.flush()
+    return job
+
+
+def create_queued_sap_balance_job(
+    db: Session,
+    *,
+    plants: list[str],
+    effective_date: str,
+    requested_by: str,
+    force_manual_override: bool = False,
+) -> RefreshJob:
+    now = db_now(db)
+    normalized_plants = list(dict.fromkeys(str(value).strip() for value in plants if str(value).strip()))
+    job = RefreshJob(
+        source_type="sap",
+        mode="stock",
+        status=QUEUED_STATUS,
+        started_at=now,
+        heartbeat_at=now,
+        requested_by=requested_by,
+        total_plk=len(normalized_plants),
+        message="SAP GetBalance stock refresh queued.",
+        metadata_json=_metadata_with_queue_fields(
+            {
+                "plants": normalized_plants,
+                "effective_date": effective_date,
+                "force_manual_override": bool(force_manual_override),
+            },
+            queue_kind="sap_balance",
+            requested_by=requested_by,
+        ),
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    return job
+
+
+def create_scheduled_sap_balance_job(
+    db: Session,
+    *,
+    plant_branches: list[tuple[str, str]],
+    business_date: date,
+    requested_by: str = "scheduler",
+) -> RefreshJob | None:
+    """Atomically reserve and enqueue the not-yet-scheduled branches for a date.
+
+    Manual retries intentionally use ``create_queued_sap_balance_job`` and do not
+    participate in these once-per-date reservations.
+    """
+    normalized: list[tuple[str, str]] = []
+    seen_plants: set[str] = set()
+    seen_branches: set[str] = set()
+    for raw_plant, raw_branch in plant_branches:
+        plant = str(raw_plant or "").strip()
+        branch_id = str(raw_branch or "").strip()
+        if not plant or not branch_id:
+            raise ValueError("Scheduled SAP targets require non-empty plant and branch IDs")
+        if plant in seen_plants or branch_id in seen_branches:
+            raise ValueError("Scheduled SAP targets must have a one-to-one plant/branch mapping")
+        seen_plants.add(plant)
+        seen_branches.add(branch_id)
+        normalized.append((plant, branch_id))
+    if not normalized:
+        raise ValueError("At least one scheduled SAP target is required")
+
+    # The lease prevents duplicate APScheduler ownership; this transaction lock
+    # is the final enqueue guard during lease handover or manual invocation.
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        db.execute(text("SELECT pg_advisory_xact_lock(hashtext('sap_balance_scheduled_enqueue'))"))
+
+    existing_rows = db.execute(
+        select(SapBalanceScheduledRun.branch_id, SapBalanceScheduledRun.plant).where(
+            SapBalanceScheduledRun.business_date == business_date
+        )
+    ).all()
+    existing_by_branch = {str(row.branch_id): str(row.plant) for row in existing_rows}
+    existing_by_plant = {str(row.plant): str(row.branch_id) for row in existing_rows}
+    for plant, branch_id in normalized:
+        if branch_id in existing_by_branch and existing_by_branch[branch_id] != plant:
+            raise ValueError("Scheduled SAP branch mapping changed after reservation")
+        if plant in existing_by_plant and existing_by_plant[plant] != branch_id:
+            raise ValueError("Scheduled SAP plant mapping changed after reservation")
+    missing = [
+        (plant, branch_id)
+        for plant, branch_id in normalized
+        if branch_id not in existing_by_branch and plant not in existing_by_plant
+    ]
+    if not missing:
+        db.commit()
+        return None
+
+    now = db_now(db)
+    plants = [plant for plant, _branch_id in missing]
+    job = RefreshJob(
+        source_type="sap",
+        mode="stock",
+        status=QUEUED_STATUS,
+        started_at=now,
+        heartbeat_at=now,
+        requested_by=requested_by,
+        total_plk=len(plants),
+        message="Scheduled SAP GetBalance stock refresh queued.",
+        metadata_json=_metadata_with_queue_fields(
+            {
+                "plants": plants,
+                "effective_date": business_date.isoformat(),
+                "force_manual_override": False,
+                "scheduled": True,
+                "scheduled_business_date": business_date.isoformat(),
+            },
+            queue_kind="sap_balance",
+            requested_by=requested_by,
+        ),
+    )
+    db.add(job)
+    db.flush()
+    db.add_all(
+        [
+            SapBalanceScheduledRun(
+                business_date=business_date,
+                branch_id=branch_id,
+                plant=plant,
+                refresh_job_id=int(job.id),
+                created_at=now,
+            )
+            for plant, branch_id in missing
+        ]
+    )
+    db.commit()
+    db.refresh(job)
     return job
 
 

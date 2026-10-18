@@ -25,6 +25,7 @@ from ...models import (
     ProductExtra,
     ProductRating,
     ReferenceImportJob,
+    ReferenceUpdateStatus,
     UniversalList,
     UniversalListPriceFormat,
 )
@@ -240,10 +241,12 @@ def _reference_versions_snapshot(db: Session, branch_id: str) -> dict:
 
     latest_jobs = {}
     for data_type in ("stock", "cost", "rating_global", "rating_local", "products"):
+        branch_token = f'"{branch_id}"'
         row = (
             db.execute(
                 select(ReferenceImportJob)
                 .where(ReferenceImportJob.data_type == data_type)
+                .where(ReferenceImportJob.branch_ids_json.like(f"%{branch_token}%"))
                 .order_by(ReferenceImportJob.finished_at.desc(), ReferenceImportJob.created_at.desc(), ReferenceImportJob.id.desc())
                 .limit(1)
             )
@@ -259,6 +262,11 @@ def _reference_versions_snapshot(db: Session, branch_id: str) -> dict:
             "createdAt": row.created_at,
             "finishedAt": row.finished_at,
         } if row else None
+    stock_status = db.execute(
+        select(ReferenceUpdateStatus)
+        .where(ReferenceUpdateStatus.branch_id == branch_id)
+        .where(ReferenceUpdateStatus.data_type == "stock")
+    ).scalars().first()
     return {
         "branchId": branch_id,
         "capturedAt": now_kz_naive(),
@@ -271,6 +279,13 @@ def _reference_versions_snapshot(db: Session, branch_id: str) -> dict:
             "localRatingRows": count(ProductRating, ProductRating.branch_id == branch_id, ProductRating.rating_type == "local"),
         },
         "latestImportJobs": latest_jobs,
+        "stockSnapshot": {
+            "snapshotId": stock_status.active_stock_snapshot_id,
+            "sourceType": stock_status.active_source_type or "",
+            "effectiveDate": stock_status.stock_effective_date,
+            "publishedAt": stock_status.last_success_at or stock_status.last_updated_at,
+            "productCount": stock_status.active_snapshot_product_count,
+        } if stock_status else None,
     }
 
 

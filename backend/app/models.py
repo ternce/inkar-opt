@@ -1754,6 +1754,25 @@ class RefreshJob(Base):
     )
 
 
+class SapBalanceScheduledRun(Base):
+    """Durable reservation for one scheduled SAP branch refresh."""
+
+    __tablename__ = "sap_balance_scheduled_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    business_date: Mapped[date] = mapped_column(Date, nullable=False)
+    branch_id: Mapped[str] = mapped_column(Text, nullable=False)
+    plant: Mapped[str] = mapped_column(String(16), nullable=False)
+    refresh_job_id: Mapped[int] = mapped_column(ForeignKey("refresh_jobs.id"), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("business_date", "branch_id", name="uq_sap_scheduled_run_date_branch"),
+        UniqueConstraint("business_date", "plant", name="uq_sap_scheduled_run_date_plant"),
+        Index("ix_sap_scheduled_runs_date", "business_date"),
+    )
+
+
 class ParserDailyRun(Base):
     __tablename__ = "parser_daily_runs"
 
@@ -2146,6 +2165,14 @@ class ReferenceUpdateStatus(Base):
     current_import_finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_successful_import_job_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     active_snapshot_product_count: Mapped[int] = mapped_column(Integer, default=0)
+    active_stock_snapshot_id: Mapped[int | None] = mapped_column(
+        ForeignKey("stock_snapshots.id"), nullable=True, index=True
+    )
+    active_source_type: Mapped[str] = mapped_column(String(32), default="")
+    stock_effective_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_failure_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_failure_reason: Mapped[str] = mapped_column(Text, default="")
 
     __table_args__ = (
         UniqueConstraint("branch_id", "data_type", name="uq_reference_update_branch_type"),
@@ -2162,6 +2189,7 @@ class BranchStock(Base):
     sku: Mapped[str] = mapped_column(Text, index=True)
     stock: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
     source_type: Mapped[str] = mapped_column(String(32), default="excel")
+    snapshot_id: Mapped[int | None] = mapped_column(ForeignKey("stock_snapshots.id"), nullable=True, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
 
     __table_args__ = (
@@ -2173,6 +2201,47 @@ class BranchStock(Base):
             postgresql_where=text("stock > 0"),
             sqlite_where=text("stock > 0"),
         ),
+    )
+
+
+class StockSnapshot(Base):
+    __tablename__ = "stock_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    branch_id: Mapped[str] = mapped_column(Text, index=True)
+    source_type: Mapped[str] = mapped_column(String(32), index=True)
+    sap_plant: Mapped[str] = mapped_column(String(16), default="")
+    lgort: Mapped[str] = mapped_column(String(16), default="")
+    effective_date: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="staged", index=True)
+    item_count: Mapped[int] = mapped_column(Integer, default=0)
+    mapped_product_count: Mapped[int] = mapped_column(Integer, default=0)
+    content_fingerprint: Mapped[str] = mapped_column(String(64), default="", index=True)
+    import_job_id: Mapped[int | None] = mapped_column(ForeignKey("reference_import_jobs.id"), nullable=True, index=True)
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_stock_snapshots_branch_status", "branch_id", "status", "published_at"),
+    )
+
+
+class StockSnapshotItem(Base):
+    __tablename__ = "stock_snapshot_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    snapshot_id: Mapped[int] = mapped_column(ForeignKey("stock_snapshots.id"), index=True)
+    ordinal: Mapped[int] = mapped_column(Integer)
+    material: Mapped[str] = mapped_column(Text)
+    normalized_sku: Mapped[str] = mapped_column(Text, index=True)
+    product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id"), nullable=True, index=True)
+    quantity: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    raw_json: Mapped[str] = mapped_column(Text, default="{}")
+
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "ordinal", name="uq_stock_snapshot_item_ordinal"),
+        Index("ix_stock_snapshot_items_snapshot_product", "snapshot_id", "product_id"),
     )
 
 

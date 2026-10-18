@@ -62,6 +62,8 @@ from .models import (
     BendRange,
     BranchCost,
     BranchStock,
+    StockSnapshot,
+    StockSnapshotItem,
     Job,
     PriceSourceAccount,
     ParserDailyRun,
@@ -338,6 +340,8 @@ from .services.references.sources import ReferenceFilePayload, make_reference_so
 from .services.references.statuses import import_job_to_dict, list_reference_imports, list_reference_statuses, reference_readiness_matrix
 from .services.references.templates import build_reference_template, reference_template_filename
 from .services.references.types import BRANCHES, REFERENCE_TYPES, USER_SELECTABLE_BRANCHES, branch_display_name, canonical_branch_id
+from .services.references.sap_balance import SAP_PLANTS, branch_id_for_plant, configured_branch_map, fetch_balance
+from .services.references.stock_snapshots import import_sap_balance_payload, record_sap_import_failure
 from .services.regions import canonical_supported_city_name
 from .services.pricing_workflow.analytics import analytics_for_run, build_workflow_analytics
 from .services.pricing_workflow.contexts import list_contexts
@@ -368,9 +372,11 @@ from .services.provisor_auto_refresh import (
     normalize_mode as normalize_refresh_mode,
     new_owner_token as new_refresh_owner_token,
     release_emit_scheduler_lock,
+    release_sap_scheduler_lock,
     release_lock,
     release_scheduler_lock,
     renew_emit_scheduler_lock,
+    renew_sap_scheduler_lock,
     renew_global_refresh_lock,
     renew_scheduler_lock,
     refresh_job_to_status,
@@ -380,6 +386,7 @@ from .services.provisor_auto_refresh import (
     start_job as start_refresh_job,
     target_counts as refresh_target_counts,
     try_acquire_emit_scheduler_lock,
+    try_acquire_sap_scheduler_lock,
     try_acquire_global_refresh_lock,
     try_acquire_scheduler_lock,
     try_create_refresh_job,
@@ -404,6 +411,8 @@ from .services.refresh_queue import (
     create_queued_emit_refresh_job,
     create_queued_price_format_refresh_job,
     create_queued_provisor_auto_refresh_job,
+    create_queued_sap_balance_job,
+    create_scheduled_sap_balance_job,
     recover_expired_orphan_locks,
     recover_stale_parser_jobs,
 )
@@ -433,6 +442,9 @@ _emit_refresh_scheduler = None
 _emit_refresh_scheduler_token: str | None = None
 _emit_refresh_scheduler_renew_task = None
 _parser_daily_scheduler = None
+_sap_balance_scheduler = None
+_sap_balance_scheduler_token: str | None = None
+_sap_balance_scheduler_renew_task = None
 _emit_worker: EmitWorker | None = None
 
 
@@ -1046,6 +1058,7 @@ def _worker_startup() -> None:
         _start_provisor_auto_refresh_scheduler()
         _start_emit_refresh_scheduler()
         _start_parser_daily_scheduler()
+        _start_sap_balance_scheduler()
     except Exception:
         import traceback
 
@@ -1055,6 +1068,7 @@ def _worker_startup() -> None:
 
 
 def _worker_shutdown() -> None:
+    _shutdown_sap_balance_scheduler()
     _shutdown_parser_daily_scheduler()
     _shutdown_provisor_auto_refresh_scheduler()
     _shutdown_emit_refresh_scheduler()
@@ -1370,6 +1384,120 @@ def _shutdown_parser_daily_scheduler() -> None:
     logger.info("[PARSER_DAILY_SCHEDULER] scheduler_shutdown")
 
 
+async def _queue_scheduled_sap_balance() -> None:
+    if not settings.sap_balance_enabled or not settings.sap_balance_schedule_enabled:
+        return
+    business_date = current_business_date(settings, now=_parser_daily_local_now())
+    plant_branches = [(row.plant, branch_id_for_plant(settings, row.plant)) for row in SAP_PLANTS]
+    with SessionLocal() as db:
+        job = create_scheduled_sap_balance_job(
+            db,
+            plant_branches=plant_branches,
+            business_date=business_date,
+            requested_by="scheduler",
+        )
+    logger.info(
+        "[SAP_BALANCE_SCHEDULER] enqueue_result=%s business_date=%s job_id=%s branches=%s",
+        "queued" if job is not None else "already_reserved",
+        business_date.isoformat(),
+        getattr(job, "id", None),
+        len(plant_branches),
+    )
+
+
+def _start_sap_balance_scheduler() -> None:
+    global _sap_balance_scheduler, _sap_balance_scheduler_token, _sap_balance_scheduler_renew_task
+    if not settings.sap_balance_enabled or not settings.sap_balance_schedule_enabled:
+        logger.info("[SAP_BALANCE_SCHEDULER] enabled=false")
+        return
+    if _process_role() != "worker" or _sap_balance_scheduler is not None:
+        return
+    owner_token = new_refresh_owner_token()
+    with SessionLocal() as db:
+        if not try_acquire_sap_scheduler_lock(db, owner_token=owner_token):
+            logger.info("[SAP_BALANCE_SCHEDULER] registration=skipped reason=lease_owned")
+            return
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        from apscheduler.triggers.cron import CronTrigger
+
+        scheduler = AsyncIOScheduler(timezone=settings.app_timezone)
+        scheduler.add_job(
+            _queue_scheduled_sap_balance,
+            trigger=CronTrigger.from_crontab(settings.sap_balance_cron, timezone=settings.app_timezone),
+            id="sap_balance_daily",
+            name="SAP GetBalance daily stock refresh",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
+            replace_existing=True,
+        )
+        scheduler.start()
+    except Exception:
+        with SessionLocal() as db:
+            release_sap_scheduler_lock(db, owner_token=owner_token)
+        logger.exception("[SAP_BALANCE_SCHEDULER] setup_failed lease_released=true")
+        return
+    _sap_balance_scheduler = scheduler
+    _sap_balance_scheduler_token = owner_token
+    try:
+        _sap_balance_scheduler_renew_task = _create_task_on_running_loop(_renew_sap_scheduler_ownership, owner_token)
+    except RuntimeError:
+        scheduler.shutdown(wait=False)
+        _sap_balance_scheduler = None
+        _sap_balance_scheduler_token = None
+        with SessionLocal() as db:
+            release_sap_scheduler_lock(db, owner_token=owner_token)
+        logger.error("[SAP_BALANCE_SCHEDULER] setup_failed reason=no_running_event_loop lease_released=true")
+        return
+    local_now = _parser_daily_local_now()
+    if _latest_parser_daily_fire_today(trigger, now=local_now) is not None:
+        _create_task_on_running_loop(_queue_scheduled_sap_balance)
+        logger.info(
+            "[SAP_BALANCE_SCHEDULER] startup_catchup=queued business_date=%s",
+            current_business_date(settings, now=local_now).isoformat(),
+        )
+    logger.info(
+        "[SAP_BALANCE_SCHEDULER] enabled=true cron=%s timezone=%s owner=%s",
+        settings.sap_balance_cron,
+        settings.app_timezone,
+        owner_token,
+    )
+
+
+async def _renew_sap_scheduler_ownership(owner_token: str) -> None:
+    global _sap_balance_scheduler, _sap_balance_scheduler_token, _sap_balance_scheduler_renew_task
+    while True:
+        await asyncio.sleep(30)
+        with SessionLocal() as db:
+            renewed = renew_sap_scheduler_lock(db, owner_token=owner_token)
+        if renewed:
+            continue
+        logger.error("[SAP_BALANCE_SCHEDULER] lease_lost owner=%s", owner_token)
+        scheduler = _sap_balance_scheduler
+        if scheduler is not None:
+            scheduler.shutdown(wait=False)
+            _sap_balance_scheduler = None
+        if _sap_balance_scheduler_token == owner_token:
+            _sap_balance_scheduler_token = None
+        _sap_balance_scheduler_renew_task = None
+        return
+
+
+def _shutdown_sap_balance_scheduler() -> None:
+    global _sap_balance_scheduler, _sap_balance_scheduler_token, _sap_balance_scheduler_renew_task
+    if _sap_balance_scheduler_renew_task is not None:
+        _sap_balance_scheduler_renew_task.cancel()
+        _sap_balance_scheduler_renew_task = None
+    if _sap_balance_scheduler is not None:
+        _sap_balance_scheduler.shutdown(wait=False)
+        _sap_balance_scheduler = None
+    if _sap_balance_scheduler_token:
+        with SessionLocal() as db:
+            release_sap_scheduler_lock(db, owner_token=_sap_balance_scheduler_token)
+        _sap_balance_scheduler_token = None
+
+
 async def _run_scheduled_provisor_refresh(*, mode: str) -> None:
     started_at = time.perf_counter()
     loop_running, loop_id = _scheduler_loop_info()
@@ -1673,6 +1801,99 @@ async def _run_queued_price_format_refresh_job(job_id: int, *, owner_token: str)
         db.close()
 
 
+async def _run_queued_sap_balance_job(job_id: int, *, owner_token: str) -> None:
+    db = SessionLocal()
+    heartbeat_task = None
+    try:
+        job = db.get(RefreshJob, job_id)
+        if job is None:
+            return
+        metadata = json.loads(job.metadata_json or "{}")
+        plants = [str(value) for value in metadata.get("plants", [])]
+        effective_date = date.fromisoformat(str(metadata.get("effective_date") or now_kz_naive().date().isoformat()))
+        force = bool(metadata.get("force_manual_override"))
+        successes = 0
+        failures: list[dict[str, str]] = []
+
+        async def beat() -> None:
+            while True:
+                await asyncio.sleep(30)
+                with SessionLocal() as heartbeat_db:
+                    current = heartbeat_db.get(RefreshJob, job_id)
+                    if current is None or refresh_job_owner_token(current) != owner_token:
+                        return
+                    if not renew_global_refresh_lock(heartbeat_db, owner_token=owner_token):
+                        return
+                    current.heartbeat_at = now_kz_naive()
+                    heartbeat_db.commit()
+
+        heartbeat_task = asyncio.create_task(beat())
+        for plant in plants:
+            branch_id = ""
+            failure_audited = False
+            try:
+                branch_id = branch_id_for_plant(settings, plant)
+                payload = await fetch_balance(
+                    settings,
+                    plant=plant,
+                    date_from=effective_date,
+                    date_to=effective_date,
+                )
+                imported = import_sap_balance_payload(
+                    db,
+                    branch_id=branch_id,
+                    payload=payload,
+                    user_name=str(job.requested_by or "SAP scheduler"),
+                    manual_precedence_hours=settings.sap_manual_precedence_hours,
+                    force=force,
+                )
+                if imported.status != "success":
+                    failure_audited = True
+                    raise ValueError(imported.error or "SAP stock publication failed")
+                successes += 1
+            except Exception as exc:
+                db.rollback()
+                failures.append({"plant": plant, "error": str(exc)})
+                if branch_id and not failure_audited:
+                    record_sap_import_failure(
+                        db,
+                        branch_id=branch_id,
+                        plant=plant,
+                        effective_date=effective_date,
+                        user_name=str(job.requested_by or "SAP scheduler"),
+                        error=str(exc),
+                    )
+                logger.exception("[SAP_BALANCE] plant=%s refresh_failed", plant)
+            job = db.get(RefreshJob, job_id)
+            if job is None or refresh_job_owner_token(job) != owner_token:
+                raise RuntimeError("SAP refresh job ownership was lost")
+            job.processed_plk = successes + len(failures)
+            job.success_count = successes
+            job.failed_count = len(failures)
+            job.heartbeat_at = now_kz_naive()
+            job.message = f"SAP GetBalance processed {job.processed_plk}/{len(plants)} plants."
+            renew_global_refresh_lock(db, owner_token=owner_token)
+            db.commit()
+        job = db.get(RefreshJob, job_id)
+        if job is not None:
+            finish_refresh_job(
+                db,
+                job,
+                status="success" if not failures else "partial_success" if successes else "failed",
+                message=f"SAP GetBalance completed: {successes} successful, {len(failures)} failed.",
+                error=json.dumps(failures, ensure_ascii=False),
+                metadata={"failures": failures, "current_stage": "completed"},
+                owner_token=owner_token,
+                allowed_statuses={"running"},
+                release_refresh=False,
+                release_global=True,
+            )
+    finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+        db.close()
+
+
 async def _execute_claimed_refresh_job(job_id: int, *, owner_token: str) -> None:
     with SessionLocal() as db:
         job = db.get(RefreshJob, job_id)
@@ -1690,6 +1911,9 @@ async def _execute_claimed_refresh_job(job_id: int, *, owner_token: str) -> None
     try:
         if source_type == "emit":
             await _emit_worker_instance().run_job(job_id, owner_token=owner_token)
+            return
+        if source_type == "sap" and queue_kind == "sap_balance":
+            await _run_queued_sap_balance_job(job_id, owner_token=owner_token)
             return
         if queue_kind == "price_format_refresh":
             await _run_queued_price_format_refresh_job(job_id, owner_token=owner_token)
@@ -1882,6 +2106,23 @@ def _generated_price_export_rows(
         ).scalars().all()
     )
     products = [row for row in products if str(row.get("sku") or "") in calculated_skus]
+    product_id_by_sku = {
+        str(code): int(product_id)
+        for product_id, code in db.execute(select(Product.id, Product.code).where(Product.code.in_(calculated_skus))).all()
+    }
+    stock_by_product = _stock_quantities_for_price_list(
+        db,
+        pl=pl,
+        pf=pf,
+        product_ids=list(product_id_by_sku.values()),
+    )
+    for product_row in products:
+        product_id = product_id_by_sku.get(str(product_row.get("sku") or ""))
+        product_row["stock"] = (
+            float(stock_by_product[product_id])
+            if product_id is not None and stock_by_product.get(product_id) is not None
+            else None
+        )
     calculated_by_sku = {
         str(product.code): cp
         for cp, product in db.execute(
@@ -1908,6 +2149,69 @@ def _generated_price_export_rows(
         top_sort=top_sort,
     )
     return pl, pf, products, competitor_columns
+
+
+def _stock_snapshot_id_from_price_list(pl: PriceList) -> int | None:
+    for raw in (pl.run_reference_versions_json, pl.run_snapshot_json):
+        try:
+            payload = json.loads(raw or "{}")
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        reconciliation = payload.get("generationReconciliation")
+        if not isinstance(reconciliation, dict):
+            reconciliation = (payload.get("runReferenceVersions") or {}).get("generationReconciliation") if isinstance(payload.get("runReferenceVersions"), dict) else {}
+        value = reconciliation.get("stock_snapshot_id") if isinstance(reconciliation, dict) else None
+        if value not in (None, ""):
+            return int(value)
+    return None
+
+
+def _stock_quantities_for_price_list(
+    db: Session,
+    *,
+    pl: PriceList,
+    pf: PriceFormat,
+    product_ids: list[int],
+) -> dict[int, Decimal | None]:
+    if not product_ids:
+        return {}
+    snapshot_id = _stock_snapshot_id_from_price_list(pl)
+    if snapshot_id is not None:
+        snapshot = db.get(StockSnapshot, snapshot_id)
+        expected_branch_id = reference_branch_id_for_price_format(pf)
+        if (
+            snapshot is None
+            or snapshot.status not in {"active", "superseded"}
+            or str(snapshot.branch_id) != str(expected_branch_id)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="stock snapshot provenance does not match generated price-list branch",
+            )
+        rows = db.execute(
+            select(StockSnapshotItem.product_id, StockSnapshotItem.quantity)
+            .where(StockSnapshotItem.snapshot_id == snapshot_id)
+            .where(StockSnapshotItem.product_id.in_(product_ids))
+        ).all()
+    else:
+        branch_id = reference_branch_id_for_price_format(pf)
+        rows = db.execute(
+            select(BranchStock.product_id, BranchStock.stock)
+            .where(BranchStock.branch_id == branch_id)
+            .where(BranchStock.product_id.in_(product_ids))
+        ).all()
+    result: dict[int, Decimal | None] = {}
+    for product_id, quantity in rows:
+        key = int(product_id)
+        if key in result:
+            raise HTTPException(status_code=409, detail="ambiguous stock snapshot product mapping")
+        result[key] = Decimal(str(quantity)) if quantity is not None else None
+    missing = set(product_ids) - set(result)
+    if snapshot_id is not None and missing:
+        raise HTTPException(status_code=409, detail="stock snapshot provenance is incomplete for generated price list")
+    return result
 
 
 def _frontend_dist_dir() -> Path | None:
@@ -4116,6 +4420,7 @@ def _generated_item_dict(
     pf: PriceFormat,
     extra: ProductExtra | None,
     ratings: dict[str, int | None] | None = None,
+    branch_stock: Decimal | None | object = Ellipsis,
 ) -> dict:
     cost = float(cp.cost or 0)
     final = float(cp.final_price or 0)
@@ -4154,7 +4459,12 @@ def _generated_item_dict(
         "global_rating": global_rating,
         "local_rating": local_rating,
         "manufacturer": extra.manufacturer if extra else "",
-        "stock": float(extra.stock) if extra and extra.stock is not None else None,
+        "stock": (
+            float(branch_stock) if branch_stock is not Ellipsis and branch_stock is not None
+            else None if branch_stock is not Ellipsis
+            else float(extra.stock) if extra and extra.stock is not None
+            else None
+        ),
         "cost": cost,
         "basePrice": float(cp.base_price or 0),
         "mdc": float(cp.base_price or 0),
@@ -4529,10 +4839,12 @@ def get_generated_price_list_items(
     } if rows else {}
     competitor_columns = _competitor_columns_for_price_list(db, pl, pf)
     competitor_prices = _competitor_prices_by_product(db, pf=pf, product_ids=product_ids, columns=competitor_columns)
+    stock_by_product = _stock_quantities_for_price_list(db, pl=pl, pf=pf, product_ids=product_ids)
     items = []
     for cp, product in rows:
         item = _generated_item_dict(
-            db, cp, product, pf, extras.get(product.id), ratings_by_product.get(int(product.id), {})
+            db, cp, product, pf, extras.get(product.id), ratings_by_product.get(int(product.id), {}),
+            stock_by_product.get(int(product.id)),
         )
         item["competitorPrices"] = competitor_prices.get(int(product.id), {})
         items.append(item)
@@ -8610,6 +8922,87 @@ def get_reference_branches(current_user: AppUser = Depends(get_current_user)):
         for row in USER_SELECTABLE_BRANCHES
         if str(row["id"]) in ids or user_can_access_branch(current_user, str(row["id"]), str(row["name"]))
     ]
+
+
+@app.get("/api/references/sap/plants")
+def get_reference_sap_plants(current_user: AppUser = Depends(get_current_user)):
+    branch_map = configured_branch_map(settings)
+    return [
+        {
+            "plant": row.plant,
+            "name": row.name,
+            "branchId": branch_map.get(row.plant, ""),
+            "lgort": "1000",
+            "enabled": bool(settings.sap_balance_enabled),
+        }
+        for row in SAP_PLANTS
+        if can_see_all_branches(current_user)
+        or user_can_access_branch(current_user, branch_map.get(row.plant, ""), row.name)
+    ]
+
+
+@app.post("/api/references/sap/refresh")
+async def post_reference_sap_refresh(
+    plant: str = Query(..., min_length=4, max_length=4),
+    effective_date: date | None = Query(None),
+    force_manual_override: bool = Query(False),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_write_access),
+):
+    if not settings.sap_balance_enabled:
+        raise HTTPException(status_code=503, detail="SAP GetBalance integration is disabled")
+    try:
+        branch_id = branch_id_for_plant(settings, plant)
+        _ensure_reference_branch_access(current_user, branch_id)
+        balance_date = effective_date or now_kz_naive().date()
+        active = active_parser_refresh_job(db, sources=("sap",))
+        if active is not None:
+            raise HTTPException(status_code=409, detail="SAP GetBalance refresh is already queued or running")
+        job = create_queued_sap_balance_job(
+            db,
+            plants=[plant],
+            effective_date=balance_date.isoformat(),
+            requested_by=current_user.username or "SAP manual refresh",
+            force_manual_override=force_manual_override,
+        )
+        return refresh_job_to_status(job)
+    except HTTPException:
+        raise
+    except (ValueError, httpx.HTTPError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.get("/api/references/sap/status")
+def get_reference_sap_status(
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    rows = db.execute(
+        select(RefreshJob)
+        .where(RefreshJob.source_type == "sap")
+        .order_by(RefreshJob.id.desc())
+        .limit(limit)
+    ).scalars().all()
+    branch_map = configured_branch_map(settings)
+    result = []
+    for row in rows:
+        try:
+            metadata = json.loads(row.metadata_json or "{}")
+        except Exception:
+            metadata = {}
+        plants = [str(value) for value in metadata.get("plants", [])] if isinstance(metadata, dict) else []
+        if not can_see_all_branches(current_user) and not any(
+            user_can_access_branch(
+                current_user,
+                branch_map.get(plant, ""),
+                next((item.name for item in SAP_PLANTS if item.plant == plant), ""),
+            )
+            for plant in plants
+        ):
+            continue
+        result.append(refresh_job_to_status(row))
+    return result
 
 
 @app.get("/api/references/status")
@@ -13479,7 +13872,7 @@ def export_price_list_csv(
     return StreamingResponse(
         iter([buffer.getvalue()]),
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f"attachment; filename=\"{filename}\""},
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
     )
 
 
@@ -13547,7 +13940,7 @@ def export_price_list_xlsx(
     return StreamingResponse(
         iter([bio.getvalue()]),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename=\"{filename}\""},
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
     )
 
 

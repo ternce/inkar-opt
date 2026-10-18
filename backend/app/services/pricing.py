@@ -196,7 +196,11 @@ class SelectedSourceMeta:
 class StockGenerationSnapshot:
     branch_id: str
     product_ids: set[int]
+    quantity_by_product_id: dict[int, Decimal | None]
     cost_by_product_id: dict[int, Decimal]
+    snapshot_id: int | None
+    source_type: str
+    effective_date: date | None
     reconciliation: dict
 
 
@@ -259,15 +263,26 @@ def _load_stock_generation_snapshot(db: Session, branch_id: str) -> StockGenerat
     stock_status = _successful_reference_status(db, "stock", branch_id)
     stock_rows = (
         db.execute(
-            select(BranchStock.product_id, BranchStock.sku)
+            select(BranchStock.product_id, BranchStock.sku, BranchStock.stock, BranchStock.snapshot_id)
             .where(BranchStock.branch_id == branch_id)
             .where(BranchStock.product_id.is_not(None))
         )
         .all()
     )
-    product_ids = {int(product_id) for product_id, _sku in stock_rows if product_id is not None}
+    product_ids = {int(product_id) for product_id, _sku, _stock, _snapshot_id in stock_rows if product_id is not None}
     if stock_status is None or not product_ids:
         raise ValueError(MISSING_STOCK_REFERENCE_ERROR)
+    snapshot_ids = {int(snapshot_id) for _product_id, _sku, _stock, snapshot_id in stock_rows if snapshot_id is not None}
+    if len(snapshot_ids) > 1:
+        raise ValueError("active branch stock mixes multiple snapshots")
+    active_snapshot_id = int(stock_status.active_stock_snapshot_id) if stock_status.active_stock_snapshot_id else None
+    if active_snapshot_id is not None and snapshot_ids != {active_snapshot_id}:
+        raise ValueError("active branch stock does not match mandatory snapshot provenance")
+    quantity_by_product_id = {
+        int(product_id): (_as_decimal(stock) if stock is not None else None)
+        for product_id, _sku, stock, _snapshot_id in stock_rows
+        if product_id is not None
+    }
 
     cost_status = _successful_reference_status(db, "cost", branch_id)
     cost_rows = []
@@ -291,7 +306,7 @@ def _load_stock_generation_snapshot(db: Session, branch_id: str) -> StockGenerat
     expires_at = uploaded_at + timedelta(hours=24) if uploaded_at else None
     stock_file_rows = int(stock_job.rows_total if stock_job is not None else stock_status.rows_count or len(stock_rows) or 0)
     invalid_stock_skus = int(stock_job.rows_failed if stock_job is not None else 0)
-    stock_distinct_skus = len({str(sku or "").strip() for _product_id, sku in stock_rows if str(sku or "").strip()})
+    stock_distinct_skus = len({str(sku or "").strip() for _product_id, sku, _stock, _snapshot_id in stock_rows if str(sku or "").strip()})
     duplicate_stock_skus = max(0, stock_file_rows - invalid_stock_skus - stock_distinct_skus)
     products_with_cost = len(product_ids & set(cost_by_product_id))
     reconciliation = {
@@ -307,11 +322,18 @@ def _load_stock_generation_snapshot(db: Session, branch_id: str) -> StockGenerat
         "excluded_by_universal_lists": 0,
         "stale_calculated_rows_removed": 0,
         "calculated_rows": 0,
+        "stock_snapshot_id": active_snapshot_id,
+        "stock_source_type": stock_status.active_source_type or "legacy",
+        "stock_effective_date": stock_status.stock_effective_date.isoformat() if stock_status.stock_effective_date else "",
     }
     return StockGenerationSnapshot(
         branch_id=branch_id,
         product_ids=product_ids,
+        quantity_by_product_id=quantity_by_product_id,
         cost_by_product_id=cost_by_product_id,
+        snapshot_id=active_snapshot_id,
+        source_type=stock_status.active_source_type or "legacy",
+        effective_date=stock_status.stock_effective_date,
         reconciliation=reconciliation,
     )
 

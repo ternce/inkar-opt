@@ -37,6 +37,9 @@ def test_prod_worker_service_uses_worker_role_and_no_published_port():
     assert "PROCESS_ROLE: worker" in worker
     assert 'command: ["python", "-m", "app.worker"]' in worker
     assert "\n    ports:" not in worker
+    # Server 77 uses the authoritative DATABASE_URL on server 75; starting the
+    # worker must not implicitly start a competing local PostgreSQL container.
+    assert "depends_on:" not in worker
 
 
 def test_emit_tmp_volume_belongs_only_to_worker():
@@ -55,9 +58,19 @@ def test_web_and_worker_share_backend_image_and_db_dependency():
     assert "<<: *backend-image" in worker
     assert "<<: *backend-env" in web
     assert "<<: *backend-env" in worker
-    assert "DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-inkar}:${POSTGRES_PASSWORD:-CHANGE_ME}@db:5432/${POSTGRES_DB:-inkar_opt}}" in text
+    assert "DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set for production}" in text
     assert "condition: service_healthy" in web
-    assert "condition: service_healthy" in worker
+    assert "condition: service_healthy" not in worker
+
+
+def test_prod_worker_receives_disabled_by_default_sap_configuration():
+    text = _compose_text()
+    worker = _service_block("worker")
+    assert "<<: *backend-env" in worker
+    assert "SAP_BALANCE_ENABLED: ${SAP_BALANCE_ENABLED:-false}" in text
+    assert "SAP_BALANCE_SCHEDULE_ENABLED: ${SAP_BALANCE_SCHEDULE_ENABLED:-false}" in text
+    assert "SAP_BALANCE_BRANCH_MAP_JSON:" in text
+    assert "SAP_MANUAL_PRECEDENCE_HOURS:" in text
 
 
 def test_rollback_single_app_service_is_profile_gated_all_mode():

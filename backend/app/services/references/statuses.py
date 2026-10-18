@@ -40,6 +40,12 @@ def status_to_dict(row: ReferenceUpdateStatus) -> dict:
         "lastSuccessfulSnapshotId": row.last_successful_import_job_id,
         "lastSuccessfulImportAt": local_iso(row.last_updated_at) if row.last_updated_at else "",
         "activeSnapshotProductCount": row.active_snapshot_product_count or row.rows_count,
+        "activeStockSnapshotId": row.active_stock_snapshot_id,
+        "activeSource": (row.active_source_type or "").upper(),
+        "stockEffectiveDate": row.stock_effective_date.isoformat() if row.stock_effective_date else "",
+        "lastSuccessfulRefresh": local_iso(row.last_success_at) if row.last_success_at else "",
+        "lastFailedRefresh": local_iso(row.last_failure_at) if row.last_failure_at else "",
+        "lastFailureReason": row.last_failure_reason or "",
     }
 
 
@@ -69,6 +75,12 @@ def list_reference_statuses(*, db: Session) -> list[dict]:
                         "lastSuccessfulSnapshotId": None,
                         "lastSuccessfulImportAt": "",
                         "activeSnapshotProductCount": 0,
+                        "activeStockSnapshotId": None,
+                        "activeSource": "",
+                        "stockEffectiveDate": "",
+                        "lastSuccessfulRefresh": "",
+                        "lastFailedRefresh": "",
+                        "lastFailureReason": "",
                     },
                 )
             )
@@ -107,6 +119,12 @@ def reference_readiness_matrix(*, db: Session) -> dict:
                             "lastSuccessfulSnapshotId": None,
                             "lastSuccessfulImportAt": "",
                             "activeSnapshotProductCount": 0,
+                            "activeStockSnapshotId": None,
+                            "activeSource": "",
+                            "stockEffectiveDate": "",
+                            "lastSuccessfulRefresh": "",
+                            "lastFailedRefresh": "",
+                            "lastFailureReason": "",
                         },
                     )
                     for code in READINESS_COLUMNS

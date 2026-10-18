@@ -64,6 +64,16 @@ class Settings(BaseModel):
     vidman_price_base_url: str
     price_source_secret: str | None
     redis_url: str | None
+    sap_balance_enabled: bool
+    sap_balance_schedule_enabled: bool
+    sap_balance_base_url: str
+    sap_balance_username: str | None
+    sap_balance_password: str | None
+    sap_balance_company_code: str | None
+    sap_balance_cron: str
+    sap_balance_timeout_seconds: int
+    sap_balance_branch_map_json: str
+    sap_manual_precedence_hours: int
 
 
 @lru_cache
@@ -170,4 +180,16 @@ def get_settings() -> Settings:
         vidman_price_base_url=os.getenv("VIDMAN_PRICE_BASE_URL", "https://prv.kz"),
         price_source_secret=os.getenv("PRICE_SOURCE_SECRET"),
         redis_url=os.getenv("REDIS_URL"),
+        sap_balance_enabled=env_bool("SAP_BALANCE_ENABLED", False),
+        sap_balance_schedule_enabled=env_bool("SAP_BALANCE_SCHEDULE_ENABLED", False),
+        sap_balance_base_url=os.getenv(
+            "SAP_BALANCE_BASE_URL", "https://sap-piq.inkar.kz:53443/RESTAdapter/getBalance"
+        ).strip(),
+        sap_balance_username=os.getenv("SAP_BALANCE_USERNAME"),
+        sap_balance_password=os.getenv("SAP_BALANCE_PASSWORD"),
+        sap_balance_company_code=os.getenv("SAP_BALANCE_COMPANY_CODE"),
+        sap_balance_cron=os.getenv("SAP_BALANCE_CRON", "0 4 * * *").strip() or "0 4 * * *",
+        sap_balance_timeout_seconds=max(1, int(os.getenv("SAP_BALANCE_TIMEOUT_SECONDS", "120"))),
+        sap_balance_branch_map_json=os.getenv("SAP_BALANCE_BRANCH_MAP_JSON", "{}").strip() or "{}",
+        sap_manual_precedence_hours=max(0, int(os.getenv("SAP_MANUAL_PRECEDENCE_HOURS", "24"))),
     )

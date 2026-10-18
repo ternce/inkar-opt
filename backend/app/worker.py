@@ -6,8 +6,14 @@ import signal
 
 from .config import get_settings
 from .db import SessionLocal
-from .main import _execute_claimed_refresh_job, _worker_shutdown, _worker_startup
-from .services.refresh_queue import claim_next_queued_refresh_job, worker_identity
+from .main import _execute_claimed_refresh_job, _start_sap_balance_scheduler, _worker_shutdown, _worker_startup
+from .services.emit_worker import EmitConfig
+from .services.refresh_queue import (
+    claim_next_queued_refresh_job,
+    recover_expired_orphan_locks,
+    recover_stale_parser_jobs,
+    worker_identity,
+)
 from .services.parser_daily_orchestrator import advance_pending_daily_runs
 
 logger = logging.getLogger(__name__)
@@ -15,17 +21,33 @@ logger = logging.getLogger(__name__)
 
 async def _poll_refresh_queue(*, stop_event: asyncio.Event, worker_id: str, poll_interval: float) -> None:
     retry_delay = poll_interval
+    settings = get_settings()
+    recovery_interval = max(30.0, min(60.0, settings.parser_worker_stale_heartbeat_seconds / 3))
+    next_recovery_at = 0.0
     while not stop_event.is_set():
         claimed_id: int | None = None
         owner_token: str | None = None
         had_error = False
+        ensure_sap_scheduler = False
         try:
             with SessionLocal() as db:
+                loop_now = asyncio.get_running_loop().time()
+                if loop_now >= next_recovery_at:
+                    recover_stale_parser_jobs(
+                        db,
+                        stale_heartbeat_seconds=settings.parser_worker_stale_heartbeat_seconds,
+                        emit_config=EmitConfig.from_settings(settings),
+                    )
+                    recover_expired_orphan_locks(db)
+                    next_recovery_at = loop_now + recovery_interval
+                    ensure_sap_scheduler = True
                 advance_pending_daily_runs(db)
                 job, token = claim_next_queued_refresh_job(db, worker_id=worker_id)
                 if job is not None and token:
                     claimed_id = int(job.id)
                     owner_token = token
+            if ensure_sap_scheduler:
+                _start_sap_balance_scheduler()
             if claimed_id is not None and owner_token:
                 retry_delay = poll_interval
                 await _execute_claimed_refresh_job(claimed_id, owner_token=owner_token)
