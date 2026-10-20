@@ -481,6 +481,13 @@ def _ensure_compatible_columns() -> None:
             ("current_import_finished_at", "DATETIME"),
             ("last_successful_import_job_id", "INTEGER"),
             ("active_snapshot_product_count", "INTEGER DEFAULT 0"),
+            ("active_stock_snapshot_id", "INTEGER"),
+            ("active_source_type", "VARCHAR(32) DEFAULT ''"),
+            ("stock_effective_date", "DATE"),
+            ("last_success_at", "DATETIME"),
+        ],
+        "branch_stock": [
+            ("snapshot_id", "INTEGER"),
         ],
         "calculated_prices": [
             ("price_from_competitor", "NUMERIC(18, 4)"),
@@ -808,6 +815,7 @@ def _ensure_compatible_column_types() -> None:
         "reference_update_statuses": (
             "current_import_status",
             "last_successful_import_job_id",
+            "active_source_type",
         ),
         "universal_lists": ("code", "name", "status", "type"),
         "calculated_prices": (

@@ -62,6 +62,8 @@ from .models import (
     BendRange,
     BranchCost,
     BranchStock,
+    StockSnapshot,
+    StockSnapshotItem,
     Job,
     PriceSourceAccount,
     ParserDailyRun,
@@ -1866,6 +1868,23 @@ def _generated_price_export_rows(
         ).scalars().all()
     )
     products = [row for row in products if str(row.get("sku") or "") in calculated_skus]
+    product_id_by_sku = {
+        str(code): int(product_id)
+        for product_id, code in db.execute(select(Product.id, Product.code).where(Product.code.in_(calculated_skus))).all()
+    }
+    stock_by_product = _stock_quantities_for_price_list(
+        db,
+        pl=pl,
+        pf=pf,
+        product_ids=list(product_id_by_sku.values()),
+    )
+    for product_row in products:
+        product_id = product_id_by_sku.get(str(product_row.get("sku") or ""))
+        product_row["stock"] = (
+            float(stock_by_product[product_id])
+            if product_id is not None and stock_by_product.get(product_id) is not None
+            else None
+        )
     calculated_by_sku = {
         str(product.code): cp
         for cp, product in db.execute(
@@ -1892,6 +1911,74 @@ def _generated_price_export_rows(
         top_sort=top_sort,
     )
     return pl, pf, products, competitor_columns
+
+
+def _stock_snapshot_id_from_price_list(pl: PriceList) -> int | None:
+    for raw in (pl.run_reference_versions_json, pl.run_snapshot_json):
+        try:
+            payload = json.loads(raw or "{}")
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        reconciliation = payload.get("generationReconciliation")
+        if not isinstance(reconciliation, dict):
+            run_reference_versions = payload.get("runReferenceVersions")
+            reconciliation = (
+                run_reference_versions.get("generationReconciliation")
+                if isinstance(run_reference_versions, dict)
+                else {}
+            )
+        value = reconciliation.get("stock_snapshot_id") if isinstance(reconciliation, dict) else None
+        if value not in (None, ""):
+            return int(value)
+    return None
+
+
+def _stock_quantities_for_price_list(
+    db: Session,
+    *,
+    pl: PriceList,
+    pf: PriceFormat,
+    product_ids: list[int],
+) -> dict[int, Decimal | None]:
+    if not product_ids:
+        return {}
+    snapshot_id = _stock_snapshot_id_from_price_list(pl)
+    if snapshot_id is not None:
+        snapshot = db.get(StockSnapshot, snapshot_id)
+        expected_branch_id = reference_branch_id_for_price_format(pf)
+        if (
+            snapshot is None
+            or snapshot.status not in {"active", "superseded"}
+            or str(snapshot.branch_id) != str(expected_branch_id)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="stock snapshot provenance does not match generated price-list branch",
+            )
+        rows = db.execute(
+            select(StockSnapshotItem.product_id, StockSnapshotItem.quantity)
+            .where(StockSnapshotItem.snapshot_id == snapshot_id)
+            .where(StockSnapshotItem.product_id.in_(product_ids))
+        ).all()
+    else:
+        branch_id = reference_branch_id_for_price_format(pf)
+        rows = db.execute(
+            select(BranchStock.product_id, BranchStock.stock)
+            .where(BranchStock.branch_id == branch_id)
+            .where(BranchStock.product_id.in_(product_ids))
+        ).all()
+    result: dict[int, Decimal | None] = {}
+    for product_id, quantity in rows:
+        key = int(product_id)
+        if key in result:
+            raise HTTPException(status_code=409, detail="ambiguous stock snapshot product mapping")
+        result[key] = Decimal(str(quantity)) if quantity is not None else None
+    missing = set(product_ids) - set(result)
+    if snapshot_id is not None and missing:
+        raise HTTPException(status_code=409, detail="stock snapshot provenance is incomplete for generated price list")
+    return result
 
 
 def _frontend_dist_dir() -> Path | None:
@@ -4085,6 +4172,7 @@ def _generated_item_dict(
     pf: PriceFormat,
     extra: ProductExtra | None,
     ratings: dict[str, int | None] | None = None,
+    branch_stock: Decimal | None | object = Ellipsis,
 ) -> dict:
     cost = float(cp.cost or 0)
     final = float(cp.final_price or 0)
@@ -4123,7 +4211,12 @@ def _generated_item_dict(
         "global_rating": global_rating,
         "local_rating": local_rating,
         "manufacturer": extra.manufacturer if extra else "",
-        "stock": float(extra.stock) if extra and extra.stock is not None else None,
+        "stock": (
+            float(branch_stock) if branch_stock is not Ellipsis and branch_stock is not None
+            else None if branch_stock is not Ellipsis
+            else float(extra.stock) if extra and extra.stock is not None
+            else None
+        ),
         "cost": cost,
         "basePrice": float(cp.base_price or 0),
         "mdc": float(cp.base_price or 0),
@@ -4498,10 +4591,12 @@ def get_generated_price_list_items(
     } if rows else {}
     competitor_columns = _competitor_columns_for_price_list(db, pl, pf)
     competitor_prices = _competitor_prices_by_product(db, pf=pf, product_ids=product_ids, columns=competitor_columns)
+    stock_by_product = _stock_quantities_for_price_list(db, pl=pl, pf=pf, product_ids=product_ids)
     items = []
     for cp, product in rows:
         item = _generated_item_dict(
-            db, cp, product, pf, extras.get(product.id), ratings_by_product.get(int(product.id), {})
+            db, cp, product, pf, extras.get(product.id), ratings_by_product.get(int(product.id), {}),
+            stock_by_product.get(int(product.id)),
         )
         item["competitorPrices"] = competitor_prices.get(int(product.id), {})
         items.append(item)

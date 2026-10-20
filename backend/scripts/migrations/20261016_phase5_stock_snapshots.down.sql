@@ -1,0 +1,11 @@
+DROP INDEX IF EXISTS ix_reference_update_active_stock_snapshot;
+ALTER TABLE reference_update_statuses DROP CONSTRAINT IF EXISTS fk_reference_update_active_stock_snapshot;
+ALTER TABLE reference_update_statuses DROP COLUMN IF EXISTS last_success_at;
+ALTER TABLE reference_update_statuses DROP COLUMN IF EXISTS stock_effective_date;
+ALTER TABLE reference_update_statuses DROP COLUMN IF EXISTS active_source_type;
+ALTER TABLE reference_update_statuses DROP COLUMN IF EXISTS active_stock_snapshot_id;
+DROP INDEX IF EXISTS ix_branch_stock_snapshot_id;
+ALTER TABLE branch_stock DROP CONSTRAINT IF EXISTS fk_branch_stock_snapshot;
+ALTER TABLE branch_stock DROP COLUMN IF EXISTS snapshot_id;
+DROP TABLE IF EXISTS stock_snapshot_items;
+DROP TABLE IF EXISTS stock_snapshots;
