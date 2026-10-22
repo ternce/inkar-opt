@@ -6,6 +6,7 @@ if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 import logging
 import json
+import hashlib
 import time
 import tracemalloc
 import difflib
@@ -39,11 +40,13 @@ from .config import get_settings
 from . import data
 from .db import SessionLocal, init_db
 from .deps import (
+    ROLE_ADMIN,
     assigned_branch_ids,
     can_see_all_branches,
     current_user_to_dict,
     get_current_user,
     get_db,
+    require_admin_access,
     require_write_access,
     user_can_access_branch,
 )
@@ -345,8 +348,18 @@ from .services.references.sources import ReferenceFilePayload, make_reference_so
 from .services.references.statuses import import_job_to_dict, list_reference_imports, list_reference_statuses, reference_readiness_matrix
 from .services.references.templates import build_reference_template, reference_template_filename
 from .services.references.types import BRANCHES, REFERENCE_TYPES, USER_SELECTABLE_BRANCHES, branch_display_name, canonical_branch_id
-from .services.references.sap_balance import SAP_PLANTS, branch_id_for_plant, configured_branch_map, fetch_balance
-from .services.references.stock_snapshots import import_sap_balance_payload, record_sap_import_failure
+from .services.references.sap_balance import (
+    SAP_PLANTS,
+    branch_id_for_plant,
+    configured_branch_map,
+    fetch_balance,
+    parse_saved_balance_payload,
+)
+from .services.references.stock_snapshots import (
+    import_sap_balance_payload,
+    preview_sap_catalog_registration,
+    record_sap_import_failure,
+)
 from .services.regions import canonical_supported_city_name
 from .services.pricing_workflow.analytics import analytics_for_run, build_workflow_analytics
 from .services.pricing_workflow.contexts import list_contexts
@@ -7950,6 +7963,10 @@ def get_competitor_code_mappings_product_catalog(
     include_candidates: bool = Query(True),
     task_scope: str = Query(""),
     assignee_user_id: int | None = Query(None),
+    assortment: str = Query("all"),
+    branch_id: str = Query(""),
+    all_branches: bool = Query(False),
+    include_legacy_stock: bool = Query(True),
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(get_current_user),
 ):
@@ -7976,6 +7993,10 @@ def get_competitor_code_mappings_product_catalog(
             format_code=format_code or formatCode,
             task_scope=task_scope,
             assignee_user_id=assignee_user_id,
+            assortment=assortment,
+            branch_id=branch_id,
+            all_branches=all_branches,
+            include_legacy_stock=include_legacy_stock,
         )
         result["taskCounts"] = manual_matching_counts(db, current_user)
         return result
@@ -8428,8 +8449,8 @@ def create_competitor_code_mapping(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     status = str(payload.get("status") or "mapped").strip().lower()
-    if status not in {"mapped", "unmapped", "rejected"}:
-        raise HTTPException(status_code=400, detail="status must be mapped, unmapped or rejected")
+    if status not in {"mapped", "review", "unmapped", "rejected"}:
+        raise HTTPException(status_code=400, detail="status must be mapped, review, unmapped or rejected")
     pf = _price_format_for_mapping_request(
         db,
         payload.get("formatCode") or payload.get("format_code"),
@@ -8449,7 +8470,7 @@ def create_competitor_code_mapping(
     )
 
     stage_started_at = time.perf_counter()
-    if status == "mapped" or (current_user.role != "admin" and status in {"rejected", "unmapped"}):
+    if status in {"mapped", "review"} or (current_user.role != "admin" and status in {"rejected", "unmapped"}):
         if product_id is None:
             raise HTTPException(status_code=400, detail="productId is required for a manual task decision")
         product = db.get(Product, product_id)
@@ -8562,7 +8583,9 @@ def create_competitor_code_mapping(
 
     stage_started_at = time.perf_counter()
     try:
-        touched = apply_mapping_to_matching_items(db=db, mapping=row, product=product, clear=status == "unmapped")
+        touched = 0 if status == "review" else apply_mapping_to_matching_items(
+            db=db, mapping=row, product=product, clear=status == "unmapped"
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     _mapping_confirm_timing(
@@ -8943,6 +8966,10 @@ def get_reference_sap_plants(current_user: AppUser = Depends(get_current_user)):
             "branchId": branch_map.get(row.plant, ""),
             "lgort": "1000",
             "enabled": bool(settings.sap_balance_enabled),
+            "canRefresh": bool(settings.sap_balance_enabled and current_user.role == ROLE_ADMIN),
+            "offlineImportEnabled": bool(
+                settings.sap_offline_import_enabled and current_user.role == ROLE_ADMIN
+            ),
         }
         for row in SAP_PLANTS
         if can_see_all_branches(current_user)
@@ -8956,7 +8983,7 @@ async def post_reference_sap_refresh(
     effective_date: date | None = Query(None),
     force_manual_override: bool = Query(False),
     db: Session = Depends(get_db),
-    current_user: AppUser = Depends(require_write_access),
+    current_user: AppUser = Depends(require_admin_access),
 ):
     if not settings.sap_balance_enabled:
         raise HTTPException(status_code=503, detail="SAP GetBalance integration is disabled")
@@ -8979,6 +9006,104 @@ async def post_reference_sap_refresh(
         raise
     except (ValueError, httpx.HTTPError) as exc:
         raise HTTPException(status_code=502, detail=str(exc))
+
+
+def _decode_saved_sap_payload(content: bytes, *, plant: str, effective_date: date | None):
+    try:
+        document = json.loads(content.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("saved SAP payload must be valid UTF-8 JSON") from exc
+    if not isinstance(document, dict):
+        raise ValueError("saved SAP payload must be a JSON object")
+    return parse_saved_balance_payload(document, requested_plant=plant, effective_date=effective_date)
+
+
+@app.post("/api/references/sap/catalog-preview")
+async def post_reference_sap_catalog_preview(
+    plant: str = Form(..., min_length=4, max_length=4),
+    effective_date: date | None = Form(None),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_admin_access),
+):
+    """Read-only catalog preview for a saved GetBalance payload; never contacts SAP."""
+    if not settings.sap_offline_import_enabled:
+        raise HTTPException(status_code=503, detail="offline SAP import is disabled")
+    try:
+        branch_id = branch_id_for_plant(settings, plant)
+        _ensure_reference_branch_access(current_user, branch_id)
+        content = await _read_upload_limited(file, max_bytes=50 * 1024 * 1024)
+        payload = _decode_saved_sap_payload(content, plant=plant, effective_date=effective_date)
+        preview = preview_sap_catalog_registration(db, payload)
+        return {
+            **preview.as_dict(),
+            "plant": plant,
+            "branchId": branch_id,
+            "effectiveDate": payload.effective_date.isoformat(),
+            "rawRowCount": payload.raw_row_count,
+            "payloadSha256": hashlib.sha256(content).hexdigest(),
+            "requiresApproval": bool(preview.missing),
+            "publicationPerformed": False,
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/references/sap/import-payload")
+async def post_reference_sap_import_payload(
+    plant: str = Form(..., min_length=4, max_length=4),
+    effective_date: date | None = Form(None),
+    approve_catalog_registration: bool = Form(False),
+    expected_sha256: str = Form(..., min_length=64, max_length=64),
+    force_manual_override: bool = Form(False),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_admin_access),
+):
+    """Explicitly approved offline publication. This endpoint never calls SAP."""
+    if not settings.sap_offline_import_enabled:
+        raise HTTPException(status_code=503, detail="offline SAP import is disabled")
+    try:
+        branch_id = branch_id_for_plant(settings, plant)
+        _ensure_reference_branch_access(current_user, branch_id)
+        content = await _read_upload_limited(file, max_bytes=50 * 1024 * 1024)
+        actual_sha256 = hashlib.sha256(content).hexdigest()
+        if actual_sha256 != expected_sha256.strip().lower():
+            raise ValueError("saved SAP payload changed after preview; preview it again")
+        payload = _decode_saved_sap_payload(content, plant=plant, effective_date=effective_date)
+        preview = preview_sap_catalog_registration(db, payload)
+        if preview.missing and not approve_catalog_registration:
+            raise ValueError(
+                f"explicit approval is required to create {len(preview.missing)} internal Products"
+            )
+        imported = import_sap_balance_payload(
+            db,
+            branch_id=branch_id,
+            payload=payload,
+            user_name=current_user.username or "SAP saved payload operator",
+            manual_precedence_hours=settings.sap_manual_precedence_hours,
+            force=force_manual_override,
+            approve_catalog_registration=approve_catalog_registration,
+            payload_sha256=actual_sha256,
+        )
+        if imported.status != "success":
+            raise HTTPException(status_code=409, detail=imported.error or "SAP stock publication failed")
+        assignment_result = None
+        worker_ids = configured_worker_ids()
+        if worker_ids is not None:
+            assignment_result = reconcile_manual_matching_assignments(db, worker_ids)
+        return {
+            "job": import_job_to_dict(imported),
+            "plant": plant,
+            "branchId": branch_id,
+            "payloadSha256": actual_sha256,
+            "catalogCreatedProductCount": len(preview.missing),
+            "matchingAssignments": assignment_result,
+        }
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/references/sap/status")

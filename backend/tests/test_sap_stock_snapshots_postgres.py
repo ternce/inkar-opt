@@ -14,7 +14,10 @@ from sqlalchemy.pool import NullPool
 
 from backend.app.db import Base
 from backend.app.models import BranchStock, Product, ReferenceImportJob, ReferenceUpdateStatus, StockSnapshot
+from backend.app.services.competitors.code_mappings import list_product_catalog_code_mappings
+from backend.app.services.references.sap_balance import SapBalanceItem, SapBalancePayload
 from backend.app.services.references.stock_snapshots import CanonicalStockRow, publish_stock_snapshot
+from backend.app.services.references.stock_snapshots import import_sap_balance_payload, preview_sap_catalog_registration
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,7 +42,10 @@ def pg_engine():
         if not 160000 <= version < 170000:
             pytest.skip("PostgreSQL 16 required")
         connection.exec_driver_sql(f'CREATE SCHEMA "{schema}"')
-    engine = create_engine(url, poolclass=NullPool, connect_args={"options": f"-csearch_path={schema},public"})
+    # Do not include public in search_path: CREATE TABLE IF NOT EXISTS would
+    # otherwise resolve existing application tables and leak fixtures into the
+    # developer database instead of this disposable schema.
+    engine = create_engine(url, poolclass=NullPool, connect_args={"options": f"-csearch_path={schema}"})
     Base.metadata.create_all(engine)
     try:
         yield engine
@@ -140,7 +146,7 @@ def test_phase5_migration_is_additive_and_reversible():
     try:
         with admin.begin() as connection:
             connection.exec_driver_sql(f'CREATE SCHEMA "{schema}"')
-        engine = create_engine(url, poolclass=NullPool, connect_args={"options": f"-csearch_path={schema},public"})
+        engine = create_engine(url, poolclass=NullPool, connect_args={"options": f"-csearch_path={schema}"})
         with engine.begin() as connection:
             connection.exec_driver_sql("CREATE TABLE products (id SERIAL PRIMARY KEY)")
             connection.exec_driver_sql("CREATE TABLE reference_import_jobs (id SERIAL PRIMARY KEY)")
@@ -159,3 +165,44 @@ def test_phase5_migration_is_additive_and_reversible():
         with admin.begin() as connection:
             connection.exec_driver_sql(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
         admin.dispose()
+
+
+def test_postgresql_approved_sap_catalog_registration_and_active_branch_scope_are_atomic(pg_engine):
+    branch = "pg-approved-" + uuid.uuid4().hex
+    other_branch = "pg-other-" + uuid.uuid4().hex
+    material = "8" + uuid.uuid4().hex[:17]
+    # Use digits only while retaining an exact 18-character SAP identity.
+    material = "8" + "".join(str(int(char, 16) % 10) for char in material[1:])
+    payload = SapBalancePayload(
+        "1001",
+        date(2026, 10, 21),
+        (
+            SapBalanceItem(material, "1001", "1000", "a", Decimal("1.25"), {"materialText": "PG SAP product"}),
+            SapBalanceItem(material, "1001", "1000", "b", Decimal("2.75"), {"materialText": "PG SAP product"}),
+        ),
+        2,
+    )
+    with Session(pg_engine) as db:
+        preview = preview_sap_catalog_registration(db, payload)
+        assert len(preview.missing) == 1
+        failed = import_sap_balance_payload(
+            db, branch_id=branch, payload=payload, user_name="pg-test",
+            manual_precedence_hours=0, approve_catalog_registration=False,
+        )
+        assert failed.status == "error"
+        assert db.scalar(select(func.count(Product.id)).where(Product.code == material)) == 0
+
+        success = import_sap_balance_payload(
+            db, branch_id=branch, payload=payload, user_name="pg-test",
+            manual_precedence_hours=0, approve_catalog_registration=True,
+        )
+        assert success.status == "success"
+        product = db.scalar(select(Product).where(Product.code == material))
+        assert product is not None
+        stock = db.scalar(select(BranchStock).where(BranchStock.branch_id == branch))
+        assert stock.stock == Decimal("4.0000")
+        catalog = list_product_catalog_code_mappings(db=db, assortment="active", branch_id=branch)
+        assert catalog["metrics"][0]["total"] == 1
+        assert catalog["items"][0]["productId"] == product.id
+        isolated = list_product_catalog_code_mappings(db=db, assortment="active", branch_id=other_branch)
+        assert isolated["metrics"][0]["total"] == 0

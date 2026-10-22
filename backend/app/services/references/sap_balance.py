@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -14,6 +15,31 @@ from .types import canonical_branch_id
 
 
 SAP_LGORT = "1000"
+
+
+def _validate_endpoint_authorization(settings: Settings) -> None:
+    """Fail closed before network I/O when the configured SAP tier is ambiguous."""
+    target = settings.sap_balance_target_environment.strip().lower()
+    if target not in {"piq", "pip"}:
+        raise ValueError("SAP_BALANCE_TARGET_ENVIRONMENT must be either 'piq' or 'pip'")
+
+    parsed = urlparse(settings.sap_balance_base_url)
+    hostname = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not hostname:
+        raise ValueError("SAP_BALANCE_BASE_URL must be an HTTPS URL with a hostname")
+
+    endpoint_label = hostname.split(".")[0].split("-")
+    is_piq_host = "piq" in endpoint_label
+    is_pip_host = "pip" in endpoint_label
+    if target == "piq":
+        if not is_piq_host:
+            raise ValueError("SAP target environment is PIQ but SAP_BALANCE_BASE_URL is not a PIQ endpoint")
+        if not settings.sap_balance_allow_piq_requests:
+            raise ValueError("PIQ SAP requests require SAP_BALANCE_ALLOW_PIQ_REQUESTS=true")
+    elif is_piq_host or not is_pip_host:
+        raise ValueError("SAP target environment is PIP but SAP_BALANCE_BASE_URL is not a PIP endpoint")
+
+
 SAP_BALANCE_ROW_LIMIT = 100_000
 
 
@@ -106,8 +132,6 @@ def parse_balance_response(payload: dict[str, Any], *, requested_plant: str, eff
         raise ValueError(f"SAP GetBalance reached the {SAP_BALANCE_ROW_LIMIT}-row safety limit")
 
     parsed: list[SapBalanceItem] = []
-    visible_keys: set[tuple[str, str, str, str]] = set()
-    duplicates: list[tuple[str, str, str, str]] = []
     for index, raw in enumerate(raw_items, start=1):
         if not isinstance(raw, dict):
             raise ValueError(f"SAP item {index} must be an object")
@@ -131,15 +155,64 @@ def parse_balance_response(payload: dict[str, Any], *, requested_plant: str, eff
             quantity = Decimal(str(quantity_raw))
         except (InvalidOperation, TypeError, ValueError) as exc:
             raise ValueError(f"SAP item {index} has invalid endingStockQuantity") from exc
-        visible_key = (material, plant, lgort, charge)
-        if visible_key in visible_keys:
-            duplicates.append(visible_key)
-        visible_keys.add(visible_key)
+        if not quantity.is_finite():
+            raise ValueError(f"SAP item {index} has invalid endingStockQuantity")
         parsed.append(SapBalanceItem(material, plant, lgort, charge, quantity, dict(raw)))
-    if duplicates:
-        sample = ", ".join("/".join(key) for key in duplicates[:5])
-        raise ValueError(f"SAP GetBalance contains ambiguous duplicate visible keys: {sample}")
     return SapBalancePayload(requested_plant, effective_date, tuple(parsed), row_count)
+
+
+def parse_saved_balance_payload(
+    payload: dict[str, Any],
+    *,
+    requested_plant: str | None = None,
+    effective_date: date | None = None,
+) -> SapBalancePayload:
+    """Load the deterministic, canonical payload format produced by diagnostics.
+
+    Raw PIQ responses continue to use :func:`parse_balance_response`; accepting
+    this shape is deliberately limited to explicit operator file uploads.
+    """
+
+    plant = str(requested_plant or payload.get("plant") or "").strip()
+    raw_date = effective_date or date.fromisoformat(str(payload.get("effective_date") or ""))
+    if plant not in SAP_PLANT_BY_CODE:
+        raise ValueError(f"SAP plant is not approved: {plant}")
+    if requested_plant and str(payload.get("plant") or requested_plant).strip() != requested_plant:
+        raise ValueError("saved SAP payload plant does not match the selected plant")
+    raw_items = payload.get("items")
+    if not isinstance(raw_items, list):
+        raise ValueError("saved SAP payload items must be an array")
+    rows: list[SapBalanceItem] = []
+    for index, raw in enumerate(raw_items, start=1):
+        if not isinstance(raw, dict):
+            raise ValueError(f"saved SAP item {index} must be an object")
+        material = raw.get("material")
+        if not isinstance(material, str):
+            raise ValueError(f"saved SAP item {index} material must be a string")
+        item_plant = str(raw.get("plant") or "").strip()
+        lgort = str(raw.get("lgort") or "").strip()
+        if item_plant != plant:
+            raise ValueError(f"saved SAP item {index} plant mismatch: expected {plant}, got {item_plant or 'missing'}")
+        if lgort != SAP_LGORT:
+            raise ValueError(f"saved SAP item {index} LGORT mismatch: expected {SAP_LGORT}, got {lgort or 'missing'}")
+        try:
+            quantity = Decimal(str(raw.get("quantity")))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ValueError(f"saved SAP item {index} has invalid quantity") from exc
+        if not quantity.is_finite():
+            raise ValueError(f"saved SAP item {index} has invalid quantity")
+        evidence = raw.get("raw") if isinstance(raw.get("raw"), dict) else dict(raw)
+        rows.append(
+            SapBalanceItem(
+                material.strip(),
+                item_plant,
+                lgort,
+                str(raw.get("charge") or raw.get("charg") or "").strip(),
+                quantity,
+                dict(evidence),
+            )
+        )
+    return SapBalancePayload(plant, raw_date, tuple(rows), len(rows))
 
 
 def configured_branch_map(settings: Settings) -> dict[str, str]:
@@ -197,20 +270,33 @@ async def fetch_balance(
 ) -> SapBalancePayload:
     if not settings.sap_balance_enabled:
         raise ValueError("SAP GetBalance integration is disabled")
+    _validate_endpoint_authorization(settings)
     if not settings.sap_balance_username or not settings.sap_balance_password:
         raise ValueError("SAP GetBalance credentials are not configured")
     request_json = build_balance_request(settings, plant=plant, date_from=date_from, date_to=date_to)
     owns_client = client is None
+    timeout = httpx.Timeout(float(settings.sap_balance_timeout_seconds))
     if client is None:
-        client = httpx.AsyncClient(timeout=settings.sap_balance_timeout_seconds)
+        client = httpx.AsyncClient(timeout=timeout)
     try:
-        response = await client.post(
-            settings.sap_balance_base_url,
-            json=request_json,
-            auth=(settings.sap_balance_username, settings.sap_balance_password),
-        )
-        response.raise_for_status()
-        body = response.json()
+        try:
+            response = await client.post(
+                settings.sap_balance_base_url,
+                json=request_json,
+                auth=(settings.sap_balance_username, settings.sap_balance_password),
+                timeout=timeout,
+            )
+            response.raise_for_status()
+        except httpx.TimeoutException as exc:
+            raise TimeoutError(
+                f"SAP GetBalance timed out after {settings.sap_balance_timeout_seconds} seconds"
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            raise ValueError(f"SAP GetBalance HTTP error: status={exc.response.status_code}") from exc
+        try:
+            body = response.json()
+        except (ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("SAP GetBalance returned invalid JSON") from exc
         if not isinstance(body, dict):
             raise ValueError("SAP GetBalance returned non-object JSON")
         return parse_balance_response(body, requested_plant=plant, effective_date=date_to)

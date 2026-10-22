@@ -66,6 +66,9 @@ class Settings(BaseModel):
     redis_url: str | None
     sap_balance_enabled: bool
     sap_balance_schedule_enabled: bool
+    sap_offline_import_enabled: bool
+    sap_balance_target_environment: str
+    sap_balance_allow_piq_requests: bool
     sap_balance_base_url: str
     sap_balance_username: str | None
     sap_balance_password: str | None
@@ -182,6 +185,11 @@ def get_settings() -> Settings:
         redis_url=os.getenv("REDIS_URL"),
         sap_balance_enabled=env_bool("SAP_BALANCE_ENABLED", False),
         sap_balance_schedule_enabled=env_bool("SAP_BALANCE_SCHEDULE_ENABLED", False),
+        # Saved-payload preview/publication is a separate, administrative workflow.
+        # It must never be enabled implicitly by the live integration flags.
+        sap_offline_import_enabled=env_bool("SAP_OFFLINE_IMPORT_ENABLED", False),
+        sap_balance_target_environment=os.getenv("SAP_BALANCE_TARGET_ENVIRONMENT", "piq").strip().lower() or "piq",
+        sap_balance_allow_piq_requests=env_bool("SAP_BALANCE_ALLOW_PIQ_REQUESTS", False),
         sap_balance_base_url=os.getenv(
             "SAP_BALANCE_BASE_URL", "https://sap-piq.inkar.kz:53443/RESTAdapter/getBalance"
         ).strip(),
@@ -189,7 +197,9 @@ def get_settings() -> Settings:
         sap_balance_password=os.getenv("SAP_BALANCE_PASSWORD"),
         sap_balance_company_code=os.getenv("SAP_BALANCE_COMPANY_CODE"),
         sap_balance_cron=os.getenv("SAP_BALANCE_CRON", "0 4 * * *").strip() or "0 4 * * *",
-        sap_balance_timeout_seconds=max(1, int(os.getenv("SAP_BALANCE_TIMEOUT_SECONDS", "120"))),
+        # The approved GetBalance response can legitimately take about 131s.
+        # Keep this configurable while providing enough default headroom.
+        sap_balance_timeout_seconds=max(1, int(os.getenv("SAP_BALANCE_TIMEOUT_SECONDS", "240"))),
         sap_balance_branch_map_json=os.getenv("SAP_BALANCE_BRANCH_MAP_JSON", "{}").strip() or "{}",
         sap_manual_precedence_hours=max(0, int(os.getenv("SAP_MANUAL_PRECEDENCE_HOURS", "24"))),
     )

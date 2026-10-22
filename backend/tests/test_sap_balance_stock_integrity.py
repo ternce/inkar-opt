@@ -19,8 +19,15 @@ from sqlalchemy.pool import StaticPool
 import backend.app.main as main
 from backend.app.config import get_settings
 from backend.app.db import Base
-from backend.app.main import _stock_quantities_for_price_list, export_price_list_csv, export_price_list_xlsx
+from backend.app.deps import require_admin_access, require_write_access
+from backend.app.main import (
+    _stock_quantities_for_price_list,
+    export_price_list_csv,
+    export_price_list_xlsx,
+    get_generated_price_list_items,
+)
 from backend.app.models import (
+    AppUser,
     BranchStock,
     CalculatedPrice,
     PriceFormat,
@@ -35,18 +42,22 @@ from backend.app.models import (
 )
 from backend.app.services.references.sap_balance import (
     SAP_PLANTS,
+    SapBalanceItem,
+    SapBalancePayload,
     branch_id_for_plant,
     fetch_balance,
     parse_balance_response,
 )
 from backend.app.services.references.stock_snapshots import (
     CanonicalStockRow,
+    canonical_rows_from_sap,
     import_sap_balance_payload,
     publish_stock_snapshot,
 )
 from backend.app.services.references.imports import import_reference_excel
 from backend.app.services.references.stock_diagnostics import compare_stock_quantities
 from backend.app.services.sku import normalize_sku
+from backend.scripts.diagnose_sap_balance_json import mapping_report, write_reconciliation_csv
 from backend.app.services.refresh_queue import (
     claim_next_queued_refresh_job,
     create_queued_provisor_auto_refresh_job,
@@ -120,6 +131,7 @@ def test_sap_parser_preserves_leading_zeroes_and_decimal_quantity():
 
 def test_fetch_balance_uses_basic_auth_and_only_requested_plant_lgort(monkeypatch):
     monkeypatch.setenv("SAP_BALANCE_ENABLED", "true")
+    monkeypatch.setenv("SAP_BALANCE_ALLOW_PIQ_REQUESTS", "true")
     monkeypatch.setenv("SAP_BALANCE_USERNAME", "local-user")
     monkeypatch.setenv("SAP_BALANCE_PASSWORD", "local-pass")
     monkeypatch.setenv("SAP_BALANCE_COMPANY_CODE", "LOCAL")
@@ -149,6 +161,119 @@ def test_fetch_balance_uses_basic_auth_and_only_requested_plant_lgort(monkeypatc
         assert captured["authorization"] == "Basic " + base64.b64encode(b"local-user:local-pass").decode()
     finally:
         get_settings.cache_clear()
+
+
+def test_sap_mutation_access_requires_admin():
+    non_admin = AppUser(username="pricing", role="pricing_manager", is_active=True)
+    with pytest.raises(HTTPException) as exc_info:
+        require_admin_access(non_admin)
+    assert exc_info.value.status_code == 403
+
+
+def test_sap_submission_routes_are_admin_only_while_manual_imports_keep_write_access():
+    dependency_calls = {
+        route.path: {dependency.call for dependency in route.dependant.dependencies}
+        for route in main.app.routes
+        if hasattr(route, "dependant")
+    }
+    for path in {
+        "/api/references/sap/refresh",
+        "/api/references/sap/catalog-preview",
+        "/api/references/sap/import-payload",
+    }:
+        assert require_admin_access in dependency_calls[path]
+    for path in {"/api/references/import", "/api/references/import/batch"}:
+        assert require_write_access in dependency_calls[path]
+        assert require_admin_access not in dependency_calls[path]
+
+
+def test_offline_sap_endpoints_are_disabled_independently_by_default(monkeypatch):
+    monkeypatch.setattr(main.settings, "sap_offline_import_enabled", False)
+    monkeypatch.setattr(main.settings, "sap_balance_enabled", True)
+    admin = AppUser(username="admin", role="admin", is_active=True)
+
+    with pytest.raises(HTTPException) as preview_error:
+        asyncio.run(
+            main.post_reference_sap_catalog_preview(
+                plant="1004", effective_date=None, file=None, db=_session(), current_user=admin
+            )
+        )
+    with pytest.raises(HTTPException) as publication_error:
+        asyncio.run(
+            main.post_reference_sap_import_payload(
+                plant="1004",
+                effective_date=None,
+                approve_catalog_registration=True,
+                expected_sha256="0" * 64,
+                force_manual_override=False,
+                file=None,
+                db=_session(),
+                current_user=admin,
+            )
+        )
+    assert preview_error.value.status_code == 503
+    assert publication_error.value.status_code == 503
+
+
+def test_piq_endpoint_requires_separate_explicit_authorization():
+    settings = get_settings().model_copy(
+        update={
+            "sap_balance_enabled": True,
+            "sap_balance_target_environment": "piq",
+            "sap_balance_allow_piq_requests": False,
+            "sap_balance_base_url": "https://sap-piq.inkar.kz:53443/RESTAdapter/getBalance",
+            "sap_balance_username": "fixture-user",
+            "sap_balance_password": "fixture-password",
+            "sap_balance_company_code": "LOCAL",
+        }
+    )
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500, request=request)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await fetch_balance(
+                settings,
+                plant="1004",
+                date_from=date(2026, 10, 14),
+                date_to=date(2026, 10, 14),
+                client=client,
+            )
+
+    with pytest.raises(ValueError, match="SAP_BALANCE_ALLOW_PIQ_REQUESTS=true"):
+        asyncio.run(run())
+    assert calls == 0
+
+
+def test_pip_target_rejects_piq_endpoint_before_network_io():
+    settings = get_settings().model_copy(
+        update={
+            "sap_balance_enabled": True,
+            "sap_balance_target_environment": "pip",
+            "sap_balance_allow_piq_requests": True,
+            "sap_balance_base_url": "https://sap-piq.inkar.kz:53443/RESTAdapter/getBalance",
+            "sap_balance_username": "fixture-user",
+            "sap_balance_password": "fixture-password",
+            "sap_balance_company_code": "LOCAL",
+        }
+    )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(500, request=request))) as client:
+            return await fetch_balance(
+                settings,
+                plant="1004",
+                date_from=date(2026, 10, 14),
+                date_to=date(2026, 10, 14),
+                client=client,
+            )
+
+    with pytest.raises(ValueError, match="not a PIP endpoint"):
+        asyncio.run(run())
 
 
 def test_sap_queue_keeps_explicit_plants_and_effective_date():
@@ -199,7 +324,7 @@ def test_sap_worker_completion_releases_shared_mutex_for_provisor(monkeypatch):
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
-    material = "0000000001005213"
+    material = "1005213".zfill(18)
     with Session() as db:
         db.add(Product(code=normalize_sku(material), name="Esik worker fixture", cost=1))
         db.commit()
@@ -266,10 +391,212 @@ def test_sap_parser_rejects_unsafe_responses(body, message):
         parse_balance_response(body, requested_plant="1004", effective_date=date(2026, 10, 14))
 
 
-def test_sap_parser_rejects_ambiguous_visible_duplicates():
-    body = _response("1004", [_item("0001", "2"), _item("0001", "3")])
-    with pytest.raises(ValueError, match="ambiguous duplicate"):
-        parse_balance_response(body, requested_plant="1004", effective_date=date(2026, 10, 14))
+def test_sap_repeat_visible_records_are_preserved_and_aggregated_exactly():
+    db = _session()
+    product = Product(code="1".zfill(18), name="Repeated batch fixture", cost=1)
+    db.add(product)
+    db.flush()
+    body = _response("1004", [_item("0001", "2.1250"), _item("0001", "3.3750")])
+    payload = parse_balance_response(body, requested_plant="1004", effective_date=date(2026, 10, 14))
+    rows = canonical_rows_from_sap(db, payload)
+    assert len(payload.items) == 2
+    assert len(rows) == 1
+    assert rows[0].quantity == Decimal("5.5000")
+    assert rows[0].material == "0001"
+    assert rows[0].raw["batch_row_count"] == 2
+    assert [row["source_row_number"] for row in rows[0].raw["sap_rows"]] == [1, 2]
+    assert [row["quantity"] for row in rows[0].raw["sap_rows"]] == ["2.1250", "3.3750"]
+
+
+def test_sap_multiple_batches_for_one_material_publish_one_product_row():
+    db = _session()
+    material = "0000000001005213"
+    product = Product(code=material, name="Batch aggregation fixture", cost=1)
+    db.add(product)
+    db.flush()
+    payload = parse_balance_response(
+        _response(
+            "1004",
+            [
+                _item(material, "0.1001", charge="batch-a"),
+                _item(material, "0.2002", charge="batch-b"),
+                _item(material, "0.3003", charge="batch-c"),
+            ],
+        ),
+        requested_plant="1004",
+        effective_date=date(2026, 10, 14),
+    )
+    rows = canonical_rows_from_sap(db, payload)
+    assert [(row.product_id, row.quantity) for row in rows] == [(product.id, Decimal("0.6006"))]
+    assert [row["charge"] for row in rows[0].raw["sap_rows"]] == ["batch-a", "batch-b", "batch-c"]
+
+
+def test_catalog_reconciliation_classifies_only_verified_identifiers(tmp_path):
+    db = _session()
+    db.add_all(
+        [
+            Product(code="000000000000000101", name="Exact product", cost=1),
+            Product(code="000000000000000999", name="Potential duplicate", cost=1),
+        ]
+    )
+    db.commit()
+    payload = parse_balance_response(
+        _response(
+            "1004",
+            [
+                {**_item("000000000000000101", "1"), "materialText": "Exact product"},
+                {**_item("000000000000000202", "2"), "materialText": "Potential duplicate"},
+                {**_item("000000000000000303", "3"), "materialText": "Absent product"},
+            ],
+        ),
+        requested_plant="1004",
+        effective_date=date(2026, 10, 14),
+    )
+    report, unresolved = mapping_report(db, payload)
+    assert report["classificationCounts"] == {
+        "exactVerifiedMatches": 1,
+        "authoritativeIdentifierMatches": 0,
+        "absentFromCurrentCatalogIdentifiers": 1,
+        "potentialDuplicatesRequiringManualVerification": 1,
+        "unresolvedOrAmbiguous": 0,
+    }
+    assert report["publicationSafe"] is False
+    assert {row["sap_material_id"] for row in unresolved} == {
+        "000000000000000202",
+        "000000000000000303",
+    }
+    potential = next(row for row in unresolved if row["sap_material_id"].endswith("202"))
+    assert potential["potential_matching_catalog_identifier"] == "000000000000000999"
+
+    output = tmp_path / "reconciliation.csv"
+    write_reconciliation_csv(output, unresolved)
+    assert output.read_text(encoding="utf-8-sig").count("\n") == 3
+
+
+def test_sap_canonicalization_rejects_ambiguous_internal_code_normalization():
+    db = _session()
+    db.add_all(
+        [
+            Product(code="000000000000000123", name="First", cost=1),
+            Product(code="legacy-123", name="Second", cost=1),
+        ]
+    )
+    db.commit()
+    payload = parse_balance_response(
+        _response("1004", [_item("000000000000000123", "1")]),
+        requested_plant="1004",
+        effective_date=date(2026, 10, 14),
+    )
+    with pytest.raises(ValueError, match="ambiguous internal product mappings"):
+        canonical_rows_from_sap(db, payload)
+
+
+@pytest.mark.parametrize(
+    "payload, message",
+    [
+        (
+            SapBalancePayload(
+                plant="1004",
+                effective_date=date(2026, 10, 14),
+                items=(SapBalanceItem("0001", "1005", "1000", "", Decimal("1"), {}),),
+                raw_row_count=1,
+            ),
+            "plant mismatch",
+        ),
+        (
+            SapBalancePayload(
+                plant="1004",
+                effective_date=date(2026, 10, 14),
+                items=(SapBalanceItem("0001", "1004", "4000", "", Decimal("1"), {}),),
+                raw_row_count=1,
+            ),
+            "LGORT mismatch",
+        ),
+        (
+            SapBalancePayload(
+                plant="1004",
+                effective_date=date(2026, 10, 14),
+                items=(),
+                raw_row_count=1,
+            ),
+            "incomplete",
+        ),
+    ],
+)
+def test_sap_canonicalization_revalidates_scope_and_completeness(payload, message):
+    with pytest.raises(ValueError, match=message):
+        canonical_rows_from_sap(_session(), payload)
+
+
+@pytest.mark.parametrize("quantity", ["NaN", "Infinity", "-Infinity"])
+def test_sap_parser_rejects_non_finite_quantities(quantity):
+    with pytest.raises(ValueError, match="invalid endingStockQuantity"):
+        parse_balance_response(
+            _response("1004", [_item("0001", quantity)]),
+            requested_plant="1004",
+            effective_date=date(2026, 10, 14),
+        )
+
+
+def test_fetch_balance_reports_timeout_without_retry(monkeypatch):
+    monkeypatch.setenv("SAP_BALANCE_ENABLED", "true")
+    monkeypatch.setenv("SAP_BALANCE_ALLOW_PIQ_REQUESTS", "true")
+    monkeypatch.setenv("SAP_BALANCE_USERNAME", "local-user")
+    monkeypatch.setenv("SAP_BALANCE_PASSWORD", "local-pass")
+    monkeypatch.setenv("SAP_BALANCE_COMPANY_CODE", "LOCAL")
+    monkeypatch.setenv("SAP_BALANCE_TIMEOUT_SECONDS", "240")
+    get_settings.cache_clear()
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout("offline timeout fixture", request=request)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await fetch_balance(
+                get_settings(),
+                plant="1004",
+                date_from=date(2026, 10, 14),
+                date_to=date(2026, 10, 14),
+                client=client,
+            )
+
+    try:
+        with pytest.raises(TimeoutError, match="240 seconds"):
+            asyncio.run(run())
+        assert calls == 1
+    finally:
+        get_settings.cache_clear()
+
+
+def test_fetch_balance_rejects_malformed_json(monkeypatch):
+    monkeypatch.setenv("SAP_BALANCE_ENABLED", "true")
+    monkeypatch.setenv("SAP_BALANCE_ALLOW_PIQ_REQUESTS", "true")
+    monkeypatch.setenv("SAP_BALANCE_USERNAME", "local-user")
+    monkeypatch.setenv("SAP_BALANCE_PASSWORD", "local-pass")
+    monkeypatch.setenv("SAP_BALANCE_COMPANY_CODE", "LOCAL")
+    get_settings.cache_clear()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"not-json")
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await fetch_balance(
+                get_settings(),
+                plant="1004",
+                date_from=date(2026, 10, 14),
+                date_to=date(2026, 10, 14),
+                client=client,
+            )
+
+    try:
+        with pytest.raises(ValueError, match="invalid JSON"):
+            asyncio.run(run())
+    finally:
+        get_settings.cache_clear()
 
 
 def test_sap_missing_product_fails_without_replacing_active_snapshot():
@@ -303,6 +630,64 @@ def test_sap_missing_product_fails_without_replacing_active_snapshot():
     status = db.scalar(select(ReferenceUpdateStatus).where(ReferenceUpdateStatus.branch_id == "Есик"))
     assert status.active_stock_snapshot_id == first.id
     assert db.scalar(select(BranchStock.stock).where(BranchStock.branch_id == "Есик")) == Decimal("32.0000")
+
+
+def test_sap_absence_carries_forward_active_stock_without_breaking_idempotency():
+    db = _session()
+    branch_id = "carry-forward-test"
+    returned = Product(code="1005213".zfill(18), name="Returned", cost=1)
+    absent = Product(code="1017769".zfill(18), name="Absent", cost=1)
+    db.add_all([returned, absent])
+    db.flush()
+    manual = _job(db, branch_id)
+    manual_snapshot = publish_stock_snapshot(
+        db,
+        branch_id=branch_id,
+        source_type="manual",
+        effective_date=date(2026, 10, 14),
+        rows=[
+            CanonicalStockRow(returned.code, returned.code, returned.id, Decimal("32"), {"manual": True}),
+            CanonicalStockRow(absent.code, absent.code, absent.id, Decimal("3"), {"manual": True}),
+        ],
+        import_job=manual,
+    )
+    db.commit()
+    payload = parse_balance_response(
+        _response("1004", [_item(returned.code, "6")]),
+        requested_plant="1004",
+        effective_date=date(2026, 10, 15),
+    )
+    first_job = import_sap_balance_payload(
+        db,
+        branch_id=branch_id,
+        payload=payload,
+        user_name="worker",
+        manual_precedence_hours=0,
+    )
+    first_status = db.scalar(select(ReferenceUpdateStatus).where(ReferenceUpdateStatus.branch_id == branch_id))
+    first_sap_snapshot_id = first_status.active_stock_snapshot_id
+    assert first_job.status == "success"
+    assert first_sap_snapshot_id != manual_snapshot.id
+    assert dict(
+        db.execute(
+            select(BranchStock.product_id, BranchStock.stock).where(BranchStock.branch_id == branch_id)
+        ).all()
+    ) == {returned.id: Decimal("6.0000"), absent.id: Decimal("3.0000")}
+    first_sap_snapshot = db.get(StockSnapshot, first_sap_snapshot_id)
+    metadata = json.loads(first_sap_snapshot.metadata_json)
+    assert metadata["carried_forward_product_count"] == 1
+    assert metadata["absent_material_policy"] == "carry_forward_pending_business_decision"
+
+    second_job = import_sap_balance_payload(
+        db,
+        branch_id=branch_id,
+        payload=payload,
+        user_name="retry",
+        manual_precedence_hours=0,
+    )
+    second_status = db.scalar(select(ReferenceUpdateStatus).where(ReferenceUpdateStatus.branch_id == branch_id))
+    assert second_job.status == "success"
+    assert second_status.active_stock_snapshot_id == first_sap_snapshot_id
 
 
 def test_manual_csv_uses_same_atomic_snapshot_publication_path():
@@ -431,7 +816,7 @@ def test_generated_price_list_keeps_exact_historical_esik_snapshot_after_republi
     db.commit()
 
     second_job = _job(db, "Есик", "sap")
-    publish_stock_snapshot(
+    second = publish_stock_snapshot(
         db,
         branch_id="Есик",
         source_type="sap",
@@ -461,6 +846,59 @@ def test_generated_price_list_keeps_exact_historical_esik_snapshot_after_republi
         {sku.zfill(18): expected for sku, (expected, _wrong) in examples.items()},
         {product.code: historical[product.id] for product in products},
     )["mismatchCount"] == 0
+
+    admin = AppUser(username="stock-integrity-test", role="admin", is_active=True)
+    historical_api = get_generated_price_list_items(
+        price_list.number,
+        q=None,
+        zone=None,
+        top_filter="all",
+        sort=None,
+        page=1,
+        page_size=100,
+        db=db,
+        current_user=admin,
+    )
+    assert {row["sku"]: Decimal(str(row["stock"])) for row in historical_api["items"]} == {
+        sku.zfill(18): expected for sku, (expected, _wrong) in examples.items()
+    }
+
+    current_price_list = PriceList(
+        number="GPL_1004_001_Esik_2026-10-16_current",
+        price_format_id=pf.id,
+        run_reference_versions_json=json.dumps(
+            {"generationReconciliation": {"stock_snapshot_id": second.id}}
+        ),
+    )
+    db.add(current_price_list)
+    db.flush()
+    db.add_all(
+        [
+            CalculatedPrice(
+                price_list_id=current_price_list.id,
+                product_id=product.id,
+                cost=Decimal("1"),
+                base_price=Decimal("1"),
+                final_price=Decimal("1"),
+            )
+            for product in products
+        ]
+    )
+    db.commit()
+    current_api = get_generated_price_list_items(
+        current_price_list.number,
+        q=None,
+        zone=None,
+        top_filter="all",
+        sort=None,
+        page=1,
+        page_size=100,
+        db=db,
+        current_user=admin,
+    )
+    assert {row["sku"]: Decimal(str(row["stock"])) for row in current_api["items"]} == {
+        sku.zfill(18): wrong for sku, (_expected, wrong) in examples.items()
+    }
 
     response = export_price_list_xlsx(
         price_list.number,

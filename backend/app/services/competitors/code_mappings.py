@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+import json
 from datetime import datetime
 from decimal import Decimal
 
@@ -22,10 +23,14 @@ from ...models import (
     Product,
     ProductExtra,
     ManualMatchingAssignment,
+    ReferenceUpdateStatus,
+    StockSnapshot,
 )
 from ..competitor_assignments import get_assigned_competitor_price_lists
 from ..competitor_read_models import matched_positive_item_filter
 from ..provisor_goods import ProvisorGoodsCandidate
+from ..references.types import canonical_branch_id
+from ...timezone import now_kz_naive
 
 logger = logging.getLogger(__name__)
 
@@ -48,18 +53,45 @@ def current_positive_stock_condition(product_id_column):
     )
 
 
-def current_positive_stock_by_product_subquery():
+def current_positive_stock_by_product_subquery(
+    *,
+    branch_id: str = "",
+    all_branches: bool = True,
+    active_snapshot_only: bool = False,
+    include_legacy_stock: bool = True,
+):
     """Aggregate current positive stock once for catalog ordering and display."""
-    return (
+    stmt = (
         select(
             BranchStock.product_id.label("product_id"),
             func.count(func.distinct(BranchStock.branch_id)).label("stock_region_count"),
             func.sum(BranchStock.stock).label("current_stock_qty"),
         )
         .where(BranchStock.stock > 0)
-        .group_by(BranchStock.product_id)
-        .subquery("current_positive_stock")
     )
+    if not all_branches:
+        if not branch_id:
+            raise ValueError("branch_id is required for branch-specific stock scope")
+        stmt = stmt.where(BranchStock.branch_id == canonical_branch_id(branch_id))
+    if active_snapshot_only:
+        stmt = stmt.join(
+            ReferenceUpdateStatus,
+            and_(
+                ReferenceUpdateStatus.branch_id == BranchStock.branch_id,
+                ReferenceUpdateStatus.data_type == "stock",
+            ),
+            isouter=True,
+        )
+        active_row = and_(
+            ReferenceUpdateStatus.active_stock_snapshot_id.is_not(None),
+            BranchStock.snapshot_id == ReferenceUpdateStatus.active_stock_snapshot_id,
+        )
+        legacy_row = and_(
+            ReferenceUpdateStatus.active_stock_snapshot_id.is_(None),
+            BranchStock.snapshot_id.is_(None),
+        )
+        stmt = stmt.where(or_(active_row, legacy_row) if include_legacy_stock else active_row)
+    return stmt.group_by(BranchStock.product_id).subquery("current_positive_stock")
 
 
 STRUCTURED_MANUAL_FIELDS = (
@@ -1895,6 +1927,63 @@ def _product_catalog_resolve_price_format_id(db: Session, format_code: str) -> i
     return db.scalar(select(PriceFormat.id).where(PriceFormat.code == code))
 
 
+def _product_catalog_stock_scope_metadata(
+    db: Session,
+    *,
+    branch_id: str,
+    all_branches: bool,
+    include_legacy_stock: bool,
+) -> dict:
+    status_stmt = select(ReferenceUpdateStatus).where(ReferenceUpdateStatus.data_type == "stock")
+    if not all_branches:
+        status_stmt = status_stmt.where(ReferenceUpdateStatus.branch_id == branch_id)
+    statuses = db.scalars(status_stmt.order_by(ReferenceUpdateStatus.branch_id)).all()
+    status_by_branch = {str(row.branch_id): row for row in statuses}
+
+    branch_stmt = select(BranchStock.branch_id).where(BranchStock.stock > 0).distinct()
+    if not all_branches:
+        branch_stmt = branch_stmt.where(BranchStock.branch_id == branch_id)
+    positive_branches = sorted(str(value) for value in db.scalars(branch_stmt) if value)
+    legacy_branches = [
+        value
+        for value in positive_branches
+        if status_by_branch.get(value) is None or status_by_branch[value].active_stock_snapshot_id is None
+    ]
+    snapshots: list[dict] = []
+    carried_total = 0
+    for status in statuses:
+        if not status.active_stock_snapshot_id:
+            continue
+        snapshot = db.get(StockSnapshot, int(status.active_stock_snapshot_id))
+        if snapshot is None:
+            continue
+        try:
+            metadata = json.loads(snapshot.metadata_json or "{}")
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        carried = int(metadata.get("carried_forward_product_count") or 0) if isinstance(metadata, dict) else 0
+        carried_total += carried
+        effective = status.stock_effective_date or snapshot.effective_date
+        snapshots.append({
+            "branchId": str(status.branch_id),
+            "snapshotId": int(snapshot.id),
+            "sourceType": str(status.active_source_type or snapshot.source_type or ""),
+            "effectiveDate": effective.isoformat() if effective else None,
+            "ageDays": (now_kz_naive().date() - effective).days if effective else None,
+            "publishedAt": snapshot.published_at.isoformat() if snapshot.published_at else None,
+            "carriedForwardProductCount": carried,
+        })
+    return {
+        "scope": "all_branches" if all_branches else "branch",
+        "branchId": None if all_branches else branch_id,
+        "activeSnapshots": snapshots,
+        "legacyStockIncluded": bool(include_legacy_stock and legacy_branches),
+        "legacyBranches": legacy_branches if include_legacy_stock else [],
+        "excludedLegacyBranches": [] if include_legacy_stock else legacy_branches,
+        "carriedForwardProductCount": carried_total,
+    }
+
+
 def _product_catalog_provisor_goods_mapping_payload(product: Product) -> dict:
     external = str(product.provisor_goods_id or "")
     match_key = source_match_key(platform="provisor", source_external_key=external)
@@ -1928,13 +2017,29 @@ def list_product_catalog_code_mappings(
     format_code: str = "",
     task_scope: str = "all",
     assignee_user_id: int | None = None,
+    assortment: str = "all",
+    branch_id: str = "",
+    all_branches: bool = False,
+    include_legacy_stock: bool = True,
 ) -> dict:
     platforms = _product_catalog_platforms(platform)
     status = status if status in {"all", "mapped", "review", "unmapped"} else "all"
     page = max(1, int(page or 1))
     limit = max(1, min(int(limit or 50), 200))
-    price_format_id = _product_catalog_resolve_price_format_id(db, format_code)
-    format_product_exists = _product_catalog_format_product_exists(price_format_id)
+    assortment = assortment if assortment in {"all", "active"} else "all"
+    price_format = db.scalar(select(PriceFormat).where(PriceFormat.code == str(format_code or "").strip())) if format_code else None
+    price_format_id = int(price_format.id) if price_format is not None else None
+    scoped_branch_id = canonical_branch_id(branch_id) if branch_id else ""
+    stock_all_branches = bool(all_branches or not scoped_branch_id)
+    if assortment == "active" and price_format is not None:
+        scoped_branch_id = canonical_branch_id(
+            str(getattr(price_format, "reference_branch_id", "") or "").strip()
+            or str(price_format.branch or "").strip()
+        )
+        stock_all_branches = False
+    if assortment == "active" and not stock_all_branches and not scoped_branch_id:
+        raise ValueError("branch_id is required for active assortment")
+    format_product_exists = _product_catalog_format_product_exists(price_format_id) if assortment == "all" else None
     assigned_ids = (
         [int(item.price_list.id) for item in get_assigned_competitor_price_lists(db=db, price_format_id=price_format_id)]
         if price_format_id is not None
@@ -1943,7 +2048,12 @@ def list_product_catalog_code_mappings(
     mapped_exists = _product_catalog_mapped_exists(platforms)
     review_exists = _product_catalog_review_exists(platforms)
     global_unmapped = global_unmapped_product_condition()
-    current_stock = current_positive_stock_by_product_subquery()
+    current_stock = current_positive_stock_by_product_subquery(
+        branch_id=scoped_branch_id,
+        all_branches=stock_all_branches,
+        active_snapshot_only=assortment == "active",
+        include_legacy_stock=include_legacy_stock,
+    )
     stock_region_count = func.coalesce(current_stock.c.stock_region_count, 0)
     current_stock_qty = func.coalesce(current_stock.c.current_stock_qty, 0)
     is_stock_priority = current_stock.c.product_id.is_not(None)
@@ -1976,17 +2086,38 @@ def list_product_catalog_code_mappings(
             Product.id.in_(external_product_ids) if external_product_ids else literal(False),
         )
 
-    base_count_stmt = select(func.count(Product.id)).select_from(Product).outerjoin(ProductExtra, ProductExtra.product_id == Product.id)
+    scope_stmt = select(Product.id.label("product_id")).select_from(Product).outerjoin(
+        ProductExtra, ProductExtra.product_id == Product.id
+    )
+    if assortment == "active":
+        scope_stmt = scope_stmt.join(current_stock, current_stock.c.product_id == Product.id)
     if format_product_exists is not None:
-        base_count_stmt = base_count_stmt.where(format_product_exists)
+        scope_stmt = scope_stmt.where(format_product_exists)
     if task_filter is not None:
-        base_count_stmt = base_count_stmt.where(task_filter)
+        scope_stmt = scope_stmt.where(task_filter)
+    scoped_products = scope_stmt.distinct().cte("scoped_product_catalog")
+    scoped_join = Product.id == scoped_products.c.product_id
+    base_count_stmt = (
+        select(func.count())
+        .select_from(scoped_products)
+        .join(Product, scoped_join)
+        .outerjoin(ProductExtra, ProductExtra.product_id == Product.id)
+    )
     mapped_count_stmt = base_count_stmt.where(mapped_exists)
-    review_count_stmt = base_count_stmt.where(~mapped_exists).where(review_exists)
+    review_count_stmt = base_count_stmt.where(~mapped_exists, review_exists)
     total_products = int(db.scalar(base_count_stmt) or 0)
     mapped_products = int(db.scalar(mapped_count_stmt) or 0)
     review_products = int(db.scalar(review_count_stmt) or 0)
     unmapped_products = max(0, total_products - mapped_products - review_products)
+
+    duplicate_goods_ids = (
+        select(Product.provisor_goods_id.label("goods_id"))
+        .where(Product.provisor_goods_id.is_not(None))
+        .group_by(Product.provisor_goods_id)
+        .having(func.count(Product.id) > 1)
+        .subquery("duplicate_provisor_goods_ids")
+    )
+    is_ambiguous_provisor = Product.provisor_goods_id.in_(select(duplicate_goods_ids.c.goods_id))
 
     product_stmt = (
         select(
@@ -1996,7 +2127,9 @@ def list_product_catalog_code_mappings(
             is_stock_priority.label("is_stock_priority"),
             stock_region_count.label("stock_region_count"),
             current_stock_qty.label("current_stock_qty"),
+            is_ambiguous_provisor.label("is_ambiguous_provisor"),
         )
+        .join(scoped_products, scoped_products.c.product_id == Product.id)
         .outerjoin(ProductExtra, ProductExtra.product_id == Product.id)
         .outerjoin(current_stock, current_stock.c.product_id == Product.id)
         .order_by(
@@ -2007,10 +2140,6 @@ def list_product_catalog_code_mappings(
         )
     )
     count_stmt = base_count_stmt
-    if format_product_exists is not None:
-        product_stmt = product_stmt.where(format_product_exists)
-    if task_filter is not None:
-        product_stmt = product_stmt.where(task_filter)
     if product_filter is not None:
         product_stmt = product_stmt.where(product_filter)
         count_stmt = count_stmt.where(product_filter)
@@ -2049,21 +2178,8 @@ def list_product_catalog_code_mappings(
         ).scalars():
             mappings_by_product.setdefault(int(row.our_product_id), []).append(_product_catalog_mapping_payload(row))
 
-    review_product_ids: set[int] = set()
-    if product_ids:
-        review_product_ids = {
-            int(item)
-            for item in db.execute(
-                select(CompetitorCodeMapping.our_product_id)
-                .where(CompetitorCodeMapping.platform.in_(platforms))
-                .where(CompetitorCodeMapping.status == "review")
-                .where(CompetitorCodeMapping.our_product_id.in_(product_ids))
-            ).scalars()
-            if item is not None
-        }
-
     rows: list[dict] = []
-    for product, extra, is_unmapped, stock_priority, region_count, stock_qty in product_rows:
+    for product, extra, is_unmapped, stock_priority, region_count, stock_qty, is_ambiguous in product_rows:
         product_id = int(product.id)
         mappings = list(mappings_by_product.get(product_id, []))
         if "provisor" in platforms and product.provisor_goods_id is not None:
@@ -2087,6 +2203,7 @@ def list_product_catalog_code_mappings(
                 "isStockPriority": bool(stock_priority),
                 "stockRegionCount": int(region_count or 0),
                 "currentStockQty": float(stock_qty or 0),
+                "ambiguousProvisorIdentity": bool(is_ambiguous),
             }
         )
 
@@ -2101,9 +2218,41 @@ def list_product_catalog_code_mappings(
         "coveragePercent": round((mapped_products / total_products) * 100, 2) if total_products else 0,
         "mappingCoveragePercent": round((mapped_products / total_products) * 100, 2) if total_products else 0,
     }
+    source_platforms = sorted(SUPPORTED_PLATFORMS)
+    coverage_columns = [
+        base_count_stmt.where(_product_catalog_mapped_exists([source_platform]))
+        .scalar_subquery()
+        .label(f"{source_platform}_mapped")
+        for source_platform in source_platforms
+    ]
+    coverage_columns.append(
+        base_count_stmt.where(is_ambiguous_provisor).scalar_subquery().label("ambiguous_provisor_products")
+    )
+    coverage_row = db.execute(select(*coverage_columns)).one()
+    source_coverage = []
+    for index, source_platform in enumerate(source_platforms):
+        source_count = int(coverage_row[index] or 0)
+        source_coverage.append({
+            "platform": source_platform,
+            "total": total_products,
+            "mapped": source_count,
+            "coveragePercent": round((source_count / total_products) * 100, 2) if total_products else 0,
+            "definition": "confirmed_product_mapping",
+        })
+    ambiguous_provisor_products = int(coverage_row[len(source_platforms)] or 0)
+    stock_scope = _product_catalog_stock_scope_metadata(
+        db,
+        branch_id=scoped_branch_id,
+        all_branches=stock_all_branches,
+        include_legacy_stock=include_legacy_stock,
+    ) if assortment == "active" else None
     return {
         "items": rows,
         "metrics": [metrics],
+        "sourceCoverage": source_coverage,
+        "ambiguousProvisorProductCount": ambiguous_provisor_products,
+        "assortment": assortment,
+        "stockScope": stock_scope,
         "pagination": {"page": page, "pageSize": limit, "total": filtered_total, "pageCount": page_count},
         "platforms": platforms,
     }
@@ -2485,7 +2634,7 @@ def upsert_code_mapping(
     created_by: str = "",
 ) -> CompetitorCodeMapping:
     platform = platform_from_value(platform)
-    status = status if status in {"mapped", "unmapped", "rejected"} else "mapped"
+    status = status if status in {"mapped", "review", "unmapped", "rejected"} else "mapped"
     key = source_payload.get("source_match_key") or source_match_key(
         platform=platform,
         source_external_key=source_payload.get("source_external_key"),
@@ -2510,10 +2659,10 @@ def upsert_code_mapping(
     row.source_manufacturer = str(source_payload.get("source_manufacturer") or "")
     row.source_dosage_form = str(source_payload.get("source_dosage_form") or "")
     row.source_normalized_name = str(source_payload.get("source_normalized_name") or normalize_mapping_text(row.source_name))
-    row.our_product_id = product.id if product and status == "mapped" else None
-    row.our_sku = product.code if product and status == "mapped" else ""
+    row.our_product_id = product.id if product and status in {"mapped", "review"} else None
+    row.our_sku = product.code if product and status in {"mapped", "review"} else ""
     row.status = status
-    row.confidence = Decimal(str(confidence)) if confidence is not None and status == "mapped" else None
+    row.confidence = Decimal(str(confidence)) if confidence is not None and status in {"mapped", "review"} else None
     row.approved_at = datetime.utcnow() if status == "mapped" else None
     row.updated_at = datetime.utcnow()
     row.created_by = created_by
@@ -2622,7 +2771,7 @@ def apply_mapping_to_matching_items(
     target_source_ids = [
         int(source_id)
         for source_id in db.execute(
-            select(item.price_list_id).where(source_scope, identity_condition).distinct()
+            select(item.price_list_id).where(source_scope, identity_condition).group_by(item.price_list_id)
         ).scalars()
     ]
     acquire_transaction_write_locks(

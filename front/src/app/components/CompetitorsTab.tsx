@@ -276,6 +276,23 @@ type CodeMappingMetric = {
   };
 };
 
+type SourceCoverage = { platform: Platform; total: number; mapped: number; coveragePercent: number };
+type StockScope = {
+  scope: 'branch' | 'all_branches';
+  branchId?: string | null;
+  activeSnapshots: Array<{
+    branchId: string;
+    snapshotId: number;
+    sourceType: string;
+    effectiveDate?: string | null;
+    ageDays?: number | null;
+    carriedForwardProductCount: number;
+  }>;
+  legacyStockIncluded: boolean;
+  legacyBranches: string[];
+  carriedForwardProductCount: number;
+};
+
 type CodeMappingCandidate = {
   itemId?: number | null;
   priceListId?: number | null;
@@ -354,6 +371,7 @@ type CodeMappingRow = CodeMappingCandidate & {
   isStockPriority?: boolean;
   stockRegionCount?: number;
   currentStockQty?: number;
+  ambiguousProvisorIdentity?: boolean;
 };
 
 type MappingPagination = {
@@ -873,6 +891,12 @@ export function CompetitorsTab({ formatCode, branch, currentUser }: Props) {
   const [matchingWorkers, setMatchingWorkers] = useState<Array<{ id: number; displayName: string }>>([]);
   const [codeRows, setCodeRows] = useState<CodeMappingRow[]>([]);
   const [metrics, setMetrics] = useState<CodeMappingMetric[]>([]);
+  const [sourceCoverage, setSourceCoverage] = useState<SourceCoverage[]>([]);
+  const [stockScope, setStockScope] = useState<StockScope | null>(null);
+  const [ambiguousProvisorProductCount, setAmbiguousProvisorProductCount] = useState(0);
+  const [mappingAssortment, setMappingAssortment] = useState<'all' | 'active'>('all');
+  const [mappingBranch, setMappingBranch] = useState(branch || '__all__');
+  const [mappingBranches, setMappingBranches] = useState<Array<{ id: string; name: string }>>([]);
   const [selectedRow, setSelectedRow] = useState<CodeMappingRow | null>(null);
   const [selectedCandidate, setSelectedCandidate] = useState<CodeMappingCandidate | null>(null);
   const [productSearch, setProductSearch] = useState('');
@@ -1027,7 +1051,11 @@ export function CompetitorsTab({ formatCode, branch, currentUser }: Props) {
       page: String(mappingPage),
       limit: '50',
       include_candidates: 'false',
+      assortment: mappingAssortment,
+      include_legacy_stock: 'true',
     });
+    if (mappingBranch === '__all__') params.set('all_branches', 'true');
+    else params.set('branch_id', mappingBranch);
     if (currentUser.role === 'admin') {
       params.set('task_scope', taskScope);
       if (taskScope.startsWith('user:')) {
@@ -1054,6 +1082,9 @@ export function CompetitorsTab({ formatCode, branch, currentUser }: Props) {
       if (!res.ok) throw new Error(data?.detail || text || 'Не удалось загрузить таблицу соответствий');
       setCodeRows(Array.isArray(data?.items) ? data.items : []);
       setMetrics(Array.isArray(data?.metrics) ? data.metrics : []);
+      setSourceCoverage(Array.isArray(data?.sourceCoverage) ? data.sourceCoverage : []);
+      setStockScope(data?.stockScope || null);
+      setAmbiguousProvisorProductCount(Number(data?.ambiguousProvisorProductCount || 0));
       setMappingPagination(data?.pagination || { page: mappingPage, pageSize: 50, total: 0, pageCount: 0 });
       setTaskCounts(data?.taskCounts || null);
       if (data?.pagination?.page && data.pagination.page !== mappingPage) setMappingPage(data.pagination.page);
@@ -1143,7 +1174,13 @@ export function CompetitorsTab({ formatCode, branch, currentUser }: Props) {
       mappingRequestKeyRef.current = '';
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, mappingPlatform, mappingStatus, mappingFormatScope, appliedSourceQuery, appliedProductQuery, mappingPage, formatCode, taskScope]);
+  }, [activeTab, mappingPlatform, mappingStatus, mappingFormatScope, mappingAssortment, mappingBranch, appliedSourceQuery, appliedProductQuery, mappingPage, formatCode, taskScope]);
+
+  useEffect(() => {
+    void fetch('/api/references/branches')
+      .then((response) => response.ok ? response.json() : [])
+      .then((data) => setMappingBranches(Array.isArray(data) ? data : []));
+  }, []);
 
   useEffect(() => {
     if (currentUser.role !== 'admin') return;
@@ -2001,6 +2038,46 @@ export function CompetitorsTab({ formatCode, branch, currentUser }: Props) {
             ))}
           </div>
         </div>
+        <div className="mt-4 flex flex-wrap items-center gap-3 border-t border-gray-100 pt-4">
+          <label className="flex cursor-pointer items-center gap-2 text-sm font-medium text-gray-800">
+            <Checkbox
+              checked={mappingAssortment === 'active'}
+              onCheckedChange={(checked) => {
+                setMappingAssortment(checked === true ? 'active' : 'all');
+                setMappingPage(1);
+                setSelectedRow(null);
+              }}
+            />
+            Только активный ассортимент
+          </label>
+          <Select
+            value={mappingBranch}
+            onValueChange={(value) => { setMappingBranch(value); setMappingPage(1); setSelectedRow(null); }}
+            disabled={mappingFormatScope === 'current' && mappingAssortment === 'active'}
+          >
+            <SelectTrigger className="w-64"><SelectValue placeholder="Выберите филиал" /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__all__">Все филиалы</SelectItem>
+              {mappingBranches.map((item) => <SelectItem key={item.id} value={item.id}>{item.name}</SelectItem>)}
+            </SelectContent>
+          </Select>
+          {mappingFormatScope === 'current' && mappingAssortment === 'active' ? (
+            <span className="text-xs text-gray-500">Филиал определяется опорным филиалом ЦФ {formatCode}.</span>
+          ) : null}
+        </div>
+        {stockScope ? (
+          <div className="mt-3 rounded-md border border-blue-100 bg-blue-50 px-3 py-2 text-xs text-blue-900">
+            <div>Остатки: {stockScope.scope === 'all_branches' ? 'все филиалы' : stockScope.branchId || 'филиал'} · снимков: {stockScope.activeSnapshots.length}</div>
+            {stockScope.activeSnapshots.map((snapshot) => (
+              <div key={`${snapshot.branchId}-${snapshot.snapshotId}`} className="mt-1">
+                {snapshot.branchId}: {snapshot.sourceType || 'неизвестный источник'} · {snapshot.effectiveDate || 'дата не указана'}
+                {snapshot.ageDays !== null && snapshot.ageDays !== undefined ? ` · ${snapshot.ageDays} дн.` : ''}
+              </div>
+            ))}
+            {stockScope.legacyStockIncluded ? <div className="mt-1 font-semibold text-amber-800">Включены legacy-остатки без активного снимка: {stockScope.legacyBranches.join(', ')}</div> : null}
+            {stockScope.carriedForwardProductCount > 0 ? <div className="mt-1 font-semibold text-amber-800">Перенесено из предыдущих снимков: {fmtNumber(stockScope.carriedForwardProductCount)} SKU</div> : null}
+          </div>
+        ) : null}
       </div>
 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-6">
@@ -2016,6 +2093,21 @@ export function CompetitorsTab({ formatCode, branch, currentUser }: Props) {
             <div className="mt-2 text-2xl font-semibold text-gray-900">{typeof value === 'string' ? value : fmtNumber(value as number | undefined)}</div>
           </div>
         ))}
+      </div>
+
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+        {sourceCoverage.map((item) => (
+          <div key={item.platform} className="admin-card p-4">
+            <div className="text-xs font-medium uppercase tracking-wide text-gray-500">Покрытие {platformLabel(item.platform)}</div>
+            <div className="mt-2 text-xl font-semibold text-gray-900">{fmtNumber(item.coveragePercent)}%</div>
+            <div className="mt-1 text-xs text-gray-500">{fmtNumber(item.mapped)} из {fmtNumber(item.total)} подтверждённых сопоставлений</div>
+          </div>
+        ))}
+        <div className="admin-card p-4">
+          <div className="text-xs font-medium uppercase tracking-wide text-gray-500">Неоднозначные Provisor ID</div>
+          <div className="mt-2 text-xl font-semibold text-amber-700">{fmtNumber(ambiguousProvisorProductCount)}</div>
+          <div className="mt-1 text-xs text-gray-500">Показываются отдельно и не означают наличие актуальной цены.</div>
+        </div>
       </div>
 
       <div className="admin-card p-4">

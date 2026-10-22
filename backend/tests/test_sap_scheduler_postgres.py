@@ -172,7 +172,7 @@ def test_database_scheduler_lease_has_single_owner_and_can_be_released(pg_engine
 def test_two_workers_claim_scheduled_sap_job_exactly_once_and_winner_completes(pg_engine, monkeypatch):
     business_date = date(2031, 1, 2)
     with Session(pg_engine) as db:
-        product_code = normalize_sku("0000000001005213")
+        product_code = normalize_sku("1005213")
         if db.scalar(select(Product.id).where(Product.code == product_code)) is None:
             db.add(Product(code=product_code, name="SAP worker fixture", cost=1))
             db.commit()
@@ -211,7 +211,7 @@ def test_two_workers_claim_scheduled_sap_job_exactly_once_and_winner_completes(p
                     "rowCount": 1,
                     "items": [
                         {
-                            "material": "0000000001005213",
+                            "material": "000000000001005213",
                             "plant": plant,
                             "lgort": "1000",
                             "charge": "",

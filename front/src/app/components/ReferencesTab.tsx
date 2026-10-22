@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { toast } from 'sonner';
 import { Download, FileUp, RefreshCw, Search } from 'lucide-react';
 import { Button } from './ui/button';
+import { Checkbox } from './ui/checkbox';
 import { Input } from './ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './ui/tabs';
@@ -32,7 +33,19 @@ type ReferenceStatus = {
   lastFailureReason?: string;
 };
 
-type SapPlant = { plant: string; name: string; branchId: string; lgort: string; enabled: boolean };
+type SapPlant = { plant: string; name: string; branchId: string; lgort: string; enabled: boolean; canRefresh: boolean; offlineImportEnabled: boolean };
+type SapCatalogPreview = {
+  plant: string;
+  branchId: string;
+  effectiveDate: string;
+  rawRowCount: number;
+  materialCount: number;
+  existingProductCount: number;
+  missingProductCount: number;
+  missingProducts: Array<{ material: string; materialText: string }>;
+  payloadSha256: string;
+  requiresApproval: boolean;
+};
 
 type ReadinessMatrix = {
   columns: ReferenceType[];
@@ -123,6 +136,9 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
   const [sapPlants, setSapPlants] = useState<SapPlant[]>([]);
   const [selectedSapPlant, setSelectedSapPlant] = useState('');
   const [sapRefreshes, setSapRefreshes] = useState<any[]>([]);
+  const [savedSapFile, setSavedSapFile] = useState<File | null>(null);
+  const [sapCatalogPreview, setSapCatalogPreview] = useState<SapCatalogPreview | null>(null);
+  const [approveSapCatalog, setApproveSapCatalog] = useState(false);
 
   const [selectedType, setSelectedType] = useState('');
   const [selectedBranchIds, setSelectedBranchIds] = useState<string[]>([]);
@@ -140,6 +156,7 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
 
   const typeName = useMemo(() => Object.fromEntries(types.map((row) => [row.code, row.name])), [types]);
   const branchName = useMemo(() => Object.fromEntries(branches.map((row) => [row.id, row.name])), [branches]);
+  const selectedSapConfig = sapPlants.find((row) => row.plant === selectedSapPlant);
 
   const loadAll = async () => {
     setIsLoading(true);
@@ -271,6 +288,57 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
     }
   };
 
+  const previewSavedSapPayload = async () => {
+    if (isReadOnly || !selectedSapPlant || !savedSapFile) return;
+    setIsLoading(true);
+    setError(null);
+    setSapCatalogPreview(null);
+    setApproveSapCatalog(false);
+    try {
+      const fd = new FormData();
+      fd.append('plant', selectedSapPlant);
+      fd.append('file', savedSapFile);
+      const res = await fetch('/api/references/sap/catalog-preview', { method: 'POST', body: fd });
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) throw new Error(data?.detail || text || 'Не удалось проверить сохранённый ответ SAP');
+      setSapCatalogPreview(data);
+      toast.success('Предпросмотр SAP завершён без публикации остатков');
+    } catch (e: any) {
+      setError(e?.message || 'Ошибка предпросмотра SAP');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const publishSavedSapPayload = async () => {
+    if (isReadOnly || !selectedSapPlant || !savedSapFile || !sapCatalogPreview) return;
+    if (sapCatalogPreview.requiresApproval && !approveSapCatalog) {
+      return setError(`Подтвердите создание ${sapCatalogPreview.missingProductCount} внутренних товаров`);
+    }
+    setIsLoading(true);
+    setError(null);
+    try {
+      const fd = new FormData();
+      fd.append('plant', selectedSapPlant);
+      fd.append('file', savedSapFile);
+      fd.append('expected_sha256', sapCatalogPreview.payloadSha256);
+      fd.append('approve_catalog_registration', String(approveSapCatalog));
+      const res = await fetch('/api/references/sap/import-payload', { method: 'POST', body: fd });
+      const text = await res.text();
+      const data = parseJsonOrNull(text);
+      if (!res.ok) throw new Error(data?.detail || text || 'Не удалось опубликовать сохранённый ответ SAP');
+      toast.success(`SAP-остатки опубликованы; создано товаров: ${data?.catalogCreatedProductCount || 0}`);
+      setSapCatalogPreview(null);
+      setApproveSapCatalog(false);
+      await loadAll();
+    } catch (e: any) {
+      setError(e?.message || 'Ошибка публикации SAP');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   const uploadBatch = async () => {
     if (isReadOnly) return setError('Роль просмотра: массовая загрузка доступна только для просмотра');
     if (!batchTypeIds.length) return setError('Выберите типы данных для массовой загрузки');
@@ -378,7 +446,11 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
             <div className="admin-card p-4">
               <div className="mb-4 text-sm font-semibold text-gray-900">SAP GetBalance · остатки</div>
               <div className="grid gap-3 md:grid-cols-[minmax(240px,1fr)_auto]">
-                <Select value={selectedSapPlant} onValueChange={setSelectedSapPlant}>
+                <Select value={selectedSapPlant} onValueChange={(value) => {
+                  setSelectedSapPlant(value);
+                  setSapCatalogPreview(null);
+                  setApproveSapCatalog(false);
+                }}>
                   <SelectTrigger><SelectValue placeholder="Выберите SAP plant" /></SelectTrigger>
                   <SelectContent>
                     {sapPlants.map((plant) => (
@@ -392,7 +464,7 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
                   type="button"
                   variant="outline"
                   onClick={refreshFromSap}
-                  disabled={isLoading || isReadOnly || !selectedSapPlant || !sapPlants.find((row) => row.plant === selectedSapPlant)?.enabled}
+                  disabled={isLoading || isReadOnly || !selectedSapPlant || !selectedSapConfig?.canRefresh}
                 >
                   <RefreshCw className="mr-2 h-4 w-4" />
                   Обновить из SAP
@@ -406,6 +478,48 @@ export function ReferencesTab({ isReadOnly = false }: { isReadOnly?: boolean }) 
                   Последнее задание: {sapRefreshes[0].status} · {sapRefreshes[0].message || 'без сообщения'}
                 </div>
               ) : null}
+              <div className="mt-4 border-t border-gray-100 pt-4">
+                <div className="mb-2 text-sm font-semibold text-gray-900">Сохранённый ответ SAP · без внешнего запроса</div>
+                <div className="grid gap-2 md:grid-cols-[minmax(280px,1fr)_auto]">
+                  <Input
+                    type="file"
+                    accept=".json,application/json"
+                    disabled={isLoading || isReadOnly || !selectedSapConfig?.offlineImportEnabled}
+                    onChange={(event) => {
+                      setSavedSapFile(event.target.files?.[0] ?? null);
+                      setSapCatalogPreview(null);
+                      setApproveSapCatalog(false);
+                    }}
+                  />
+                  <Button type="button" variant="outline" onClick={previewSavedSapPayload} disabled={isLoading || isReadOnly || !selectedSapConfig?.offlineImportEnabled || !selectedSapPlant || !savedSapFile}>
+                    Предпросмотр каталога
+                  </Button>
+                </div>
+                {!selectedSapConfig?.offlineImportEnabled ? (
+                  <div className="mt-2 text-xs text-gray-500">Offline SAP preview and publication are disabled by configuration or require an administrator.</div>
+                ) : null}
+                {sapCatalogPreview ? (
+                  <div className="mt-3 rounded-md border border-blue-200 bg-blue-50 p-3 text-sm text-blue-950">
+                    <div className="grid gap-2 sm:grid-cols-4">
+                      <div>Строк SAP: <strong>{sapCatalogPreview.rawRowCount}</strong></div>
+                      <div>Материалов: <strong>{sapCatalogPreview.materialCount}</strong></div>
+                      <div>Уже в каталоге: <strong>{sapCatalogPreview.existingProductCount}</strong></div>
+                      <div>Новые товары: <strong>{sapCatalogPreview.missingProductCount}</strong></div>
+                    </div>
+                    <div className="mt-2 text-xs text-gray-600">Филиал: {sapCatalogPreview.branchId} · дата: {sapCatalogPreview.effectiveDate} · SHA-256: {sapCatalogPreview.payloadSha256}</div>
+                    {sapCatalogPreview.requiresApproval ? (
+                      <label className="mt-3 flex cursor-pointer items-start gap-2 rounded border border-amber-200 bg-amber-50 p-2 text-amber-900">
+                        <Checkbox checked={approveSapCatalog} onCheckedChange={(value) => setApproveSapCatalog(value === true)} />
+                        <span>Я подтверждаю создание {sapCatalogPreview.missingProductCount} внутренних товаров по точным Material ID и materialText без сопоставлений конкурентов.</span>
+                      </label>
+                    ) : null}
+                    <Button className="mt-3" onClick={publishSavedSapPayload} disabled={isLoading || !selectedSapConfig?.offlineImportEnabled || (sapCatalogPreview.requiresApproval && !approveSapCatalog)}>
+                      Опубликовать снимок SAP
+                    </Button>
+                    <div className="mt-2 text-xs text-gray-600">Регистрация товаров и публикация снимка выполняются одной транзакцией. Цены и себестоимость не создаются.</div>
+                  </div>
+                ) : null}
+              </div>
             </div>
             <div className="admin-card p-4">
               <div className="mb-4 flex items-center justify-between gap-3">

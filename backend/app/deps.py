@@ -123,3 +123,9 @@ def require_write_access(current_user: AppUser = Depends(get_current_user)) -> A
     if not can_write(current_user):
         raise HTTPException(status_code=403, detail="viewer is read-only")
     return current_user
+
+
+def require_admin_access(current_user: AppUser = Depends(get_current_user)) -> AppUser:
+    if current_user.role != ROLE_ADMIN:
+        raise HTTPException(status_code=403, detail="administrator access is required")
+    return current_user

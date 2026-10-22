@@ -25,6 +25,7 @@ from ...timezone import now_kz_naive
 from ..manufacturers import resolve_manufacturer
 from ..sku import normalize_sku
 from .parsers import as_decimal, as_int, parse_csv_rows, parse_excel_rows
+from .catalog_registration import get_or_create_product
 from .stock_snapshots import CanonicalStockRow, publish_stock_snapshot
 from .types import REFERENCE_TYPE_BY_CODE, branch_display_name, canonical_branch_id
 from .validators import required_columns_for
@@ -118,13 +119,7 @@ def _branch_name(branch_id: str) -> str:
 
 
 def _get_or_create_product(db: Session, sku: str, name: str | None = None) -> Product:
-    row = db.execute(select(Product).where(Product.code == sku)).scalars().first()
-    if row is None:
-        row = Product(code=sku, name=name or sku, cost=0)
-        db.add(row)
-        db.flush()
-    elif name and not (row.name or "").strip():
-        row.name = name
+    row, _created = get_or_create_product(db, code=sku, name=name)
     return row
 
 
