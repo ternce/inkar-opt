@@ -147,13 +147,22 @@ def publish_stock_snapshot(
     now = now_kz_naive()
     fingerprint = stock_content_fingerprint(rows)
     active_snapshot = db.get(StockSnapshot, status.active_stock_snapshot_id) if status.active_stock_snapshot_id else None
+    snapshot_metadata = dict(metadata or {})
+    if sap_plant:
+        snapshot_metadata["sap_plant"] = sap_plant
+    if lgort:
+        snapshot_metadata["lgort"] = lgort
+    try:
+        active_metadata = json.loads(active_snapshot.metadata_json or "{}") if active_snapshot else {}
+    except (TypeError, json.JSONDecodeError):
+        active_metadata = {}
     if (
         active_snapshot is not None
         and active_snapshot.status == "active"
         and active_snapshot.source_type == source_type
         and active_snapshot.effective_date == effective_date
-        and active_snapshot.sap_plant == sap_plant
-        and active_snapshot.lgort == lgort
+        and str(active_metadata.get("sap_plant") or "") == sap_plant
+        and str(active_metadata.get("lgort") or "") == lgort
         and active_snapshot.content_fingerprint == fingerprint
         and active_snapshot.item_count == len(rows)
     ):
@@ -167,15 +176,13 @@ def publish_stock_snapshot(
     snapshot = StockSnapshot(
         branch_id=branch_id,
         source_type=source_type,
-        sap_plant=sap_plant,
-        lgort=lgort,
         effective_date=effective_date,
         status="staged",
         item_count=len(rows),
         mapped_product_count=len(rows),
         content_fingerprint=fingerprint,
         import_job_id=import_job.id,
-        metadata_json=json.dumps(metadata or {}, ensure_ascii=False, default=str),
+        metadata_json=json.dumps(snapshot_metadata, ensure_ascii=False, default=str),
     )
     db.add(snapshot)
     db.flush()

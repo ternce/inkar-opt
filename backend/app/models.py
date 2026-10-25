@@ -2210,8 +2210,6 @@ class StockSnapshot(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     branch_id: Mapped[str] = mapped_column(Text, index=True)
     source_type: Mapped[str] = mapped_column(String(32), index=True)
-    sap_plant: Mapped[str] = mapped_column(String(16), default="")
-    lgort: Mapped[str] = mapped_column(String(16), default="")
     effective_date: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(32), default="staged", index=True)
     item_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -2242,6 +2240,49 @@ class StockSnapshotItem(Base):
     __table_args__ = (
         UniqueConstraint("snapshot_id", "ordinal", name="uq_stock_snapshot_item_ordinal"),
         Index("ix_stock_snapshot_items_snapshot_product", "snapshot_id", "product_id"),
+    )
+
+
+class SapMatchingSourceBatch(Base):
+    """Versioned GetBalance material source; never participates in stock publication."""
+
+    __tablename__ = "sap_matching_source_batches"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    plant: Mapped[str] = mapped_column(String(16), default="", nullable=False)
+    lgort: Mapped[str] = mapped_column(String(16), default="1000", nullable=False)
+    effective_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    payload_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    record_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    imported_by: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    imported_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("source_version", "plant", "lgort", name="uq_sap_matching_batch_version_scope"),
+        Index("ix_sap_matching_batch_active_scope", "active", "plant", "lgort"),
+    )
+
+
+class SapMatchingSourceItem(Base):
+    __tablename__ = "sap_matching_source_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("sap_matching_source_batches.id"), nullable=False, index=True)
+    material: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_sku: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id"), nullable=True, index=True)
+    product_name: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    manufacturer: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    identity_status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    raw_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    imported_at: Mapped[datetime] = mapped_column(DateTime, default=now_kz_naive, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("batch_id", "normalized_sku", name="uq_sap_matching_item_batch_sku"),
+        Index("ix_sap_matching_item_product_status", "product_id", "identity_status"),
     )
 
 

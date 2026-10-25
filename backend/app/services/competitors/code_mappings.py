@@ -1483,6 +1483,7 @@ def _provisor_goods_source_payload(candidate: ProvisorGoodsCandidate) -> dict:
         "packageCount": candidate.package_count,
         "producer": candidate.producer,
         "corporation": candidate.corporation,
+        "country": candidate.country,
         "inn": candidate.inn,
         "atc": candidate.atc,
         "fullName": candidate.full_name,

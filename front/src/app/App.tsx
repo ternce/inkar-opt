@@ -21,6 +21,7 @@ import {
   SlidersHorizontal,
   Trash2,
   Users,
+  Wrench,
 } from 'lucide-react';
 import { Button } from './components/ui/button';
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from './components/ui/dialog';
@@ -38,6 +39,7 @@ import { ReportsTab } from './components/ReportsTab';
 import { UserGuideTab } from './components/UserGuideTab';
 import { VidmanMatchingReviewTab } from './components/VidmanMatchingReviewTab';
 import { VidmanInternalCoverageTab } from './components/VidmanInternalCoverageTab';
+import { SapProvisorMatchingTab } from './components/SapProvisorMatchingTab';
 import { SUPPORTED_CITIES, isSupportedCity } from './supportedCities';
 import {
   competitorFreshnessClassName,
@@ -85,6 +87,7 @@ type NavigationKey =
   | 'competitor-domain'
   | 'vidman-review'
   | 'vidman-internal-coverage'
+  | 'sap-provisor-matching'
   | 'analytics'
   | 'reports'
   | 'help';
@@ -94,6 +97,7 @@ type NavigationItem = {
   label: string;
   description: string;
   icon: typeof Home;
+  adminOnly?: boolean;
 };
 
 type PricingContextState = {
@@ -131,6 +135,7 @@ const navigationItems: NavigationItem[] = [
   { key: 'competitor-domain', label: 'Конкуренты', description: 'Прайс-листы конкурентов, персентили и соответствия кодов', icon: Users },
   { key: 'analytics', label: 'Итоги ЦО', description: 'Итоги переоценки, изменения цен и причины расчёта', icon: BarChart3 },
   { key: 'reports', label: 'Отчёты', description: 'Аналитические отчёты по результатам расчёта цен', icon: BarChart3 },
+  { key: 'sap-provisor-matching', label: 'SAP → Provisor · Ручное сопоставление', description: 'Техническое ручное сопоставление товаров SAP с официальным каталогом Provisor', icon: Wrench, adminOnly: true },
 ];
 
 navigationItems.push({
@@ -471,6 +476,8 @@ export default function App() {
         return <VidmanMatchingReviewTab isReadOnly={Boolean(currentUser?.isReadOnly)} />;
       case 'vidman-internal-coverage':
         return <VidmanInternalCoverageTab isReadOnly={Boolean(currentUser?.isReadOnly)} />;
+      case 'sap-provisor-matching':
+        return currentUser.role === 'admin' ? <SapProvisorMatchingTab /> : null;
       case 'analytics':
         return (
           <AnalyticsTab
@@ -566,7 +573,7 @@ export default function App() {
 
             <div className="sidebar-section-label">Разделы</div>
             <nav className="sidebar-nav">
-              {navigationItems.map((item) => {
+              {navigationItems.filter((item) => !item.adminOnly || currentUser.role === 'admin').map((item) => {
                 const Icon = item.icon;
                 return (
                   <button

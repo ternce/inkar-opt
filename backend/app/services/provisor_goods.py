@@ -37,6 +37,7 @@ class ProvisorGoodsCandidate:
     package_count: int | None
     producer: str
     corporation: str
+    country: str
     inn: str
     atc: str
     full_name: str
@@ -93,6 +94,11 @@ def parse_goods_response(data: Any, *, limit: int) -> list[ProvisorGoodsCandidat
                 package_count=_package_count(raw.get("number")),
                 producer=_name(raw.get("producer")),
                 corporation=_name(raw.get("corporation")),
+                country=(
+                    _name(raw.get("country"))
+                    or _name(raw.get("producerCountry"))
+                    or str(raw.get("countryName") or "").strip()
+                ),
                 inn=_name(raw.get("inn")),
                 atc=_name(raw.get("atc")),
                 full_name=str(raw.get("fullName") or "").strip(),

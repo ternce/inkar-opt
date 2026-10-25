@@ -310,6 +310,13 @@ from .services.competitors.code_mappings import (
 )
 from .services.provisor_candidate_search import official_external_search, official_product_candidates
 from .services.provisor_goods import ProvisorGoodsError
+from .services.sap_provisor_matching import (
+    SapProvisorQueueUnavailable,
+    confirm_sap_provisor_mapping,
+    import_sap_matching_payload,
+    import_sap_matching_rows,
+    list_unmatched_sap_products,
+)
 from .services.vidman_review_api import (
     approve_review_match,
     list_review_queue,
@@ -8366,6 +8373,203 @@ async def search_competitor_items_for_mapping(
         q=q,
         limit=limit,
     )
+
+
+@app.post("/api/admin/sap-provisor/source/import")
+async def post_admin_sap_provisor_source_import(
+    source_version: str = Form(..., alias="sourceVersion", min_length=1, max_length=128),
+    plant: str = Form("", max_length=16),
+    effective_date: date | None = Form(None, alias="effectiveDate"),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_admin_access),
+):
+    """Import matching evidence only; this never invokes stock publication."""
+    content = await _read_upload_limited(file, max_bytes=50 * 1024 * 1024)
+    digest = hashlib.sha256(content).hexdigest()
+    filename = str(file.filename or "").lower()
+    try:
+        if filename.endswith(".csv"):
+            decoded = content.decode("utf-8-sig")
+            records = list(csv.DictReader(io.StringIO(decoded)))
+            rows = []
+            for index, record in enumerate(records, start=2):
+                material = str(record.get("sap_sku") or record.get("material") or record.get("sap_material_id") or "").strip()
+                if not material:
+                    raise ValueError(f"CSV row {index} has no SAP material")
+                rows.append({
+                    "material": material, "plant": plant, "lgort": "1000",
+                    "raw": {
+                        "materialText": record.get("sap_name") or record.get("sap_material_name") or "",
+                        "manufacturer": record.get("sap_manufacturer") or "",
+                        "historical_product_id": record.get("product_id") or "",
+                    },
+                })
+            result = import_sap_matching_rows(
+                db, rows=rows, source_version=source_version, source_type="historical_csv",
+                plant=plant, lgort="1000", effective_date=effective_date,
+                imported_by=current_user.username or "admin", payload_sha256=digest,
+            )
+        else:
+            try:
+                document = json.loads(content.decode("utf-8-sig"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("matching source must be valid UTF-8 JSON or CSV") from exc
+            if isinstance(document, dict):
+                payload = parse_saved_balance_payload(document, requested_plant=plant or None, effective_date=effective_date)
+                result = import_sap_matching_payload(
+                    db, payload=payload, source_version=source_version, source_type="saved_getbalance",
+                    imported_by=current_user.username or "admin", payload_sha256=digest,
+                )
+            elif isinstance(document, list) and all(isinstance(value, str) for value in document):
+                rows = [{"material": value, "plant": plant, "lgort": "1000", "raw": {}} for value in document]
+                result = import_sap_matching_rows(
+                    db, rows=rows, source_version=source_version, source_type="historical_sku_list",
+                    plant=plant, lgort="1000", effective_date=effective_date,
+                    imported_by=current_user.username or "admin", payload_sha256=digest,
+                )
+            else:
+                raise ValueError("unsupported matching-source JSON shape")
+        db.commit()
+        return result
+    except (UnicodeDecodeError, ValueError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        db.rollback()
+        raise
+
+
+@app.post("/api/admin/sap-provisor/source/refresh")
+async def post_admin_sap_provisor_source_refresh(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_admin_access),
+):
+    """Explicit SAP fetch for matching evidence only; never publishes branch stock."""
+    try:
+        plant = str(payload.get("plant") or "").strip()
+        balance_date = date.fromisoformat(str(payload.get("effectiveDate") or ""))
+        source_version = str(payload.get("sourceVersion") or f"getbalance-{balance_date.isoformat()}").strip()
+        balance = await fetch_balance(settings, plant=plant, date_from=balance_date, date_to=balance_date)
+        canonical = json.dumps({
+            "plant": balance.plant, "effective_date": balance.effective_date.isoformat(),
+            "items": [{"material": row.material, "plant": row.plant, "lgort": row.lgort,
+                       "charge": row.charge, "quantity": str(row.quantity), "raw": row.raw}
+                      for row in balance.items],
+        }, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+        result = import_sap_matching_payload(
+            db, payload=balance, source_version=source_version, source_type="getbalance_refresh",
+            imported_by=current_user.username or "admin", payload_sha256=hashlib.sha256(canonical).hexdigest(),
+        )
+        db.commit()
+        return result
+    except (ValueError, TimeoutError, httpx.HTTPError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        db.rollback()
+        raise
+
+
+@app.get("/api/admin/sap-provisor/unmatched")
+def get_admin_sap_provisor_unmatched(
+    q: str = Query(""),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, alias="pageSize"),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_admin_access),
+):
+    try:
+        return list_unmatched_sap_products(db, q=q, page=page, page_size=page_size)
+    except SapProvisorQueueUnavailable as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/admin/sap-provisor/products/{product_id}/candidates")
+async def get_admin_sap_provisor_candidates(
+    product_id: int,
+    limit: int = Query(10, ge=1, le=30),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_admin_access),
+):
+    try:
+        return await official_product_candidates(db=db, product_id=product_id, limit=limit)
+    except ProvisorGoodsError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=502,
+            detail="Не удалось получить кандидатов из официального каталога Provisor",
+        ) from exc
+
+
+@app.get("/api/admin/sap-provisor/search")
+async def get_admin_sap_provisor_search(
+    q: str = Query(..., min_length=1),
+    limit: int = Query(30, ge=1, le=30),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_admin_access),
+):
+    try:
+        return await official_external_search(db=db, query=q, limit=limit)
+    except ProvisorGoodsError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=502,
+            detail="Поиск в официальном каталоге Provisor недоступен",
+        ) from exc
+
+
+@app.post("/api/admin/sap-provisor/mappings")
+async def post_admin_sap_provisor_mapping(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_admin_access),
+):
+    try:
+        product_id = int(payload.get("productId"))
+        goods_id = int(payload.get("goodsId"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Укажите товар SAP и Provisor Goods ID") from exc
+    if product_id <= 0 or goods_id <= 0:
+        raise HTTPException(status_code=400, detail="Укажите товар SAP и Provisor Goods ID")
+
+    # Confirmation validates the selected identity against the official Goods
+    # catalog again. A cached/local candidate is never sufficient for a write.
+    db.rollback()
+    try:
+        candidates = await official_external_search(db=db, query=str(goods_id), limit=10)
+    except ProvisorGoodsError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Не удалось подтвердить Goods ID в официальном каталоге Provisor",
+        ) from exc
+    candidate = next(
+        (
+            row
+            for row in candidates
+            if str(row.get("sourceExternalKey") or "") == str(goods_id)
+            and str(row.get("sourceMatchKey") or "") == f"provisor:{goods_id}"
+        ),
+        None,
+    )
+    if candidate is None:
+        raise HTTPException(status_code=422, detail="Goods ID не найден в официальном каталоге Provisor")
+    try:
+        return confirm_sap_provisor_mapping(
+            db,
+            product_id=product_id,
+            candidate=candidate,
+            username=current_user.username or "admin",
+        )
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception:
+        db.rollback()
+        raise
 
 
 @app.get("/api/manual-matching/workers")
