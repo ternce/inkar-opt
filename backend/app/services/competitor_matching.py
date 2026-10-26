@@ -42,7 +42,10 @@ from .pricing_workflow.locks import (
     PricingWorkflowTransactionLockLease,
     acquire_transaction_write_locks,
 )
-from .matching_cache.config import matching_cache_read_mode
+from .matching_cache.config import (
+    matching_cache_read_allowed_for_price_format,
+    matching_cache_read_mode,
+)
 from .matching_cache.materialization import (
     CacheMaterializationResult,
     materialize_ready_snapshots,
@@ -5026,11 +5029,27 @@ def rebuild_competitor_prices_for_selected(
             "percentileMode": effective_percentile_mode(price_list, item.assignment.percentile_mode),
         }
     configured_read_mode = matching_cache_read_mode()
-    read_mode = configured_read_mode if allow_matching_cache else "disabled"
+    # The master/read kill switches must keep the legacy path inert even if a
+    # dormant allowlist value is malformed. Validate the allowlist only when
+    # reads are actually enabled.
+    format_cache_allowed = (
+        matching_cache_read_allowed_for_price_format(price_format_id)
+        if configured_read_mode != "disabled"
+        else True
+    )
+    read_mode = (
+        configured_read_mode
+        if allow_matching_cache and format_cache_allowed
+        else "disabled"
+    )
     cache_disabled_reason = (
-        "cache_disabled"
-        if allow_matching_cache
-        else "cache_bypassed_during_source_publication"
+        "cache_bypassed_during_source_publication"
+        if not allow_matching_cache
+        else (
+            "price_format_not_allowlisted"
+            if configured_read_mode != "disabled" and not format_cache_allowed
+            else "cache_disabled"
+        )
     )
     if not selected:
         db.execute(

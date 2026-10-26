@@ -70,6 +70,7 @@ def run(
     os.environ["MATCH_CACHE_SHADOW_ENABLED"] = "false"
     os.environ["MATCH_CACHE_READ"] = "true"
     os.environ["MATCH_CACHE_READ_MODE"] = "required"
+    os.environ["MATCH_CACHE_READ_ALLOW_ALL"] = "true"
 
     engine = create_engine(database_url, pool_size=2, max_overflow=0, pool_timeout=5)
     pool = {"checkedOut": 0, "peakCheckedOut": 0, "totalCheckouts": 0}

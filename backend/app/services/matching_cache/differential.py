@@ -19,11 +19,16 @@ from sqlalchemy.orm import Session
 
 from ...models import (
     CompetitorMatchSnapshotItem,
+    CompetitorPrice,
+    CompetitorPriceList,
     CompetitorPriceListItem,
+    CompetitorSourcePublication,
+    CompetitorSourcePublicationItem,
     CompetitorSourceVersion,
     CompetitorSourceVersionItem,
     Product,
 )
+from ..competitor_coefficients import effective_price_coefficient
 from .capture import iter_legacy_source_rows
 
 
@@ -162,22 +167,42 @@ def compare_legacy_and_shadow_matches(
         legacy.append({
             "sourceRowKey": row.source_row_key,
             "duplicateOrdinal": row.duplicate_ordinal,
+            "productId": item.product_id,
             "productCode": product_codes.get(item.product_id),
+            "sourceGoodsId": item.provisor_goods_id,
+            "sourceDistributorGoodsId": str(item.distributor_goods_id or ""),
+            "competitorPrice": item.distributor_price,
+            "sourceManufacturer": str(item.raw_manufacturer or ""),
             "matchType": str(item.match_type or "unmatched"),
             "matchScore": item.match_score,
             "matchKey": str(item.match_key or ""),
             "matchedSku": str(item.matched_sku or ""),
+            "isManual": "manual" in str(item.match_type or "").casefold(),
+            "isRejected": "reject" in str(item.match_type or "").casefold(),
+            "isAuthoritative": (
+                "manual" in str(item.match_type or "").casefold()
+                or str(item.match_type or "").startswith("vidman_")
+                or str(item.match_type or "").startswith("provisor_goods")
+            ),
         })
 
     shadow = [
         {
             "sourceRowKey": row.source_row_key,
             "duplicateOrdinal": row.duplicate_ordinal,
+            "productId": decision.product_id,
             "productCode": product_codes.get(decision.product_id),
+            "sourceGoodsId": row.provisor_goods_id,
+            "sourceDistributorGoodsId": str(row.distributor_goods_id or ""),
+            "competitorPrice": row.distributor_price,
+            "sourceManufacturer": str(row.raw_manufacturer or ""),
             "matchType": decision.match_type,
             "matchScore": decision.match_score,
             "matchKey": decision.match_key,
             "matchedSku": decision.matched_sku,
+            "isManual": decision.is_manual,
+            "isRejected": decision.is_rejected,
+            "isAuthoritative": decision.is_authoritative,
         }
         for decision, row in db.execute(
             select(CompetitorMatchSnapshotItem, CompetitorSourceVersionItem)
@@ -202,5 +227,176 @@ def compare_legacy_and_shadow_matches(
         legacy=legacy,
         shadow=shadow,
         identity_fields=("sourceRowKey", "duplicateOrdinal"),
-        compare_fields=("productCode", "matchType", "matchScore", "matchKey", "matchedSku"),
+        compare_fields=(
+            "productId",
+            "productCode",
+            "sourceGoodsId",
+            "sourceDistributorGoodsId",
+            "competitorPrice",
+            "sourceManufacturer",
+            "matchType",
+            "matchScore",
+            "matchKey",
+            "matchedSku",
+            "isManual",
+            "isRejected",
+            "isAuthoritative",
+        ),
+    )
+
+
+def compare_legacy_and_shadow_materialization(
+    *,
+    db: Session,
+    price_format_id: int,
+    snapshots_by_source_id: Mapping[int, int],
+) -> DifferentialReport:
+    """Compare current business rows with the cache's read-only projection.
+
+    No materialization is executed.  Published physical lineage supplies the
+    stable source-row identity and current physical item ID used by both paths.
+    """
+
+    source_ids = tuple(sorted(int(value) for value in snapshots_by_source_id))
+    sources = {
+        int(row.id): row
+        for row in db.scalars(
+            select(CompetitorPriceList).where(CompetitorPriceList.id.in_(source_ids))
+        )
+    }
+    publications = {
+        int(row.competitor_price_list_id): row
+        for row in db.scalars(
+            select(CompetitorSourcePublication).where(
+                CompetitorSourcePublication.competitor_price_list_id.in_(source_ids),
+                CompetitorSourcePublication.status == "published",
+            )
+        )
+    }
+
+    lineage_by_physical_id: dict[int, tuple[int, CompetitorSourceVersionItem]] = {}
+    for publication_item, version_item, version in db.execute(
+        select(
+            CompetitorSourcePublicationItem,
+            CompetitorSourceVersionItem,
+            CompetitorSourceVersion,
+        )
+        .join(
+            CompetitorSourceVersionItem,
+            CompetitorSourceVersionItem.id
+            == CompetitorSourcePublicationItem.source_version_item_id,
+        )
+        .join(
+            CompetitorSourceVersion,
+            CompetitorSourceVersion.id == CompetitorSourceVersionItem.source_version_id,
+        )
+        .where(CompetitorSourceVersion.competitor_price_list_id.in_(source_ids))
+        .where(
+            CompetitorSourcePublicationItem.source_publication_id.in_(
+                [int(row.id) for row in publications.values()]
+            )
+        )
+    ):
+        lineage_by_physical_id[int(publication_item.physical_source_item_id)] = (
+            int(version.competitor_price_list_id),
+            version_item,
+        )
+
+    legacy: list[dict[str, Any]] = []
+    for row in db.scalars(
+        select(CompetitorPrice).where(
+            CompetitorPrice.price_format_id == int(price_format_id),
+            CompetitorPrice.product_id.is_not(None),
+        )
+    ):
+        lineage = lineage_by_physical_id.get(int(row.source_item_id or 0))
+        source_id, version_item = lineage if lineage is not None else (0, None)
+        legacy.append({
+            "sourceId": source_id,
+            "sourceRowKey": (
+                version_item.source_row_key
+                if version_item is not None
+                else f"unmapped:{row.source_item_id}"
+            ),
+            "duplicateOrdinal": (
+                version_item.duplicate_ordinal if version_item is not None else -1
+            ),
+            "productId": row.product_id,
+            "sourceItemId": row.source_item_id,
+            "sourceGoodsId": row.source_goods_id,
+            "sourceDistributorGoodsId": str(row.source_distributor_goods_id or ""),
+            "competitorPrice": row.source_price,
+            "effectiveCoefficient": row.coefficient,
+            "matchType": str(row.match_type or ""),
+            "sourceManufacturer": str(row.source_manufacturer or ""),
+            "sourceName": str(row.source_name or ""),
+            "supplier": str(row.supplier or ""),
+            "priceDate": row.price_date,
+        })
+
+    shadow: list[dict[str, Any]] = []
+    for source_id, snapshot_id in sorted(snapshots_by_source_id.items()):
+        source = sources.get(int(source_id))
+        publication = publications.get(int(source_id))
+        if source is None or publication is None:
+            continue
+        for decision, version_item, publication_item in db.execute(
+            select(
+                CompetitorMatchSnapshotItem,
+                CompetitorSourceVersionItem,
+                CompetitorSourcePublicationItem,
+            )
+            .join(
+                CompetitorSourceVersionItem,
+                CompetitorSourceVersionItem.id
+                == CompetitorMatchSnapshotItem.source_version_item_id,
+            )
+            .join(
+                CompetitorSourcePublicationItem,
+                CompetitorSourcePublicationItem.source_version_item_id
+                == CompetitorSourceVersionItem.id,
+            )
+            .where(
+                CompetitorMatchSnapshotItem.match_snapshot_id == int(snapshot_id),
+                CompetitorSourcePublicationItem.source_publication_id
+                == int(publication.id),
+                CompetitorMatchSnapshotItem.product_id.is_not(None),
+                CompetitorSourceVersionItem.distributor_price.is_not(None),
+            )
+        ):
+            shadow.append({
+                "sourceId": int(source_id),
+                "sourceRowKey": version_item.source_row_key,
+                "duplicateOrdinal": version_item.duplicate_ordinal,
+                "productId": decision.product_id,
+                "sourceItemId": publication_item.physical_source_item_id,
+                "sourceGoodsId": version_item.provisor_goods_id,
+                "sourceDistributorGoodsId": str(version_item.distributor_goods_id or ""),
+                "competitorPrice": version_item.distributor_price,
+                "effectiveCoefficient": effective_price_coefficient(source),
+                "matchType": str(decision.match_type or ""),
+                "sourceManufacturer": str(version_item.raw_manufacturer or ""),
+                "sourceName": f"{source.source_type}:{source.source_key}",
+                "supplier": str(source.supplier or source.display_name or ""),
+                "priceDate": source.price_date,
+            })
+
+    return compare_records(
+        artifact="competitor_price_materialization",
+        legacy=legacy,
+        shadow=shadow,
+        identity_fields=("sourceId", "sourceRowKey", "duplicateOrdinal"),
+        compare_fields=(
+            "productId",
+            "sourceItemId",
+            "sourceGoodsId",
+            "sourceDistributorGoodsId",
+            "competitorPrice",
+            "effectiveCoefficient",
+            "matchType",
+            "sourceManufacturer",
+            "sourceName",
+            "supplier",
+            "priceDate",
+        ),
     )

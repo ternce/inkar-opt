@@ -15,6 +15,12 @@ from .services.refresh_queue import (
     worker_identity,
 )
 from .services.parser_daily_orchestrator import advance_pending_daily_runs
+from .services.matching_cache.config import (
+    matching_cache_worker_enabled,
+    matching_cache_worker_lease_seconds,
+    matching_cache_worker_poll_interval_seconds,
+)
+from .services.matching_cache.worker import run_one_matching_job
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +71,66 @@ async def _poll_refresh_queue(*, stop_event: asyncio.Event, worker_id: str, poll
         retry_delay = min(max(poll_interval, retry_delay * 2), 60) if had_error else poll_interval
 
 
+async def _poll_matching_cache_queue(
+    *, stop_event: asyncio.Event, worker_id: str, poll_interval: float, lease_seconds: int
+) -> None:
+    """Run the existing matching-cache state machine without blocking other queues.
+
+    Cache matching is intentionally single-concurrency per worker process.  The
+    database job claim uses ``FOR UPDATE SKIP LOCKED`` and an expiring lease, so
+    multiple worker hosts may safely run this poller without duplicate claims.
+    """
+
+    completed = 0
+    failed = 0
+    retry_delay = poll_interval
+    while not stop_event.is_set():
+        had_error = False
+        try:
+            result = await asyncio.to_thread(
+                run_one_matching_job,
+                session_factory=SessionLocal,
+                worker_id=worker_id,
+                lease_seconds=lease_seconds,
+            )
+            if result == "succeeded":
+                completed += 1
+                retry_delay = poll_interval
+                logger.info(
+                    "[MATCH_CACHE_WORKER_METRICS] worker=%s result=%s completed=%s failed=%s",
+                    worker_id,
+                    result,
+                    completed,
+                    failed,
+                )
+                continue
+            if result == "failed":
+                failed += 1
+            if result in {"pending", "failed", "lost"}:
+                logger.warning(
+                    "[MATCH_CACHE_WORKER_METRICS] worker=%s result=%s completed=%s failed=%s",
+                    worker_id,
+                    result,
+                    completed,
+                    failed,
+                )
+            retry_delay = poll_interval
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            had_error = True
+            logger.exception(
+                "[MATCH_CACHE_WORKER_DB_RETRY] worker=%s retry_in_sec=%s",
+                worker_id,
+                retry_delay,
+            )
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=retry_delay)
+        except asyncio.TimeoutError:
+            pass
+        retry_delay = min(max(poll_interval, retry_delay * 2), 60) if had_error else poll_interval
+
+
 async def run() -> None:
     settings = get_settings()
     if settings.process_role != "worker":
@@ -93,6 +159,26 @@ async def run() -> None:
         )
         for idx in range(settings.parser_worker_concurrency)
     ]
+    if matching_cache_worker_enabled():
+        cache_worker_id = f"{worker_id}:matching-cache"
+        cache_poll_interval = float(matching_cache_worker_poll_interval_seconds())
+        cache_lease_seconds = matching_cache_worker_lease_seconds()
+        logger.info(
+            "[MATCH_CACHE_WORKER_START] worker=%s poll_interval_sec=%s lease_sec=%s concurrency=1",
+            cache_worker_id,
+            cache_poll_interval,
+            cache_lease_seconds,
+        )
+        queue_tasks.append(
+            asyncio.create_task(
+                _poll_matching_cache_queue(
+                    stop_event=stop_event,
+                    worker_id=cache_worker_id,
+                    poll_interval=cache_poll_interval,
+                    lease_seconds=cache_lease_seconds,
+                )
+            )
+        )
     try:
         await stop_event.wait()
     finally:

@@ -39,11 +39,17 @@ from backend.app.models import (
     Product,
     CalculatedPrice,
     BendRange,
+    BranchStock,
     MarkupRange,
     NoCompetitorMarkupRange,
     SourceGoodsMatch,
+    StockSnapshot,
 )
 from backend.app.services.matching_cache.capture import capture_and_publish_legacy_source_version
+from backend.app.services.matching_cache.backfill import (
+    backfill_existing_source,
+    plan_existing_source,
+)
 from backend.app.services.matching_cache.config import matching_cache_enabled
 from backend.app.services.matching_cache.dependencies import (
     MANUAL_CODE_MAPPINGS,
@@ -79,11 +85,16 @@ from backend.app.services.matching_cache.shadow import (
 )
 from backend.app.services.matching_cache import shadow as shadow_service
 from backend.app.services.matching_cache import capture as capture_service
+from backend.app.services.matching_cache import worker as matching_cache_worker_service
 from backend.app.services.matching_cache.materialization import (
     MatchingCacheConflict,
     MatchingCacheUnavailable,
 )
-from backend.app.services.matching_cache.differential import compare_legacy_and_shadow_matches, compare_records
+from backend.app.services.matching_cache.differential import (
+    compare_legacy_and_shadow_matches,
+    compare_legacy_and_shadow_materialization,
+    compare_records,
+)
 from backend.app.timezone import now_kz_naive
 from backend.app.services.pricing import resolve_competitor_price
 from backend.app.services.competitor_matching import rematch_price_list_items_by_product
@@ -274,6 +285,141 @@ def test_source_version_reuses_identical_content_and_changes_generation(pg_engin
         assert changed.version.content_sha256 != first.version.content_sha256
 
 
+def test_existing_source_backfill_is_idempotent_and_does_not_touch_business_outputs(
+    pg_engine, source_id
+):
+    token = uuid.uuid4().hex
+    with Session(pg_engine) as db:
+        source = db.get(CompetitorPriceList, source_id)
+        db.add(
+            CompetitorPriceListItem(
+                price_list_id=source_id,
+                name=f"Backfill {token}",
+                distributor_goods_name=f"Backfill {token}",
+                distributor_goods_id=f"BACKFILL-{token}",
+                distributor_price=Decimal("12.34"),
+            )
+        )
+        db.commit()
+        format_id = int(source.price_format_id)
+
+    with Session(pg_engine) as db:
+        before_prices = int(db.scalar(select(func.count(PriceList.id))) or 0)
+        before_calculated = int(db.scalar(select(func.count(CalculatedPrice.id))) or 0)
+        before_competitor_prices = int(
+            db.scalar(select(func.count(CompetitorPrice.id))) or 0
+        )
+        before_branch_stock = int(db.scalar(select(func.count(BranchStock.id))) or 0)
+        before_stock_snapshots = int(
+            db.scalar(select(func.count(StockSnapshot.id))) or 0
+        )
+        source_item_before = db.scalar(
+            select(CompetitorPriceListItem).where(
+                CompetitorPriceListItem.price_list_id == source_id
+            )
+        )
+        source_values_before = (
+            source_item_before.distributor_goods_id,
+            source_item_before.distributor_price,
+            source_item_before.product_id,
+            source_item_before.match_type,
+        )
+        plan = plan_existing_source(
+            db=db, competitor_price_list_id=source_id, batch_size=100
+        )
+        assert plan.row_count == 1
+        assert plan.would_create_version is True
+        db.rollback()
+
+    with Session(pg_engine) as db:
+        first = backfill_existing_source(
+            db=db,
+            competitor_price_list_id=source_id,
+            price_format_id=format_id,
+            batch_size=100,
+        )
+        db.commit()
+
+    with Session(pg_engine) as db:
+        second = backfill_existing_source(
+            db=db,
+            competitor_price_list_id=source_id,
+            price_format_id=format_id,
+            batch_size=100,
+        )
+        db.commit()
+        assert second.source_version_id == first.source_version_id
+        assert second.source_publication_id == first.source_publication_id
+        assert second.snapshot_id == first.snapshot_id
+        assert second.job_id == first.job_id
+        assert second.source_version_reused is True
+        assert second.source_publication_reused is True
+        assert second.snapshot_reused is True
+        assert second.job_reused is True
+        assert int(db.scalar(select(func.count(PriceList.id))) or 0) == before_prices
+        assert (
+            int(db.scalar(select(func.count(CalculatedPrice.id))) or 0)
+            == before_calculated
+        )
+        assert (
+            int(db.scalar(select(func.count(CompetitorPrice.id))) or 0)
+            == before_competitor_prices
+        )
+        assert int(db.scalar(select(func.count(BranchStock.id))) or 0) == before_branch_stock
+        assert (
+            int(db.scalar(select(func.count(StockSnapshot.id))) or 0)
+            == before_stock_snapshots
+        )
+        source_item_after = db.scalar(
+            select(CompetitorPriceListItem).where(
+                CompetitorPriceListItem.price_list_id == source_id
+            )
+        )
+        assert (
+            source_item_after.distributor_goods_id,
+            source_item_after.distributor_price,
+            source_item_after.product_id,
+            source_item_after.match_type,
+        ) == source_values_before
+        # Keep the module-scoped PostgreSQL schema neutral for later job-claim
+        # tests; production backfill intentionally leaves this job pending.
+        queued_job = db.get(CompetitorMatchJob, int(second.job_id))
+        queued_job.status = "cancelled"
+        db.commit()
+
+
+def test_existing_application_worker_executes_backfilled_job(
+    pg_engine, source_id, monkeypatch
+):
+    monkeypatch.setenv("MATCH_CACHE_ENABLED", "true")
+    monkeypatch.setenv("MATCH_CACHE_WORKER_ENABLED", "true")
+    monkeypatch.setattr(
+        matching_cache_worker_service,
+        "assert_database_dependency_tracking",
+        lambda _db: None,
+    )
+    with Session(pg_engine) as db:
+        _add_legacy_item(db, source_id, code=f"WORKER-{uuid.uuid4().hex}")
+        result = backfill_existing_source(
+            db=db, competitor_price_list_id=source_id, batch_size=100
+        )
+        job_id = int(result.job_id)
+        snapshot_id = int(result.snapshot_id)
+        db.commit()
+
+    outcome = matching_cache_worker_service.run_one_matching_job(
+        session_factory=lambda: Session(pg_engine),
+        worker_id="existing-app-worker:test",
+        lease_seconds=900,
+    )
+    assert outcome == "succeeded"
+    with Session(pg_engine) as db:
+        assert db.get(CompetitorMatchJob, job_id).status == "succeeded"
+        snapshot = db.get(CompetitorMatchSnapshot, snapshot_id)
+        assert snapshot.status == "ready"
+        assert int(snapshot.input_row_count) == 1
+
+
 def test_duplicate_rows_are_retained_and_affect_fingerprint(pg_engine, source_id):
     duplicated = canonical_source_content(_rows())
     reordered = canonical_source_content(list(reversed(_rows())))
@@ -448,6 +594,7 @@ def _enable_dual_write(monkeypatch, *, shadow: bool = False) -> None:
     monkeypatch.setenv("MATCH_CACHE_SHADOW_ENABLED", "true" if shadow else "false")
     monkeypatch.setenv("MATCH_CACHE_READ", "false")
     monkeypatch.setenv("MATCH_CACHE_WORKER_ENABLED", "false")
+    monkeypatch.setenv("MATCH_CACHE_READ_ALLOW_ALL", "true")
 
 
 def _add_legacy_item(db: Session, source_id: int, *, code: str, price: str = "10") -> int:
@@ -1778,6 +1925,46 @@ def test_job_claim_retry_and_crash_recovery(pg_engine, source_id, monkeypatch):
         assert recovered.attempt_count == 2
 
 
+def test_expired_lease_recovery_skips_job_locked_by_active_builder(
+    pg_engine, source_id, monkeypatch
+):
+    _enable_dual_write(monkeypatch)
+    with Session(pg_engine) as db:
+        _add_legacy_item(db, source_id, code=f"LEASE-LOCK-{uuid.uuid4().hex}")
+        capture = capture_and_publish_legacy_source_version(
+            db=db, competitor_price_list_id=source_id
+        )
+        job, _ = enqueue_matching_job(
+            db=db,
+            source_version_id=int(capture.version_id),
+            dependency_fingerprint="e" * 64,
+        )
+        job_id = int(job.id)
+        db.commit()
+    with Session(pg_engine) as db:
+        claimed = claim_next_matching_job(
+            db=db, worker_id="active-builder", lease_seconds=60
+        )
+        assert claimed is not None and int(claimed.id) == job_id
+        claimed.lease_expires_at = now_kz_naive() - timedelta(seconds=1)
+        db.commit()
+
+    with Session(pg_engine) as active_builder:
+        active_builder.scalar(
+            select(CompetitorMatchJob)
+            .where(CompetitorMatchJob.id == job_id)
+            .with_for_update()
+        )
+        with Session(pg_engine) as recovery:
+            assert recover_stale_matching_jobs(db=recovery) == 0
+            recovery.rollback()
+        active_builder.rollback()
+
+    with Session(pg_engine) as recovery:
+        assert recover_stale_matching_jobs(db=recovery) == 1
+        recovery.commit()
+
+
 def test_connection_loss_during_match_rolls_back_legacy_side_effects(
     pg_engine, source_id, monkeypatch
 ):
@@ -2183,6 +2370,14 @@ def test_end_to_end_materialization_calculation_analytics_and_excel_parity(
             )
             assert republished.succeeded and republished.reused
         db.commit()
+        compare_legacy_and_shadow_materialization(
+            db=db,
+            price_format_id=int(price_format.id),
+            snapshots_by_source_id={
+                int(source.id): snapshot_id
+                for source, snapshot_id in zip(sources[:-1], snapshot_ids[:-1])
+            },
+        ).assert_exact()
         db.execute(delete(CompetitorPrice).where(
             CompetitorPrice.price_format_id == price_format.id,
             CompetitorPrice.product_id.is_not(None),

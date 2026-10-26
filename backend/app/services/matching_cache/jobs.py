@@ -4,7 +4,7 @@ from datetime import timedelta
 import hashlib
 import logging
 
-from sqlalchemy import case, select, update
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -64,36 +64,31 @@ def enqueue_matching_job(
 
 def recover_stale_matching_jobs(*, db: Session) -> int:
     now = now_kz_naive()
-    result = db.execute(
-        update(CompetitorMatchJob)
+    # Lock only expired rows that are not still owned by an active build.
+    # The builder holds the job row lock for its atomic snapshot transaction;
+    # SKIP LOCKED therefore prevents an elapsed wall-clock lease from blocking
+    # another worker or creating a second writer for the same snapshot.
+    rows = db.scalars(
+        select(CompetitorMatchJob)
         .where(CompetitorMatchJob.status == "running")
         .where(CompetitorMatchJob.lease_expires_at.is_not(None))
         .where(CompetitorMatchJob.lease_expires_at < now)
-        .values(
-            status=case(
-                (
-                    CompetitorMatchJob.attempt_count >= CompetitorMatchJob.max_attempts,
-                    "failed",
-                ),
-                else_="pending",
-            ),
-            available_at=now,
-            claimed_by="",
-            heartbeat_at=None,
-            lease_expires_at=None,
-            finished_at=case(
-                (
-                    CompetitorMatchJob.attempt_count >= CompetitorMatchJob.max_attempts,
-                    now,
-                ),
-                else_=None,
-            ),
-            error="worker lease expired",
-            updated_at=now,
-        )
-        .execution_options(synchronize_session=False)
-    )
-    count = int(result.rowcount or 0)
+        .order_by(CompetitorMatchJob.id.asc())
+        .with_for_update(skip_locked=True)
+    ).all()
+    for row in rows:
+        terminal = int(row.attempt_count) >= int(row.max_attempts)
+        row.status = "failed" if terminal else "pending"
+        row.available_at = now
+        row.claimed_by = ""
+        row.heartbeat_at = None
+        row.lease_expires_at = None
+        row.finished_at = now if terminal else None
+        row.error = "worker lease expired"
+        row.updated_at = now
+    if rows:
+        db.flush()
+    count = len(rows)
     if count:
         logger.warning("[MATCH_CACHE_JOB_RECOVERY] recovered=%s", count)
     return count

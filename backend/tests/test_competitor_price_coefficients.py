@@ -88,6 +88,44 @@ def _prepare(db, pf):
     db.flush()
 
 
+def test_matching_cache_read_allowlist_keeps_other_formats_on_legacy_path(monkeypatch):
+    db = _session()
+    pf = _format(db, code="PILOT-ISOLATION")
+    product = _product(db, code="PILOT-SKU")
+    _plk(db, pf, product, source_key="pilot-isolation", price=100)
+    monkeypatch.setenv("MATCH_CACHE_ENABLED", "true")
+    monkeypatch.setenv("MATCH_CACHE_READ", "true")
+    monkeypatch.setenv("MATCH_CACHE_READ_MODE", "required")
+    monkeypatch.setenv("MATCH_CACHE_READ_PRICE_FORMAT_IDS", str(int(pf.id) + 1))
+
+    summary = rebuild_competitor_prices_for_selected(
+        db=db, price_format_id=int(pf.id)
+    )
+
+    assert summary["_matchingCache"]["mode"] == "disabled"
+    assert summary["_matchingCache"]["hit"] is False
+    assert summary["_matchingCache"]["reason"] == "price_format_not_allowlisted"
+    assert summary["_matchingCache"]["fullRematchInvocationCount"] == 1
+
+
+def test_matching_cache_kill_switch_ignores_dormant_allowlist(monkeypatch):
+    db = _session()
+    pf = _format(db, code="CACHE-KILL-SWITCH")
+    product = _product(db, code="CACHE-KILL-SKU")
+    _plk(db, pf, product, source_key="kill-switch", price=100)
+    monkeypatch.setenv("MATCH_CACHE_ENABLED", "false")
+    monkeypatch.setenv("MATCH_CACHE_READ", "true")
+    monkeypatch.setenv("MATCH_CACHE_READ_PRICE_FORMAT_IDS", "invalid")
+
+    summary = rebuild_competitor_prices_for_selected(
+        db=db, price_format_id=int(pf.id)
+    )
+
+    assert summary["_matchingCache"]["mode"] == "disabled"
+    assert summary["_matchingCache"]["reason"] == "cache_disabled"
+    assert summary["_matchingCache"]["fullRematchInvocationCount"] == 1
+
+
 def test_default_coefficient_is_one_and_raw_price_is_preserved():
     db = _session()
     pf = _format(db)

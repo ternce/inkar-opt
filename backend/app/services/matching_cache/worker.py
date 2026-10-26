@@ -15,6 +15,7 @@ from .jobs import (
     claim_next_matching_job,
     complete_matching_job,
     fail_matching_job,
+    heartbeat_matching_job,
     recover_stale_matching_jobs,
 )
 from .shadow import ShadowSnapshotConflict, build_shadow_snapshot, get_or_create_shadow_snapshot
@@ -55,6 +56,16 @@ def run_one_matching_job(
             )
             if job is None:
                 return "lost"
+            # Refresh the lease at the last safe boundary before the long
+            # matching transaction. The locked job/snapshot/source rows then
+            # serialize the build; the production lease is deliberately much
+            # longer than the measured full matcher runtime.
+            heartbeat_matching_job(
+                db=db,
+                job_id=job_id,
+                worker_id=worker_id,
+                lease_seconds=lease_seconds,
+            )
             vector = build_dependency_vector(db=db)
             if vector.fingerprint != job.dependency_fingerprint:
                 raise ShadowSnapshotConflict("stale dependency fingerprint at job execution")
@@ -75,6 +86,12 @@ def run_one_matching_job(
                 match_snapshot_id=result.snapshot_id,
             )
             db.commit()
+            logger.info(
+                "[MATCH_CACHE_JOB_SUCCEEDED] job_id=%s snapshot_id=%s worker=%s",
+                job_id,
+                result.snapshot_id,
+                worker_id,
+            )
             return "succeeded"
     except Exception as exc:
         retryable = not isinstance(exc, ShadowSnapshotConflict)
