@@ -55,12 +55,9 @@ class DependencyVector:
 
 
 def with_matching_context(
-    vector: DependencyVector, *, price_format_ids: tuple[int, ...], source_ids: tuple[int, ...]
+    vector: DependencyVector, *, context: Mapping[str, Any]
 ) -> DependencyVector:
-    context = {
-        "priceFormatIds": list(price_format_ids),
-        "sourceIds": list(source_ids),
-    }
+    context = dict(context)
     payload = {
         "revisions": dict(sorted(vector.revisions.items())),
         "matcherVersion": vector.matcher_version,
@@ -75,6 +72,13 @@ def with_matching_context(
         fingerprint=hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
         matching_context=context,
     )
+
+
+def matching_context_key(context: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        dict(context), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _json(value: Mapping[str, Any] | None) -> str:

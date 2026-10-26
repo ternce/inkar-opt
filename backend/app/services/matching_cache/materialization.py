@@ -28,7 +28,7 @@ from ..pricing_workflow.locks import (
     PricingWorkflowCapacityExceeded,
     PricingWorkflowConflict,
 )
-from .dependencies import build_dependency_vector
+from .dependencies import build_dependency_vector, matching_context_key
 from .context import MatchingContextConflict, build_source_dependency_vector
 
 
@@ -217,10 +217,14 @@ def _resolve_source_snapshot(
         # current version simply has no snapshot yet, so fallback mode may run
         # the locked legacy matcher and required mode reports unavailable.
         return None
+    expected_context_key = matching_context_key(vector.matching_context or {})
+    if exact.matching_context_key and exact.matching_context_key != expected_context_key:
+        _conflict(f"source {source_id} snapshot context identity mismatch")
     if exact.status in {"pending", "running"}:
-        raise MatchingCacheUnavailable(
-            f"matching cache snapshot {exact.id} is not ready (status={exact.status})"
-        )
+        # Building is a safe availability miss: fallback mode runs the locked
+        # legacy matcher, while required mode is converted to unavailable by
+        # the caller. Corrupt/failed artifacts still fail closed below.
+        return None
     if exact.status not in {"ready", "published"} or exact.ready_at is None or exact.error:
         _conflict(f"source {source_id} snapshot {exact.id} is not publishable")
     try:
@@ -378,6 +382,7 @@ def materialize_ready_snapshots(
                 competitor_price_list_id=int(item.price_list.id),
                 base_vector=vector,
                 expected_source_ids=expected_source_ids,
+                price_format_id=int(price_format_id),
             )
         except MatchingContextConflict as exc:
             _conflict(str(exc))

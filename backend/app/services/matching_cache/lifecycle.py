@@ -28,7 +28,7 @@ from .config import (
 from .context import (
     MatchingContextConflict,
     build_source_dependency_vector,
-    resolve_matching_context,
+    resolve_matching_contexts,
 )
 from .jobs import enqueue_matching_job
 from .shadow import get_or_create_shadow_snapshot
@@ -74,11 +74,6 @@ def reconcile_matching_cache_lifecycle(*, db: Session) -> LifecycleResult:
     errors: list[str] = []
     for source_id in source_ids:
         try:
-            context = resolve_matching_context(
-                db=db, competitor_price_list_id=source_id
-            )
-            if not context.eligible:
-                continue
             version = db.scalar(
                 select(CompetitorSourceVersion).where(
                     CompetitorSourceVersion.competitor_price_list_id == source_id,
@@ -115,30 +110,34 @@ def reconcile_matching_cache_lifecycle(*, db: Session) -> LifecycleResult:
                 version = db.get(CompetitorSourceVersion, int(outcome.version_id))
             if version is None:
                 raise RuntimeError("published source version is missing after capture")
-
-            vector, _ = build_source_dependency_vector(
-                db=db,
-                competitor_price_list_id=source_id,
-            )
-            snapshot, reused = get_or_create_shadow_snapshot(
-                db=db, source_version_id=int(version.id), vector=vector
-            )
-            if not reused:
-                snapshots_created += 1
-            if snapshot.status in {"ready", "published"}:
-                already_ready += 1
-                continue
-            job, job_reused = enqueue_matching_job(
-                db=db,
-                source_version_id=int(version.id),
-                dependency_fingerprint=vector.fingerprint,
-                match_snapshot_id=int(snapshot.id),
-            )
-            if not job_reused:
-                jobs_created += 1
-            elif job.status == "failed" and int(job.attempt_count) < int(job.max_attempts):
-                job.status = "pending"
-                job.error = ""
+            for context in resolve_matching_contexts(
+                db=db, competitor_price_list_id=source_id
+            ):
+                vector, _ = build_source_dependency_vector(
+                    db=db,
+                    competitor_price_list_id=source_id,
+                    context_key=context.context_key,
+                )
+                snapshot, reused = get_or_create_shadow_snapshot(
+                    db=db, source_version_id=int(version.id), vector=vector
+                )
+                if not reused:
+                    snapshots_created += 1
+                if snapshot.status in {"ready", "published"}:
+                    already_ready += 1
+                    continue
+                job, job_reused = enqueue_matching_job(
+                    db=db,
+                    source_version_id=int(version.id),
+                    dependency_fingerprint=vector.fingerprint,
+                    matching_context_key=context.context_key,
+                    match_snapshot_id=int(snapshot.id),
+                )
+                if not job_reused:
+                    jobs_created += 1
+                elif job.status == "failed" and int(job.attempt_count) < int(job.max_attempts):
+                    job.status = "pending"
+                    job.error = ""
         except MatchingContextConflict as exc:
             conflicts += 1
             errors.append(f"source {source_id}: {exc}")
@@ -182,7 +181,9 @@ def matching_cache_status(*, db: Session) -> dict:
         }
         try:
             vector, context = build_source_dependency_vector(
-                db=db, competitor_price_list_id=int(source.id)
+                db=db,
+                competitor_price_list_id=int(source.id),
+                price_format_id=format_id,
             )
             version = db.scalar(select(CompetitorSourceVersion).where(
                 CompetitorSourceVersion.competitor_price_list_id == int(source.id),
@@ -195,6 +196,7 @@ def matching_cache_status(*, db: Session) -> dict:
                 ).order_by(CompetitorMatchSnapshot.id.desc()).limit(1))
                 pending_jobs = int(db.query(CompetitorMatchJob).filter(
                     CompetitorMatchJob.source_version_id == int(version.id),
+                    CompetitorMatchJob.matching_context_key == context.context_key,
                     CompetitorMatchJob.status.in_(("pending", "running")),
                 ).count())
                 source_status.update({
@@ -207,6 +209,8 @@ def matching_cache_status(*, db: Session) -> dict:
                     ),
                     "pendingJobs": pending_jobs,
                     "matchingSourceIds": list(context.source_ids),
+                    "matchingContextKey": context.context_key,
+                    "matchingPriceFormatIds": list(context.price_format_ids),
                 })
                 if snapshot is not None and snapshot.status in {"ready", "published"}:
                     source_status.update({"ready": True, "reason": "ready"})

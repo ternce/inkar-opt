@@ -95,6 +95,7 @@ from backend.app.services.matching_cache.context import (
     MatchingContextConflict,
     build_source_dependency_vector,
     resolve_matching_context,
+    resolve_matching_contexts,
 )
 from backend.app.services.matching_cache.lifecycle import (
     matching_cache_status,
@@ -129,6 +130,8 @@ PHASE2B2_UP_MIGRATION = REPO_ROOT / "backend/scripts/migrations/20261014_phase2b
 PHASE2B2_DOWN_MIGRATION = REPO_ROOT / "backend/scripts/migrations/20261014_phase2b2_shadow_jobs.down.sql"
 LINEAGE_UP_MIGRATION = REPO_ROOT / "backend/scripts/migrations/20261015_phase2b4_stable_source_lineage.up.sql"
 LINEAGE_DOWN_MIGRATION = REPO_ROOT / "backend/scripts/migrations/20261015_phase2b4_stable_source_lineage.down.sql"
+MULTI_CONTEXT_UP_MIGRATION = REPO_ROOT / "backend/scripts/migrations/20261026_matching_cache_multi_context.up.sql"
+MULTI_CONTEXT_DOWN_MIGRATION = REPO_ROOT / "backend/scripts/migrations/20261026_matching_cache_multi_context.down.sql"
 NEW_TABLES = {
     "competitor_source_versions",
     "competitor_source_version_items",
@@ -253,6 +256,8 @@ def test_migration_upgrade_and_downgrade_on_postgresql_16():
             _execute_script(connection, UP_MIGRATION)
             _execute_script(connection, PHASE2B2_UP_MIGRATION)
             _execute_script(connection, LINEAGE_UP_MIGRATION)
+            _execute_script(connection, MULTI_CONTEXT_UP_MIGRATION)
+            _execute_script(connection, MULTI_CONTEXT_UP_MIGRATION)
         migration_inspector = inspect(engine)
         assert NEW_TABLES <= set(migration_inspector.get_table_names())
         for table_name in NEW_TABLES:
@@ -260,6 +265,7 @@ def test_migration_upgrade_and_downgrade_on_postgresql_16():
             orm_columns = set(Base.metadata.tables[table_name].columns.keys())
             assert migration_columns == orm_columns
         with engine.begin() as connection:
+            _execute_script(connection, MULTI_CONTEXT_DOWN_MIGRATION)
             _execute_script(connection, LINEAGE_DOWN_MIGRATION)
             _execute_script(connection, PHASE2B2_DOWN_MIGRATION)
             _execute_script(connection, DOWN_MIGRATION)
@@ -837,30 +843,66 @@ def test_automatic_lifecycle_captures_enqueues_builds_and_invalidates(
         db.rollback()
 
 
-def test_matching_context_fails_closed_for_shared_source_with_incompatible_cohorts(
-    pg_engine
+def test_shared_source_has_independent_contexts_for_incompatible_cohorts(
+    pg_engine, monkeypatch
 ):
+    _enable_dual_write(monkeypatch)
+    monkeypatch.setenv("MATCH_CACHE_WORKER_ENABLED", "true")
+    monkeypatch.setattr(
+        matching_cache_worker_service,
+        "assert_database_dependency_tracking",
+        lambda _db: None,
+    )
     token = uuid.uuid4().hex
     with Session(pg_engine) as db:
         first_format = PriceFormat(code=f"CTX-A-{token}", name="A", branch="test")
         second_format = PriceFormat(code=f"CTX-B-{token}", name="B", branch="test")
-        db.add_all([first_format, second_format])
+        shared_product = Product(
+            code=f"CTX-SHARED-{token}", name=f"Shared duplicate {token}", cost=1
+        )
+        other_product = Product(
+            code=f"CTX-OTHER-{token}", name=f"Other row {token}", cost=1
+        )
+        db.add_all([first_format, second_format, shared_product, other_product])
         db.flush()
         shared = CompetitorPriceList(
             price_format_id=first_format.id,
             source_type="manual",
             source_key=f"shared:{token}",
             display_name="Shared",
+            items_count=2,
         )
         other = CompetitorPriceList(
             price_format_id=second_format.id,
             source_type="manual",
             source_key=f"other:{token}",
             display_name="Other",
+            items_count=1,
         )
         db.add_all([shared, other])
         db.flush()
         db.add_all([
+            CompetitorPriceListItem(
+                price_list_id=shared.id,
+                name=shared_product.name,
+                distributor_goods_id="SHARED",
+                distributor_price=Decimal("10"),
+                raw_json="{}",
+            ),
+            CompetitorPriceListItem(
+                price_list_id=shared.id,
+                name=shared_product.name,
+                distributor_goods_id="SHARED",
+                distributor_price=Decimal("10"),
+                raw_json="{}",
+            ),
+            CompetitorPriceListItem(
+                price_list_id=other.id,
+                name=other_product.name,
+                distributor_goods_id="OTHER",
+                distributor_price=Decimal("11"),
+                raw_json="{}",
+            ),
             PriceFormatCompetitorAssignment(
                 price_format_id=first_format.id,
                 competitor_price_list_id=shared.id,
@@ -878,9 +920,201 @@ def test_matching_context_fails_closed_for_shared_source_with_incompatible_cohor
             ),
         ])
         db.flush()
+        contexts = resolve_matching_contexts(
+            db=db, competitor_price_list_id=int(shared.id)
+        )
+        assert len(contexts) == 2
+        first_context = resolve_matching_context(
+            db=db,
+            competitor_price_list_id=int(shared.id),
+            price_format_id=int(first_format.id),
+        )
+        second_context = resolve_matching_context(
+            db=db,
+            competitor_price_list_id=int(shared.id),
+            price_format_id=int(second_format.id),
+        )
+        assert first_context.source_ids == (int(shared.id),)
+        assert second_context.source_ids == tuple(sorted((int(shared.id), int(other.id))))
+        assert first_context.context_key != second_context.context_key
         with pytest.raises(MatchingContextConflict):
             resolve_matching_context(db=db, competitor_price_list_id=int(shared.id))
+        shared_id = int(shared.id)
+        other_id = int(other.id)
+        second_format_id = int(second_format.id)
+        first_format_id = int(first_format.id)
+        db.commit()
+
+    legacy_by_format: dict[int, list[dict]] = {}
+    for format_id in (first_format_id, second_format_id):
+        with Session(pg_engine) as db:
+            legacy = rebuild_competitor_prices_for_selected(
+                db=db, price_format_id=format_id, allow_matching_cache=False
+            )
+            assert legacy["_matchingCache"]["fullRematchInvocationCount"] in {1, 2}
+            legacy_by_format[format_id] = _physical_competitor_records(db, format_id)
+            db.rollback()
+
+    with Session(pg_engine) as db:
+        reconcile_matching_cache_lifecycle(db=db)
+        version = db.scalar(select(CompetitorSourceVersion).where(
+            CompetitorSourceVersion.competitor_price_list_id == shared_id,
+            CompetitorSourceVersion.status == "published",
+        ))
+        contexts = resolve_matching_contexts(
+            db=db, competitor_price_list_id=shared_id
+        )
+        vectors = [
+            build_source_dependency_vector(
+                db=db,
+                competitor_price_list_id=shared_id,
+                context_key=context.context_key,
+            )[0]
+            for context in contexts
+        ]
+        snapshots = db.scalars(select(CompetitorMatchSnapshot).where(
+            CompetitorMatchSnapshot.source_version_id == int(version.id),
+            CompetitorMatchSnapshot.dependency_fingerprint.in_(
+                [vector.fingerprint for vector in vectors]
+            ),
+        )).all()
+        jobs = db.scalars(select(CompetitorMatchJob).where(
+            CompetitorMatchJob.source_version_id == int(version.id)
+        )).all()
+        version_id = int(version.id)
+        assert len(snapshots) == 2
+        assert {row.matching_context_key for row in snapshots} == {
+            context.context_key for context in contexts
+        }
+        assert len(jobs) == 2
+        assert {row.matching_context_key for row in jobs} == {
+            context.context_key for context in contexts
+        }
+        other_jobs = db.scalars(
+            select(CompetitorMatchJob)
+            .join(
+                CompetitorSourceVersion,
+                CompetitorSourceVersion.id == CompetitorMatchJob.source_version_id,
+            )
+            .where(
+                CompetitorSourceVersion.competitor_price_list_id == other_id,
+                CompetitorMatchJob.status == "pending",
+            )
+        ).all()
+        for job in other_jobs:
+            job.available_at = now_kz_naive() + timedelta(hours=1)
+        db.commit()
+
+    outcomes: list[str] = []
+    for batch in range(4):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes.extend(pool.map(
+                lambda worker_id: matching_cache_worker_service.run_one_matching_job(
+                    session_factory=lambda: Session(pg_engine),
+                    worker_id=worker_id,
+                    lease_seconds=120,
+                ),
+                (f"context-{batch}-a-{token}", f"context-{batch}-b-{token}"),
+            ))
+        with Session(pg_engine) as db:
+            ready_count = int(db.scalar(
+                select(func.count(CompetitorMatchSnapshot.id)).where(
+                    CompetitorMatchSnapshot.source_version_id == version_id,
+                    CompetitorMatchSnapshot.status == "ready",
+                )
+            ) or 0)
+        if ready_count == 2:
+            break
+    assert outcomes.count("succeeded") >= 2
+
+    with Session(pg_engine) as db:
+        ready_context_keys = set(db.scalars(
+            select(CompetitorMatchSnapshot.matching_context_key).where(
+                CompetitorMatchSnapshot.source_version_id == version_id,
+                CompetitorMatchSnapshot.status == "ready",
+            )
+        ))
+        assert ready_context_keys == {
+            context.context_key for context in contexts
+        }
+
+    monkeypatch.setenv("MATCH_CACHE_READ", "true")
+    monkeypatch.setenv("MATCH_CACHE_READ_MODE", "required")
+    monkeypatch.setenv("MATCH_CACHE_READ_ALLOW_ALL", "true")
+    with Session(pg_engine) as db:
+        cached_first = rebuild_competitor_prices_for_selected(
+            db=db, price_format_id=first_format_id
+        )
+        assert cached_first["_matchingCache"]["hit"] is True
+        assert cached_first["_matchingCache"]["fullRematchInvocationCount"] == 0
+        assert _physical_competitor_records(db, first_format_id) == legacy_by_format[first_format_id]
         db.rollback()
+
+    with Session(pg_engine) as db:
+        before = int(db.scalar(select(func.count(CompetitorMatchJob.id)).where(
+            CompetitorMatchJob.source_version_id == version_id
+        )) or 0)
+        reconcile_matching_cache_lifecycle(db=db)
+        after = int(db.scalar(select(func.count(CompetitorMatchJob.id)).where(
+            CompetitorMatchJob.source_version_id == version_id
+        )) or 0)
+        assert before == after == 2
+        db.rollback()
+
+    monkeypatch.setenv("MATCH_CACHE_READ_MODE", "fallback")
+    with Session(pg_engine) as db:
+        fallback = rebuild_competitor_prices_for_selected(
+            db=db, price_format_id=second_format_id
+        )
+        assert fallback["_matchingCache"]["hit"] is False
+        assert fallback["_matchingCache"]["fullRematchInvocationCount"] == 2
+        assert _physical_competitor_records(db, second_format_id) == legacy_by_format[second_format_id]
+        db.rollback()
+
+    with Session(pg_engine) as db:
+        other_version_ids = select(CompetitorSourceVersion.id).where(
+            CompetitorSourceVersion.competitor_price_list_id == other_id
+        )
+        for job in db.scalars(select(CompetitorMatchJob).where(
+            CompetitorMatchJob.source_version_id.in_(other_version_ids),
+            CompetitorMatchJob.status == "pending",
+        )):
+            job.available_at = now_kz_naive() - timedelta(seconds=1)
+        db.commit()
+    assert matching_cache_worker_service.run_one_matching_job(
+        session_factory=lambda: Session(pg_engine),
+        worker_id=f"context-other-{token}",
+        lease_seconds=120,
+    ) == "succeeded"
+    monkeypatch.setenv("MATCH_CACHE_READ_MODE", "required")
+    with Session(pg_engine) as db:
+        cached_second = rebuild_competitor_prices_for_selected(
+            db=db, price_format_id=second_format_id
+        )
+        assert cached_second["_matchingCache"]["hit"] is True
+        assert cached_second["_matchingCache"]["fullRematchInvocationCount"] == 0
+        assert _physical_competitor_records(db, second_format_id) == legacy_by_format[second_format_id]
+        db.rollback()
+
+    # Do not leave this test's deliberately unprocessed lifecycle jobs ahead
+    # of the lower-level FIFO claim/recovery tests in this module.
+    with Session(pg_engine) as db:
+        jobs = db.scalars(
+            select(CompetitorMatchJob)
+            .join(
+                CompetitorSourceVersion,
+                CompetitorSourceVersion.id == CompetitorMatchJob.source_version_id,
+            )
+            .where(
+                CompetitorSourceVersion.competitor_price_list_id.in_(
+                    (shared_id, other_id)
+                )
+            )
+        ).all()
+        for job in jobs:
+            if job.status in {"pending", "running"}:
+                job.status = "cancelled"
+        db.commit()
 
 
 def test_capture_failure_savepoint_preserves_legacy_import(
@@ -901,6 +1135,123 @@ def test_capture_failure_savepoint_preserves_legacy_import(
         db.commit()
     with Session(pg_engine) as db:
         assert db.get(CompetitorPriceListItem, item_id) is not None
+
+
+def test_reference_source_version_invalidates_only_its_matching_context(
+    pg_engine, monkeypatch
+):
+    _enable_dual_write(monkeypatch)
+    token = uuid.uuid4().hex
+    with Session(pg_engine) as db:
+        formats = [
+            PriceFormat(code=f"REF-A-{token}", name="Reference A", branch="test"),
+            PriceFormat(code=f"REF-B-{token}", name="Reference B", branch="test"),
+        ]
+        db.add_all(formats)
+        db.flush()
+        shared = CompetitorPriceList(
+            price_format_id=formats[0].id,
+            source_type="manual",
+            source_key=f"ref-shared:{token}",
+            display_name="Shared",
+            items_count=1,
+        )
+        references = [
+            CompetitorPriceList(
+                price_format_id=formats[index].id,
+                source_type="provisor",
+                source_key=f"ref-{index}:{token}",
+                display_name=f"Reference {index}",
+                items_count=1,
+            )
+            for index in range(2)
+        ]
+        db.add_all([shared, *references])
+        db.flush()
+        db.add(CompetitorPriceListItem(
+            price_list_id=shared.id,
+            name="Shared",
+            distributor_goods_id="SHARED",
+            distributor_price=Decimal("10"),
+            raw_json="{}",
+        ))
+        for index, reference in enumerate(references):
+            db.add(CompetitorPriceListItem(
+                price_list_id=reference.id,
+                filial_id=128,
+                name=f"Reference {index}",
+                distributor_goods_id=f"REF-{index}",
+                provisor_goods_id=9000 + index,
+                distributor_price=Decimal("11"),
+                raw_json="{}",
+            ))
+        db.add_all([
+            PriceFormatCompetitorAssignment(
+                price_format_id=formats[index].id,
+                competitor_price_list_id=source.id,
+                is_active=True,
+            )
+            for index, reference in enumerate(references)
+            for source in (shared, reference)
+        ])
+        db.commit()
+        shared_id = int(shared.id)
+        reference_ids = [int(item.id) for item in references]
+        format_ids = [int(item.id) for item in formats]
+
+    with Session(pg_engine) as db:
+        for source_id in [shared_id, *reference_ids]:
+            outcome = capture_and_publish_legacy_source_version(
+                db=db, competitor_price_list_id=source_id
+            )
+            assert outcome.succeeded
+        before = {
+            format_id: resolve_matching_context(
+                db=db,
+                competitor_price_list_id=shared_id,
+                price_format_id=format_id,
+            ).context_key
+            for format_id in format_ids
+        }
+        first_reference = db.get(CompetitorPriceList, reference_ids[0])
+        first_reference.price_coefficient = Decimal("1.25")
+        db.flush()
+        coefficient_only = resolve_matching_context(
+            db=db,
+            competitor_price_list_id=shared_id,
+            price_format_id=format_ids[0],
+        ).context_key
+        assert coefficient_only == before[format_ids[0]]
+
+        first_item = db.scalar(select(CompetitorPriceListItem).where(
+            CompetitorPriceListItem.price_list_id == reference_ids[0]
+        ))
+        first_item.provisor_goods_id = 9999
+        db.flush()
+        monkeypatch.setenv("MATCH_CACHE_SHADOW_ENABLED", "true")
+        outcome = capture_and_publish_legacy_source_version(
+            db=db, competitor_price_list_id=reference_ids[0]
+        )
+        assert outcome.succeeded
+        scheduled_source_ids = set(db.scalars(
+            select(CompetitorSourceVersion.competitor_price_list_id)
+            .join(
+                CompetitorMatchJob,
+                CompetitorMatchJob.source_version_id == CompetitorSourceVersion.id,
+            )
+        ))
+        assert {shared_id, reference_ids[0]} <= scheduled_source_ids
+        after = {
+            format_id: resolve_matching_context(
+                db=db,
+                competitor_price_list_id=shared_id,
+                price_format_id=format_id,
+            ).context_key
+            for format_id in format_ids
+        }
+        assert after[format_ids[0]] != before[format_ids[0]]
+        assert after[format_ids[1]] == before[format_ids[1]]
+        db.rollback()
         assert db.scalar(
             select(func.count(CompetitorSourceVersion.id)).where(
                 CompetitorSourceVersion.competitor_price_list_id == source_id

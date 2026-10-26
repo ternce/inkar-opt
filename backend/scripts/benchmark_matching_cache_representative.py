@@ -141,7 +141,9 @@ def run(*, database_url: str, product_count: int, source_count: int, warm_iterat
                     db=db, competitor_price_list_id=source_id
                 )
                 vector, _context = build_source_dependency_vector(
-                    db=db, competitor_price_list_id=source_id
+                    db=db,
+                    competitor_price_list_id=source_id,
+                    price_format_id=int(price_format.id),
                 )
                 snapshot, _ = get_or_create_shadow_snapshot(
                     db=db, source_version_id=int(capture.version_id), vector=vector

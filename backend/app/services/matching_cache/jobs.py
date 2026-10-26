@@ -29,6 +29,7 @@ def enqueue_matching_job(
     db: Session,
     source_version_id: int,
     dependency_fingerprint: str,
+    matching_context_key: str = "",
     match_snapshot_id: int | None = None,
     max_attempts: int = 3,
 ) -> tuple[CompetitorMatchJob, bool]:
@@ -38,6 +39,14 @@ def enqueue_matching_job(
     )
     existing = db.scalar(select(CompetitorMatchJob).where(CompetitorMatchJob.idempotency_key == key))
     if existing is not None:
+        if matching_context_key and not existing.matching_context_key:
+            existing.matching_context_key = str(matching_context_key)
+            db.flush()
+        elif (
+            matching_context_key
+            and existing.matching_context_key != str(matching_context_key)
+        ):
+            raise MatchingJobConflict("matching job context identity mismatch")
         return existing, True
     try:
         with db.begin_nested():
@@ -46,6 +55,7 @@ def enqueue_matching_job(
                 source_version_id=int(source_version_id),
                 match_snapshot_id=match_snapshot_id,
                 dependency_fingerprint=str(dependency_fingerprint),
+                matching_context_key=str(matching_context_key),
                 status="pending",
                 max_attempts=max(1, int(max_attempts)),
                 available_at=now_kz_naive(),
@@ -59,6 +69,14 @@ def enqueue_matching_job(
         )
         if existing is None:
             raise
+        if matching_context_key and not existing.matching_context_key:
+            existing.matching_context_key = str(matching_context_key)
+            db.flush()
+        elif (
+            matching_context_key
+            and existing.matching_context_key != str(matching_context_key)
+        ):
+            raise MatchingJobConflict("matching job context identity mismatch")
         return existing, True
 
 

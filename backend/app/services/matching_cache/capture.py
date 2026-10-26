@@ -17,7 +17,7 @@ from ...models import (
 )
 from ..pricing_workflow.locks import acquire_transaction_write_locks
 from .config import matching_cache_dual_write_enabled, matching_cache_shadow_enabled
-from .context import build_source_dependency_vector
+from .context import build_source_dependency_vector, resolve_matching_contexts
 from .fingerprints import (
     CanonicalSourceHasher,
     CanonicalSourceRow,
@@ -287,19 +287,48 @@ def capture_and_publish_legacy_source_version(
                 from .jobs import enqueue_matching_job
                 from .shadow import get_or_create_shadow_snapshot
 
-                vector, _context = build_source_dependency_vector(
+                scheduled: set[tuple[int, str]] = set()
+                for context in resolve_matching_contexts(
                     db=db,
                     competitor_price_list_id=int(version.competitor_price_list_id),
-                )
-                snapshot, _ = get_or_create_shadow_snapshot(
-                    db=db, source_version_id=int(version.id), vector=vector
-                )
-                enqueue_matching_job(
-                    db=db,
-                    source_version_id=int(version.id),
-                    dependency_fingerprint=vector.fingerprint,
-                    match_snapshot_id=int(snapshot.id),
-                )
+                ):
+                    for price_format_id in context.price_format_ids:
+                        for affected_source_id in context.source_ids:
+                            affected_version = (
+                                version
+                                if affected_source_id
+                                == int(version.competitor_price_list_id)
+                                else db.scalar(select(CompetitorSourceVersion).where(
+                                    CompetitorSourceVersion.competitor_price_list_id
+                                    == affected_source_id,
+                                    CompetitorSourceVersion.status == "published",
+                                ))
+                            )
+                            if affected_version is None:
+                                continue
+                            vector, affected_context = build_source_dependency_vector(
+                                db=db,
+                                competitor_price_list_id=affected_source_id,
+                                price_format_id=price_format_id,
+                            )
+                            schedule_key = (
+                                int(affected_version.id), vector.fingerprint
+                            )
+                            if schedule_key in scheduled:
+                                continue
+                            scheduled.add(schedule_key)
+                            snapshot, _ = get_or_create_shadow_snapshot(
+                                db=db,
+                                source_version_id=int(affected_version.id),
+                                vector=vector,
+                            )
+                            enqueue_matching_job(
+                                db=db,
+                                source_version_id=int(affected_version.id),
+                                dependency_fingerprint=vector.fingerprint,
+                                matching_context_key=affected_context.context_key,
+                                match_snapshot_id=int(snapshot.id),
+                            )
             io_after = _postgres_io_sample(db)
             wal_bytes = (
                 _wal_bytes_between(db, io_before[0], io_after[0])

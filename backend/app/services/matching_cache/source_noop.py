@@ -19,7 +19,11 @@ from ...models import (
     CompetitorSourceVersionItem,
 )
 from .config import matching_cache_source_noop_enabled
-from .context import build_source_dependency_vector
+from .context import (
+    build_source_dependency_vector,
+    resolve_matching_context,
+    resolve_matching_contexts,
+)
 from .fingerprints import CanonicalSourceHasher, SOURCE_CONTENT_FIELDS, canonical_source_row
 
 
@@ -284,33 +288,42 @@ def validate_unchanged_source_import(
 
     snapshot_id: int | None = None
     if require_snapshot:
-        vector, _context = build_source_dependency_vector(
+        snapshots: list[int] = []
+        contexts = resolve_matching_contexts(
             db=db, competitor_price_list_id=source_id
         )
-        snapshot = db.scalar(
-            select(CompetitorMatchSnapshot)
-            .where(
-                CompetitorMatchSnapshot.source_version_id == int(version.id),
-                CompetitorMatchSnapshot.dependency_fingerprint == vector.fingerprint,
-                CompetitorMatchSnapshot.matcher_version == vector.matcher_version,
-                CompetitorMatchSnapshot.normalization_version == vector.normalization_version,
-                CompetitorMatchSnapshot.status.in_(("ready", "published")),
+        if not contexts:
+            contexts = (resolve_matching_context(
+                db=db, competitor_price_list_id=source_id
+            ),)
+        for context in contexts:
+            vector, _context = build_source_dependency_vector(
+                db=db,
+                competitor_price_list_id=source_id,
+                context_key=context.context_key,
             )
-            .order_by(CompetitorMatchSnapshot.id.desc())
-        )
-        if snapshot is None:
-            return _reject("dependency_valid_snapshot_absent")
-        snapshot_count = int(
-            db.scalar(
+            snapshot = db.scalar(
+                select(CompetitorMatchSnapshot)
+                .where(
+                    CompetitorMatchSnapshot.source_version_id == int(version.id),
+                    CompetitorMatchSnapshot.dependency_fingerprint == vector.fingerprint,
+                    CompetitorMatchSnapshot.matcher_version == vector.matcher_version,
+                    CompetitorMatchSnapshot.normalization_version == vector.normalization_version,
+                    CompetitorMatchSnapshot.status.in_(("ready", "published")),
+                )
+                .order_by(CompetitorMatchSnapshot.id.desc())
+            )
+            if snapshot is None:
+                return _reject("dependency_valid_snapshot_absent")
+            snapshot_count = int(db.scalar(
                 select(func.count(CompetitorMatchSnapshotItem.id)).where(
                     CompetitorMatchSnapshotItem.match_snapshot_id == int(snapshot.id)
                 )
-            )
-            or 0
-        )
-        if snapshot_count != expected:
-            return _reject("snapshot_row_count_mismatch")
-        snapshot_id = int(snapshot.id)
+            ) or 0)
+            if snapshot_count != expected:
+                return _reject("snapshot_row_count_mismatch")
+            snapshots.append(int(snapshot.id))
+        snapshot_id = snapshots[0] if len(snapshots) == 1 else None
 
     return SourceNoopDecision(
         True,

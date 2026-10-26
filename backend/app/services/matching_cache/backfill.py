@@ -162,6 +162,7 @@ def backfill_existing_source(
     vector, _context = build_source_dependency_vector(
         db=db,
         competitor_price_list_id=source_id,
+        price_format_id=int(price_format_id) if price_format_id is not None else None,
     )
     snapshot, snapshot_reused = get_or_create_shadow_snapshot(
         db=db, source_version_id=int(version.id), vector=vector
@@ -173,6 +174,7 @@ def backfill_existing_source(
             db=db,
             source_version_id=int(version.id),
             dependency_fingerprint=vector.fingerprint,
+            matching_context_key=_context.context_key,
             match_snapshot_id=int(snapshot.id),
         )
     return BackfillResult(

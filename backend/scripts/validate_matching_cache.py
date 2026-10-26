@@ -76,11 +76,12 @@ def main() -> int:
             exact = False
         base_vector = build_dependency_vector(db=db)
         for source_id in args.source_ids:
-            vector, _context = build_source_dependency_vector(
+            vector, requested_context = build_source_dependency_vector(
                 db=db,
                 competitor_price_list_id=source_id,
                 base_vector=base_vector,
                 expected_source_ids=tuple(assigned_source_ids),
+                price_format_id=int(args.price_format_id),
             )
             version = db.scalar(
                 select(CompetitorSourceVersion).where(
@@ -130,7 +131,14 @@ def main() -> int:
                     int(value)
                     for value in snapshot_stats["legacyMatchingContext"]["sourceIds"]
                 )
-                context_exact = snapshot_context_ids == assigned_source_ids
+                expected_context = {
+                    **requested_context.identity_dict(),
+                    "contextKey": requested_context.context_key,
+                }
+                context_exact = (
+                    snapshot_stats["legacyMatchingContext"]
+                    in (expected_context, requested_context.identity_dict())
+                )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 snapshot_context_ids = []
                 context_exact = False
@@ -153,6 +161,7 @@ def main() -> int:
                     "snapshotInputRows": int(snapshot.input_row_count),
                     "matchingContextExact": context_exact,
                     "snapshotMatchingSourceIds": snapshot_context_ids,
+                    "matchingContextKey": requested_context.context_key,
                     "exact": source_exact,
                     "decisionComparison": decision_report,
                 }

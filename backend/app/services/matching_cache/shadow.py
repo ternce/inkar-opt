@@ -45,6 +45,7 @@ from .dependencies import (
     VIDMAN_AUTHORITATIVE,
     DependencyVector,
     build_dependency_vector,
+    matching_context_key,
 )
 from .context import (
     MatchingContextConflict,
@@ -170,12 +171,28 @@ def get_or_create_shadow_snapshot(
         .where(CompetitorMatchSnapshot.normalization_version == vector.normalization_version)
     )
     if existing is not None:
+        expected_context_key = (
+            matching_context_key(vector.matching_context)
+            if vector.matching_context is not None else ""
+        )
+        if expected_context_key and not existing.matching_context_key:
+            existing.matching_context_key = expected_context_key
+            db.flush()
+        elif (
+            expected_context_key
+            and existing.matching_context_key != expected_context_key
+        ):
+            raise ShadowSnapshotConflict("snapshot context identity mismatch")
         return existing, True
     try:
         with db.begin_nested():
             row = CompetitorMatchSnapshot(
                 source_version_id=int(source_version_id),
                 dependency_fingerprint=vector.fingerprint,
+                matching_context_key=(
+                    matching_context_key(vector.matching_context)
+                    if vector.matching_context is not None else ""
+                ),
                 dependency_vector_json=json.dumps(
                     vector.as_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
                 ),
@@ -201,6 +218,15 @@ def get_or_create_shadow_snapshot(
         )
         if row is None:
             raise
+        expected_context_key = (
+            matching_context_key(vector.matching_context)
+            if vector.matching_context is not None else ""
+        )
+        if expected_context_key and not row.matching_context_key:
+            row.matching_context_key = expected_context_key
+            db.flush()
+        elif expected_context_key and row.matching_context_key != expected_context_key:
+            raise ShadowSnapshotConflict("snapshot context identity mismatch")
         return row, True
 
 
@@ -221,6 +247,7 @@ def build_shadow_snapshot(
     lock_target = db.execute(
         select(
             CompetitorMatchSnapshot.source_version_id,
+            CompetitorMatchSnapshot.matching_context_key,
             CompetitorSourceVersion.competitor_price_list_id,
         )
         .join(
@@ -235,6 +262,7 @@ def build_shadow_snapshot(
         context = resolve_matching_context(
             db=db,
             competitor_price_list_id=int(lock_target.competitor_price_list_id),
+            context_key=str(lock_target.matching_context_key or "") or None,
         )
     except MatchingContextConflict as exc:
         raise ShadowSnapshotConflict(str(exc)) from exc
@@ -248,6 +276,7 @@ def build_shadow_snapshot(
         locked_context = resolve_matching_context(
             db=db,
             competitor_price_list_id=int(lock_target.competitor_price_list_id),
+            context_key=str(lock_target.matching_context_key or "") or None,
         )
     except MatchingContextConflict as exc:
         raise ShadowSnapshotConflict(str(exc)) from exc
@@ -294,6 +323,7 @@ def build_shadow_snapshot(
         competitor_price_list_id=int(source_version.competitor_price_list_id),
         base_vector=base_vector_before,
         expected_source_ids=context.source_ids,
+        context_key=context.context_key,
     )
     required_fingerprint = expected_dependency_fingerprint or snapshot.dependency_fingerprint
     if required_fingerprint not in {
@@ -515,6 +545,7 @@ def build_shadow_snapshot(
             competitor_price_list_id=int(source_version.competitor_price_list_id),
             base_vector=base_vector_after,
             expected_source_ids=context.source_ids,
+            context_key=context.context_key,
         )
         final_source = fingerprint_legacy_source(
             db=db, competitor_price_list_id=int(source_version.competitor_price_list_id)
@@ -539,8 +570,8 @@ def build_shadow_snapshot(
                     key: value for key, value in stats.items() if not str(key).startswith("_")
                 },
                 "legacyMatchingContext": {
-                    "priceFormatIds": list(context.price_format_ids),
-                    "sourceIds": list(context.source_ids),
+                    **context.identity_dict(),
+                    "contextKey": context.context_key,
                 },
                 "matchingDecisionMode": (
                     "authoritative_legacy_output"

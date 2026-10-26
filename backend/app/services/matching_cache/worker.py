@@ -94,6 +94,7 @@ def run_one_matching_job(
             vector, _context = build_source_dependency_vector(
                 db=db,
                 competitor_price_list_id=int(source_version.competitor_price_list_id),
+                context_key=str(job.matching_context_key or "") or None,
             )
             if vector.fingerprint != job.dependency_fingerprint:
                 raise ShadowSnapshotConflict("stale dependency fingerprint at job execution")

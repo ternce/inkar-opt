@@ -889,6 +889,7 @@ class CompetitorMatchSnapshot(Base):
         ForeignKey("competitor_source_versions.id"), nullable=False, index=True
     )
     dependency_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    matching_context_key: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     dependency_vector_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     product_catalog_revision: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     manual_code_mapping_revision: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
@@ -921,6 +922,12 @@ class CompetitorMatchSnapshot(Base):
             name="ck_comp_match_snapshot_status",
         ),
         Index("ix_comp_match_snapshot_source_status", "source_version_id", "status"),
+        Index(
+            "ix_comp_match_snapshot_source_context_status",
+            "source_version_id",
+            "matching_context_key",
+            "status",
+        ),
     )
 
 
@@ -963,6 +970,7 @@ class CompetitorMatchJob(Base):
         ForeignKey("competitor_match_snapshots.id"), nullable=True, index=True
     )
     dependency_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    matching_context_key: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
@@ -984,6 +992,7 @@ class CompetitorMatchJob(Base):
         CheckConstraint("max_attempts >= 1", name="ck_comp_match_job_max_attempts"),
         Index("ix_comp_match_job_claim", "status", "available_at", "id"),
         Index("ix_comp_match_job_recovery", "status", "lease_expires_at"),
+        Index("ix_comp_match_job_context", "matching_context_key", "status"),
     )
 
 
