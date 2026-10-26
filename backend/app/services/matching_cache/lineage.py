@@ -13,6 +13,7 @@ from ...models import (
     CompetitorSourceVersionItem,
 )
 from ...timezone import now_kz_naive
+from .fingerprints import FINGERPRINT_FORMAT_VERSION
 
 
 class SourceLineageError(RuntimeError):
@@ -37,6 +38,7 @@ def publish_physical_source_lineage(
         competitor_price_list_id=source_id,
         source_version_id=version_id,
         row_count=expected,
+        fingerprint_format_version=FINGERPRINT_FORMAT_VERSION,
         status="pending",
         error="",
     )

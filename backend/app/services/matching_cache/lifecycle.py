@@ -31,6 +31,7 @@ from .context import (
     resolve_matching_contexts,
 )
 from .jobs import enqueue_matching_job
+from .fingerprints import FINGERPRINT_FORMAT_VERSION
 from .shadow import get_or_create_shadow_snapshot
 
 
@@ -93,7 +94,12 @@ def reconcile_matching_cache_lifecycle(*, db: Session) -> LifecycleResult:
             # Physical-row triggers invalidate the publication on every source
             # mutation. Re-capture only when lineage is absent/invalid instead
             # of hashing every large source on every idle worker poll.
-            if version is None or publication is None:
+            if (
+                version is None
+                or publication is None
+                or publication.fingerprint_format_version
+                != FINGERPRINT_FORMAT_VERSION
+            ):
                 outcome = capture_and_publish_legacy_source_version(
                     db=db,
                     competitor_price_list_id=source_id,

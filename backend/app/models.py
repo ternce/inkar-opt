@@ -593,6 +593,9 @@ class CompetitorSourcePublication(Base):
         ForeignKey("competitor_source_versions.id"), nullable=False, index=True
     )
     row_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    fingerprint_format_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, default=""
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
     error: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_kz_naive)

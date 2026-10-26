@@ -64,6 +64,7 @@ from backend.app.services.matching_cache.dependencies import (
     ensure_dependency_revision,
 )
 from backend.app.services.matching_cache.fingerprints import (
+    FINGERPRINT_FORMAT_VERSION,
     LEGACY_FIELD_ALIASES,
     SOURCE_CONTENT_FIELDS,
     canonical_source_content,
@@ -133,6 +134,8 @@ LINEAGE_UP_MIGRATION = REPO_ROOT / "backend/scripts/migrations/20261015_phase2b4
 LINEAGE_DOWN_MIGRATION = REPO_ROOT / "backend/scripts/migrations/20261015_phase2b4_stable_source_lineage.down.sql"
 MULTI_CONTEXT_UP_MIGRATION = REPO_ROOT / "backend/scripts/migrations/20261026_matching_cache_multi_context.up.sql"
 MULTI_CONTEXT_DOWN_MIGRATION = REPO_ROOT / "backend/scripts/migrations/20261026_matching_cache_multi_context.down.sql"
+FINGERPRINT_LINEAGE_UP_MIGRATION = REPO_ROOT / "backend/scripts/migrations/20261026_matching_cache_fingerprint_lineage.up.sql"
+FINGERPRINT_LINEAGE_DOWN_MIGRATION = REPO_ROOT / "backend/scripts/migrations/20261026_matching_cache_fingerprint_lineage.down.sql"
 NEW_TABLES = {
     "competitor_source_versions",
     "competitor_source_version_items",
@@ -259,6 +262,8 @@ def test_migration_upgrade_and_downgrade_on_postgresql_16():
             _execute_script(connection, LINEAGE_UP_MIGRATION)
             _execute_script(connection, MULTI_CONTEXT_UP_MIGRATION)
             _execute_script(connection, MULTI_CONTEXT_UP_MIGRATION)
+            _execute_script(connection, FINGERPRINT_LINEAGE_UP_MIGRATION)
+            _execute_script(connection, FINGERPRINT_LINEAGE_UP_MIGRATION)
         migration_inspector = inspect(engine)
         assert NEW_TABLES <= set(migration_inspector.get_table_names())
         for table_name in NEW_TABLES:
@@ -266,6 +271,7 @@ def test_migration_upgrade_and_downgrade_on_postgresql_16():
             orm_columns = set(Base.metadata.tables[table_name].columns.keys())
             assert migration_columns == orm_columns
         with engine.begin() as connection:
+            _execute_script(connection, FINGERPRINT_LINEAGE_DOWN_MIGRATION)
             _execute_script(connection, MULTI_CONTEXT_DOWN_MIGRATION)
             _execute_script(connection, LINEAGE_DOWN_MIGRATION)
             _execute_script(connection, PHASE2B2_DOWN_MIGRATION)
@@ -876,6 +882,151 @@ def test_automatic_lifecycle_captures_enqueues_builds_and_invalidates(
         assert refreshed.snapshots_created == 1
         assert refreshed.jobs_created == 1
         db.rollback()
+
+
+def test_lifecycle_recaptures_published_v1_lineage_once_before_v4_jobs(
+    pg_engine, monkeypatch
+):
+    _enable_dual_write(monkeypatch)
+    token = uuid.uuid4().hex
+    with Session(pg_engine) as db:
+        price_format = PriceFormat(
+            code=f"V1-V2-{token}", name="Fingerprint migration", branch="test"
+        )
+        product = Product(
+            code=f"V1-V2-SKU-{token}", name=f"Fingerprint {token}", cost=1
+        )
+        db.add_all([price_format, product])
+        db.flush()
+        source = CompetitorPriceList(
+            price_format_id=price_format.id,
+            source_type="manual",
+            source_key=f"v1-v2:{token}",
+            display_name="Fingerprint migration source",
+            items_count=1,
+        )
+        db.add(source)
+        db.flush()
+        db.add_all([
+            CompetitorPriceListItem(
+                price_list_id=source.id,
+                name=product.name,
+                raw_name=product.name,
+                distributor_goods_name=product.name,
+                distributor_goods_id=product.code,
+                distributor_price=Decimal("10"),
+                match_type="unmatched",
+                raw_json="{}",
+            ),
+            PriceFormatCompetitorAssignment(
+                price_format_id=price_format.id,
+                competitor_price_list_id=source.id,
+                is_active=True,
+            ),
+        ])
+        db.flush()
+        capture = capture_and_publish_legacy_source_version(
+            db=db,
+            competitor_price_list_id=int(source.id),
+            force_enabled=True,
+            enqueue_shadow=False,
+        )
+        old_version = db.get(CompetitorSourceVersion, int(capture.version_id))
+        old_publication = db.get(
+            CompetitorSourcePublication, int(capture.publication_id)
+        )
+        # Reproduce a deployed v1 record: published lineage is present and row
+        # count matches, but its immutable content hash uses the old algorithm.
+        old_version.content_sha256 = "f" * 64
+        old_version.matching_input_sha256 = "f" * 64
+        old_version.source_metadata_json = "{}"
+        old_publication.fingerprint_format_version = ""
+        vector, context = build_source_dependency_vector(
+            db=db, competitor_price_list_id=int(source.id)
+        )
+        old_snapshot, _ = get_or_create_shadow_snapshot(
+            db=db, source_version_id=int(old_version.id), vector=vector
+        )
+        old_snapshot.status = "failed"
+        old_job, _ = enqueue_matching_job(
+            db=db,
+            source_version_id=int(old_version.id),
+            dependency_fingerprint=vector.fingerprint,
+            matching_context_key=context.context_key,
+            match_snapshot_id=int(old_snapshot.id),
+        )
+        old_job.status = "failed"
+        old_job.attempt_count = 1
+        old_job.error = "active source content no longer matches the immutable version"
+        source_id = int(source.id)
+        old_version_id = int(old_version.id)
+        old_publication_id = int(old_publication.id)
+        old_job_id = int(old_job.id)
+        db.commit()
+
+    with Session(pg_engine) as db:
+        migrated = reconcile_matching_cache_lifecycle(db=db)
+        assert migrated.captured_sources == 1
+        assert migrated.jobs_created >= 1
+        new_version = db.scalar(select(CompetitorSourceVersion).where(
+            CompetitorSourceVersion.competitor_price_list_id == source_id,
+            CompetitorSourceVersion.status == "published",
+        ))
+        new_publication = db.scalar(select(CompetitorSourcePublication).where(
+            CompetitorSourcePublication.competitor_price_list_id == source_id,
+            CompetitorSourcePublication.status == "published",
+        ))
+        assert int(new_version.id) != old_version_id
+        assert new_version.content_sha256 != "f" * 64
+        assert json.loads(new_version.source_metadata_json)[
+            "fingerprintFormatVersion"
+        ] == FINGERPRINT_FORMAT_VERSION
+        assert new_publication.fingerprint_format_version == FINGERPRINT_FORMAT_VERSION
+        assert db.get(CompetitorSourceVersion, old_version_id).content_sha256 == "f" * 64
+        assert db.get(CompetitorSourcePublication, old_publication_id).status == "superseded"
+        assert db.get(CompetitorMatchJob, old_job_id).status == "failed"
+        new_version_id = int(new_version.id)
+        source_version_ids = select(CompetitorSourceVersion.id).where(
+            CompetitorSourceVersion.competitor_price_list_id == source_id
+        )
+        job_count = int(db.scalar(select(func.count(CompetitorMatchJob.id)).where(
+            CompetitorMatchJob.source_version_id.in_(source_version_ids)
+        )) or 0)
+        assert db.scalar(select(func.count(CompetitorMatchJob.id)).where(
+            CompetitorMatchJob.source_version_id == new_version_id
+        )) == 1
+        new_job = db.scalar(select(CompetitorMatchJob).where(
+            CompetitorMatchJob.source_version_id == new_version_id
+        ))
+        new_snapshot = db.get(CompetitorMatchSnapshot, int(new_job.match_snapshot_id))
+        assert new_job.status == "pending"
+        assert int(new_snapshot.source_version_id) == new_version_id
+        assert new_snapshot.matcher_version == MATCHER_VERSION
+        db.commit()
+
+    source_item_reads = 0
+
+    def observe_idle_sql(_conn, _cursor, statement, _params, _context, _many):
+        nonlocal source_item_reads
+        if (
+            str(statement).lstrip().casefold().startswith("select")
+            and "competitor_price_list_items" in str(statement).casefold()
+        ):
+            source_item_reads += 1
+
+    event.listen(pg_engine, "before_cursor_execute", observe_idle_sql)
+    try:
+        with Session(pg_engine) as db:
+            idle = reconcile_matching_cache_lifecycle(db=db)
+            assert idle.captured_sources == 0
+            assert idle.jobs_created == 0
+            assert int(db.scalar(select(func.count(CompetitorMatchJob.id)).where(
+                CompetitorMatchJob.source_version_id.in_(source_version_ids)
+            )) or 0) == job_count
+            db.rollback()
+    finally:
+        event.remove(pg_engine, "before_cursor_execute", observe_idle_sql)
+    assert source_item_reads == 0
 
 
 def test_shared_source_has_independent_contexts_for_incompatible_cohorts(

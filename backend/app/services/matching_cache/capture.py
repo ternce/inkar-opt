@@ -21,6 +21,7 @@ from .context import build_source_dependency_vector, resolve_matching_contexts
 from .fingerprints import (
     CanonicalSourceHasher,
     CanonicalSourceRow,
+    FINGERPRINT_FORMAT_VERSION,
     canonical_source_row,
 )
 from .lineage import publish_physical_source_lineage
@@ -189,6 +190,8 @@ def create_or_reuse_legacy_source_version(
             CompetitorSourceVersion.competitor_price_list_id == source_id
         )
     )
+    version_metadata = dict(source_metadata or {})
+    version_metadata["fingerprintFormatVersion"] = FINGERPRINT_FORMAT_VERSION
     version = CompetitorSourceVersion(
         competitor_price_list_id=source_id,
         generation=int(generation or 0) + 1,
@@ -197,7 +200,7 @@ def create_or_reuse_legacy_source_version(
         row_count=fingerprint.row_count,
         status="pending",
         source_metadata_json=json.dumps(
-            source_metadata or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+            version_metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
         ),
     )
     db.add(version)
