@@ -19,17 +19,23 @@ from backend.app.models import (
     CompetitorSourcePublication,
     CompetitorSourceVersion,
     PriceFormat,
+    PriceFormatCompetitorAssignment,
     Product,
     ProductExtra,
 )
 from backend.scripts.benchmark_matching_cache import run as run_benchmark
-from backend.app.services.matching_cache.dependencies import MANUAL_CODE_MAPPINGS, PRODUCT_CATALOG
+from backend.app.services.matching_cache.dependencies import (
+    MANUAL_CODE_MAPPINGS,
+    PRODUCT_CATALOG,
+    SOURCE_GOODS_MAPPINGS,
+)
 from backend.app.services.matching_cache.dependencies import (
     PROVISOR_REFERENCES,
     PROVISOR_SUBSTITUTES,
     VIDMAN_AUTHORITATIVE,
     build_dependency_vector,
 )
+from backend.app.services.matching_cache.context import build_source_dependency_vector
 from backend.app.services.matching_cache.dependency_tracking import assert_database_dependency_tracking
 from backend.app.services.matching_cache.capture import capture_and_publish_legacy_source_version
 from backend.app.services.matching_cache.shadow import build_shadow_snapshot, get_or_create_shadow_snapshot
@@ -58,6 +64,10 @@ PHASE3B_MIGRATION = (
 STABLE_SOURCE_IDENTITY_MIGRATION = (
     Path(__file__).resolve().parents[2]
     / "backend/scripts/migrations/20261026_matching_cache_stable_source_identity.up.sql"
+)
+SOURCE_GOODS_DEPENDENCY_MIGRATION = (
+    Path(__file__).resolve().parents[2]
+    / "backend/scripts/migrations/20261027_matching_cache_source_goods_dependency.up.sql"
 )
 
 
@@ -92,6 +102,8 @@ def trigger_engine():
             raw.execute(MIGRATION.read_text(encoding="utf-8"))
             raw.execute(PHASE3B_MIGRATION.read_text(encoding="utf-8"))
             raw.execute(STABLE_SOURCE_IDENTITY_MIGRATION.read_text(encoding="utf-8"))
+            raw.execute(SOURCE_GOODS_DEPENDENCY_MIGRATION.read_text(encoding="utf-8"))
+            raw.execute(SOURCE_GOODS_DEPENDENCY_MIGRATION.read_text(encoding="utf-8"))
             raw.commit()
         finally:
             raw.close()
@@ -132,7 +144,7 @@ def test_raw_sql_and_empty_rebuild_are_transactionally_invalidating(trigger_engi
         assert _revision(db, PRODUCT_CATALOG) == before + 1
 
 
-def test_approved_source_goods_invalidates_but_auto_learning_does_not(trigger_engine):
+def test_source_goods_identity_invalidates_without_timestamp_refresh_loop(trigger_engine):
     token = uuid.uuid4().hex
     with Session(trigger_engine) as db:
         product = Product(code=f"TRIGGER-{token}", name="Trigger", cost=1)
@@ -141,6 +153,8 @@ def test_approved_source_goods_invalidates_but_auto_learning_does_not(trigger_en
         product_id = int(product.id)
     with Session(trigger_engine) as db:
         before = _revision(db, MANUAL_CODE_MAPPINGS)
+        source_before = _revision(db, SOURCE_GOODS_MAPPINGS)
+        fingerprint_before = build_dependency_vector(db=db).fingerprint
         db.execute(text(
             """INSERT INTO source_goods_matches
                (source_type, distributor_goods_id, distributor_goods_name,
@@ -150,12 +164,99 @@ def test_approved_source_goods_invalidates_but_auto_learning_does_not(trigger_en
         db.commit()
     with Session(trigger_engine) as db:
         assert _revision(db, MANUAL_CODE_MAPPINGS) == before
+        assert _revision(db, SOURCE_GOODS_MAPPINGS) == source_before + 1
+        assert build_dependency_vector(db=db).fingerprint != fingerprint_before
+        db.execute(text(
+            "UPDATE source_goods_matches SET similarity_score=99, updated_at=CURRENT_TIMESTAMP "
+            "WHERE distributor_goods_id=:key"
+        ), {"key": f"AUTO-{token}"})
+        db.commit()
+    with Session(trigger_engine) as db:
+        assert _revision(db, SOURCE_GOODS_MAPPINGS) == source_before + 1
         db.execute(text(
             "UPDATE source_goods_matches SET match_method='manual_approved' WHERE distributor_goods_id=:key"
         ), {"key": f"AUTO-{token}"})
         db.commit()
     with Session(trigger_engine) as db:
         assert _revision(db, MANUAL_CODE_MAPPINGS) == before + 1
+        assert _revision(db, SOURCE_GOODS_MAPPINGS) == source_before + 1
+
+
+def test_auto_source_goods_change_cannot_reuse_ready_snapshot(trigger_engine):
+    token = uuid.uuid4().hex
+    with Session(trigger_engine) as db:
+        price_format = PriceFormat(
+            code=f"SGM-STALE-{token}", name="Source mapping dependency", branch="test"
+        )
+        product = Product(code=f"SGM-SKU-{token}", name="Source map product", cost=1)
+        db.add_all([price_format, product])
+        db.flush()
+        source = CompetitorPriceList(
+            price_format_id=price_format.id,
+            source_type="provisor",
+            source_key=f"provisor:source-map:{token}",
+            display_name="Source map dependency",
+        )
+        db.add(source)
+        db.flush()
+        db.add_all([
+            CompetitorPriceListItem(
+                price_list_id=source.id,
+                name=product.name,
+                distributor_goods_name=product.name,
+                distributor_goods_id=f"DIST-{token}",
+                provisor_goods_id=180682,
+                distributor_price=10,
+                raw_json="{}",
+            ),
+            PriceFormatCompetitorAssignment(
+                price_format_id=price_format.id,
+                competitor_price_list_id=source.id,
+                is_active=True,
+            ),
+        ])
+        db.flush()
+        capture = capture_and_publish_legacy_source_version(
+            db=db,
+            competitor_price_list_id=int(source.id),
+            force_enabled=True,
+            enqueue_shadow=False,
+        )
+        before_vector, _ = build_source_dependency_vector(
+            db=db, competitor_price_list_id=int(source.id)
+        )
+        before_snapshot, _ = get_or_create_shadow_snapshot(
+            db=db, source_version_id=int(capture.version_id), vector=before_vector
+        )
+        before_snapshot.status = "ready"
+        before_snapshot.input_row_count = 1
+        db.commit()
+
+        db.execute(text(
+            """INSERT INTO source_goods_matches
+               (price_format_id, source_type, distributor_goods_id, goods_id,
+                distributor_goods_name, distributor_producer, product_id,
+                match_method, created_at, updated_at)
+               VALUES (:price_format, 'provisor', :key, 180682, '', '',
+                       :product, 'fuzzy_name_manufacturer', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"""
+        ), {
+            "price_format": int(price_format.id),
+            "key": f"DIST-{token}",
+            "product": int(product.id),
+        })
+        db.commit()
+
+        after_vector, _ = build_source_dependency_vector(
+            db=db, competitor_price_list_id=int(source.id)
+        )
+        after_snapshot, reused = get_or_create_shadow_snapshot(
+            db=db, source_version_id=int(capture.version_id), vector=after_vector
+        )
+        assert after_vector.fingerprint != before_vector.fingerprint
+        assert not reused
+        assert int(after_snapshot.id) != int(before_snapshot.id)
+        assert after_snapshot.status == "pending"
+        db.rollback()
 
 
 def test_trigger_revision_rolls_back_with_writer_transaction(trigger_engine):

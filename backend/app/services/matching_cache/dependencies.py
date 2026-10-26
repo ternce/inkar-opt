@@ -13,7 +13,7 @@ from ...models import CompetitorMatchDependencyRevision
 from ...timezone import now_kz_naive
 
 
-MATCHER_VERSION = "legacy-context-scoped-decisions-v4"
+MATCHER_VERSION = "legacy-context-scoped-decisions-v5"
 NORMALIZATION_VERSION = "legacy-drug-normalization-v1"
 
 PRODUCT_CATALOG = "product_catalog"
@@ -21,6 +21,7 @@ MANUAL_CODE_MAPPINGS = "manual_code_mappings"
 PROVISOR_REFERENCES = "provisor_references"
 PROVISOR_SUBSTITUTES = "provisor_substitutes"
 VIDMAN_AUTHORITATIVE = "vidman_authoritative"
+SOURCE_GOODS_MAPPINGS = "source_goods_mappings"
 MATCHING_ALGORITHM = "matching_algorithm"
 NORMALIZATION_ALGORITHM = "normalization_algorithm"
 
@@ -30,6 +31,7 @@ TRACKED_DEPENDENCIES = (
     PROVISOR_REFERENCES,
     PROVISOR_SUBSTITUTES,
     VIDMAN_AUTHORITATIVE,
+    SOURCE_GOODS_MAPPINGS,
     MATCHING_ALGORITHM,
     NORMALIZATION_ALGORITHM,
 )

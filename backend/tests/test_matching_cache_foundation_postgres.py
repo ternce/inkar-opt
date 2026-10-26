@@ -59,6 +59,7 @@ from backend.app.services.matching_cache.dependencies import (
     MATCHER_VERSION,
     NORMALIZATION_VERSION,
     PRODUCT_CATALOG,
+    SOURCE_GOODS_MAPPINGS,
     build_dependency_vector,
     bump_dependency_revision,
     ensure_dependency_revision,
@@ -1492,7 +1493,7 @@ def test_provisor_and_manual_import_publication_paths_dual_write(
         ) == 1
 
 
-def test_dependency_tracking_is_atomic_and_auto_learn_does_not_loop(
+def test_dependency_tracking_is_atomic_and_auto_learn_tracks_identity_only(
     pg_engine, monkeypatch
 ):
     _enable_dual_write(monkeypatch)
@@ -1540,6 +1541,13 @@ def test_dependency_tracking_is_atomic_and_auto_learn_does_not_loop(
         )
         db.add(auto)
         db.commit()
+        source_mapping_revision = db.scalar(
+            select(CompetitorMatchDependencyRevision.revision).where(
+                CompetitorMatchDependencyRevision.scope_type == SOURCE_GOODS_MAPPINGS,
+                CompetitorMatchDependencyRevision.scope_key == "global",
+            )
+        )
+        assert source_mapping_revision == 1
         assert db.scalar(
             select(CompetitorMatchDependencyRevision.revision).where(
                 CompetitorMatchDependencyRevision.scope_type == MANUAL_CODE_MAPPINGS,
@@ -1549,6 +1557,12 @@ def test_dependency_tracking_is_atomic_and_auto_learn_does_not_loop(
         auto.match_method = "manual_approved"
         auto.goods_id = 123
         db.commit()
+        assert db.scalar(
+            select(CompetitorMatchDependencyRevision.revision).where(
+                CompetitorMatchDependencyRevision.scope_type == SOURCE_GOODS_MAPPINGS,
+                CompetitorMatchDependencyRevision.scope_key == "global",
+            )
+        ) == 2
         assert db.scalar(
             select(CompetitorMatchDependencyRevision.revision).where(
                 CompetitorMatchDependencyRevision.scope_type == MANUAL_CODE_MAPPINGS,
@@ -1563,6 +1577,12 @@ def test_dependency_tracking_is_atomic_and_auto_learn_does_not_loop(
                 CompetitorMatchDependencyRevision.scope_key == "global",
             )
         ) == 2
+        assert db.scalar(
+            select(CompetitorMatchDependencyRevision.revision).where(
+                CompetitorMatchDependencyRevision.scope_type == SOURCE_GOODS_MAPPINGS,
+                CompetitorMatchDependencyRevision.scope_key == "global",
+            )
+        ) == 3
 
 
 def test_matching_dependency_writer_model_coverage_is_explicit():
@@ -3226,6 +3246,31 @@ def test_end_to_end_materialization_calculation_analytics_and_excel_parity(
                 db=db, competitor_price_list_id=int(source.id)
             )
             assert republished.succeeded and republished.reused
+        db.commit()
+        # The legacy run may have learned new SourceGoodsMatch identities.
+        # Those mappings affect Goods-ID precedence, so the worker must
+        # replace the now-stale snapshots before cache reads are required.
+        for index, source in enumerate(sources[:-1]):
+            current_vector, _ = build_source_dependency_vector(
+                db=db, competitor_price_list_id=int(source.id)
+            )
+            current_snapshot, reused = get_or_create_shadow_snapshot(
+                db=db,
+                source_version_id=int(
+                    db.scalar(select(CompetitorSourceVersion.id).where(
+                        CompetitorSourceVersion.competitor_price_list_id == int(source.id),
+                        CompetitorSourceVersion.status == "published",
+                    ))
+                ),
+                vector=current_vector,
+            )
+            assert not reused
+            build_shadow_snapshot(
+                db=db,
+                snapshot_id=int(current_snapshot.id),
+                expected_dependency_fingerprint=current_vector.fingerprint,
+            )
+            snapshot_ids[index] = int(current_snapshot.id)
         db.commit()
         compare_legacy_and_shadow_materialization(
             db=db,

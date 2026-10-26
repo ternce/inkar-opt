@@ -23,6 +23,7 @@ from .dependencies import (
     PRODUCT_CATALOG,
     PROVISOR_REFERENCES,
     PROVISOR_SUBSTITUTES,
+    SOURCE_GOODS_MAPPINGS,
     VIDMAN_AUTHORITATIVE,
 )
 
@@ -41,7 +42,7 @@ DEPENDENCY_MODEL_COVERAGE = {
     "ProvisorGoodsMap": (PROVISOR_REFERENCES,),
     "ProductSubstituteMatch": (PROVISOR_SUBSTITUTES,),
     "VidmanProductMatch": (VIDMAN_AUTHORITATIVE,),
-    "SourceGoodsMatch": (MANUAL_CODE_MAPPINGS,),
+    "SourceGoodsMatch": (SOURCE_GOODS_MAPPINGS, MANUAL_CODE_MAPPINGS),
 }
 
 REQUIRED_DATABASE_TRIGGERS = frozenset({
@@ -180,13 +181,21 @@ def _scopes_for(obj: object) -> set[str]:
         if _changed(obj, ("canonical_product_id", "product_id", "status", "match_type", "confidence")):
             scopes.add(VIDMAN_AUTHORITATIVE)
     elif isinstance(obj, SourceGoodsMatch):
-        # The legacy matcher auto-learns these rows. Tracking those writes would
-        # invalidate the very snapshot that produced them forever. Only an
-        # explicitly manual/approved row is an authoritative dependency.
+        # Auto-learned rows participate in Goods-ID precedence, so identity
+        # changes must invalidate snapshots. Matcher-only timestamp/score/method
+        # refreshes are deliberately excluded to avoid an invalidation loop.
+        identity_fields = (
+            "price_format_id",
+            "source_type",
+            "distributor_goods_id",
+            "goods_id",
+            "product_id",
+        )
+        identity_changed = _changed(obj, identity_fields)
+        if identity_changed:
+            scopes.add(SOURCE_GOODS_MAPPINGS)
         method = str(getattr(obj, "match_method", "") or "").casefold()
-        if ("manual" in method or "approved" in method) and _changed(
-            obj, ("price_format_id", "source_type", "distributor_goods_id", "goods_id", "product_id")
-        ):
+        if ("manual" in method or "approved" in method) and identity_changed:
             scopes.add(MANUAL_CODE_MAPPINGS)
     return scopes
 
