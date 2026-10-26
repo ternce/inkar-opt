@@ -117,12 +117,24 @@ def main() -> int:
                 exact = False
                 continue
             snapshots_by_source_id[source_id] = int(snapshot.id)
+            try:
+                snapshot_stats = json.loads(snapshot.stats_json or "{}")
+                snapshot_context_ids = sorted(
+                    int(value)
+                    for value in snapshot_stats["legacyMatchingContext"]["sourceIds"]
+                )
+                context_exact = snapshot_context_ids == assigned_source_ids
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                snapshot_context_ids = []
+                context_exact = False
             decision_report = compare_legacy_and_shadow_matches(
                 db=db,
                 competitor_price_list_id=source_id,
                 snapshot_id=int(snapshot.id),
             ).as_dict()
-            source_exact = content_exact and bool(decision_report["exact"])
+            source_exact = (
+                content_exact and context_exact and bool(decision_report["exact"])
+            )
             reports.append(
                 {
                     "sourceId": source_id,
@@ -132,6 +144,8 @@ def main() -> int:
                     "sourceContentExact": content_exact,
                     "activeSourceRows": active.row_count,
                     "snapshotInputRows": int(snapshot.input_row_count),
+                    "matchingContextExact": context_exact,
+                    "snapshotMatchingSourceIds": snapshot_context_ids,
                     "exact": source_exact,
                     "decisionComparison": decision_report,
                 }

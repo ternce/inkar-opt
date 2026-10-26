@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import json
 from typing import Any
 
 from sqlalchemy import select
@@ -109,6 +110,24 @@ def backfill_existing_source(
         batch_size=batch_size,
     )
     version = created.version
+    try:
+        source_metadata = json.loads(version.source_metadata_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        source_metadata = {}
+    if not isinstance(source_metadata, dict):
+        source_metadata = {}
+    source_metadata.update({
+        "matchingDecisionMode": "authoritative_legacy_output",
+        "origin": "existing_source_backfill",
+        "priceFormatId": int(price_format_id) if price_format_id is not None else None,
+    })
+    version.source_metadata_json = json.dumps(
+        source_metadata,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
     if version.status in {"pending", "failed"}:
         mark_source_version_matching(db=db, version_id=int(version.id))
         mark_source_version_ready(db=db, version_id=int(version.id))

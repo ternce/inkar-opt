@@ -21,9 +21,19 @@ from ...models import (
     CompetitorPriceListItem,
     CompetitorSourceVersion,
     CompetitorSourceVersionItem,
+    PriceFormatCompetitorAssignment,
 )
 from ...timezone import now_kz_naive
-from ..competitor_matching import rematch_price_list_items_by_product
+from ..competitor_assignments import get_assigned_competitor_price_lists
+from ..competitor_matching import (
+    _product_indexes,
+    _sync_provisor_reference_mapping_from_items,
+    rematch_price_list_items_by_product,
+)
+from ..competitor_source_config import (
+    MULTI_PRICE_PERCENTILE_MODE,
+    effective_percentile_mode,
+)
 from ..pricing_workflow.locks import acquire_transaction_write_locks
 from .capture import (
     _postgres_io_sample,
@@ -63,6 +73,66 @@ class ShadowSnapshotResult:
 
 def _revision(vector: DependencyVector, scope: str) -> int:
     return int(vector.revisions.get(f"{scope}:global", 0))
+
+
+@dataclass(frozen=True)
+class _LegacyMatchingContext:
+    price_format_ids: tuple[int, ...]
+    source_ids: tuple[int, ...]
+
+
+def _legacy_matching_context(
+    *, db: Session, competitor_price_list_id: int
+) -> _LegacyMatchingContext:
+    """Resolve the exact physical-source cohort used by the legacy rebuild.
+
+    A cache snapshot is source-scoped, while the legacy matcher builds its
+    product indexes after synchronizing Provisor references for every physical
+    source assigned to the target price format.  Reusing a source snapshot
+    across two different cohorts would therefore be unsafe, so ambiguous
+    active assignments fail closed.
+    """
+
+    source_id = int(competitor_price_list_id)
+    price_format_ids = tuple(
+        int(value)
+        for value in db.scalars(
+            select(PriceFormatCompetitorAssignment.price_format_id)
+            .where(
+                PriceFormatCompetitorAssignment.competitor_price_list_id == source_id,
+                PriceFormatCompetitorAssignment.is_active.is_(True),
+            )
+            .order_by(PriceFormatCompetitorAssignment.price_format_id.asc())
+        )
+    )
+    contexts: dict[tuple[int, ...], list[int]] = {}
+    for price_format_id in price_format_ids:
+        physical_source_ids = tuple(
+            sorted(
+                int(item.price_list.id)
+                for item in get_assigned_competitor_price_lists(
+                    db=db, price_format_id=price_format_id
+                )
+                if effective_percentile_mode(
+                    item.price_list, item.assignment.percentile_mode
+                )
+                != MULTI_PRICE_PERCENTILE_MODE
+            )
+        )
+        if source_id in physical_source_ids:
+            contexts.setdefault(physical_source_ids, []).append(price_format_id)
+    if not contexts:
+        return _LegacyMatchingContext((), (source_id,))
+    if len(contexts) != 1:
+        rendered = ", ".join(
+            f"sources={list(source_ids)} formats={format_ids}"
+            for source_ids, format_ids in sorted(contexts.items())
+        )
+        raise ShadowSnapshotConflict(
+            f"source {source_id} has ambiguous legacy matching cohorts: {rendered}"
+        )
+    source_ids, format_ids = next(iter(contexts.items()))
+    return _LegacyMatchingContext(tuple(sorted(format_ids)), source_ids)
 
 
 class _DecisionSpool:
@@ -187,7 +257,14 @@ def get_or_create_shadow_snapshot(
 def build_shadow_snapshot(
     *, db: Session, snapshot_id: int, expected_dependency_fingerprint: str = ""
 ) -> ShadowSnapshotResult:
-    """Run the active matcher in a rolled-back savepoint and persist only its decisions."""
+    """Validate with the matcher, then cache the immutable legacy decisions.
+
+    Existing-source backfills explicitly freeze the production legacy
+    workflow's final authoritative decision fields. Reinterpreting those rows
+    can change precedence after the legacy run has persisted SourceGoodsMatch
+    rows, so their rolled-back matcher is diagnostic only. Normal import
+    captures continue to use the shadow rematch result.
+    """
 
     started_at = time.perf_counter()
     io_before = _postgres_io_sample(db)
@@ -204,11 +281,22 @@ def build_shadow_snapshot(
     ).one_or_none()
     if lock_target is None:
         raise ShadowSnapshotConflict(f"snapshot not found: {snapshot_id}")
+    context = _legacy_matching_context(
+        db=db,
+        competitor_price_list_id=int(lock_target.competitor_price_list_id),
+    )
     acquire_transaction_write_locks(
         db,
-        source_ids=[int(lock_target.competitor_price_list_id)],
+        price_format_ids=context.price_format_ids,
+        source_ids=context.source_ids,
         retry_timeout_seconds=5.0,
     )
+    locked_context = _legacy_matching_context(
+        db=db,
+        competitor_price_list_id=int(lock_target.competitor_price_list_id),
+    )
+    if locked_context != context:
+        raise ShadowSnapshotConflict("legacy matching cohort changed while acquiring locks")
     snapshot = db.scalar(
         select(CompetitorMatchSnapshot)
         .where(CompetitorMatchSnapshot.id == int(snapshot_id))
@@ -235,6 +323,15 @@ def build_shadow_snapshot(
     )
     if source_version is None or source_version.status != "published":
         raise ShadowSnapshotConflict("shadow matching requires a published source version")
+    try:
+        source_metadata = json.loads(source_version.source_metadata_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        source_metadata = {}
+    preserve_authoritative_decisions = (
+        isinstance(source_metadata, dict)
+        and source_metadata.get("matchingDecisionMode")
+        == "authoritative_legacy_output"
+    )
     vector_before = build_dependency_vector(db=db)
     required_fingerprint = expected_dependency_fingerprint or snapshot.dependency_fingerprint
     if vector_before.fingerprint != required_fingerprint:
@@ -254,6 +351,11 @@ def build_shadow_snapshot(
             CompetitorSourceVersionItem.source_ordinal,
             CompetitorSourceVersionItem.source_row_key,
             CompetitorSourceVersionItem.duplicate_ordinal,
+            CompetitorSourceVersionItem.authoritative_product_id,
+            CompetitorSourceVersionItem.authoritative_match_key,
+            CompetitorSourceVersionItem.authoritative_match_type,
+            CompetitorSourceVersionItem.authoritative_match_score,
+            CompetitorSourceVersionItem.authoritative_matched_sku,
         )
         .where(CompetitorSourceVersionItem.source_version_id == source_version.id)
         .order_by(CompetitorSourceVersionItem.source_ordinal.asc())
@@ -272,7 +374,17 @@ def build_shadow_snapshot(
         ):
             if version_item is missing_row or active_row is missing_row:
                 raise ShadowSnapshotConflict("active source identity mapping is incomplete")
-            version_item_id, ordinal, row_key, duplicate_ordinal = version_item
+            (
+                version_item_id,
+                ordinal,
+                row_key,
+                duplicate_ordinal,
+                product_id,
+                match_key,
+                match_type_value,
+                match_score,
+                matched_sku,
+            ) = version_item
             expected = (int(ordinal), str(row_key), int(duplicate_ordinal))
             actual = (
                 active_row.source_ordinal,
@@ -286,6 +398,27 @@ def build_shadow_snapshot(
                 "INSERT INTO identity_map (legacy_id, source_version_item_id) VALUES (?, ?)",
                 (int(legacy_id), int(version_item_id)),
             )
+            if preserve_authoritative_decisions:
+                match_type = str(match_type_value or "unmatched")
+                folded = match_type.casefold()
+                spool.connection.execute(
+                    "INSERT INTO decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        int(legacy_id),
+                        int(product_id) if product_id is not None else None,
+                        str(match_key or ""),
+                        match_type,
+                        str(match_score) if match_score is not None else None,
+                        str(matched_sku or ""),
+                        int("manual" in folded),
+                        int("reject" in folded),
+                        int(
+                            "manual" in folded
+                            or match_type.startswith("vidman_")
+                            or match_type.startswith("provisor_goods")
+                        ),
+                    ),
+                )
             identity_count += 1
         spool.connection.commit()
         if identity_count != int(source_version.row_count):
@@ -299,45 +432,52 @@ def build_shadow_snapshot(
         db.flush()
 
         stats: dict = {}
-        decision_count = 0
+        decision_count = identity_count if preserve_authoritative_decisions else 0
         nested = db.begin_nested()
         try:
+            _sync_provisor_reference_mapping_from_items(
+                db,
+                price_list_ids=list(context.source_ids),
+            )
+            product_indexes = _product_indexes(db)
             stats = rematch_price_list_items_by_product(
                 db=db,
                 price_list=price_list,
+                product_indexes=product_indexes,
                 flush=True,
                 collect_matched_rows=False,
                 persist_materialized_fields=False,
             )
-            active_items = db.scalars(
-                select(CompetitorPriceListItem)
-                .where(CompetitorPriceListItem.price_list_id == price_list.id)
-                .order_by(CompetitorPriceListItem.id.asc())
-                .execution_options(yield_per=2000, stream_results=True)
-            )
-            for item in active_items:
-                match_type = str(item.match_type or "unmatched")
-                folded = match_type.casefold()
-                spool.connection.execute(
-                    """INSERT INTO decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        int(item.id),
-                        int(item.product_id) if item.product_id is not None else None,
-                        str(item.match_key or ""),
-                        match_type,
-                        str(item.match_score) if item.match_score is not None else None,
-                        str(item.matched_sku or ""),
-                        int("manual" in folded),
-                        int("reject" in folded),
-                        int(
-                            "manual" in folded
-                            or match_type.startswith("vidman_")
-                            or match_type.startswith("provisor_goods")
-                        ),
-                    ),
+            if not preserve_authoritative_decisions:
+                active_items = db.scalars(
+                    select(CompetitorPriceListItem)
+                    .where(CompetitorPriceListItem.price_list_id == price_list.id)
+                    .order_by(CompetitorPriceListItem.id.asc())
+                    .execution_options(yield_per=2000, stream_results=True)
                 )
-                decision_count += 1
-            spool.connection.commit()
+                for item in active_items:
+                    match_type = str(item.match_type or "unmatched")
+                    folded = match_type.casefold()
+                    spool.connection.execute(
+                        "INSERT INTO decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            int(item.id),
+                            int(item.product_id) if item.product_id is not None else None,
+                            str(item.match_key or ""),
+                            match_type,
+                            str(item.match_score) if item.match_score is not None else None,
+                            str(item.matched_sku or ""),
+                            int("manual" in folded),
+                            int("reject" in folded),
+                            int(
+                                "manual" in folded
+                                or match_type.startswith("vidman_")
+                                or match_type.startswith("provisor_goods")
+                            ),
+                        ),
+                    )
+                    decision_count += 1
+                spool.connection.commit()
         finally:
             nested.rollback()
             db.expire_all()
@@ -425,6 +565,15 @@ def build_shadow_snapshot(
                 "legacyStats": {
                     key: value for key, value in stats.items() if not str(key).startswith("_")
                 },
+                "legacyMatchingContext": {
+                    "priceFormatIds": list(context.price_format_ids),
+                    "sourceIds": list(context.source_ids),
+                },
+                "matchingDecisionMode": (
+                    "authoritative_legacy_output"
+                    if preserve_authoritative_decisions
+                    else "shadow_rematch"
+                ),
             },
             ensure_ascii=False,
             sort_keys=True,

@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from decimal import Decimal
 import io
+import json
 import os
 from pathlib import Path
 import threading
@@ -37,6 +38,7 @@ from backend.app.models import (
     PricingContext,
     PricingWorkflowRun,
     Product,
+    ProductExtra,
     CalculatedPrice,
     BendRange,
     BranchStock,
@@ -53,6 +55,8 @@ from backend.app.services.matching_cache.backfill import (
 from backend.app.services.matching_cache.config import matching_cache_enabled
 from backend.app.services.matching_cache.dependencies import (
     MANUAL_CODE_MAPPINGS,
+    MATCHER_VERSION,
+    NORMALIZATION_VERSION,
     PRODUCT_CATALOG,
     build_dependency_vector,
     bump_dependency_revision,
@@ -679,6 +683,36 @@ def test_streaming_import_capture_reuses_and_republishes_changed_content(
         assert statuses == ["published", "superseded"]
 
 
+def test_matcher_version_change_cannot_reuse_previous_snapshot(
+    pg_engine, source_id, monkeypatch
+):
+    _enable_dual_write(monkeypatch)
+    with Session(pg_engine) as db:
+        _add_legacy_item(db, source_id, code=f"VERSION-{uuid.uuid4().hex}")
+        capture = capture_and_publish_legacy_source_version(
+            db=db, competitor_price_list_id=source_id
+        )
+        vector = build_dependency_vector(db=db)
+        old = CompetitorMatchSnapshot(
+            source_version_id=int(capture.version_id),
+            dependency_fingerprint=vector.fingerprint,
+            dependency_vector_json=json.dumps(vector.as_dict(), sort_keys=True),
+            matcher_version="legacy-product-first-v1",
+            normalization_version=NORMALIZATION_VERSION,
+            status="ready",
+            ready_at=now_kz_naive(),
+        )
+        db.add(old)
+        db.flush()
+        current, reused = get_or_create_shadow_snapshot(
+            db=db, source_version_id=int(capture.version_id), vector=vector
+        )
+        assert reused is False
+        assert int(current.id) != int(old.id)
+        assert current.matcher_version == MATCHER_VERSION
+        db.rollback()
+
+
 def test_capture_failure_savepoint_preserves_legacy_import(
     pg_engine, source_id, monkeypatch
 ):
@@ -930,6 +964,118 @@ def test_shadow_match_uses_legacy_semantics_without_active_side_effects(
         parity.assert_exact()
         nested.rollback()
         db.expire_all()
+
+
+def test_shadow_provisor_reference_sync_uses_legacy_assigned_source_cohort(
+    pg_engine, monkeypatch
+):
+    """An unassigned reference source must not alter a shadow decision."""
+
+    _enable_dual_write(monkeypatch)
+    token = uuid.uuid4().hex
+    goods_id = 700_000_000 + int(token[:6], 16)
+    with Session(pg_engine) as db:
+        price_format = PriceFormat(
+            code=f"COHORT-{token}", name="Cohort parity", branch="test"
+        )
+        product = Product(
+            code=f"COHORT-SKU-{token}",
+            name=f"Cohortamed {token} 10 mg tablets",
+            cost=1,
+        )
+        db.add_all([price_format, product])
+        db.flush()
+        db.add(ProductExtra(product_id=product.id, manufacturer="Cohort Factory"))
+        target = CompetitorPriceList(
+            price_format_id=price_format.id,
+            source_type="provisor",
+            source_key=f"provisor:target:{token}",
+            display_name="Assigned target",
+            account_id=f"target-{token}",
+        )
+        unrelated = CompetitorPriceList(
+            price_format_id=price_format.id,
+            source_type="provisor",
+            source_key=f"provisor:unassigned-reference:{token}",
+            display_name="Unassigned reference",
+            account_id=f"unassigned-{token}",
+        )
+        db.add_all([target, unrelated])
+        db.flush()
+        target_item = CompetitorPriceListItem(
+            price_list_id=target.id,
+            filial_id=200,
+            provisor_goods_id=goods_id,
+            name=product.name,
+            raw_name=product.name,
+            raw_manufacturer="Cohort Factory",
+            distributor_goods_name=product.name,
+            distributor_goods_id=f"TARGET-{token}",
+            distributor_price=Decimal("10"),
+            match_type="unmatched",
+            raw_json="{}",
+        )
+        unrelated_reference = CompetitorPriceListItem(
+            price_list_id=unrelated.id,
+            filial_id=128,
+            provisor_goods_id=goods_id,
+            name=product.name,
+            raw_name=product.name,
+            distributor_goods_name=product.name,
+            distributor_goods_id=product.code,
+            distributor_price=Decimal("11"),
+            match_type="unmatched",
+            raw_json="{}",
+        )
+        db.add_all([target_item, unrelated_reference])
+        db.add(
+            PriceFormatCompetitorAssignment(
+                price_format_id=price_format.id,
+                competitor_price_list_id=target.id,
+                is_active=True,
+            )
+        )
+        db.flush()
+        rebuild_competitor_prices_for_selected(
+            db=db,
+            price_format_id=int(price_format.id),
+            allow_matching_cache=False,
+        )
+        assert product.provisor_goods_id is None
+        assert target_item.product_id == product.id
+        assert target_item.match_type != "provisor_goods_id"
+        product_id = int(product.id)
+
+        backfill = backfill_existing_source(
+            db=db,
+            competitor_price_list_id=int(target.id),
+            price_format_id=int(price_format.id),
+            enqueue_job=False,
+        )
+        vector = build_dependency_vector(db=db)
+        snapshot_id = int(backfill.snapshot_id)
+        source_id = int(target.id)
+        db.commit()
+
+    with Session(pg_engine) as db:
+        build_shadow_snapshot(
+            db=db,
+            snapshot_id=snapshot_id,
+            expected_dependency_fingerprint=vector.fingerprint,
+        )
+        parity = compare_legacy_and_shadow_matches(
+            db=db,
+            competitor_price_list_id=source_id,
+            snapshot_id=snapshot_id,
+        )
+        parity.assert_exact()
+        snapshot = db.get(CompetitorMatchSnapshot, snapshot_id)
+        snapshot_stats = json.loads(snapshot.stats_json)
+        assert snapshot_stats["legacyMatchingContext"]["sourceIds"] == [source_id]
+        db.commit()
+
+    with Session(pg_engine) as db:
+        assert db.get(Product, product_id).provisor_goods_id is None
 
 
 def test_lightweight_matcher_preserves_ties_manual_priority_and_item_reuse(
@@ -2292,6 +2438,11 @@ def test_end_to_end_materialization_calculation_analytics_and_excel_parity(
                 )
                 for field in SOURCE_CONTENT_FIELDS
             }
+            sources.append(source)
+
+        # Snapshot decisions depend on the complete physical assignment
+        # cohort, so establish every assignment before building any snapshot.
+        for source in sources:
             capture = capture_and_publish_legacy_source_version(
                 db=db, competitor_price_list_id=int(source.id)
             )
@@ -2305,7 +2456,6 @@ def test_end_to_end_materialization_calculation_analytics_and_excel_parity(
                 expected_dependency_fingerprint=vector.fingerprint,
             )
             snapshot_ids.append(int(snapshot.id))
-            sources.append(source)
 
         # Release source-version transaction locks before the independent
         # workflow materialization lease is acquired.
@@ -2326,12 +2476,12 @@ def test_end_to_end_materialization_calculation_analytics_and_excel_parity(
             reimported_items[new_ids[0]] = original_items[old_ids[0]]
         original_items = reimported_items
         db.commit()
-        # Establish the legacy decision set explicitly.  The selected-source
-        # rebuild may legitimately skip raw matching for source modes whose
-        # materialization policy changes independently of the matcher.
-        for source in sources[:-1]:
-            rematch_price_list_items_by_product(db=db, price_list=source)
-        db.flush()
+        # Establish decisions through the production cohort-scoped path.
+        rebuild_competitor_prices_for_selected(
+            db=db,
+            price_format_id=int(price_format.id),
+            allow_matching_cache=False,
+        )
         for source, snapshot_id in zip(sources[:-1], snapshot_ids[:-1]):
             compare_legacy_and_shadow_matches(
                 db=db,

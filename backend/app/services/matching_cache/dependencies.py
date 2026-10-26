@@ -13,7 +13,7 @@ from ...models import CompetitorMatchDependencyRevision
 from ...timezone import now_kz_naive
 
 
-MATCHER_VERSION = "legacy-product-first-v1"
+MATCHER_VERSION = "legacy-authoritative-decisions-v2"
 NORMALIZATION_VERSION = "legacy-drug-normalization-v1"
 
 PRODUCT_CATALOG = "product_catalog"

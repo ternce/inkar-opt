@@ -115,7 +115,7 @@ def _conflict(reason: str) -> None:
 
 
 def _resolve_source_snapshot(
-    *, db: Session, assigned_item: Any, vector: Any
+    *, db: Session, assigned_item: Any, vector: Any, expected_source_ids: tuple[int, ...]
 ) -> ResolvedSourceSnapshot | None:
     source = assigned_item.price_list
     source_id = int(source.id)
@@ -240,6 +240,17 @@ def _resolve_source_snapshot(
         _conflict(f"source {source_id} snapshot statistics are corrupt")
     if not isinstance(stored_stats, dict):
         _conflict(f"source {source_id} snapshot statistics are invalid")
+    matching_context = stored_stats.get("legacyMatchingContext")
+    if not isinstance(matching_context, dict):
+        _conflict(f"source {source_id} snapshot matching context is missing")
+    try:
+        stored_source_ids = tuple(
+            sorted(int(value) for value in matching_context.get("sourceIds", ()))
+        )
+    except (TypeError, ValueError):
+        _conflict(f"source {source_id} snapshot matching context is invalid")
+    if stored_source_ids != expected_source_ids:
+        _conflict(f"source {source_id} snapshot matching cohort mismatch")
     legacy_stats = stored_stats.get("legacyStats") or {}
     if not isinstance(legacy_stats, dict):
         _conflict(f"source {source_id} snapshot legacy statistics are invalid")
@@ -357,9 +368,15 @@ def materialize_ready_snapshots(
 
     lookup_started = time.perf_counter()
     vector = build_dependency_vector(db=db)
+    expected_source_ids = tuple(sorted(int(item.price_list.id) for item in assigned))
     resolved: list[ResolvedSourceSnapshot] = []
     for item in assigned:
-        result = _resolve_source_snapshot(db=db, assigned_item=item, vector=vector)
+        result = _resolve_source_snapshot(
+            db=db,
+            assigned_item=item,
+            vector=vector,
+            expected_source_ids=expected_source_ids,
+        )
         if result is None:
             reason = f"snapshot_absent_for_source_{int(item.price_list.id)}"
             if read_mode == "required":
