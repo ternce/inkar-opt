@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import threading
+import time
 import uuid
 
 import pytest
@@ -90,6 +91,15 @@ from backend.app.services.matching_cache.shadow import (
 from backend.app.services.matching_cache import shadow as shadow_service
 from backend.app.services.matching_cache import capture as capture_service
 from backend.app.services.matching_cache import worker as matching_cache_worker_service
+from backend.app.services.matching_cache.context import (
+    MatchingContextConflict,
+    build_source_dependency_vector,
+    resolve_matching_context,
+)
+from backend.app.services.matching_cache.lifecycle import (
+    matching_cache_status,
+    reconcile_matching_cache_lifecycle,
+)
 from backend.app.services.matching_cache.materialization import (
     MatchingCacheConflict,
     MatchingCacheUnavailable,
@@ -710,6 +720,166 @@ def test_matcher_version_change_cannot_reuse_previous_snapshot(
         assert reused is False
         assert int(current.id) != int(old.id)
         assert current.matcher_version == MATCHER_VERSION
+        db.rollback()
+
+
+def test_automatic_lifecycle_captures_enqueues_builds_and_invalidates(
+    pg_engine, monkeypatch
+):
+    _enable_dual_write(monkeypatch)
+    monkeypatch.setenv("MATCH_CACHE_WORKER_ENABLED", "true")
+    monkeypatch.setenv("MATCH_CACHE_AUTO_PREPARE_ENABLED", "true")
+    monkeypatch.setattr(
+        matching_cache_worker_service,
+        "assert_database_dependency_tracking",
+        lambda _db: None,
+    )
+    token = uuid.uuid4().hex
+    with Session(pg_engine) as db:
+        price_format = PriceFormat(code=f"AUTO-{token}", name="Automatic cache", branch="test")
+        product = Product(code=f"AUTO-SKU-{token}", name=f"Automatic {token}", cost=1)
+        db.add_all([price_format, product])
+        db.flush()
+        source = CompetitorPriceList(
+            price_format_id=price_format.id,
+            source_type="manual",
+            source_key=f"automatic:{token}",
+            display_name="Automatic source",
+            items_count=1,
+        )
+        db.add(source)
+        db.flush()
+        db.add_all([
+            CompetitorPriceListItem(
+                price_list_id=source.id,
+                name=product.name,
+                raw_name=product.name,
+                distributor_goods_name=product.name,
+                distributor_goods_id=product.code,
+                distributor_price=Decimal("10"),
+                match_type="unmatched",
+                raw_json="{}",
+            ),
+            PriceFormatCompetitorAssignment(
+                price_format_id=price_format.id,
+                competitor_price_list_id=source.id,
+                is_active=True,
+            ),
+        ])
+        db.commit()
+        source_id = int(source.id)
+        price_format_id = int(price_format.id)
+
+    with Session(pg_engine) as db:
+        result = reconcile_matching_cache_lifecycle(db=db)
+        assert result.captured_sources == 1
+        assert result.jobs_created == 1
+        version = db.scalar(select(CompetitorSourceVersion).where(
+            CompetitorSourceVersion.competitor_price_list_id == source_id,
+            CompetitorSourceVersion.status == "published",
+        ))
+        assert json.loads(version.source_metadata_json)["matchingDecisionMode"] == "shadow_rematch"
+        db.commit()
+
+    monkeypatch.setattr(
+        matching_cache_worker_service,
+        "_last_lifecycle_reconcile_monotonic",
+        time.monotonic(),
+    )
+    assert matching_cache_worker_service.run_one_matching_job(
+        session_factory=lambda: Session(pg_engine),
+        worker_id=f"auto-{token}",
+        lease_seconds=120,
+    ) == "succeeded"
+
+    with Session(pg_engine) as db:
+        status = matching_cache_status(db=db)
+        format_status = next(
+            row for row in status["formats"] if row["priceFormatId"] == price_format_id
+        )
+        assert format_status["ready"] is True
+        assert format_status["readPolicy"] == {
+            "mode": "disabled",
+            "authorized": False,
+            "configurationError": None,
+        }
+        initial_version = db.scalar(select(CompetitorSourceVersion).where(
+            CompetitorSourceVersion.competitor_price_list_id == source_id,
+            CompetitorSourceVersion.status == "published",
+        ))
+        source_item = db.scalar(select(CompetitorPriceListItem).where(
+            CompetitorPriceListItem.price_list_id == source_id
+        ))
+        source_item.distributor_price = Decimal("11")
+        db.flush()
+        source_refresh = reconcile_matching_cache_lifecycle(db=db)
+        assert source_refresh.captured_sources == 1
+        assert source_refresh.snapshots_created == 1
+        assert source_refresh.jobs_created == 1
+        refreshed_version = db.scalar(select(CompetitorSourceVersion).where(
+            CompetitorSourceVersion.competitor_price_list_id == source_id,
+            CompetitorSourceVersion.status == "published",
+        ))
+        assert int(refreshed_version.id) != int(initial_version.id)
+        first_vector, _ = build_source_dependency_vector(
+            db=db, competitor_price_list_id=source_id
+        )
+        product = db.scalar(select(Product).where(Product.code == f"AUTO-SKU-{token}"))
+        product.name = f"Automatic changed {token}"
+        db.flush()
+        second_vector, _ = build_source_dependency_vector(
+            db=db, competitor_price_list_id=source_id
+        )
+        assert second_vector.fingerprint != first_vector.fingerprint
+        refreshed = reconcile_matching_cache_lifecycle(db=db)
+        assert refreshed.snapshots_created == 1
+        assert refreshed.jobs_created == 1
+        db.rollback()
+
+
+def test_matching_context_fails_closed_for_shared_source_with_incompatible_cohorts(
+    pg_engine
+):
+    token = uuid.uuid4().hex
+    with Session(pg_engine) as db:
+        first_format = PriceFormat(code=f"CTX-A-{token}", name="A", branch="test")
+        second_format = PriceFormat(code=f"CTX-B-{token}", name="B", branch="test")
+        db.add_all([first_format, second_format])
+        db.flush()
+        shared = CompetitorPriceList(
+            price_format_id=first_format.id,
+            source_type="manual",
+            source_key=f"shared:{token}",
+            display_name="Shared",
+        )
+        other = CompetitorPriceList(
+            price_format_id=second_format.id,
+            source_type="manual",
+            source_key=f"other:{token}",
+            display_name="Other",
+        )
+        db.add_all([shared, other])
+        db.flush()
+        db.add_all([
+            PriceFormatCompetitorAssignment(
+                price_format_id=first_format.id,
+                competitor_price_list_id=shared.id,
+                is_active=True,
+            ),
+            PriceFormatCompetitorAssignment(
+                price_format_id=second_format.id,
+                competitor_price_list_id=shared.id,
+                is_active=True,
+            ),
+            PriceFormatCompetitorAssignment(
+                price_format_id=second_format.id,
+                competitor_price_list_id=other.id,
+                is_active=True,
+            ),
+        ])
+        db.flush()
+        with pytest.raises(MatchingContextConflict):
+            resolve_matching_context(db=db, competitor_price_list_id=int(shared.id))
         db.rollback()
 
 

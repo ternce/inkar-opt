@@ -29,6 +29,7 @@ from ..pricing_workflow.locks import (
     PricingWorkflowConflict,
 )
 from .dependencies import build_dependency_vector
+from .context import MatchingContextConflict, build_source_dependency_vector
 
 
 class MatchingCacheConflict(PricingWorkflowConflict):
@@ -371,10 +372,19 @@ def materialize_ready_snapshots(
     expected_source_ids = tuple(sorted(int(item.price_list.id) for item in assigned))
     resolved: list[ResolvedSourceSnapshot] = []
     for item in assigned:
+        try:
+            source_vector, _context = build_source_dependency_vector(
+                db=db,
+                competitor_price_list_id=int(item.price_list.id),
+                base_vector=vector,
+                expected_source_ids=expected_source_ids,
+            )
+        except MatchingContextConflict as exc:
+            _conflict(str(exc))
         result = _resolve_source_snapshot(
             db=db,
             assigned_item=item,
-            vector=vector,
+            vector=source_vector,
             expected_source_ids=expected_source_ids,
         )
         if result is None:

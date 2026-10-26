@@ -21,18 +21,12 @@ from ...models import (
     CompetitorPriceListItem,
     CompetitorSourceVersion,
     CompetitorSourceVersionItem,
-    PriceFormatCompetitorAssignment,
 )
 from ...timezone import now_kz_naive
-from ..competitor_assignments import get_assigned_competitor_price_lists
 from ..competitor_matching import (
     _product_indexes,
     _sync_provisor_reference_mapping_from_items,
     rematch_price_list_items_by_product,
-)
-from ..competitor_source_config import (
-    MULTI_PRICE_PERCENTILE_MODE,
-    effective_percentile_mode,
 )
 from ..pricing_workflow.locks import acquire_transaction_write_locks
 from .capture import (
@@ -51,6 +45,11 @@ from .dependencies import (
     VIDMAN_AUTHORITATIVE,
     DependencyVector,
     build_dependency_vector,
+)
+from .context import (
+    MatchingContextConflict,
+    build_source_dependency_vector,
+    resolve_matching_context,
 )
 
 
@@ -73,66 +72,6 @@ class ShadowSnapshotResult:
 
 def _revision(vector: DependencyVector, scope: str) -> int:
     return int(vector.revisions.get(f"{scope}:global", 0))
-
-
-@dataclass(frozen=True)
-class _LegacyMatchingContext:
-    price_format_ids: tuple[int, ...]
-    source_ids: tuple[int, ...]
-
-
-def _legacy_matching_context(
-    *, db: Session, competitor_price_list_id: int
-) -> _LegacyMatchingContext:
-    """Resolve the exact physical-source cohort used by the legacy rebuild.
-
-    A cache snapshot is source-scoped, while the legacy matcher builds its
-    product indexes after synchronizing Provisor references for every physical
-    source assigned to the target price format.  Reusing a source snapshot
-    across two different cohorts would therefore be unsafe, so ambiguous
-    active assignments fail closed.
-    """
-
-    source_id = int(competitor_price_list_id)
-    price_format_ids = tuple(
-        int(value)
-        for value in db.scalars(
-            select(PriceFormatCompetitorAssignment.price_format_id)
-            .where(
-                PriceFormatCompetitorAssignment.competitor_price_list_id == source_id,
-                PriceFormatCompetitorAssignment.is_active.is_(True),
-            )
-            .order_by(PriceFormatCompetitorAssignment.price_format_id.asc())
-        )
-    )
-    contexts: dict[tuple[int, ...], list[int]] = {}
-    for price_format_id in price_format_ids:
-        physical_source_ids = tuple(
-            sorted(
-                int(item.price_list.id)
-                for item in get_assigned_competitor_price_lists(
-                    db=db, price_format_id=price_format_id
-                )
-                if effective_percentile_mode(
-                    item.price_list, item.assignment.percentile_mode
-                )
-                != MULTI_PRICE_PERCENTILE_MODE
-            )
-        )
-        if source_id in physical_source_ids:
-            contexts.setdefault(physical_source_ids, []).append(price_format_id)
-    if not contexts:
-        return _LegacyMatchingContext((), (source_id,))
-    if len(contexts) != 1:
-        rendered = ", ".join(
-            f"sources={list(source_ids)} formats={format_ids}"
-            for source_ids, format_ids in sorted(contexts.items())
-        )
-        raise ShadowSnapshotConflict(
-            f"source {source_id} has ambiguous legacy matching cohorts: {rendered}"
-        )
-    source_ids, format_ids = next(iter(contexts.items()))
-    return _LegacyMatchingContext(tuple(sorted(format_ids)), source_ids)
 
 
 class _DecisionSpool:
@@ -211,7 +150,18 @@ def cleanup_stale_shadow_spools(
 def get_or_create_shadow_snapshot(
     *, db: Session, source_version_id: int, vector: DependencyVector | None = None
 ) -> tuple[CompetitorMatchSnapshot, bool]:
-    vector = vector or build_dependency_vector(db=db)
+    source_version = db.get(CompetitorSourceVersion, int(source_version_id))
+    if source_version is None:
+        raise ShadowSnapshotConflict(f"source version not found: {source_version_id}")
+    base_vector = vector or build_dependency_vector(db=db)
+    if base_vector.matching_context is None:
+        vector, _context = build_source_dependency_vector(
+            db=db,
+            competitor_price_list_id=int(source_version.competitor_price_list_id),
+            base_vector=base_vector,
+        )
+    else:
+        vector = base_vector
     existing = db.scalar(
         select(CompetitorMatchSnapshot)
         .where(CompetitorMatchSnapshot.source_version_id == int(source_version_id))
@@ -281,20 +231,26 @@ def build_shadow_snapshot(
     ).one_or_none()
     if lock_target is None:
         raise ShadowSnapshotConflict(f"snapshot not found: {snapshot_id}")
-    context = _legacy_matching_context(
-        db=db,
-        competitor_price_list_id=int(lock_target.competitor_price_list_id),
-    )
+    try:
+        context = resolve_matching_context(
+            db=db,
+            competitor_price_list_id=int(lock_target.competitor_price_list_id),
+        )
+    except MatchingContextConflict as exc:
+        raise ShadowSnapshotConflict(str(exc)) from exc
     acquire_transaction_write_locks(
         db,
         price_format_ids=context.price_format_ids,
         source_ids=context.source_ids,
         retry_timeout_seconds=5.0,
     )
-    locked_context = _legacy_matching_context(
-        db=db,
-        competitor_price_list_id=int(lock_target.competitor_price_list_id),
-    )
+    try:
+        locked_context = resolve_matching_context(
+            db=db,
+            competitor_price_list_id=int(lock_target.competitor_price_list_id),
+        )
+    except MatchingContextConflict as exc:
+        raise ShadowSnapshotConflict(str(exc)) from exc
     if locked_context != context:
         raise ShadowSnapshotConflict("legacy matching cohort changed while acquiring locks")
     snapshot = db.scalar(
@@ -332,10 +288,21 @@ def build_shadow_snapshot(
         and source_metadata.get("matchingDecisionMode")
         == "authoritative_legacy_output"
     )
-    vector_before = build_dependency_vector(db=db)
+    base_vector_before = build_dependency_vector(db=db)
+    vector_before, _ = build_source_dependency_vector(
+        db=db,
+        competitor_price_list_id=int(source_version.competitor_price_list_id),
+        base_vector=base_vector_before,
+        expected_source_ids=context.source_ids,
+    )
     required_fingerprint = expected_dependency_fingerprint or snapshot.dependency_fingerprint
-    if vector_before.fingerprint != required_fingerprint:
+    if required_fingerprint not in {
+        vector_before.fingerprint,
+        base_vector_before.fingerprint,
+    }:
         raise ShadowSnapshotConflict("stale dependency fingerprint before shadow matching")
+    if snapshot.dependency_fingerprint != vector_before.fingerprint:
+        raise ShadowSnapshotConflict("snapshot matching context fingerprint is stale")
     current_source = fingerprint_legacy_source(
         db=db, competitor_price_list_id=int(source_version.competitor_price_list_id)
     )
@@ -542,7 +509,13 @@ def build_shadow_snapshot(
             )
             or 0
         )
-        vector_after = build_dependency_vector(db=db)
+        base_vector_after = build_dependency_vector(db=db)
+        vector_after, _ = build_source_dependency_vector(
+            db=db,
+            competitor_price_list_id=int(source_version.competitor_price_list_id),
+            base_vector=base_vector_after,
+            expected_source_ids=context.source_ids,
+        )
         final_source = fingerprint_legacy_source(
             db=db, competitor_price_list_id=int(source_version.competitor_price_list_id)
         )

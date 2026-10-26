@@ -17,6 +17,7 @@ from backend.app.db import SessionLocal
 from backend.app.models import CompetitorMatchSnapshot, CompetitorSourceVersion
 from backend.app.services.matching_cache.capture import fingerprint_legacy_source
 from backend.app.services.matching_cache.dependencies import build_dependency_vector
+from backend.app.services.matching_cache.context import build_source_dependency_vector
 from backend.app.services.matching_cache.differential import (
     compare_legacy_and_shadow_matches,
     compare_legacy_and_shadow_materialization,
@@ -73,8 +74,14 @@ def main() -> int:
         assignment_exact = assigned_source_ids == requested_source_ids
         if not assignment_exact:
             exact = False
-        vector = build_dependency_vector(db=db)
+        base_vector = build_dependency_vector(db=db)
         for source_id in args.source_ids:
+            vector, _context = build_source_dependency_vector(
+                db=db,
+                competitor_price_list_id=source_id,
+                base_vector=base_vector,
+                expected_source_ids=tuple(assigned_source_ids),
+            )
             version = db.scalar(
                 select(CompetitorSourceVersion).where(
                     CompetitorSourceVersion.competitor_price_list_id == source_id,

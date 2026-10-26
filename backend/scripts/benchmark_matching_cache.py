@@ -37,7 +37,7 @@ from backend.app.services.matching_cache.capture import (
     capture_and_publish_legacy_source_version,
     fingerprint_legacy_source,
 )
-from backend.app.services.matching_cache.dependencies import build_dependency_vector
+from backend.app.services.matching_cache.context import build_source_dependency_vector
 from backend.app.services.matching_cache.shadow import build_shadow_snapshot, get_or_create_shadow_snapshot
 
 
@@ -216,7 +216,9 @@ def run(*, database_url: str, source_id: int, expected_rows: int | None, commit:
             )
             result["sourceVersionReuseSeconds"] = time.perf_counter() - started
             result["sourceVersionRepeatReused"] = repeated_capture.reused
-            vector = build_dependency_vector(db=db)
+            vector, _context = build_source_dependency_vector(
+                db=db, competitor_price_list_id=source_id
+            )
             snapshot, snapshot_reused = get_or_create_shadow_snapshot(
                 db=db, source_version_id=capture.version_id, vector=vector
             )

@@ -33,7 +33,7 @@ from backend.app.models import (
 from backend.app.services import competitor_matching as matching_service
 from backend.app.services.competitor_matching import rebuild_competitor_prices_for_selected
 from backend.app.services.matching_cache.capture import capture_and_publish_legacy_source_version
-from backend.app.services.matching_cache.dependencies import build_dependency_vector
+from backend.app.services.matching_cache.context import build_source_dependency_vector
 from backend.app.services.matching_cache.shadow import build_shadow_snapshot, get_or_create_shadow_snapshot
 
 
@@ -77,6 +77,7 @@ def run(*, database_url: str, product_count: int, source_count: int, warm_iterat
         })
         snapshot_timings: list[float] = []
         snapshot_ids: list[int] = []
+        source_ids: list[int] = []
         with Session(engine) as db:
             price_format = PriceFormat(
                 code=f"BENCH-{uuid.uuid4().hex}",
@@ -130,10 +131,18 @@ def run(*, database_url: str, product_count: int, source_count: int, warm_iterat
                     is_active=True,
                 ))
                 db.flush()
+                source_ids.append(int(source.id))
+
+            # The matching context is the complete assigned physical-source
+            # cohort. Build only after every assignment exists so the benchmark
+            # does not manufacture snapshots that are stale by construction.
+            for source_id in source_ids:
                 capture = capture_and_publish_legacy_source_version(
-                    db=db, competitor_price_list_id=int(source.id)
+                    db=db, competitor_price_list_id=source_id
                 )
-                vector = build_dependency_vector(db=db)
+                vector, _context = build_source_dependency_vector(
+                    db=db, competitor_price_list_id=source_id
+                )
                 snapshot, _ = get_or_create_shadow_snapshot(
                     db=db, source_version_id=int(capture.version_id), vector=vector
                 )

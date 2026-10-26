@@ -45,6 +45,11 @@ DEPENDENCY_MODEL_COVERAGE = {
 }
 
 REQUIRED_DATABASE_TRIGGERS = frozenset({
+    "trg_comp_source_rows_insert_invalidate",
+    "trg_comp_source_rows_update_invalidate",
+    "trg_comp_source_rows_delete_invalidate",
+    "trg_comp_source_rows_truncate_invalidate",
+    "trg_comp_source_lineage_delete_invalidate",
     "trg_match_cache_products",
     "trg_match_cache_products_update",
     "trg_match_cache_product_extras",

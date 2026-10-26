@@ -155,6 +155,7 @@ from .services.competitor_assignments import (
     upsert_assignment,
 )
 from .services.competitor_coefficients import effective_price_coefficient, validate_price_coefficient
+from .services.matching_cache.lifecycle import matching_cache_status
 from .services.manual_matching_assignments import (
     complete_manual_matching_task,
     configured_worker_ids,
@@ -8373,6 +8374,14 @@ async def search_competitor_items_for_mapping(
         q=q,
         limit=limit,
     )
+
+
+@app.get("/api/admin/matching-cache/status")
+def get_admin_matching_cache_status(
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_admin_access),
+):
+    return matching_cache_status(db=db)
 
 
 @app.post("/api/admin/sap-provisor/source/import")

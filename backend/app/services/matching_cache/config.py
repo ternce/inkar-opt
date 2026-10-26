@@ -77,6 +77,14 @@ def matching_cache_worker_enabled() -> bool:
     return matching_cache_enabled() and _enabled("MATCH_CACHE_WORKER_ENABLED")
 
 
+def matching_cache_auto_prepare_enabled() -> bool:
+    """Worker-side lifecycle reconciliation; never enables cache reads."""
+
+    return matching_cache_worker_enabled() and _enabled(
+        "MATCH_CACHE_AUTO_PREPARE_ENABLED"
+    )
+
+
 def _positive_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
     raw = str(os.getenv(name, default)).strip()
     try:
@@ -97,6 +105,15 @@ def matching_cache_worker_poll_interval_seconds() -> int:
 def matching_cache_worker_lease_seconds() -> int:
     return _positive_int(
         "MATCH_CACHE_WORKER_LEASE_SECONDS", 900, minimum=60, maximum=7200
+    )
+
+
+def matching_cache_auto_prepare_interval_seconds() -> int:
+    return _positive_int(
+        "MATCH_CACHE_AUTO_PREPARE_INTERVAL_SECONDS",
+        300,
+        minimum=10,
+        maximum=3600,
     )
 
 

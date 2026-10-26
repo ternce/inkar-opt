@@ -15,7 +15,7 @@ from ...models import (
     CompetitorSourceVersion,
 )
 from .capture import create_or_reuse_legacy_source_version, fingerprint_legacy_source
-from .dependencies import build_dependency_vector
+from .context import build_source_dependency_vector
 from .jobs import enqueue_matching_job
 from .lineage import publish_physical_source_lineage
 from .shadow import get_or_create_shadow_snapshot
@@ -159,7 +159,10 @@ def backfill_existing_source(
             f"source publication {publication.id} row count does not match version {version.id}"
         )
 
-    vector = build_dependency_vector(db=db)
+    vector, _context = build_source_dependency_vector(
+        db=db,
+        competitor_price_list_id=source_id,
+    )
     snapshot, snapshot_reused = get_or_create_shadow_snapshot(
         db=db, source_version_id=int(version.id), vector=vector
     )

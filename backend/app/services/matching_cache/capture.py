@@ -17,7 +17,7 @@ from ...models import (
 )
 from ..pricing_workflow.locks import acquire_transaction_write_locks
 from .config import matching_cache_dual_write_enabled, matching_cache_shadow_enabled
-from .dependencies import build_dependency_vector
+from .context import build_source_dependency_vector
 from .fingerprints import (
     CanonicalSourceHasher,
     CanonicalSourceRow,
@@ -246,10 +246,12 @@ def capture_and_publish_legacy_source_version(
     competitor_price_list_id: int,
     source_metadata: dict | None = None,
     batch_size: int = 2000,
+    force_enabled: bool = False,
+    enqueue_shadow: bool | None = None,
 ) -> CaptureOutcome:
     """Best-effort dual write isolated by a savepoint; never commits."""
 
-    if not matching_cache_dual_write_enabled():
+    if not force_enabled and not matching_cache_dual_write_enabled():
         return CaptureOutcome(enabled=False, succeeded=False)
     started_at = time.perf_counter()
     io_before = _postgres_io_sample(db)
@@ -276,11 +278,19 @@ def capture_and_publish_legacy_source_version(
             publication = publish_physical_source_lineage(
                 db=db, source_version=version
             )
-            if matching_cache_shadow_enabled():
+            should_enqueue_shadow = (
+                force_enabled or matching_cache_shadow_enabled()
+                if enqueue_shadow is None
+                else bool(enqueue_shadow)
+            )
+            if should_enqueue_shadow:
                 from .jobs import enqueue_matching_job
                 from .shadow import get_or_create_shadow_snapshot
 
-                vector = build_dependency_vector(db=db)
+                vector, _context = build_source_dependency_vector(
+                    db=db,
+                    competitor_price_list_id=int(version.competitor_price_list_id),
+                )
                 snapshot, _ = get_or_create_shadow_snapshot(
                     db=db, source_version_id=int(version.id), vector=vector
                 )

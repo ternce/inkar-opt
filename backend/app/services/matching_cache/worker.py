@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Callable
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ...models import CompetitorMatchJob, CompetitorMatchSnapshot
+from ...models import CompetitorMatchJob, CompetitorMatchSnapshot, CompetitorSourceVersion
 from ...timezone import now_kz_naive
-from .config import matching_cache_worker_enabled
-from .dependencies import build_dependency_vector
+from .config import (
+    matching_cache_auto_prepare_enabled,
+    matching_cache_auto_prepare_interval_seconds,
+    matching_cache_worker_enabled,
+)
+from .context import MatchingContextConflict, build_source_dependency_vector
 from .dependency_tracking import assert_database_dependency_tracking
 from .jobs import (
     claim_next_matching_job,
@@ -18,10 +23,12 @@ from .jobs import (
     heartbeat_matching_job,
     recover_stale_matching_jobs,
 )
+from .lifecycle import reconcile_matching_cache_lifecycle
 from .shadow import ShadowSnapshotConflict, build_shadow_snapshot, get_or_create_shadow_snapshot
 
 
 logger = logging.getLogger(__name__)
+_last_lifecycle_reconcile_monotonic = 0.0
 
 
 def run_one_matching_job(
@@ -31,6 +38,7 @@ def run_one_matching_job(
 
     if not matching_cache_worker_enabled():
         return "disabled"
+    global _last_lifecycle_reconcile_monotonic
     job_id: int | None = None
     snapshot_id: int | None = None
     with session_factory() as db:
@@ -38,6 +46,20 @@ def run_one_matching_job(
         job = claim_next_matching_job(
             db=db, worker_id=worker_id, lease_seconds=lease_seconds
         )
+        now_monotonic = time.monotonic()
+        reconcile_due = (
+            matching_cache_auto_prepare_enabled()
+            and now_monotonic - _last_lifecycle_reconcile_monotonic
+            >= matching_cache_auto_prepare_interval_seconds()
+        )
+        if job is None and reconcile_due:
+            assert_database_dependency_tracking(db)
+            lifecycle = reconcile_matching_cache_lifecycle(db=db)
+            _last_lifecycle_reconcile_monotonic = now_monotonic
+            logger.info("[MATCH_CACHE_LIFECYCLE] %s", lifecycle.as_dict())
+            job = claim_next_matching_job(
+                db=db, worker_id=worker_id, lease_seconds=lease_seconds
+            )
         if job is None:
             db.commit()
             return "idle"
@@ -66,7 +88,13 @@ def run_one_matching_job(
                 worker_id=worker_id,
                 lease_seconds=lease_seconds,
             )
-            vector = build_dependency_vector(db=db)
+            source_version = db.get(CompetitorSourceVersion, int(job.source_version_id))
+            if source_version is None:
+                raise ShadowSnapshotConflict("matching job source version is missing")
+            vector, _context = build_source_dependency_vector(
+                db=db,
+                competitor_price_list_id=int(source_version.competitor_price_list_id),
+            )
             if vector.fingerprint != job.dependency_fingerprint:
                 raise ShadowSnapshotConflict("stale dependency fingerprint at job execution")
             snapshot, _ = get_or_create_shadow_snapshot(
@@ -94,7 +122,9 @@ def run_one_matching_job(
             )
             return "succeeded"
     except Exception as exc:
-        retryable = not isinstance(exc, ShadowSnapshotConflict)
+        retryable = not isinstance(
+            exc, (ShadowSnapshotConflict, MatchingContextConflict)
+        )
         with session_factory() as db:
             job = db.get(CompetitorMatchJob, job_id)
             if job is None or job.status != "running" or job.claimed_by != worker_id:

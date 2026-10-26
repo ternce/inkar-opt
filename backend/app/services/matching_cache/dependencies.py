@@ -13,7 +13,7 @@ from ...models import CompetitorMatchDependencyRevision
 from ...timezone import now_kz_naive
 
 
-MATCHER_VERSION = "legacy-authoritative-decisions-v2"
+MATCHER_VERSION = "legacy-authoritative-decisions-v3"
 NORMALIZATION_VERSION = "legacy-drug-normalization-v1"
 
 PRODUCT_CATALOG = "product_catalog"
@@ -41,13 +41,40 @@ class DependencyVector:
     matcher_version: str
     normalization_version: str
     fingerprint: str
+    matching_context: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "revisions": dict(sorted(self.revisions.items())),
             "matcherVersion": self.matcher_version,
             "normalizationVersion": self.normalization_version,
         }
+        if self.matching_context is not None:
+            payload["matchingContext"] = self.matching_context
+        return payload
+
+
+def with_matching_context(
+    vector: DependencyVector, *, price_format_ids: tuple[int, ...], source_ids: tuple[int, ...]
+) -> DependencyVector:
+    context = {
+        "priceFormatIds": list(price_format_ids),
+        "sourceIds": list(source_ids),
+    }
+    payload = {
+        "revisions": dict(sorted(vector.revisions.items())),
+        "matcherVersion": vector.matcher_version,
+        "normalizationVersion": vector.normalization_version,
+        "matchingContext": context,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return DependencyVector(
+        revisions=dict(vector.revisions),
+        matcher_version=vector.matcher_version,
+        normalization_version=vector.normalization_version,
+        fingerprint=hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        matching_context=context,
+    )
 
 
 def _json(value: Mapping[str, Any] | None) -> str:

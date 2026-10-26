@@ -19,7 +19,7 @@ from ...models import (
     CompetitorSourceVersionItem,
 )
 from .config import matching_cache_source_noop_enabled
-from .dependencies import build_dependency_vector
+from .context import build_source_dependency_vector
 from .fingerprints import CanonicalSourceHasher, SOURCE_CONTENT_FIELDS, canonical_source_row
 
 
@@ -284,7 +284,9 @@ def validate_unchanged_source_import(
 
     snapshot_id: int | None = None
     if require_snapshot:
-        vector = build_dependency_vector(db=db)
+        vector, _context = build_source_dependency_vector(
+            db=db, competitor_price_list_id=source_id
+        )
         snapshot = db.scalar(
             select(CompetitorMatchSnapshot)
             .where(
