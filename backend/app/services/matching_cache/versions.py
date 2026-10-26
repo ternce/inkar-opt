@@ -63,7 +63,6 @@ def create_or_reuse_pending_source_version(
     A content hash unique constraint remains the final database invariant.
     """
 
-    fingerprint = canonical_source_content(rows)
     source_id = int(competitor_price_list_id)
     locked_source_id = db.execute(
         select(CompetitorPriceList.id)
@@ -72,6 +71,15 @@ def create_or_reuse_pending_source_version(
     ).scalar_one_or_none()
     if locked_source_id is None:
         raise ValueError(f"competitor price list not found: {source_id}")
+    source_type = db.scalar(
+        select(CompetitorPriceList.source_type).where(
+            CompetitorPriceList.id == source_id
+        )
+    )
+    fingerprint = canonical_source_content(
+        rows,
+        include_match_decisions=str(source_type or "") == "manual_vidman",
+    )
 
     existing = db.execute(
         select(CompetitorSourceVersion)

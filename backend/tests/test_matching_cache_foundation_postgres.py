@@ -84,6 +84,7 @@ from backend.app.services.matching_cache.jobs import (
     recover_stale_matching_jobs,
 )
 from backend.app.services.matching_cache.shadow import (
+    _authoritative_decisions_match_context,
     ShadowSnapshotConflict,
     build_shadow_snapshot,
     get_or_create_shadow_snapshot,
@@ -463,7 +464,7 @@ def test_duplicate_rows_are_retained_and_affect_fingerprint(pg_engine, source_id
         assert [row.duplicate_ordinal for row in persisted] == [0, 1]
 
 
-def test_surrogate_ids_do_not_change_content_but_legacy_match_fields_do():
+def test_surrogate_ids_and_legacy_match_outputs_do_not_change_source_content():
     first = _rows()
     second = _rows()
     for ordinal, row in enumerate(first, start=100):
@@ -483,9 +484,43 @@ def test_surrogate_ids_do_not_change_content_but_legacy_match_fields_do():
 
     assert canonical_source_content(first).content_sha256 == canonical_source_content(second).content_sha256
     second[0]["product_id"] = 11
-    assert canonical_source_content(first).content_sha256 != canonical_source_content(second).content_sha256
+    second[0]["match_type"] = "provisor_goods_id"
+    second[0]["match_score"] = "100"
+    second[0]["match_key"] = "goods:42"
+    second[0]["matched_sku"] = "DIFFERENT"
+    assert canonical_source_content(first).content_sha256 == canonical_source_content(second).content_sha256
+    assert canonical_source_content(
+        first, include_match_decisions=True
+    ).content_sha256 != canonical_source_content(
+        second, include_match_decisions=True
+    ).content_sha256
 
 
+def test_authoritative_backfill_decisions_are_never_reused_across_contexts():
+    metadata = {
+        "matchingDecisionMode": "authoritative_legacy_output",
+        "authoritativePriceFormatId": 88,
+    }
+    assert _authoritative_decisions_match_context(
+        source_metadata=metadata,
+        context_price_format_ids=(88,),
+        context_count=2,
+    )
+    assert not _authoritative_decisions_match_context(
+        source_metadata=metadata,
+        context_price_format_ids=(89,),
+        context_count=2,
+    )
+    assert not _authoritative_decisions_match_context(
+        source_metadata={"matchingDecisionMode": "authoritative_legacy_output"},
+        context_price_format_ids=(89,),
+        context_count=2,
+    )
+    assert _authoritative_decisions_match_context(
+        source_metadata={"matchingDecisionMode": "authoritative_legacy_output"},
+        context_price_format_ids=(88,),
+        context_count=1,
+    )
 def test_dependency_revision_changes_vector(pg_engine):
     scope = f"catalog-{uuid.uuid4().hex}"
     with Session(pg_engine) as db:

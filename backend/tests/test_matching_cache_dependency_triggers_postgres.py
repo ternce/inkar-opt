@@ -55,6 +55,10 @@ PHASE3B_MIGRATION = (
     Path(__file__).resolve().parents[2]
     / "backend/scripts/migrations/20261015_phase3b_safe_write_invalidation.up.sql"
 )
+STABLE_SOURCE_IDENTITY_MIGRATION = (
+    Path(__file__).resolve().parents[2]
+    / "backend/scripts/migrations/20261026_matching_cache_stable_source_identity.up.sql"
+)
 
 
 def _postgres_url() -> str:
@@ -87,6 +91,7 @@ def trigger_engine():
         try:
             raw.execute(MIGRATION.read_text(encoding="utf-8"))
             raw.execute(PHASE3B_MIGRATION.read_text(encoding="utf-8"))
+            raw.execute(STABLE_SOURCE_IDENTITY_MIGRATION.read_text(encoding="utf-8"))
             raw.commit()
         finally:
             raw.close()
@@ -407,6 +412,62 @@ def test_source_row_update_invalidates_only_affected_publication_and_rolls_back(
         assert db.scalar(select(CompetitorSourcePublication.status).where(
             CompetitorSourcePublication.competitor_price_list_id == first_source
         )) == "published"
+
+
+def test_matcher_outputs_do_not_invalidate_source_but_manual_vidman_does(
+    trigger_engine, monkeypatch
+):
+    monkeypatch.setenv("MATCH_CACHE_ENABLED", "true")
+    monkeypatch.setenv("MATCH_CACHE_DUAL_WRITE", "true")
+    token = uuid.uuid4().hex
+    with Session(trigger_engine) as db:
+        product = Product(code=f"IDENTITY-{token}", name="Identity", cost=1)
+        db.add(product)
+        db.flush()
+        source_ids: dict[str, tuple[int, int]] = {}
+        for source_type in ("provisor", "manual_vidman"):
+            source = CompetitorPriceList(
+                source_type=source_type,
+                source_key=f"stable-identity:{source_type}:{token}",
+                display_name=source_type,
+            )
+            db.add(source)
+            db.flush()
+            item = CompetitorPriceListItem(
+                price_list_id=source.id,
+                name="row",
+                distributor_goods_name="row",
+                distributor_goods_id=f"ROW-{source_type}",
+                distributor_price=Decimal("10"),
+                match_type="unmatched",
+                raw_json="{}",
+            )
+            db.add(item)
+            db.flush()
+            capture_and_publish_legacy_source_version(
+                db=db, competitor_price_list_id=int(source.id)
+            )
+            source_ids[source_type] = (int(source.id), int(item.id))
+        product_id = int(product.id)
+        db.commit()
+
+    with Session(trigger_engine) as db:
+        for _source_id, item_id in source_ids.values():
+            db.execute(text(
+                """UPDATE competitor_price_list_items
+                   SET product_id=:product_id, match_type='fuzzy_name_manufacturer',
+                       match_score=99, match_key='derived', matched_sku='derived'
+                   WHERE id=:item_id"""
+            ), {"product_id": product_id, "item_id": item_id})
+        db.commit()
+
+    with Session(trigger_engine) as db:
+        statuses = dict(db.execute(select(
+            CompetitorSourcePublication.competitor_price_list_id,
+            CompetitorSourcePublication.status,
+        )).all())
+        assert statuses[source_ids["provisor"][0]] == "published"
+        assert statuses[source_ids["manual_vidman"][0]] == "failed"
 
 
 def test_source_insert_delete_and_truncate_invalidation_is_transactional(

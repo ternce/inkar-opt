@@ -14,10 +14,17 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backend.app.db import SessionLocal
-from backend.app.models import CompetitorMatchSnapshot, CompetitorSourceVersion
+from backend.app.models import (
+    CompetitorMatchSnapshot,
+    CompetitorSourceVersion,
+    PricingWorkflowRun,
+)
 from backend.app.services.matching_cache.capture import fingerprint_legacy_source
 from backend.app.services.matching_cache.dependencies import build_dependency_vector
-from backend.app.services.matching_cache.context import build_source_dependency_vector
+from backend.app.services.matching_cache.context import (
+    build_source_dependency_vector,
+    resolve_matching_contexts,
+)
 from backend.app.services.matching_cache.differential import (
     compare_legacy_and_shadow_matches,
     compare_legacy_and_shadow_materialization,
@@ -125,6 +132,36 @@ def main() -> int:
                 exact = False
                 continue
             snapshots_by_source_id[source_id] = int(snapshot.id)
+            source_contexts = resolve_matching_contexts(
+                db=db, competitor_price_list_id=source_id
+            )
+            shared_context_format_ids = sorted({
+                int(format_id)
+                for source_context in source_contexts
+                for format_id in source_context.price_format_ids
+            })
+            latest_legacy_run = None
+            legacy_context_current = True
+            if len(source_contexts) > 1:
+                latest_legacy_run = db.scalar(
+                    select(PricingWorkflowRun)
+                    .where(
+                        PricingWorkflowRun.price_format_id.in_(
+                            shared_context_format_ids
+                        ),
+                        PricingWorkflowRun.status == "success",
+                    )
+                    .order_by(
+                        PricingWorkflowRun.finished_at.desc().nulls_last(),
+                        PricingWorkflowRun.id.desc(),
+                    )
+                    .limit(1)
+                )
+                legacy_context_current = (
+                    latest_legacy_run is not None
+                    and int(latest_legacy_run.price_format_id)
+                    == int(args.price_format_id)
+                )
             try:
                 snapshot_stats = json.loads(snapshot.stats_json or "{}")
                 snapshot_context_ids = sorted(
@@ -148,7 +185,10 @@ def main() -> int:
                 snapshot_id=int(snapshot.id),
             ).as_dict()
             source_exact = (
-                content_exact and context_exact and bool(decision_report["exact"])
+                content_exact
+                and context_exact
+                and legacy_context_current
+                and bool(decision_report["exact"])
             )
             reports.append(
                 {
@@ -162,6 +202,18 @@ def main() -> int:
                     "matchingContextExact": context_exact,
                     "snapshotMatchingSourceIds": snapshot_context_ids,
                     "matchingContextKey": requested_context.context_key,
+                    "legacyDecisionBaseline": {
+                        "currentForRequestedFormat": legacy_context_current,
+                        "sharedContextFormatIds": shared_context_format_ids,
+                        "latestSuccessfulWorkflowId": (
+                            int(latest_legacy_run.id)
+                            if latest_legacy_run is not None else None
+                        ),
+                        "latestSuccessfulPriceFormatId": (
+                            int(latest_legacy_run.price_format_id)
+                            if latest_legacy_run is not None else None
+                        ),
+                    },
                     "exact": source_exact,
                     "decisionComparison": decision_report,
                 }

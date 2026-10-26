@@ -253,6 +253,9 @@ def validate_unchanged_source_import(
             current_mapping,
             input_ordinal=ordinal,
             occurrences=occurrences,
+            include_match_decisions=(
+                authoritative_input or str(source.source_type or "") == "manual_vidman"
+            ),
         )
         hasher.add(canonical)
         row_count += 1

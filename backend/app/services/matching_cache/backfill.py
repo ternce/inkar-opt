@@ -116,10 +116,22 @@ def backfill_existing_source(
         source_metadata = {}
     if not isinstance(source_metadata, dict):
         source_metadata = {}
+    # A physical source may be shared by incompatible format contexts.  Frozen
+    # legacy decisions belong only to the context that produced them; never
+    # retag a reused immutable version as authoritative for a later backfill.
+    existing_authoritative_format = source_metadata.get(
+        "authoritativePriceFormatId", source_metadata.get("priceFormatId")
+    )
+    requested_authoritative_format = (
+        int(price_format_id) if price_format_id is not None else None
+    )
+    if existing_authoritative_format is None and not created.reused:
+        existing_authoritative_format = requested_authoritative_format
     source_metadata.update({
         "matchingDecisionMode": "authoritative_legacy_output",
         "origin": "existing_source_backfill",
-        "priceFormatId": int(price_format_id) if price_format_id is not None else None,
+        "priceFormatId": existing_authoritative_format,
+        "authoritativePriceFormatId": existing_authoritative_format,
     })
     version.source_metadata_json = json.dumps(
         source_metadata,

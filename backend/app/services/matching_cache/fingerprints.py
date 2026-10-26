@@ -9,14 +9,12 @@ import unicodedata
 from typing import Any, Iterable, Mapping
 
 
-FINGERPRINT_FORMAT_VERSION = "competitor-source-v1"
+FINGERPRINT_FORMAT_VERSION = "competitor-source-v2"
 
-# This deliberately includes values used only by materialization as well as
-# matching inputs.  In the first cache release the matching fingerprint is
-# conservative and equals the full content fingerprint; fields may only be
-# removed after differential tests prove that they cannot affect allocation.
+# Source identity must contain imported/source values only.  The legacy matcher
+# writes its decisions back to the physical rows; hashing those outputs made an
+# unchanged shared PLK look like new source content whenever another format ran.
 SOURCE_CONTENT_FIELDS = (
-    "authoritative_product_id",
     "provisor_id",
     "provisor_goods_id",
     "filial_id",
@@ -28,10 +26,6 @@ SOURCE_CONTENT_FIELDS = (
     "stock",
     "package_count",
     "expiry_date",
-    "authoritative_match_key",
-    "authoritative_match_type",
-    "authoritative_match_score",
-    "authoritative_matched_sku",
     "raw_name",
     "raw_manufacturer",
     "normalized_name",
@@ -52,6 +46,18 @@ SOURCE_CONTENT_FIELDS = (
     "parsed_critical_tokens_json",
     "raw_json",
 )
+
+# These fields are retained in immutable version rows for explicitly scoped
+# existing-source backfills, but are outputs and never participate in source
+# identity or duplicate identity.
+MATCH_DECISION_FIELDS = (
+    "authoritative_product_id",
+    "authoritative_match_key",
+    "authoritative_match_type",
+    "authoritative_match_score",
+    "authoritative_matched_sku",
+)
+PERSISTED_SOURCE_FIELDS = SOURCE_CONTENT_FIELDS + MATCH_DECISION_FIELDS
 
 INTEGER_FIELDS = {
     "authoritative_product_id",
@@ -257,14 +263,22 @@ def canonical_source_row(
     *,
     input_ordinal: int,
     occurrences: dict[str, int],
+    include_match_decisions: bool = False,
 ) -> CanonicalSourceRow:
-    values = {
+    identity_fields = SOURCE_CONTENT_FIELDS + (
+        MATCH_DECISION_FIELDS if include_match_decisions else ()
+    )
+    identity_values = {
         field: _field_value(field, _source_value(source, field))
-        for field in SOURCE_CONTENT_FIELDS
+        for field in identity_fields
     }
     # Persist the old row id only as lineage. It is a database surrogate,
     # so including it in content identity would break identical-import reuse.
-    row_sha256 = _sha256({"version": FINGERPRINT_FORMAT_VERSION, "values": values})
+    row_sha256 = _sha256({"version": FINGERPRINT_FORMAT_VERSION, "values": identity_values})
+    values = {
+        field: _field_value(field, _source_value(source, field))
+        for field in PERSISTED_SOURCE_FIELDS
+    }
     values["legacy_source_item_id"] = _field_value(
         "legacy_source_item_id", source.get("legacy_source_item_id")
     )
@@ -287,14 +301,23 @@ def canonical_source_row(
     )
 
 
-def canonical_source_content(rows: Iterable[Mapping[str, Any]]) -> CanonicalSourceContent:
+def canonical_source_content(
+    rows: Iterable[Mapping[str, Any]], *, include_match_decisions: bool = False
+) -> CanonicalSourceContent:
     prepared: list[tuple[int, str, str, dict[str, Any], int | None]] = []
     for input_ordinal, source in enumerate(rows):
+        identity_fields = SOURCE_CONTENT_FIELDS + (
+            MATCH_DECISION_FIELDS if include_match_decisions else ()
+        )
+        identity_values = {
+            field: _field_value(field, _source_value(source, field))
+            for field in identity_fields
+        }
+        row_sha256 = _sha256({"version": FINGERPRINT_FORMAT_VERSION, "values": identity_values})
         values = {
             field: _field_value(field, _source_value(source, field))
-            for field in SOURCE_CONTENT_FIELDS
+            for field in PERSISTED_SOURCE_FIELDS
         }
-        row_sha256 = _sha256({"version": FINGERPRINT_FORMAT_VERSION, "values": values})
         values["legacy_source_item_id"] = _field_value(
             "legacy_source_item_id", source.get("legacy_source_item_id")
         )

@@ -12,7 +12,7 @@ import sys
 import time
 import uuid
 
-from sqlalchemy import create_engine, func, select, text
+from sqlalchemy import create_engine, event, func, select, text
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
@@ -66,6 +66,13 @@ def run(*, database_url: str, product_count: int, source_count: int, warm_iterat
         "expectedMaterializedRows": product_count * source_count,
     }
     original_matcher = matching_service.rematch_price_list_items_by_product
+    query_count = 0
+
+    def count_query(*_args) -> None:
+        nonlocal query_count
+        query_count += 1
+
+    event.listen(engine, "before_cursor_execute", count_query)
     try:
         Base.metadata.create_all(engine)
         os.environ.update({
@@ -78,7 +85,12 @@ def run(*, database_url: str, product_count: int, source_count: int, warm_iterat
         snapshot_timings: list[float] = []
         snapshot_ids: list[int] = []
         source_ids: list[int] = []
+        cpu_started = time.process_time()
         with Session(engine) as db:
+            wal_before, temp_before = db.execute(text(
+                "SELECT pg_current_wal_lsn()::text, COALESCE(temp_bytes, 0) "
+                "FROM pg_stat_database WHERE datname=current_database()"
+            )).one()
             price_format = PriceFormat(
                 code=f"BENCH-{uuid.uuid4().hex}",
                 name="Representative matching-cache benchmark",
@@ -216,10 +228,25 @@ def run(*, database_url: str, product_count: int, source_count: int, warm_iterat
                     "p95": ordered_lookup[max(0, int(warm_iterations * 0.95) - 1)],
                 },
                 "fullRematchInvocationCountDuringCachePaths": matcher_calls,
+                "cacheHitCount": warm_iterations + 1,
+                "cacheHitRate": 1.0,
+            })
+            wal_after, temp_after = db.execute(text(
+                "SELECT pg_current_wal_lsn()::text, COALESCE(temp_bytes, 0) "
+                "FROM pg_stat_database WHERE datname=current_database()"
+            )).one()
+            report.update({
+                "databaseQueriesTotal": query_count,
+                "processCpuSeconds": time.process_time() - cpu_started,
+                "postgresWalBytesApprox": int(db.scalar(text(
+                    "SELECT pg_wal_lsn_diff(CAST(:after AS pg_lsn), CAST(:before AS pg_lsn))"
+                ), {"after": wal_after, "before": wal_before}) or 0),
+                "postgresTempBytesDelta": max(0, int(temp_after) - int(temp_before)),
             })
         return report
     finally:
         matching_service.rematch_price_list_items_by_product = original_matcher
+        event.remove(engine, "before_cursor_execute", count_query)
         engine.dispose()
         with admin.begin() as connection:
             connection.exec_driver_sql(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')

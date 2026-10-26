@@ -51,10 +51,30 @@ from .context import (
     MatchingContextConflict,
     build_source_dependency_vector,
     resolve_matching_context,
+    resolve_matching_contexts,
 )
 
 
 logger = logging.getLogger(__name__)
+
+
+def _authoritative_decisions_match_context(
+    *, source_metadata: dict, context_price_format_ids: tuple[int, ...], context_count: int
+) -> bool:
+    if source_metadata.get("matchingDecisionMode") != "authoritative_legacy_output":
+        return False
+    value = source_metadata.get(
+        "authoritativePriceFormatId", source_metadata.get("priceFormatId")
+    )
+    try:
+        authoritative_price_format_id = int(value)
+    except (TypeError, ValueError):
+        authoritative_price_format_id = None
+    if authoritative_price_format_id is not None:
+        return authoritative_price_format_id in context_price_format_ids
+    # Compatibility for old single-context backfills.  Unscoped decisions are
+    # never safe once a physical source participates in multiple contexts.
+    return context_count == 1
 
 
 class ShadowSnapshotConflict(RuntimeError):
@@ -312,10 +332,13 @@ def build_shadow_snapshot(
         source_metadata = json.loads(source_version.source_metadata_json or "{}")
     except (TypeError, json.JSONDecodeError):
         source_metadata = {}
-    preserve_authoritative_decisions = (
-        isinstance(source_metadata, dict)
-        and source_metadata.get("matchingDecisionMode")
-        == "authoritative_legacy_output"
+    preserve_authoritative_decisions = _authoritative_decisions_match_context(
+        source_metadata=source_metadata if isinstance(source_metadata, dict) else {},
+        context_price_format_ids=context.price_format_ids,
+        context_count=len(resolve_matching_contexts(
+            db=db,
+            competitor_price_list_id=int(source_version.competitor_price_list_id),
+        )),
     )
     base_vector_before = build_dependency_vector(db=db)
     vector_before, _ = build_source_dependency_vector(

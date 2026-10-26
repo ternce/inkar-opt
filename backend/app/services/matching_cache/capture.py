@@ -106,6 +106,12 @@ def _legacy_item_mapping(item: CompetitorPriceListItem, ordinal: int) -> dict:
 def iter_legacy_source_rows(
     *, db: Session, competitor_price_list_id: int, batch_size: int = 2000
 ) -> Iterator[CanonicalSourceRow]:
+    source_type = db.scalar(
+        select(CompetitorPriceList.source_type).where(
+            CompetitorPriceList.id == int(competitor_price_list_id)
+        )
+    )
+    include_match_decisions = str(source_type or "") == "manual_vidman"
     occurrences: dict[str, int] = {}
     result = db.scalars(
         select(CompetitorPriceListItem)
@@ -118,6 +124,7 @@ def iter_legacy_source_rows(
             _legacy_item_mapping(item, ordinal),
             input_ordinal=ordinal,
             occurrences=occurrences,
+            include_match_decisions=include_match_decisions,
         )
 
 
