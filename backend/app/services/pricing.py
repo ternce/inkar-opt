@@ -3029,7 +3029,11 @@ def calculate_prices(
             .first()
         )
         if existing_competitor_rows is None:
-            rebuild_competitor_prices_for_selected(db=db, price_format_id=pf.id)
+            rebuild_competitor_prices_for_selected(
+                db=db,
+                price_format_id=pf.id,
+                lock_lease=lock_lease,
+            )
             db.flush()
     if percentile_mode and physical_mode:
         existing_percentile_rows = (

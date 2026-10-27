@@ -9,10 +9,23 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
+from backend.app.db import Base
+from backend.app.services import pricing as pricing_module
+from backend.app.services.pricing_workflow import workflow as workflow_module
 from backend.app.services.pricing_workflow.locks import (
+    PRICE_FORMAT_LOCK_NAMESPACE,
     PricingWorkflowConflict,
     PricingWorkflowLockLease,
+    WorkflowLockKey,
     acquire_transaction_write_locks,
+)
+from backend.tests.test_pricing_engine_targeted_fixes import (
+    _activate_all_products_for_generation,
+    _format,
+    _product,
+    _workflow_context,
+    _workflow_payload,
+    _workflow_price_list_source,
 )
 
 
@@ -186,3 +199,60 @@ def test_conflict_diagnostics_and_partial_acquisition_cleanup(pg_engine):
     with Session(pg_engine) as retry_db:
         with PricingWorkflowLockLease(retry_db) as retry:
             retry.acquire(source_ids=[920011, 920012])
+
+
+def test_zero_materialized_rows_fallback_rebuild_does_not_self_conflict(
+    pg_engine,
+    monkeypatch,
+):
+    Base.metadata.create_all(pg_engine)
+    monkeypatch.setenv("MATCH_CACHE_ENABLED", "false")
+    monkeypatch.setenv("MATCH_CACHE_READ", "false")
+
+    with Session(pg_engine) as db:
+        pf = _format(db, price_format_id=930001)
+        product = _product(db, code="LOCK-FALLBACK-PG", cost=100)
+        context = _workflow_context(db, branch_id="lock-fallback")
+        source = _workflow_price_list_source(db, pf, product=product, price=150)
+        source.source_type = "manual"
+        _activate_all_products_for_generation(db, branch_id="lock-fallback")
+        payload = _workflow_payload(
+            context,
+            pf,
+            source,
+            percentile_sources=[],
+            price_list_number="LOCK-FALLBACK-PG-PL",
+        )
+
+        # Reproduce production's zero-row state after the workflow matching
+        # stage so calculate_prices() must execute its defensive rebuild.
+        monkeypatch.setattr(
+            workflow_module,
+            "rebuild_competitor_prices_for_selected",
+            lambda **_kwargs: {"_stageTimings": []},
+        )
+        fallback_leases = []
+        original_fallback_rebuild = pricing_module.rebuild_competitor_prices_for_selected
+
+        def capture_fallback_lease(**kwargs):
+            lease = kwargs.get("lock_lease")
+            fallback_leases.append((lease, tuple(lease.acquired_keys) if lease is not None else ()))
+            return original_fallback_rebuild(**kwargs)
+
+        monkeypatch.setattr(
+            pricing_module,
+            "rebuild_competitor_prices_for_selected",
+            capture_fallback_lease,
+        )
+
+        run = workflow_module.create_workflow_run(db=db, payload=payload)
+
+        assert len(fallback_leases) == 1
+        assert fallback_leases[0][0] is not None
+        assert WorkflowLockKey(
+            PRICE_FORMAT_LOCK_NAMESPACE,
+            int(pf.id),
+            "price_format",
+        ) in fallback_leases[0][1]
+        assert run.status != "conflict"
+        assert "pricing workflow conflict" not in str(run.error or "")
