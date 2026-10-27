@@ -13,6 +13,12 @@ from backend.app.services import competitor_matching
 from backend.app import main as main_module
 from backend.app.models import PriceList
 from backend.app.services.pricing_workflow import workflow as workflow_module
+from backend.app.services.pricing_workflow.locks import (
+    PRICE_FORMAT_LOCK_NAMESPACE,
+    PricingWorkflowConflict,
+    WorkflowLockKey,
+    workflow_lock_retry_timeout_seconds,
+)
 from backend.app.services.pricing_workflow.timing import WorkflowTimingRecorder, sanitize_error_message
 from backend.tests.test_pricing_engine_targeted_fixes import (
     _format,
@@ -267,3 +273,39 @@ def test_batch_mixed_conflict_and_success_remains_warning_200_shape(monkeypatch)
     assert result["completedFormats"] == 1
     assert result["failedFormats"] == 1
     assert [item["status"] for item in result["items"]] == ["conflict", "success"]
+
+
+def test_workflow_conflict_status_contains_bounded_wait_diagnostics(monkeypatch):
+    db, payload = _workflow_fixture()
+    monkeypatch.setenv("MATCH_CACHE_MODE", "disabled")
+    monkeypatch.setenv("PRICING_WORKFLOW_LOCK_TIMEOUT_SECONDS", "0.25")
+
+    def reject_lock(self, **kwargs):
+        assert kwargs["retry_timeout_seconds"] == pytest.approx(0.25)
+        assert kwargs["stage"] == "workflow_initial_lock"
+        key = WorkflowLockKey(
+            PRICE_FORMAT_LOCK_NAMESPACE,
+            int(payload["priceFormatId"]),
+            "price_format",
+        )
+        raise PricingWorkflowConflict(
+            key,
+            stage=kwargs["stage"],
+            waited_seconds=0.25,
+            backend_pid=4321,
+        )
+
+    monkeypatch.setattr(workflow_module.PricingWorkflowLockLease, "acquire", reject_lock)
+    run = workflow_module.create_workflow_run(db=db, payload=payload)
+
+    assert run.status == "conflict"
+    assert "stage=workflow_initial_lock" in run.error
+    assert "waited_seconds=0.250" in run.error
+    assert "backend_pid=4321" in run.error
+
+
+def test_workflow_lock_timeout_configuration_is_bounded(monkeypatch):
+    monkeypatch.setenv("PRICING_WORKFLOW_LOCK_TIMEOUT_SECONDS", "999")
+    assert workflow_lock_retry_timeout_seconds() == 60.0
+    monkeypatch.setenv("PRICING_WORKFLOW_LOCK_TIMEOUT_SECONDS", "invalid")
+    assert workflow_lock_retry_timeout_seconds() == 5.0

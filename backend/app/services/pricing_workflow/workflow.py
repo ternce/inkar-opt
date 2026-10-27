@@ -31,6 +31,7 @@ from .locks import (
     PricingWorkflowConflict,
     PricingWorkflowConcurrencySlot,
     PricingWorkflowLockLease,
+    workflow_lock_retry_timeout_seconds,
 )
 from .timing import WorkflowTimingRecorder, sanitize_error_message
 from ..pricing_rules.rules import resolve_price_format_pricing_rule
@@ -327,7 +328,12 @@ def create_workflow_run(*, db: Session, payload: dict) -> PricingWorkflowRun:
     try:
         capacity_slot.__enter__()
         lease.__enter__()
-        lease.acquire(price_format_ids=[int(pf.id)], source_ids=selected_ids)
+        lease.acquire(
+            price_format_ids=[int(pf.id)],
+            source_ids=selected_ids,
+            retry_timeout_seconds=workflow_lock_retry_timeout_seconds(),
+            stage="workflow_initial_lock",
+        )
         # Everything read before the lock was only preliminary request
         # validation. Refresh configuration under the format lock so execution
         # branches and the immutable snapshot observe one configuration version.
