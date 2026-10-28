@@ -146,6 +146,13 @@ _INVALID_CREDENTIAL_MARKERS = (
     "forbidden",
     "неверн",
 )
+_INVALID_REFRESH_TOKEN_MARKERS = (
+    "срок жизни токена истек",
+    "invalid refresh token",
+    "refresh token is invalid",
+    "refresh token expired",
+    "refresh token has expired",
+)
 
 
 def _safe_response_text(response: httpx.Response, limit: int = 1000) -> str:
@@ -159,6 +166,15 @@ def _is_invalid_credentials_response(response: httpx.Response) -> bool:
         return False
     lowered = _safe_response_text(response).casefold()
     return any(marker in lowered for marker in _INVALID_CREDENTIAL_MARKERS)
+
+
+def _is_invalid_refresh_token_response(response: httpx.Response) -> bool:
+    if _is_invalid_credentials_response(response):
+        return True
+    if response.status_code != 400:
+        return False
+    lowered = _safe_response_text(response).casefold()
+    return any(marker in lowered for marker in _INVALID_REFRESH_TOKEN_MARKERS)
 
 
 def _is_retryable_response(response: httpx.Response) -> bool:
@@ -265,7 +281,7 @@ async def _update_tokens(
         timeout=timeout,
     )
     if resp.status_code >= 400:
-        if _is_invalid_credentials_response(resp):
+        if _is_invalid_refresh_token_response(resp):
             raise ProvisorAuthError(f"Token/Update failed: HTTP {resp.status_code}")
         raise _request_error("Token/Update", resp)
 
